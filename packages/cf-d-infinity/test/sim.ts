@@ -95,6 +95,8 @@ export class SimCluster implements Cluster {
   shardIds: string[];
   net = new SimNet();
   time = 1_000_000;
+  /** 全シャードの時計をまとめて進める量 (ms)。時計の出所が実時間でも効く。 */
+  ahead = 0;
   cores = new Map<string, ShardCore>();
   backends = new Map<string, SqliteBackend>();
   meta: MetaCore;
@@ -121,7 +123,7 @@ export class SimCluster implements Cluster {
     this.cores.set(id, new ShardCore({
       id,
       backend: this.backends.get(id)!,
-      clock: { now: () => (this.o.now?.() ?? this.time) + (this.o.skewMs?.(id) ?? 0) },
+      clock: { now: () => (this.o.now?.() ?? this.time) + this.ahead + (this.o.skewMs?.(id) ?? 0) },
       peer: (to) => this.stub(id, to),
       meta: { ddlSince: (v) => this.meta.ddlSince(v) },
       background: (p) => {

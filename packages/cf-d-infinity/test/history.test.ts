@@ -1,3 +1,4 @@
+import { expectQuiescent } from "./invariants";
 import { describe, expect, it } from "vitest";
 import { SimCluster, USERS } from "./sim";
 import { checkHistory, type Read, type TxRecord } from "./history";
@@ -170,6 +171,8 @@ async function run(o: RunOpts) {
   await c.settle();
   for (const core of c.cores.values()) await core.redrive();
   await c.settle();
+  // 欠陥を入れていない実行では、後始末が済んでいることも確かめる。
+  if (!o.faults) await expectQuiescent(c);
   return { history, violations: checkHistory(history), unknown, c, splits };
 }
 
