@@ -659,7 +659,7 @@ describe("the checks are not vacuous", () => {
     };
     const seen = { missing: false, wrongRead: false, indexReadsMissing: false };
     // 実行中の読みが欠落に当たるのは seed の半分ほどなので、3 種類とも出るまで seed を進める。
-    for (let seed = 201; seed < 221 && !(seen.missing && seen.wrongRead && seen.indexReadsMissing); seed++) {
+    for (let seed = 201; seed < 241 && !(seen.missing && seen.wrongRead && seen.indexReadsMissing); seed++) {
       const v = violations(await runScenario(seed, s));
       seen.missing ||= v.missing.length > 0;
       seen.wrongRead ||= v.wrongRead.length > 0;

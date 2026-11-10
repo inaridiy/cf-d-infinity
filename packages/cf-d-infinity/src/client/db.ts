@@ -107,6 +107,8 @@ class ReadScope {
   protected wantsFresh = false;
   /** 取引でない読み取りは、開始前に確定した書き込みを必ず見る。取引は自分のスナップショットを読み続ける。 */
   protected realtime = true;
+  /** T を決めるときに時計を見たシャード。ここにないシャードは、T より後に確定した書き込みを持っているかもしれない。 */
+  private clocked = new Set<string>();
   constructor(protected db: Db, protected cat: Catalog) {}
 
   protected overlay(_shard: string): Change[] {
@@ -116,10 +118,15 @@ class ReadScope {
 
   async call(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "overlay">): Promise<ExecRes> {
     const spans = withSlots(this.cat.routing, shard, req.spans);
+    // T は、時計を見たシャードについてだけ「読みの開始前の確定をすべて含む」と言える。index を引いたシャードの時刻で
+    // 行のシャードを読むと、行のシャードの時計が進んでいれば、応答まで返った書き込みが見えない。
+    // そのシャードには、読む範囲が T より後に変わっていたら断らせて、新しい時刻でやり直す。
+    const late = this.realtime && this.T !== undefined && !this.clocked.has(shard);
     const full: ExecReq = {
-      ...req, spans, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), fresh: this.wantsFresh, realtime: this.realtime,
+      ...req, spans, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), fresh: this.wantsFresh || late, realtime: this.realtime,
     };
     const res = await this.db.shardOf(shard).exec(full);
+    if (this.T === undefined) this.clocked.add(shard);
     this.T ??= res.T;
     this.db.observe(res.hlc);
     this.record(shard, spans);
@@ -169,7 +176,7 @@ class ReadScope {
    * 表全体にすると、取引の検証で、条件に関わらない行への書き込みとも競合する。条件を押し下げられない表だけ、表全体になる。
    * shard key の span も付ける。範囲が別のシャードへ移っていれば、それで NotOwner になり、経路を取り直せる。
    */
-  private wideSpans(scans: Scan[], sks: string[]): Span[] {
+  protected wideSpans(scans: Scan[], sks: string[]): Span[] {
     return scans.flatMap((s) => [...this.scanSpans(s, sks), ...this.scanSpans(s, null)]);
   }
 
@@ -182,6 +189,7 @@ class ReadScope {
     if (this.T !== undefined || shards.length < 2) return;
     const clocks = await Promise.all(shards.map((id) => this.db.shardOf(id).now({})));
     this.T = Math.max(this.db.token, ...clocks);
+    for (const id of shards) this.clocked.add(id);
   }
 
   private scanSpans(s: Scan, sks: string[] | null): Span[] {
@@ -427,8 +435,16 @@ export class Txn extends ReadScope {
   }
 
   async statement(stmt: Node, params: Params): Promise<QueryResult> {
-    const p = await planStatement(stmt, params, this.cat, this.db.planContext(this.cat));
+    const p = await planStatement(stmt, params, this.cat, this.planContext());
     return this.execute(p);
+  }
+
+  /** 計画の途中で表を読む式は、この取引の読みとして実行する。読んだ範囲が commit で検証される。 */
+  planContext(): PlanContext {
+    return {
+      ...this.db.planContext(this.cat),
+      read: async (sql, params) => (await this.statement(parseStatements(sql)[0], params)).values[0]?.[0] ?? null,
+    };
   }
 
   /**
@@ -493,7 +509,9 @@ export class Txn extends ReadScope {
     const out: { columns: string[]; values: Value[][] } = { columns: [], values: [] };
     let changes = 0;
     const one = async (t: WriteTarget, target: Target) => {
-      const spans = this.spansFor(p.tables ?? [p.def], t.pk, target.sks);
+      // index 経由の UPDATE と DELETE は、文を shard key に絞らずに送る。読みと同じく、span も絞らない。
+      // 絞ると、ほかの行の確定済みで適用待ちの更新が決着されず、文がその行を古い値から書き換えてしまう。
+      const spans = t.wide && target.sks ? this.wideSpans(t.wide, target.sks) : this.spansFor(p.tables ?? [p.def], t.pk, target.sks);
       const res = await this.dml(target.shard, { sql: t.sql, params: t.params, spans, write: t.write });
       if (res.columns.length) out.columns = res.columns;
       out.values.push(...res.values);
@@ -1089,8 +1107,10 @@ export class Db {
       const saved = new Map([...this.ids].map(([k, v]) => [k, { ...v }]));
       try {
         const fresh = attempt === 0 ? stmt : parseStatements(source)[0];
-        const p = await planStatement(fresh, params, cat, this.planContext(cat));
+        const p = await planStatement(fresh, params, cat, this.current ? this.current.planContext() : this.planContext(cat));
         info.plan = p.kind;
+        // 計画の途中で表を読む文は、読みと書き込みを 1 つの取引にする。
+        if (p.kind === "inTxn") return await this.transaction((tx) => tx.statement(parseStatements(source)[0], params));
         return await this.dispatch(p, cat);
       } catch (e) {
         for (const [k, v] of saved) if (this.ids.get(k)?.end === v.end) this.ids.get(k)!.next = v.next;
@@ -1201,7 +1221,9 @@ export class Db {
   private async autoWrite(p: Extract<Plan, { kind: "write" }>, t: WriteTarget, cat: Catalog): Promise<QueryResult> {
     const sk = (t.route as { sks: string[] }).sks[0]!;
     const table = p.def.name;
-    const spans: Span[] = t.pk ? [{ kind: "pk", table, pk: t.pk, sk }] : [{ kind: "sk", table, sk }];
+    // サブクエリが読む表も span に入れる。入れないと、その表の確定済みで適用待ちの書き込みを待たずに実行してしまう。
+    const tables = p.tables ?? [p.def];
+    const spans: Span[] = t.pk && tables.length === 1 ? [{ kind: "pk", table, pk: t.pk, sk }] : tables.map((d) => ({ kind: "sk" as const, table: d.name, sk }));
     const res = await this.shardOf(ownerOf(cat.routing, sk)).execAuto({
       sql: t.sql, params: t.params, spans, write: t.write, schema: cat.version, minTs: this.token,
     });
