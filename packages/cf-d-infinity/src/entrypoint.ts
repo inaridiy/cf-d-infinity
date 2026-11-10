@@ -3,7 +3,7 @@ import { RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import type { RemoteResult, RemoteStatement, TransactionMode } from "./binding";
 import type { Db, QueryResult } from "./client/db";
 import type { Value } from "./types";
-import { clusterStatus, dbFor, handle, slowQueries, type Env, type SlowQuery } from "./worker";
+import { clusterStatus, dbFor, exportRows, handle, schemaSql, slowQueries, type Env, type SlowQuery } from "./worker";
 
 const toValue = (v: unknown): Value =>
   v === undefined || v === null ? null : typeof v === "boolean" ? Number(v) : (v as Value);
@@ -63,9 +63,30 @@ export class DinfDatabase extends WorkerEntrypoint<Env> {
   slowQueries(limit = 50): Promise<SlowQuery[]> {
     return slowQueries(this.env, limit);
   }
-  /** シャード、範囲表、Autoscaler の履歴を返す。 */
+  /** シャード、範囲表、各シャードの健全性と問題点、Autoscaler の履歴を返す。 */
   status() {
     return clusterStatus(this.env);
+  }
+  /** 利用者が実行した DDL を、実行した順に返す。 */
+  async schemaSql(): Promise<string[]> {
+    // trigger は DDL の履歴に文面が残らないので、現在の表定義から足す。
+    const cat = await (await dbFor(this.env, 0)).catalog();
+    return [...(await schemaSql(this.env)), ...Object.values(cat.triggers).map((t) => t.sql)];
+  }
+  /** 利用者の表の名前。内部の表 (グローバル index の実体) は含まない。 */
+  async tables(): Promise<string[]> {
+    const db = await dbFor(this.env, 0);
+    return Object.keys((await db.catalog()).tables).filter((t) => !t.startsWith("__"));
+  }
+  /**
+   * 表の行を少しずつ返す。論理エクスポートに使う。cursor が null になったら終わりである。
+   * 時点はそろえないので、書き込みを止めていなければ、取引の途中の状態が混じり得る。
+   * BLOB は JSON で運べないので、{ $blob: 16 進 } に変える。
+   */
+  async exportRows(table: string, cursor: { shard: number; after: Value[] | null } | null, limit = 1000) {
+    const page = await exportRows(this.env, table, cursor, limit);
+    const hex = (v: Uint8Array) => Array.from(v, (b) => b.toString(16).padStart(2, "0")).join("");
+    return { ...page, rows: page.rows.map((r) => r.map((v) => (v instanceof Uint8Array ? { $blob: hex(v) } : v))) };
   }
   /** `env.DB.fetch()` は HTTP の入口 (Hrana、/sql、/admin) と同じで、トークンを検査する。 */
   override fetch(request: Request): Promise<Response> {

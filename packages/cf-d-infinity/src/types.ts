@@ -196,6 +196,10 @@ export interface ShardApi {
   finishMove(req: { start: number; end: number }): Promise<void>;
   finishIncoming(req: { start: number; end: number }): Promise<void>;
   metrics(req: Record<string, never>): Promise<ShardMetrics>;
+  /** このシャードが健全かを運用者に見せるための状態。 */
+  health(req: Record<string, never>): Promise<ShardHealth>;
+  /** 表の行を主キーの順に返す。論理エクスポートに使う。 */
+  exportRows(req: { table: string; after: Value[] | null; limit: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }>;
   /** 取引の rollback でロックを手放す。届かなくても TTL で消える。 */
   unlock(req: { txn: string }): Promise<void>;
   /** DDL を適用する。全シャードへ適用してから DDL を完了させる。 */
@@ -231,6 +235,26 @@ export interface GroupCursor {
   after: Value[] | null;
   /** shard key に NULL があって after で絞れないときの読み飛ばしの数。 */
   skip?: number;
+}
+
+/** シャードの健全性。0 でない項目があれば、運用者が見るべき状態である。 */
+export interface ShardHealth {
+  id: string;
+  schema: number;
+  format: number;
+  bytes: number;
+  /** 適用待ちの intent の数と、最も古いものの年齢 (ms)。数秒を超えて残るなら、決着が届いていない。 */
+  intents: number;
+  oldestIntentMs: number;
+  /** 確定したが全参加者に適用しきれていない取引の数。 */
+  unapplied: number;
+  /** 直近の再駆動で失敗した理由。空でなければ、同じ失敗を繰り返している。 */
+  redriveErrors: string[];
+  /** 移動の途中の範囲の数 (受け取り中、送り出し中)。 */
+  incoming: number;
+  outgoing: number;
+  /** 変更ログの世代の数。 */
+  logGenerations: number;
 }
 
 export interface ShardMetrics {
@@ -367,6 +391,26 @@ export class Migrating extends Error {
  * 確定した後の適用で初めて上限に当たると、その取引は永久に適用できない。必ず確定の前に拒否する。
  */
 export const MAX_WRITE_SET_BYTES = 1_000_000;
+
+/**
+ * Durable Object に保存しているデータの形式の版。内部の表の形や意味を、互換でない形で変えるときに上げる。
+ * 新しいコードが書いた DO を古いコードが開くと、黙って壊すおそれがある。版が新しすぎれば起動を拒否する。
+ */
+export const STORAGE_FORMAT = 1;
+
+/** 保存形式の版を確かめる。初めて開く DO と、版の印がまだない DO には現在の版を書く。 */
+export function checkStorageFormat(b: Backend, table: string, what: string): void {
+  const have = b.exec(`SELECT v FROM ${table} WHERE k = 'format'`)[0]?.v as number | undefined;
+  if (have !== undefined && have > STORAGE_FORMAT) {
+    throw new Error(
+      `storage format too new: this ${what} was written by a newer cf-d-infinity (format ${have}); this code understands up to ${STORAGE_FORMAT}. ` +
+      `Deploy the newer version again; an older release must not open this data.`,
+    );
+  }
+  if (have !== STORAGE_FORMAT) {
+    b.exec(`INSERT INTO ${table}(k, v) VALUES ('format', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, STORAGE_FORMAT);
+  }
+}
 
 export class SqlError extends Error {
   constructor(message: string) {

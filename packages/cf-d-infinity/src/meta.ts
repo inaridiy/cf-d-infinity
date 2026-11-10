@@ -1,4 +1,4 @@
-import type { Backend, TableDef } from "./types";
+import { checkStorageFormat, type Backend, type TableDef } from "./types";
 import { parseDdl, type IndexInfo, type ParsedDdl, type TriggerInfo } from "./sql/ddl";
 import { applyMove, initialRouting, type Routing } from "./routing";
 
@@ -23,6 +23,8 @@ export class MetaCore {
     b.exec(`CREATE TABLE IF NOT EXISTS __ddl(version INTEGER PRIMARY KEY, entry TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __routing(version INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __seq(name TEXT PRIMARY KEY, next INTEGER NOT NULL)`);
+    b.exec(`CREATE TABLE IF NOT EXISTS __meta(k TEXT PRIMARY KEY, v)`);
+    checkStorageFormat(b, "__meta", "schema object");
   }
 
   /** 最初の範囲表に使うシャードを指定する。範囲表ができた後は効かない。 */

@@ -57,7 +57,8 @@ With `wrangler dev` or `cf dev` running:
 npx cf-d-infinity sql "SELECT id, balance FROM accounts ORDER BY id"
 npx cf-d-infinity sql --file schema.sql
 npx cf-d-infinity slow          # slow statements: SQL, duration, where it ran, shards touched
-npx cf-d-infinity status        # shards, slot ranges, autoscaler events
+npx cf-d-infinity status        # shards, their health, and anything that needs attention (exit code 2)
+npx cf-d-infinity export --out dump.sql   # schema and rows as SQL; import <file> loads it
 ```
 
 The command starts a throwaway local Worker bound to your Worker's `DinfDatabase` and calls it; no HTTP endpoint or

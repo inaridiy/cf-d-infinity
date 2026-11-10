@@ -90,12 +90,18 @@ npx cf-d-infinity sql "SELECT id, balance FROM accounts ORDER BY id"
 npx cf-d-infinity sql --file schema.sql          # several statements; also reads standard input
 npx cf-d-infinity sql "SELECT * FROM accounts WHERE id = ?" --param 1 --json
 npx cf-d-infinity slow                           # recorded slow statements, newest first
-npx cf-d-infinity status                         # shards, slot ranges, autoscaler events
+npx cf-d-infinity status                         # shards, their health, and anything that needs attention
+npx cf-d-infinity export --out dump.sql          # schema and every row, as SQL
+npx cf-d-infinity import dump.sql                # load such a file into an empty database
 ```
 
 It needs no HTTP endpoint and no token. The command starts a throwaway local Worker with a Service Binding to your Worker's `DinfDatabase` entrypoint, calls it, and exits (under a second). It finds the Worker by the `name` in `wrangler.jsonc` or `cloudflare.config.ts`; pass `--worker <NAME>` otherwise.
 
 Add `--remote` to run against the deployed Worker instead: `npx cf-d-infinity sql --remote "SELECT ..."`. The throwaway Worker still runs on your machine, and only its binding is a [remote binding](https://developers.cloudflare.com/workers/local-development/#remote-bindings), so nothing is deployed and nothing is exposed. This needs Wrangler in the project and `wrangler login`, takes several seconds per command, and runs the SQL on production data.
+
+**Health.** `status` lists each shard's size, the writes still waiting for their transaction's outcome, committed transactions not yet applied everywhere, and splits in progress. It names what needs attention (for example a committed transaction that cannot be applied, with the error) and exits with code 2 when there is something, so a monitoring script can use it.
+
+**Export.** `export` writes the DDL you ran and every row as SQL, one statement per line; `import` runs such a file. It reads shard by shard without a common timestamp, so it is not a consistent snapshot unless writes are stopped, and it refuses to run while a shard split is moving data. It is the only way to get your data out today.
 
 **Slow statements.** A statement that takes longer than `DINF_SLOW_QUERY_MS` (a var; default 500 ms, `0` records everything, `off` disables) is recorded with its SQL text, duration, where it ran (`shard` for one shard, `gather` or `partial` for a scan gathered into the Worker, `transaction` for a batch), the number of shards it touched and its retries. Bound parameters are never recorded. The last 1,000 entries are kept, and a burst is capped at 20 entries per 10 seconds per isolate. The same list is available to your code as `env.DINF_DB.slowQueries()`.
 
@@ -245,14 +251,14 @@ None of the following is a proof of the implementation:
 
 ## Limitations
 
-- **No backup or point-in-time restore across shards.** Each Durable Object has its own 30-day PITR, but nothing restores all shards to one consistent point yet.
+- **No point-in-time restore across shards.** Each Durable Object has its own 30-day PITR, but nothing restores all shards to one consistent point yet. `npx cf-d-infinity export` gives a logical dump, which is consistent only if writes are stopped while it runs.
 - **One database, two static tokens.** No multi-tenancy, no per-user permissions.
 - **Thin observability.** There is a slow-statement log (see [Command line](#command-line)), but no abort-rate or scatter-rate metrics and no tracing.
 - **Unverified platform behavior.** Whether an old Durable Object instance can serve reads during failover is not documented by Cloudflare and was not tested. Clock skew between Durable Objects has no published bound.
 - **SQLite differences.** Foreign keys are not enforced; `TEMP` tables, `ATTACH` and FTS5 are unavailable; integers beyond 2^53 lose precision; implicit rowids are unique but not contiguous. Durable Object SQLite limits also apply (for example 100 bound parameters). See [docs/sql-language.md](docs/sql-language.md).
 - **Scale limits.** At most 200,000 rows gathered into the Worker per statement; no hierarchical fan-out beyond 8 shards; a single hot row tops out around 650 writes/s; shards are never merged; the autoscaler notices new load within about a minute, then follows it every 5 seconds.
 - **No region control.** A shard is created near the Worker that first reaches it and never moves, so latency grows with distance from there.
-- **No stability promise.** Storage format, wire protocol and admin API may change between commits. The stored data carries no format version yet, so rolling your application back to an older release of this package is not checked and not safe.
+- **No stability promise.** Storage format, wire protocol and admin API may change between commits. The stored data carries a format version: a release that does not understand the format refuses to open it and says so, instead of rewriting it. No release has changed the format yet, so this has only been exercised in tests.
 - **Splitting a shard cannot be undone or cancelled, so automatic splitting is opt-in.** By default the autoscaler only records that a shard should be split (`npx cf-d-infinity status` shows `would-split`); set the var `DINF_AUTOSCALE` to `"split"` to let it act. Splitting has been measured with 128 shard-key groups per shard, not with millions. A shard-key group larger than 16 MB cannot be moved, and a split that meets one stops with an error naming it. A statement that reads a whole table is retried for under a second and then fails while a split is still moving data.
 - **The schema is fetched from one Durable Object.** Each Worker isolate caches it for 2 seconds and refetches on the request path, so that object is a dependency of every request.
 

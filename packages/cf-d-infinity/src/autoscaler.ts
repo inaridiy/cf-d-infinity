@@ -1,6 +1,6 @@
 import type { Cluster } from "./client/db";
 import { planSplit, shardsOf, type Routing } from "./routing";
-import type { ShardMetrics } from "./types";
+import type { ShardHealth, ShardMetrics } from "./types";
 
 export interface Thresholds {
   sizeBytes: number;
@@ -87,6 +87,29 @@ export function decide(metrics: ShardMetrics[], state: AutoscalerState, now: num
 export function needsFollowUp(metrics: ShardMetrics[], state: AutoscalerState, pending: number): boolean {
   return pending > 0 || metrics.some((m) => m.migrating || (state.over[m.id] ?? 0) > 0);
 }
+
+/**
+ * シャードの健全性から、運用者が見るべき問題を言葉にする。空なら問題はない。
+ * 確定した取引が適用できない状態は、放っておいても直らないので、必ず最初に挙げる。
+ */
+export function healthProblems(shards: ShardHealth[]): string[] {
+  const out: string[] = [];
+  for (const h of shards) {
+    if (h.unapplied > 0 && h.redriveErrors.length > 0) {
+      out.push(`${h.id}: ${h.unapplied} committed transaction(s) cannot be applied: ${h.redriveErrors[0]}`);
+    } else if (h.redriveErrors.length > 0) {
+      out.push(`${h.id}: background work keeps failing: ${h.redriveErrors[0]}`);
+    }
+    if (h.intents > 0 && h.oldestIntentMs > STUCK_INTENT_MS) {
+      out.push(`${h.id}: ${h.intents} write(s) have waited ${Math.round(h.oldestIntentMs / 1000)} s for their transaction's outcome`);
+    }
+  }
+  const formats = new Set(shards.map((h) => h.format));
+  if (formats.size > 1) out.push(`shards run different storage formats: ${[...formats].sort().join(", ")} (a deploy is still rolling out, or was rolled back)`);
+  return out;
+}
+/** intent がこれより長く残っていたら、決着が届いていないとみなす。再駆動は 5 秒ごとに試みる。 */
+const STUCK_INTENT_MS = 30_000;
 
 export interface SplitResult {
   parent: string;

@@ -1,9 +1,11 @@
 import { Hlc, SECOND, physicalToTs, tsToPhysical } from "../hlc";
 import type {
   Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, GroupPayload, LockOwner, MetaApi,
-  Participant, PrepareReq, PrepareRes, Row, ShardApi, ShardMetrics, Span, TableDef, Ts, TxnStatus, Value,
+  Participant, PrepareReq, PrepareRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts, TxnStatus, Value,
 } from "../types";
-import { ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, SqlError, spanCovers, unprotectedSpans } from "../types";
+import {
+  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, checkStorageFormat, spanCovers, unprotectedSpans,
+} from "../types";
 import type { DdlEntry } from "../meta";
 import { slotOf } from "../routing";
 import {
@@ -138,6 +140,8 @@ export class ShardCore implements ShardApi {
   private boot(): void {
     const b = this.b;
     b.exec(`CREATE TABLE IF NOT EXISTS __meta(k TEXT PRIMARY KEY, v)`);
+    // ほかの表に触る前に確かめる。新しい形式の DO を、古いコードが作り変えてしまわないようにする。
+    checkStorageFormat(b, "__meta", "shard");
     b.exec(`CREATE TABLE IF NOT EXISTS __ddl(version INTEGER PRIMARY KEY, entry TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __intents(
       tbl TEXT NOT NULL, pk TEXT NOT NULL, sk TEXT NOT NULL, txn TEXT NOT NULL, anchor TEXT NOT NULL,
@@ -663,6 +667,47 @@ export class ShardCore implements ShardApi {
   async finishIncoming(req: { start: number; end: number }): Promise<void> {
     this.b.exec(`DELETE FROM __incoming WHERE start = ? AND end = ?`, req.start, req.end);
     this.incoming = this.incoming.filter((x) => !(x.start === req.start && x.end === req.end));
+  }
+
+  async health(_req: Record<string, never>): Promise<ShardHealth> {
+    const one = (sql: string, ...params: Value[]) => (this.b.exec(sql, ...params)[0]?.v as number | null) ?? 0;
+    const oldest = one(`SELECT min(prepare_ts) v FROM __intents`);
+    return {
+      id: this.id, schema: this.schema, format: STORAGE_FORMAT, bytes: this.b.size(),
+      intents: one(`SELECT count(*) v FROM __intents`),
+      oldestIntentMs: oldest === 0 ? 0 : Math.max(0, this.deps.clock.now() - tsToPhysical(oldest)),
+      unapplied: one(`SELECT count(*) v FROM __txn WHERE status = 'committed' AND done = 0`),
+      redriveErrors: this.lastRedriveErrors,
+      incoming: this.incoming.length,
+      outgoing: this.fenced.filter((f) => !f.done).length,
+      logGenerations: this.logGens().length,
+    };
+  }
+
+  /**
+   * 表の行を主キーの順に、after より後から limit 行まで返す。pk は columns の中の主キーの列の位置である。
+   * 最新の確定済みの状態を読むだけで、時点はそろえない。移動の途中のシャードでは、同じ行が親と子の両方にあるので断る。
+   */
+  async exportRows(req: { table: string; after: Value[] | null; limit: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }> {
+    if (this.incoming.length > 0 || this.fenced.some((f) => !f.done)) throw new Migrating();
+    const def = this.defs.get(req.table);
+    if (!def) throw new SqlError(`no such table: ${req.table}`);
+    const cols = def.pk.map(q).join(", ");
+    const keyset = req.after !== null && req.after.every((v) => v !== null);
+    const where = keyset ? `WHERE (${cols}) > (${def.pk.map(() => "?").join(", ")})` : "";
+    const limit = Math.max(1, Math.min(req.limit, 5000));
+    const { columns, rows } = this.b.iterate(
+      `SELECT ${selectList(def)} FROM ${q(def.name)} ${where} ORDER BY ${cols} LIMIT ${limit}`, ...(keyset ? req.after! : []),
+    );
+    const out: Value[][] = [];
+    let bytes = 0;
+    for (const r of rows) {
+      out.push(r);
+      for (const v of r) bytes += sizeOf(v);
+      // 1 回の応答が大きくなりすぎないよう、行数の上限より先にバイト数で切る。続きは次の呼び出しで読む。
+      if (bytes > 4_000_000) break;
+    }
+    return { columns, rows: out, pk: def.pk.map((c) => columns.indexOf(c)) };
   }
 
   async metrics(_req: Record<string, never>): Promise<ShardMetrics> {

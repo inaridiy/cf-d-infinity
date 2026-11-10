@@ -107,6 +107,26 @@ sql.js は `process.versions.node` があると Node で動いているとみな
 `nodejs_compat` を有効にした Worker には `process` があるので、束ねる時点でこの判定を偽にしている (`scripts/esbuild-options.mjs` の `define`)。
 これがないと、`nodejs_compat` を使う利用者と cf のプロジェクトで `__dirname is not defined` になる。
 
+### 上限、健全性、保存形式の版
+
+結果の大きさはシャードが送り返す前に断つ (`SHARD_MAX_ROWS`、`SHARD_MAX_BYTES`、要求の `maxRows` と `maxBytes`)。
+1 つの取引が 1 シャードに書ける変更は 1 MB までで、確定の前にクライアントとシャードの両方が検査する (`MAX_WRITE_SET_BYTES`)。
+変更ログは 1 commit を 1 行に入れるので、これを超えると確定後の適用が DO の行の上限に当たり、取引が永久に適用できない。
+移動できる 1 グループは 16 MB までである (`GROUP_MAX_BYTES`)。
+
+`status` は各シャードの `health` を集め、`healthProblems` (`src/autoscaler.ts`) が運用者の見るべき問題を言葉にする。
+確定したのに適用できない取引、30 秒を超えて決着を待つ intent、失敗を繰り返す再駆動、シャードごとに違う保存形式が対象である。
+
+保存形式の版は `STORAGE_FORMAT` (`src/types.ts`) で、シャードと Meta の `__meta` の `format` に書く。
+内部の表の形や意味を互換でない形で変えるときに上げる。
+版が新しすぎる DO は、起動時に `storage format too new` で拒否する。古いコードに書き換えさせないためである。
+
+`export` は利用者が実行した DDL (`schemaSql`) と、各表の行 (`exportRows`) を SQL にする。
+行はシャードごとに主キーの順で読み、時点はそろえない。移動の途中のシャードがあれば断る。
+
+シミュレータの試験は、終わりに `test/invariants.ts` の検査を通す。
+intent が残っていないこと、確定した取引が全部適用済みであること、再駆動が失敗を繰り返していないこと、グローバル index が本体と一致することを見る。
+
 ### 公開する形
 
 `npm run build` (`scripts/build.mjs`) が `lib/` を作る。`npm pack` と `npm publish` は `prepack` でこれを実行する。
@@ -199,6 +219,9 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `test/rollback-read.test.ts` | どの過去時点も正確に再構成できること |
 | `test/migration.test.ts` | ライブ移動、`m5b` の反例、Autoscaler の判断 |
 | `test/workerd.test.ts` | 本物の workerd と DO の SQLite での結合テスト |
+| `test/limits.test.ts` | シャード側の上限。結果の行数とバイト数、取引の大きさ、グループの列挙と大きさ |
+| `test/health.test.ts` | 保存形式の版と、健全性の判定 |
+| `test/review-regressions.test.ts` | 設計レビューで見つかった欠陥の再現。欠陥スイッチで壊れ、外すと直る |
 | `test/ops.test.ts` | 遅い文の記録と、`cf-d-infinity` コマンド。miniflare を dev サーバに見立て、dev registry 経由で呼ぶ |
 | `test/binding.test.ts` | `DinfDatabase` と `connect()` を workerd の RPC で通す。同じ Worker の中の binding と、別の Worker からの binding の両方 |
 | `test/autoscale-cron.test.ts` | Cron から起こした Autoscaler が、負荷のある間だけ alarm で追い、増設し、負荷が止まると静まること |

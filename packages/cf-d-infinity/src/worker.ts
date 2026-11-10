@@ -1,12 +1,12 @@
 import { DurableObject, RpcTarget } from "cloudflare:workers";
 import { Db, type Cluster, type StatementStat } from "./client/db";
-import { collectMetrics, decide, DEFAULTS, needsFollowUp, nextShardNumber, split, type AutoscalerState, type Thresholds } from "./autoscaler";
+import { collectMetrics, decide, DEFAULTS, healthProblems, needsFollowUp, nextShardNumber, split, type AutoscalerState, type Thresholds } from "./autoscaler";
 import { MetaCore, type Catalog } from "./meta";
 import { planSplit, shardsOf } from "./routing";
 import { ShardCore } from "./shard/core";
 import { batonSealer, handlePipeline, serveHranaSocket, type PipelineReq } from "./client/hrana";
 import { setSqlWasm } from "./sql/scratch";
-import { checkProtocol, PROTOCOL_VERSION, type Backend, type Row, type ShardApi, type Value } from "./types";
+import { checkProtocol, PROTOCOL_VERSION, type Backend, type Row, type ShardApi, type ShardHealth, type Value } from "./types";
 // @ts-expect-error wrangler と esbuild がバンドル時に解決する
 import sqlWasm from "./sql-wasm.wasm";
 
@@ -503,8 +503,48 @@ async function dbOn(cluster: Cluster, token: number, onStatement?: (s: Statement
 
 /** シャード、範囲表、Autoscaler の履歴。 */
 export async function clusterStatus(env: Env, name = "shard", shards?: number) {
-  const cat = await clusterOf(env, shards, name).catalog();
-  return { routing: cat.routing, shards: shardsOf(cat.routing), scaler: await env.DINF_AUTOSCALER.getByName(name).status() };
+  const cluster = clusterOf(env, shards, name);
+  const cat = await cluster.catalog();
+  const ids = shardsOf(cat.routing);
+  // 1 つのシャードが答えなくても、ほかの状態は見せる。
+  const health = await Promise.all(ids.map((id) => cluster.shard(id).health({}).catch((e): ShardHealth => ({
+    id, schema: -1, format: -1, bytes: 0, intents: 0, oldestIntentMs: 0, unapplied: 0,
+    redriveErrors: [`does not answer: ${String((e as Error)?.message ?? e).slice(0, 200)}`], incoming: 0, outgoing: 0, logGenerations: 0,
+  }))));
+  return {
+    routing: cat.routing, shards: ids, schema: cat.version, health, problems: healthProblems(health),
+    scaler: await env.DINF_AUTOSCALER.getByName(name).status(),
+  };
+}
+
+/** 利用者が実行した DDL を、実行した順に返す。論理エクスポートの先頭に置く。 */
+export async function schemaSql(env: Env, name = "shard"): Promise<string[]> {
+  const { ddl } = await env.DINF_META.getByName(name).ddlSince(0);
+  return ddl.flatMap((e) => {
+    if (typeof e.user !== "string" || e.user.trim() === "") return [];
+    // 履歴の文面からは SHARD KEY が除かれている。取り込み先で行の置き場所が変わらないよう、表定義から書き戻す。
+    const def = e.defs[0];
+    const createsTable = /^\s*CREATE\s+TABLE\b/i.test(e.user) && def !== undefined && !def.name.startsWith("__");
+    return [createsTable ? `${e.user} SHARD KEY (${def.shardKey.map((c) => `"${c.replaceAll('"', '""')}"`).join(", ")})` : e.user];
+  });
+}
+
+/** 表の行を、シャードの順、主キーの順に少しずつ返す。cursor が null になったら終わりである。 */
+export async function exportRows(
+  env: Env, table: string, cursor: { shard: number; after: Value[] | null } | null, limit = 1000, name = "shard",
+): Promise<{ columns: string[]; rows: Value[][]; cursor: { shard: number; after: Value[] | null } | null }> {
+  const cluster = clusterOf(env, undefined, name);
+  const ids = shardsOf((await cluster.catalog()).routing);
+  let at = cursor ?? { shard: 0, after: null };
+  for (;;) {
+    if (at.shard >= ids.length) return { columns: [], rows: [], cursor: null };
+    const page = await cluster.shard(ids[at.shard]!).exportRows({ table, after: at.after, limit });
+    if (page.rows.length > 0) {
+      const last = page.rows[page.rows.length - 1]!;
+      return { columns: page.columns, rows: page.rows, cursor: { shard: at.shard, after: page.pk.map((i) => last[i] ?? null) } };
+    }
+    at = { shard: at.shard + 1, after: null };
+  }
 }
 
 /** 遅い文の記録を新しい順に返す。 */
