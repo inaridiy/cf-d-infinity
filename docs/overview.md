@@ -116,13 +116,26 @@ evaluation is never reimplemented, which is why the same statement gives the sam
 Multi-shard `UPDATE` and `DELETE` run only when the statement spells them out; the planner does not rewrite a
 statement into something else silently.
 
+Whatever a statement reads on a shard is recorded as a *span* and validated at commit: a primary key, a shard-key
+group, a pushed-down condition, or a whole table. The span has to cover everything the shard-side statement can
+read, not just the rows the Worker expects. A statement routed through a global index is sent without pinning the
+shard key, so its span is the pushed-down condition, not the shard keys the index listed. A subquery inside
+`INSERT ... VALUES` is evaluated first, as a read of the transaction, and sent as a constant.
+
 ## Schema changes
 
 DDL goes through `DinfMeta`, which versions the schema. The change is applied on every shard before the statement
 returns, and every request carries the schema version it was planned with; a shard rejects a request planned
 against an older schema, so a Worker with a stale cache cannot write through a dropped table.
 
-Four rules keep a schema change from tearing a transaction that is under way:
+`DinfMeta` runs the shard statements of a change in its own SQLite, on empty copies of the tables, and records the
+change only if they succeed. A statement that parses but that SQLite rejects is therefore refused up front. A
+statement that fails only where rows exist (a `UNIQUE` index over duplicates, `ADD COLUMN` with a `CHECK`) is
+*withdrawn*: the shard that cannot apply it asks `DinfMeta` to record the inverse as the next version, shards that
+have not applied the change skip both versions, and the caller gets SQLite's message. This is safe because a new
+version is recorded only after every shard applied the previous one, so nothing can have been built on the change.
+
+Five rules keep a schema change from tearing a transaction that is under way:
 
 - A shard resolves every intent it holds before it applies DDL. An intent carries row images in the old table shape,
   and a committed one could never be applied after its table or column is gone.
@@ -131,8 +144,14 @@ Four rules keep a schema change from tearing a transaction that is under way:
 - A new global index is written first, backfilled, and only then used for reads. The backfill treats the rows it
   scanned as read at the scan's timestamp, so commit-time validation rejects an entry for a row that changed since.
 - A shard born from a split catches up to its parent's schema before it accepts the parent's rows.
+- A shard that is handing over or receiving a range applies no schema change until the move is finished, and the
+  parent catches up to the child's version before it fences the range. Rows and intents in transit then always have
+  the shape of the table that receives them. The DDL driver waits for a split in progress instead of recording a
+  version the moving shards cannot take.
 
-These came out of randomized tests and a model (M11) that found six ways the first implementation got it wrong.
+The first four came out of randomized tests and a model (M11) that found six ways the first implementation got it
+wrong; the fifth, and the validation and withdrawal above, came out of a second design review and are covered by
+simulator tests but not yet by a model.
 
 ## Growing
 
@@ -144,6 +163,9 @@ progress. A split is a pull-based live migration:
 2. the parent fences that range and stops serving it,
 3. the range table switches ownership to the child, so new requests go there at once,
 4. the child pulls the data from the parent, one shard-key group at a time, on demand and in the background.
+
+A split is refused on a shard that is still receiving a range, a range cannot be fenced to a second child, and
+running an interrupted split again continues the same range.
 
 Ownership moves before the data does, which sheds load from a hot parent immediately instead of making it also pay
 for a bulk copy first. A Worker whose range table predates the split is told so: a request for a moved shard key, and
@@ -173,6 +195,9 @@ None of this is a proof of the implementation.
 - **Hierarchical fan-out** for statements that touch more than about eight shards, and semijoin reduction.
 - **Splitting inside one shard-key value**, and merging shards.
 - **Region placement.** Shards are created wherever they are first reached.
+- **An operator's way out of a committed transaction that cannot be applied.** The causes found so far are fixed
+  and `status` reports the state, but nothing can discard such a transaction.
+- **Pruning the per-group records of a finished split** (`__moved`, `__arrived`), which are kept forever.
 
 ## Ideas borrowed, and ideas left out
 

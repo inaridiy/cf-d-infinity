@@ -41,8 +41,13 @@ export class QueryResult {
   }
 }
 
+/**
+ * やり直してよい失敗か。シャードが「何も書かずに断った」と分かるものだけを数える。
+ * 基盤が返す一時的な失敗 (`retryable` の付いた例外) は数えない。要求がシャードに届いて実行された後で応答だけが
+ * 失われた場合もあり、autocommit の書き込みや 1 シャードの commit をやり直すと、同じ変更が 2 回入る。
+ */
 const isRetryable = (e: unknown) =>
-  e instanceof ConflictError || e instanceof ReadTooOld || (e as { retryable?: boolean })?.retryable === true ||
+  e instanceof ConflictError || e instanceof ReadTooOld ||
   /^(conflict|read too old|not owner|migrating|upgrading):/.test((e as Error)?.message ?? "");
 
 /** 1 文の実行の記録。遅い文の一覧に使う。 */

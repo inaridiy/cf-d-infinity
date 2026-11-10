@@ -332,7 +332,7 @@ export class ShardCore implements ShardApi {
     for (const n of e.drops) this.defs.delete(n);
   }
 
-  private async ensureSchema(version: number, catchUp = false): Promise<void> {
+  private async ensureSchema(version: number): Promise<void> {
     // 古い表定義の要求を通すと、新しいグローバル index の更新が漏れる。経路と同じく取り直させる。
     if (version < this.schema) throw new NotOwner(`stale schema ${version} < ${this.schema}`);
     if (version === this.schema) {
@@ -341,12 +341,31 @@ export class ShardCore implements ShardApi {
       if (this.schemaChange) throw new NotOwner(`stale schema ${version}: a schema change is being applied`);
       return;
     }
-    this.schemaChange ??= this.applySchema(catchUp).finally(() => {
-      this.schemaChange = null;
-    });
-    await this.schemaChange;
-    // 待っている間に、さらに新しい DDL が出ているかもしれない。要求の版が取り消されて、古くなっていることもある。
-    await this.ensureSchema(version, catchUp);
+    await this.reachSchema(version);
+    // Meta にある版は全部適用するので、要求の版を通り越していることがある。要求の版が取り消されたときもそうなる。
+    // その場合は、この要求が古い。
+    await this.ensureSchema(version);
+  }
+
+  /**
+   * 少なくともこの版まで DDL を適用する。先の版まで進んでもよい。
+   * 要求の計画の版を確かめる ensureSchema と違い、増設の手順 (受け入れ、fence、行の受け取り) が使う。
+   * そこでは「この版より古くない」ことだけが要る。
+   */
+  private async reachSchema(version: number, catchUp = false): Promise<void> {
+    while (version > this.schema) {
+      // 追いつくための適用は、移動の途中でも通る。進行中の通常の適用 (移動の途中は断られる) には合流しない。
+      if (catchUp && this.schemaChange) {
+        await this.schemaChange.catch(() => undefined);
+        continue;
+      }
+      const before = this.schema;
+      this.schemaChange ??= this.applySchema(catchUp).finally(() => {
+        this.schemaChange = null;
+      });
+      await this.schemaChange;
+      if (this.schema === before) throw new SqlError(`schema version ${version} is not recorded yet (shard ${this.id} is at ${before})`);
+    }
   }
 
   /**
@@ -526,7 +545,8 @@ export class ShardCore implements ShardApi {
   async beginIncoming(req: { start: number; end: number; from: string; schema: number }): Promise<{ schema: number }> {
     const same = () => this.incoming.some((x) => x.start === req.start && x.end === req.end && x.from_id === req.from);
     if (same()) return { schema: this.schema };
-    await this.ensureSchema(req.schema);
+    // 増設を始めた側の表定義が古いこともある。このシャードが先の版にいるなら、そのままでよい。親が fence の前に追いつく。
+    await this.reachSchema(req.schema);
     if (same()) return { schema: this.schema };
     // 重なる範囲を別の親から受け取ると、どちらの行が正しいのか決められない。送り出し中のシャードも子にしない。
     const clash = this.incoming.find((x) => x.start < req.end && req.start < x.end);
@@ -543,7 +563,8 @@ export class ShardCore implements ShardApi {
     if (same()) return;
     // 子の表定義の版まで追いついてから fence する。子が先の版にいると、親の古い形の行と intent を子が受け取れない。
     // 移動の間は、親も子も DDL を適用しない (applySchema)。
-    if (req.schema !== undefined) await this.ensureSchema(req.schema);
+    // 親が先の版にいるなら、そのままでよい。子は、行を受け取るときに親の版まで追いつく。
+    if (req.schema !== undefined) await this.reachSchema(req.schema);
     if (same()) return;
     // 同じ範囲を 2 つの子へ送り出すと、行が両方へ分かれ、範囲表はどちらか片方しか指さない。
     const clash = this.fenced.find((x) => x.start < req.end && req.start < x.end);
@@ -692,7 +713,7 @@ export class ShardCore implements ShardApi {
     // 親の表定義の版まで追いついてから受け取る。子は増設の途中で生まれるので、DDL の「全シャードへの適用」から
     // 漏れることがある。古い版のままだと、届いた行と表の形が合わず、新しい index を保守しない古い計画の書き込みも通る。
     const version = Math.max(0, ...payload.map((p) => p.schema ?? 0));
-    if (version > this.schema && !this.faults.childKeepsOldSchema) await this.ensureSchema(version, true);
+    if (!this.faults.childKeepsOldSchema) await this.reachSchema(version, true);
     const fresh = payload.filter((p) => !this.arrived.has(p.g));
     this.b.tx(() => {
       for (const p of fresh) {

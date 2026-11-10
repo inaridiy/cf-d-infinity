@@ -74,4 +74,20 @@ describe("a split that is interrupted or repeated", () => {
     expect(await census(c)).toEqual(whole);
     expect(await quiescentProblems(c)).toEqual([]);
   }, 60_000);
+
+  it("works when the split was planned with a schema older than the parent's", async () => {
+    const c = await seeded();
+    const before = await c.catalog();
+    await c.client().ddl("ALTER TABLE items ADD COLUMN extra INTEGER DEFAULT 5");
+    // 増設を始めた側は、DDL の前の表定義を持っている。親はすでに新しい版にいる。
+    const stale: Cluster = {
+      shard: (id) => c.shard(id), catalog: async () => before, applyDdl: (q) => c.applyDdl(q), publishIndex: (t, n) => c.publishIndex(t, n),
+      allocate: (t, n, m) => c.allocate(t, n, m), switchRange: (m) => c.switchRange(m),
+    };
+    expect(await outcome(split(stale, "s0", "s1"))).toBe("ok");
+    await drain(c);
+    expect(await census(c)).toEqual(whole);
+    expect((await new Db(c).query("SELECT count(*) AS n FROM items WHERE extra = 5")).rows).toEqual([{ n: ROWS }]);
+    expect(await quiescentProblems(c)).toEqual([]);
+  }, 60_000);
 });
