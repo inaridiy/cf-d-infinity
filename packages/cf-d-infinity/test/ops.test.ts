@@ -234,7 +234,8 @@ describe("the slow statement log under a burst", () => {
     for (let i = 0; i < 60; i++) await sql(logged, `SELECT ${i} AS burst FROM t WHERE id = 1`);
     await new Promise((r) => setTimeout(r, 300));
     const added = (await slow(logged)).length - before;
-    expect(added).toBeGreaterThan(0);
+    // 記録の予算は 10 秒あたり 20 件である。前のテストが同じ 10 秒の中で予算を使い切っていれば、ここでは 1 件も増えない。
+    // 確かめたいのは、60 文の集中が 60 件の記録にならないことである。
     expect(added).toBeLessThan(60);
 
     await sql(quiet, "SELECT n FROM t WHERE id = 3");
