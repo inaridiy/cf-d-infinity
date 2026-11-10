@@ -14,6 +14,9 @@
 //   BUG-6  backfill は DDL の時点の範囲表のシャードだけを読む。その後に分割で移った行を読まない。
 //   BUG-7  index で引いた読み取りは、index が挙げた shard key だけを span に入れるのに、文はシャードの全行に当てる。
 //          span の外の行の intent を決着させないので、確定済みで未適用の変更の前の行を返す。DDL とは無関係に起きる。
+//   BUG-8  全シャードを読む文は、範囲表が古いと、分割で生まれたシャードを読まない。親は移動が終わると残りの行だけを答えるので、
+//          子へ移った行が黙って欠ける。DDL とも index とも無関係に起きる。index が public になる前の読みは全シャードの走査なので、
+//          index の作成と分割を並行させた乱択で見つかった。
 //
 // 乱択の検査は、既知の欠陥に当たる種類の違反だけを許し、それ以外は 1 件でも失敗にする。
 // 許す種類は scenario ごとに KNOWN で列挙する。欠陥を直したら KNOWN から消す。
@@ -24,6 +27,7 @@ import { split } from "../src/autoscaler";
 import { ownerOf, shardsOf } from "../src/routing";
 import { encode } from "../src/shard/rows";
 import type { ShardCore } from "../src/shard/core";
+import type { Faults } from "../src/types";
 import {
   ACCT, SIDE, checkIndexReads, duplicates, extraViolations, hold, holdFinalize, indexAgreement, misplacedRows, rawRows,
   runScenario, schemaVersions, stuckWork, tenantOn, touchAll, type Env, type Rec, type Report, type Scenario,
@@ -183,10 +187,7 @@ const CASES = {
         e.useExtra = true;
       },
     },
-    seeds: [1, 2, 3, 4, 5, 6], // 未解決: index の作成と分割が同時に進むと、作成直後の index 経由の読みが稀に 1 行を取りこぼす (6 seed 中 1〜2 回)。
-    // index と表は検査点でも終了時でも一致しているので、取りこぼしは一時的である。index を先に作っておけば起きない。
-    // 原因は特定できていない。ここだけこの種類を許し、ほかの種類は 1 件も許さない。
-    known: ["indexReadsMissing"],
+    seeds: [1, 2, 3, 4, 5, 6], known: [],
   },
 } satisfies Record<string, Case>;
 
@@ -284,8 +285,8 @@ const U = `CREATE TABLE u(
   tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER,
   PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
 
-async function two() {
-  const c = new SimCluster({ shards: 2 });
+async function two(faults?: Faults) {
+  const c = new SimCluster({ shards: 2, faults });
   const db = new Db(c);
   await db.ddl(T);
   const A = await tenantOn(c, "s0");
@@ -555,6 +556,71 @@ describe("a bug in index-routed reads that the same workload found (not specific
     release();
     await c.settle();
     expect(read).toEqual([`${P}/1`]);
+  });
+});
+
+describe("a bug in whole-table reads that the same workload found (not specific to DDL or to indexes)", () => {
+  /**
+   * BUG-8。index も DDL も要らない。乱択では `WHERE v = ?` の読みが 1 行か 2 行を取りこぼす形で現れた (分割だけを流しても 8 seed 中 4 回)。
+   * index を作っている最中は、index がまだ public でないので、この読みは全シャードの走査である。
+   * 台本: 30 個の tenant に v = 7 の行が 1 行ずつある。Worker W が範囲表を取る (s0 と s1)。s0 の半分を s2 へ分割し、完了させる。
+   *   W が `SELECT ... WHERE v = 7` を実行する。
+   * 観測: W は s0 と s1 だけを読み、s2 へ移った行を返さない。誤りも返らないので、W は範囲表を取り直さない。
+   * 原因: 全表の span は shard key を持たないので、fence した範囲の検査 (ShardCore.assertOwned の NotOwner) に掛からない。
+   *   親が全表の読みを断るのは移動の途中だけで (Migrating)、finishMove の後は自分に残った行を答える。
+   *   子は W の範囲表にないので、誰にも読まれない。
+   * 修正: 全表の span に、読み手の範囲表で宛先のシャードが持つスロットの範囲を付ける (db.ts の withSlots)。
+   *   親は、その範囲が手放した範囲と重なれば、移動の完了後も NotOwner を返す。
+   */
+  const staleScatter = async (faults: Faults) => {
+    const { c, db, A } = await two(faults);
+    for (let t = 1; t <= 30; t++) await db.query("INSERT INTO t VALUES (?, 1, 7, 0)", [t]);
+    const stale = new Db(c);
+    await stale.query("SELECT 1 FROM t WHERE tenant_id = ?", [A]); // 分割の前の範囲表を持たせる
+    await split(c, "s0", "s2");
+    const moved = (await rawRows(c, "t")).filter(({ shard }) => shard === "s2").length;
+    const seen = (await stale.query("SELECT tenant_id FROM t WHERE v = 7")).rows.length;
+    return { moved, seen };
+  };
+  it("BUG-8 (fixed): a whole-table read planned with the range table from before a split returns the rows that moved", async () => {
+    const r = await staleScatter({});
+    expect(r.moved).toBeGreaterThan(0);
+    expect(r.seen).toBe(30);
+  });
+  it("BUG-8: a parent that answers whole-table reads after the move hides the moved rows (the bug)", async () => {
+    const r = await staleScatter({ staleWideRead: true });
+    expect(r.moved).toBeGreaterThan(0);
+    expect(r.seen).toBe(30 - r.moved);
+  });
+
+  /**
+   * 同じ欠陥の、commit の検証での姿。
+   * 台本: 取引 X が表全体を数える (s0 と s1 を読む)。s0 の半分を s2 へ分割し、完了させる。別の Worker が s2 へ移った tenant に 1 行足す。
+   *   X が、数えた結果を s0 に残った行へ書いて COMMIT する。
+   * 観測: COMMIT は成功する。X が読んだ範囲には X の commit より前に確定した挿入があるのに、s0 と s1 の検証はそれを見ない。
+   *   同じことを 2 つの取引が互いにすれば、どちらも相手の挿入を見ないまま確定する (write skew)。
+   * 修正後は、s0 が X の全表の span を NotOwner で断るので、X は競合になり、範囲表を取り直してやり直す。
+   */
+  const staleValidation = async (faults: Faults) => {
+    const { c, db } = await two(faults);
+    for (let t = 1; t <= 30; t++) await db.query("INSERT INTO t VALUES (?, 1, 7, 0)", [t]);
+    const tx = await new Db(c).begin();
+    const n = (await tx.query("SELECT count(*) c FROM t")).rows[0]!.c as number;
+    await split(c, "s0", "s2");
+    const kept = await tenantOn(c, "s0");
+    const moved = await tenantOn(c, "s2");
+    await new Db(c).query("INSERT INTO t VALUES (?, 2, 7, 0)", [moved]);
+    await tx.query("UPDATE t SET n = ? WHERE tenant_id = ? AND id = 1", [n, kept]);
+    return { n, inRange: kept <= 30 && moved <= 30, commit: await outcome(tx.commit()) };
+  };
+  it("BUG-8b (fixed): a transaction that read the whole table before a split cannot commit against the parent alone", async () => {
+    const r = await staleValidation({});
+    expect({ n: r.n, inRange: r.inRange }).toEqual({ n: 30, inRange: true });
+    expect(r.commit).toMatch(/not owner: s2/);
+  });
+  it("BUG-8b: without the check, the commit validates only the rows the parent kept (the bug)", async () => {
+    const r = await staleValidation({ staleWideRead: true });
+    expect({ n: r.n, inRange: r.inRange, commit: r.commit }).toEqual({ n: 30, inRange: true, commit: "ok" });
   });
 });
 

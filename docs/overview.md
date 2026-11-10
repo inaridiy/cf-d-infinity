@@ -146,7 +146,9 @@ progress. A split is a pull-based live migration:
 4. the child pulls the data from the parent, one shard-key group at a time, on demand and in the background.
 
 Ownership moves before the data does, which sheds load from a hot parent immediately instead of making it also pay
-for a bulk copy first. See [scaling.md](./scaling.md) for the timestamp rules that keep this serializable.
+for a bulk copy first. A Worker whose range table predates the split is told so: a request for a moved shard key, and
+a whole-table read that still believes the parent owns the moved slots, both get `NotOwner`, and the Worker refetches
+the range table. See [scaling.md](./scaling.md) for the timestamp rules that keep this serializable.
 
 ## How it is checked
 

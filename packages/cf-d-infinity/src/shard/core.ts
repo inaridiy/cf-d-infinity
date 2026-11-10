@@ -4,7 +4,8 @@ import type {
   Participant, PrepareReq, PrepareRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts, TxnStatus, Value,
 } from "../types";
 import {
-  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, checkStorageFormat, spanCovers, unprotectedSpans,
+  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, checkStorageFormat, isWideSpan, spanCovers,
+  unprotectedSpans,
 } from "../types";
 import type { DdlEntry } from "../meta";
 import { slotOf } from "../routing";
@@ -439,7 +440,20 @@ export class ShardCore implements ShardApi {
       const m = this.arrived.get(sk);
       if (m !== undefined && T !== null && T < m && !this.faults.servePastMove) throw new ReadTooOld(`moved at ${m}`);
     }
-    if (spans.some((s) => s.kind === "table" || (s.kind === "pred" && !s.sk))) {
+    const wide = spans.filter(isWideSpan);
+    if (wide.length > 0) {
+      // 全表の span が覆うのは、読み手の範囲表でこのシャードが持つ範囲である。
+      // その中に手放した範囲があれば、読み手の範囲表は古く、読み手は子を読まない。
+      // 移動が終わった後も断り続ける。
+      // 親が残りの行だけを答えると、子へ移った行はどのシャードからも返らない。
+      if (!this.faults.ignoreFence && !this.faults.staleWideRead) {
+        for (const s of wide) {
+          for (const [start, end] of s.slots ?? []) {
+            const f = this.fenced.find((x) => start < x.end && x.start < end);
+            if (f) throw new NotOwner(f.to);
+          }
+        }
+      }
       // 全表の読みは親と子の両方に行く。移動の途中は片方のグループが飛行中で、欠落が起こり得る。
       if (this.incoming.length > 0 || this.fenced.some((f) => !f.done)) throw new Migrating();
       if (T !== null && T < this.maxArrived && !this.faults.servePastMove) throw new ReadTooOld(`moved at ${this.maxArrived}`);

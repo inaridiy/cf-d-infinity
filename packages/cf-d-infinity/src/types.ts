@@ -63,7 +63,18 @@ export type Span = (
 ) & {
   /** 悲観的な DML の読み。T ではなくこの時刻から検証する。 */
   since?: Ts;
+  /**
+   * 読み手の範囲表で、宛先のシャードが持つスロットの範囲 [start, end) である。
+   * shard key を絞らない span に付ける。
+   * span が覆うのは、表のうちこの範囲に載る行である。
+   * 範囲表が古いと、その一部はすでに別のシャードへ移っている。
+   * シャードは手放した範囲と重なれば NotOwner を返し、読み手に範囲表を取り直させる。
+   */
+  slots?: [number, number][];
 };
+
+/** shard key を絞らない span。そのシャードの表全体を覆う。 */
+export const isWideSpan = (s: Span): boolean => s.kind === "table" || (s.kind === "pred" && !s.sk);
 
 export function spanCovers(span: Span, table: string, pk: string, sk: string): boolean {
   if (span.table !== table && span.table !== "*") return false;
@@ -331,6 +342,8 @@ export interface Faults {
   servePastMove?: boolean;
   /** 親が fence 後も要求を受理する。 */
   ignoreFence?: boolean;
+  /** 親が、移動を終えた範囲を含む全表の読みを受理する。古い範囲表の読み手が、子へ移った行を読み落とす。 */
+  staleWideRead?: boolean;
   /** 検証で F の代わりに T を使う。 */
   validateFromT?: boolean;
   /** 検証の代わりにロックの保持だけを信じる。ロックを失っても検出できない。 */
