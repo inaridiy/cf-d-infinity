@@ -7,6 +7,7 @@ import type { Catalog } from "../meta";
 import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
 import { parseStatements, text, type Node, type Params } from "../sql/cst";
 import { findTable, fullScan, planStatement, type Plan, type PlanContext, type Route, type Scan, type WriteTarget } from "../sql/plan";
+import { parseDdl } from "../sql/ddl";
 import { openScratch, ScratchDb } from "../sql/scratch";
 
 export interface Cluster {
@@ -804,6 +805,26 @@ export class Db {
     return first;
   }
 
+  /**
+   * DDL の履歴は、Worker の SQLite でも再生する (行を集めて実行する文のため)。記録する前に、ここで再生できることを確かめる。
+   * Meta が確かめるのはシャードで実行する文だけで、利用者が書いた形の文は確かめない。再生できない文が履歴に入ると、
+   * 履歴は書き換えられないので、以後、行を集める文がすべて失敗する。trigger も同じ SQLite に作るので、ここで確かめる。
+   */
+  private async assertReplays(sql: string, cat: Catalog): Promise<void> {
+    const parsed = parseDdl(sql, cat);
+    const statements = [...(parsed.user ? [parsed.user] : []), ...Object.values(parsed.triggers ?? {}).map((t) => t.sql)];
+    if (parsed.noop || statements.length === 0) return;
+    const w = await openScratch(cat);
+    try {
+      for (const t of Object.values(cat.triggers)) w.exec(t.sql);
+      for (const s of statements) w.exec(s);
+    } catch (e) {
+      throw new SqlError((e as Error)?.message ?? String(e));
+    } finally {
+      w.close();
+    }
+  }
+
   /** 全シャードに、この版までの DDL を適用させる。最初の失敗と、範囲の移動の途中のシャードがあるかを返す。 */
   private async syncAll(cat: Catalog): Promise<{ failed: unknown; moving: boolean }> {
     const done = await Promise.allSettled(shardsOf(cat.routing).map((id) => this.shardOf(id).syncSchema({ version: cat.version })));
@@ -822,7 +843,7 @@ export class Db {
    * 新しい版を記録する。先に、現在の版を全シャードへ適用させる。Meta は、その版から進んでいれば記録を断る。
    * 前の版を適用していないシャードが残ったまま次の版を積むと、前の版がそのシャードで失敗したときに取り消せなくなる。
    */
-  private async record(write: (basedOn: number) => Promise<Catalog>): Promise<{ before: Catalog; cat: Catalog }> {
+  private async record(write: (basedOn: number, before: Catalog) => Promise<Catalog>): Promise<{ before: Catalog; cat: Catalog }> {
     const deadline = Date.now() + (this.opts.splitWaitMs ?? SPLIT_WAIT_MS);
     for (let attempt = 0; ; attempt++) {
       const before = await this.cluster.catalog();
@@ -841,7 +862,7 @@ export class Db {
         throw failed;
       }
       try {
-        return { before, cat: await write(before.version) };
+        return { before, cat: await write(before.version, before) };
       } catch (e) {
         if (attempt < 5 && /schema moved to version/.test((e as Error)?.message ?? "")) continue;
         throw e;
@@ -851,7 +872,10 @@ export class Db {
 
   async ddl(sql: string): Promise<void> {
     await this.checkUnique(sql);
-    const { before, cat } = await this.record((basedOn) => this.cluster.applyDdl(sql, basedOn));
+    const { before, cat } = await this.record(async (basedOn, at) => {
+      await this.assertReplays(sql, at);
+      return this.cluster.applyDdl(sql, basedOn);
+    });
     this.publish(cat);
     this.ids.clear();
     if (cat.version === before.version) {

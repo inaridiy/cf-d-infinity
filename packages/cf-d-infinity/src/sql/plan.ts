@@ -6,6 +6,7 @@ import { encode, fold, q, selectList } from "../shard/rows";
 import type { GlobalIndexDef, TableDef, Value, WritePlan } from "../types";
 import { SqlError } from "../types";
 import { bindParams, constant, ident, normalize, render, text, walk, type Node, type Params } from "./cst";
+import { isInternalName } from "./ddl";
 
 export type Route =
   | { by: "sk"; sks: string[] }
@@ -90,7 +91,9 @@ export function fullScan(def: TableDef): Scan {
   return { table: def, sql: `SELECT ${selectList(def)} FROM ${q(def.name)}`, params: [], sks: null };
 }
 
+/** 利用者の文が名指しした表を探す。内部の表 (グローバル index の表) は、利用者の文からは存在しないものとして扱う。 */
 export function findTable(cat: Catalog, name: string): TableDef | null {
+  if (isInternalName(name)) return null;
   const key = Object.keys(cat.tables).find((k) => same(k, name));
   return key ? cat.tables[key]! : null;
 }
@@ -218,6 +221,9 @@ function scopesOf(root: Node, n: Names): Scope[] {
   walk(root, (x) => {
     if (x.type !== "common_table_expr") return;
     const name = lower(ident(x.table));
+    // CTE の名前は文の全体で集めるので、有効範囲の外の同じ名前の参照も CTE として扱われ、文ごとシャードへ送られる。
+    // 内部の表と同じ名前の CTE を認めると、その参照がシャードの内部の表を読む。
+    if (isInternalName(name)) throw new SqlError(`CTE name ${name} is reserved: names starting with "__" or "sqlite_" are internal`);
     // 実在の表と同じ名前の CTE は、文のほかの場所では本物の表を指していることがある。view と同じ扱いにして、
     // 表を条件なしで集め、シャードへ絞り込む経路を使わない。
     if (findTable(n.cat, name)) n.views.add(name);
