@@ -215,7 +215,7 @@ export interface ShardApi {
   /** このシャードが健全かを運用者に見せるための状態。 */
   health(req: Record<string, never>): Promise<ShardHealth>;
   /** 表の行を主キーの順に返す。論理エクスポートに使う。 */
-  exportRows(req: { table: string; after: Value[] | null; limit: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }>;
+  exportRows(req: { table: string; after: Value[] | null; limit: number; skip?: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }>;
   /** 取引の rollback でロックを手放す。届かなくても TTL で消える。 */
   unlock(req: { txn: string }): Promise<void>;
   /** DDL を適用する。全シャードへ適用してから DDL を完了させる。 */

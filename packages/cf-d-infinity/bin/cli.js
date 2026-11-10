@@ -5,6 +5,7 @@
 //   status  シャードと範囲表、Autoscaler の履歴を見る
 // 使い捨ての Worker を miniflare で立て、DinfDatabase への Service Binding を dev registry 経由で張る。
 // HTTP の入口もトークンも使わない。binding を張れることが権限である。
+import { importBatches, insertLines, parseInsert } from "./dump.js";
 import { spawn } from "node:child_process";
 import { createWriteStream, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -141,7 +142,7 @@ async function loadMiniflare(cwd, tool) {
 }
 
 const CONSOLE_WORKER = `
-const OPS = new Set(["query", "slowQueries", "status", "schemaSql", "tables", "exportRows"]);
+const OPS = new Set(["query", "slowQueries", "status", "schemaSql", "tables", "exportRows", "importRows"]);
 export default {
   async fetch(request, env) {
     const { op, args } = await request.json();
@@ -341,14 +342,6 @@ async function status(opts) {
 }
 
 /** 値を SQL のリテラルにする。1 文が 1 行に収まるよう、改行は char() の連結にする。 */
-function literal(v) {
-  if (v === null || v === undefined) return "NULL";
-  if (typeof v === "number") return Number.isFinite(v) ? String(v) : Number.isNaN(v) ? "NULL" : v > 0 ? "9e999" : "-9e999";
-  if (typeof v === "object" && typeof v.$blob === "string") return `X'${v.$blob}'`;
-  const quoted = `'${String(v).replaceAll("'", "''")}'`;
-  return quoted.replace(/[\n\r\0]/g, (c) => `' || char(${c.charCodeAt(0)}) || '`);
-}
-
 async function exportAll(opts) {
   const s = await call(opts, "status", []);
   const moving = s.health.filter((h) => h.incoming + h.outgoing > 0).map((h) => h.id);
@@ -364,24 +357,8 @@ async function exportAll(opts) {
     do {
       const page = await call(opts, "exportRows", [name, cursor, 1000]);
       cursor = page.cursor;
-      const cols = page.columns.map((c) => `"${c.replaceAll('"', '""')}"`).join(", ");
-      // 1 文を小さく保つ。大きな行は 1 行で 1 文になる。
-      let batch = [];
-      let size = 0;
-      const flush = async () => {
-        if (batch.length === 0) return;
-        await write(`INSERT INTO "${name.replaceAll('"', '""')}"(${cols}) VALUES ${batch.join(", ")};`);
-        batch = [];
-        size = 0;
-      };
-      for (const row of page.rows) {
-        const tuple = `(${row.map(literal).join(", ")})`;
-        if (size + tuple.length > 64_000 || batch.length >= 100) await flush();
-        batch.push(tuple);
-        size += tuple.length;
-        total++;
-      }
-      await flush();
+      for (const line of insertLines(name, page.columns, page.rows)) await write(line);
+      total += page.rows.length;
     } while (cursor !== null);
   }
   if (opts.out) {
@@ -394,27 +371,23 @@ async function importFile(opts) {
   const file = opts.positional[0];
   if (!file) throw new Fail("import needs a file written by export");
   const lines = readFileSync(file, "utf8").split("\n").map((l) => l.trim()).filter((l) => l !== "" && !l.startsWith("--"));
-  let done = 0;
-  let batch = [];
-  let size = 0;
-  const flush = async () => {
-    if (batch.length === 0) return;
-    await call(opts, "query", [batch.join("\n"), []]);
-    done += batch.length;
-    batch = [];
-    size = 0;
-  };
+  let statements = 0;
+  let rows = 0;
   for (const line of lines) {
     if (!line.endsWith(";")) throw new Fail(`import expects one complete statement per line (as export writes); line starts: ${line.slice(0, 60)}`);
-    // DDL は 1 文ずつ送る。行の挿入はまとめて送る。
-    const ddl = !/^INSERT\b/i.test(line);
-    if (ddl || size + line.length > 256_000) await flush();
-    batch.push(line);
-    size += line.length;
-    if (ddl) await flush();
+    // export が書いた INSERT は、値を取り出して引数で渡す。それ以外の文 (DDL、手で書き足した文) は、そのまま 1 文ずつ送る。
+    const insert = parseInsert(line);
+    if (!insert) {
+      await call(opts, "query", [line, []]);
+      statements++;
+      continue;
+    }
+    for (const batch of importBatches(insert.rows)) {
+      await call(opts, "importRows", [insert.table, insert.columns, batch]);
+      rows += batch.length;
+    }
   }
-  await flush();
-  console.log(`Imported ${done} statements from ${file}`);
+  console.log(`Imported ${rows} rows and ${statements} other statements from ${file}`);
 }
 
 async function main(argv) {

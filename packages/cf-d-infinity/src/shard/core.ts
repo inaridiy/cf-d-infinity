@@ -798,7 +798,7 @@ export class ShardCore implements ShardApi {
    * 表の行を主キーの順に、after より後から limit 行まで返す。pk は columns の中の主キーの列の位置である。
    * 最新の確定済みの状態を読むだけで、時点はそろえない。移動の途中のシャードでは、同じ行が親と子の両方にあるので断る。
    */
-  async exportRows(req: { table: string; after: Value[] | null; limit: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }> {
+  async exportRows(req: { table: string; after: Value[] | null; limit: number; skip?: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }> {
     if (this.incoming.length > 0 || this.fenced.some((f) => !f.done)) throw new Migrating();
     const def = this.defs.get(req.table);
     if (!def) throw new SqlError(`no such table: ${req.table}`);
@@ -810,8 +810,10 @@ export class ShardCore implements ShardApi {
     const keyset = req.after !== null && req.after.every((v) => v !== null);
     const where = keyset ? `WHERE (${cols}) > (${def.pk.map(() => "?").join(", ")})` : "";
     const limit = Math.max(1, Math.min(req.limit, 5000));
+    // 主キーに NULL を含む行は、行の比較では「その次」を表せない。その場合は、読んだ行数で続きを表す。
+    const offset = keyset ? "" : ` OFFSET ${Math.max(0, Math.floor(req.skip ?? 0))}`;
     const { columns, rows } = this.b.iterate(
-      `SELECT ${list} FROM ${q(def.name)} ${where} ORDER BY ${cols} LIMIT ${limit}`, ...(keyset ? req.after! : []),
+      `SELECT ${list} FROM ${q(def.name)} ${where} ORDER BY ${cols} LIMIT ${limit}${offset}`, ...(keyset ? req.after! : []),
     );
     const out: Value[][] = [];
     let bytes = 0;

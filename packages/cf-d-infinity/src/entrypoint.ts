@@ -3,7 +3,7 @@ import { RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import type { RemoteResult, RemoteStatement, TransactionMode } from "./binding";
 import type { Db, QueryResult } from "./client/db";
 import type { Value } from "./types";
-import { clusterStatus, dbFor, exportRows, handle, schemaSql, slowQueries, type Env, type SlowQuery } from "./worker";
+import { clusterStatus, dbFor, exportRows, handle, importRows, schemaSql, slowQueries, type Env, type ExportCursor, type SlowQuery } from "./worker";
 
 const toValue = (v: unknown): Value =>
   v === undefined || v === null ? null : typeof v === "boolean" ? Number(v) : (v as Value);
@@ -83,10 +83,14 @@ export class DinfDatabase extends WorkerEntrypoint<Env> {
    * 時点はそろえないので、書き込みを止めていなければ、取引の途中の状態が混じり得る。
    * BLOB は JSON で運べないので、{ $blob: 16 進 } に変える。
    */
-  async exportRows(table: string, cursor: { shard: number; after: Value[] | null } | null, limit = 1000) {
+  async exportRows(table: string, cursor: ExportCursor | null, limit = 1000) {
     const page = await exportRows(this.env, table, cursor, limit);
     const hex = (v: Uint8Array) => Array.from(v, (b) => b.toString(16).padStart(2, "0")).join("");
     return { ...page, rows: page.rows.map((r) => r.map((v) => (v instanceof Uint8Array ? { $blob: hex(v) } : v))) };
+  }
+  /** export が書き出した行を入れる。BLOB は { $blob: 16 進 } で受ける。 */
+  async importRows(table: string, columns: string[], rows: unknown[][]): Promise<number> {
+    return importRows(await dbFor(this.env, 0, this.background), table, columns, rows);
   }
   /** `env.DB.fetch()` は HTTP の入口 (Hrana、/sql、/admin) と同じで、トークンを検査する。 */
   override fetch(request: Request): Promise<Response> {

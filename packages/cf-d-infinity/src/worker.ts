@@ -1,5 +1,8 @@
 import { DurableObject, RpcTarget } from "cloudflare:workers";
 import { Db, type Cluster, type StatementStat } from "./client/db";
+import { exportPage, importRows, type ExportCursor } from "./transfer";
+
+export { importRows, type ExportCursor };
 import { collectMetrics, decide, DEFAULTS, healthProblems, needsFollowUp, nextShardNumber, split, type AutoscalerState, type Thresholds } from "./autoscaler";
 import { MetaCore, type Catalog } from "./meta";
 import { planSplit, shardsOf } from "./routing";
@@ -541,20 +544,9 @@ export async function schemaSql(env: Env, name = "shard"): Promise<string[]> {
 
 /** 表の行を、シャードの順、主キーの順に少しずつ返す。cursor が null になったら終わりである。 */
 export async function exportRows(
-  env: Env, table: string, cursor: { shard: number; after: Value[] | null } | null, limit = 1000, name = "shard",
-): Promise<{ columns: string[]; rows: Value[][]; cursor: { shard: number; after: Value[] | null } | null }> {
-  const cluster = clusterOf(env, undefined, name);
-  const ids = shardsOf((await cluster.catalog()).routing);
-  let at = cursor ?? { shard: 0, after: null };
-  for (;;) {
-    if (at.shard >= ids.length) return { columns: [], rows: [], cursor: null };
-    const page = await cluster.shard(ids[at.shard]!).exportRows({ table, after: at.after, limit });
-    if (page.rows.length > 0) {
-      const last = page.rows[page.rows.length - 1]!;
-      return { columns: page.columns, rows: page.rows, cursor: { shard: at.shard, after: page.pk.map((i) => last[i] ?? null) } };
-    }
-    at = { shard: at.shard + 1, after: null };
-  }
+  env: Env, table: string, cursor: ExportCursor | null, limit = 1000, name = "shard",
+): Promise<{ columns: string[]; rows: Value[][]; cursor: ExportCursor | null }> {
+  return exportPage(clusterOf(env, undefined, name), table, cursor, limit);
 }
 
 /** 遅い文の記録を新しい順に返す。 */
