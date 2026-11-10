@@ -93,7 +93,9 @@ npx cf-d-infinity slow                           # recorded slow statements, new
 npx cf-d-infinity status                         # shards, slot ranges, autoscaler events
 ```
 
-It needs no HTTP endpoint and no token. The command starts a throwaway local Worker with a Service Binding to your Worker's `DinfDatabase` entrypoint, calls it, and exits (under a second). It finds the Worker by the `name` in `wrangler.jsonc` or `cloudflare.config.ts`; pass `--worker <NAME>` otherwise. It reaches dev servers on this machine only; a deployed database is not reachable from the command yet.
+It needs no HTTP endpoint and no token. The command starts a throwaway local Worker with a Service Binding to your Worker's `DinfDatabase` entrypoint, calls it, and exits (under a second). It finds the Worker by the `name` in `wrangler.jsonc` or `cloudflare.config.ts`; pass `--worker <NAME>` otherwise.
+
+Add `--remote` to run against the deployed Worker instead: `npx cf-d-infinity sql --remote "SELECT ..."`. The throwaway Worker still runs on your machine, and only its binding is a [remote binding](https://developers.cloudflare.com/workers/local-development/#remote-bindings), so nothing is deployed and nothing is exposed. This needs Wrangler in the project and `wrangler login`, takes several seconds per command, and runs the SQL on production data.
 
 **Slow statements.** A statement that takes longer than `DINF_SLOW_QUERY_MS` (a var; default 500 ms, `0` records everything, `off` disables) is recorded with its SQL text, duration, where it ran (`shard` for one shard, `gather` or `partial` for a scan gathered into the Worker, `transaction` for a batch), the number of shards it touched and its retries. Bound parameters are never recorded. The last 1,000 entries are kept, and a burst is capped at 20 entries per 10 seconds per isolate. The same list is available to your code as `env.DINF_DB.slowQueries()`.
 
@@ -106,6 +108,7 @@ D∞ works with both Wrangler and the `cf` CLI (in beta; it runs projects throug
 | Configuration | `wrangler.jsonc`, edited by `init` | `cloudflare.config.ts`; `init` prints the block to add, because the file is a program |
 | Develop and deploy | `wrangler dev`, `wrangler deploy` | `cf dev`, `cf deploy` |
 | `npx cf-d-infinity ...` | works against `wrangler dev` | works against `cf dev` |
+| `npx cf-d-infinity ... --remote` | works (uses Wrangler's remote bindings) | needs Wrangler installed as well |
 
 In a cf project, `init` writes `src/dinf.ts`, re-exports the classes from your entrypoint, adds the dependency, and prints this for the `worker` in `cloudflare.config.ts`:
 

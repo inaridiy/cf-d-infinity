@@ -165,14 +165,18 @@ describe("the cf-d-infinity command", () => {
     expect((await cli(["slow", "--worker", "ops-quiet"])).stdout).toMatch(/No slow statements recorded/);
   });
 
-  it("exits with 1 and a readable message on a SQL error, a Worker that is not running, and --remote", async () => {
+  it("exits with 1 and a readable message on a SQL error, a Worker that is not running, and unusable flags", async () => {
     const err = await cli(["sql", "SELECT * FROM nope", ...to]);
     expect([err.code, err.stdout]).toEqual([1, ""]);
     expect(err.stderr).toMatch(/no such table: nope/);
     const down = await cli(["status", "--worker", "not-running"]);
     expect(down.code).toBe(1);
     expect(down.stderr).toMatch(/no dev server is running for the Worker "not-running"/);
-    expect((await cli(["sql", "SELECT 1", "--remote", ...to])).stderr).toMatch(/--remote is not available yet/);
+    // --remote は本番を相手にするので、ここでは Wrangler を呼ぶ前に止まる経路だけを確かめる。
+    expect((await cli(["sql", "SELECT 1", "--remote", "--local", ...to])).stderr).toMatch(/exclude each other/);
+    const bare = mkdtempSync(join(tmpdir(), "dinf-cli-"));
+    writeFileSync(join(bare, "package.json"), "{}");
+    expect((await cli(["sql", "SELECT 1", "--remote", ...to], { cwd: bare })).stderr).toMatch(/--remote needs Wrangler in this project/);
     expect((await cli(["frobnicate"])).stderr).toMatch(/unknown command/);
   });
 });

@@ -5,10 +5,12 @@
 //   status  シャードと範囲表、Autoscaler の履歴を見る
 // 使い捨ての Worker を miniflare で立て、DinfDatabase への Service Binding を dev registry 経由で張る。
 // HTTP の入口もトークンも使わない。binding を張れることが権限である。
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { createServer } from "node:net";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const HELP = `cf-d-infinity <command> [options]
@@ -20,7 +22,8 @@ Commands:
   status        list the shards, the slot ranges they own, and recent autoscaler events
 
 Options:
-  --local         target the dev server running on this machine (the default, and the only target so far)
+  --local         target the dev server running on this machine (the default)
+  --remote        target the deployed Worker. Needs Wrangler in the project and \`wrangler login\`
   --worker <NAME> the Worker that exports DinfDatabase (default: "name" in ./wrangler.jsonc or ./cloudflare.config.ts)
   --file <PATH>   sql: read the statements from a file
   --param <V>     sql: a bound parameter for "?" placeholders; repeat for more (numbers and null are typed)
@@ -28,9 +31,10 @@ Options:
   --json          print JSON instead of a table
   -h, --help      show this help
 
-Start the project with \`wrangler dev\` or \`cf dev\` first. The command starts a throwaway local Worker with a
-Service Binding to that dev server's DinfDatabase entrypoint, calls it, and exits. No HTTP endpoint and no token
-are involved.
+Without --remote, start the project with \`wrangler dev\` or \`cf dev\` first. The command starts a throwaway
+local Worker with a Service Binding to DinfDatabase, calls it, and exits. With --remote the binding is a remote
+binding to the deployed Worker, so the SQL runs against production data. Nothing is deployed, and no HTTP
+endpoint or token is involved either way.
 `;
 
 class Fail extends Error {}
@@ -49,11 +53,12 @@ function parseArgs(argv) {
     else if (a === "--limit") out.limit = Number(value());
     else if (a === "--json") out.json = true;
     else if (a === "--local") out.local = true;
-    else if (a === "--remote") throw new Fail("--remote is not available yet: this command only reaches a dev server on this machine");
+    else if (a === "--remote") out.remote = true;
     else if (a === "-h" || a === "--help") out.help = true;
     else if (a.startsWith("--")) throw new Fail(`unknown option ${a}; see --help`);
     else out.positional.push(a);
   }
+  if (out.local && out.remote) throw new Fail("--local and --remote exclude each other");
   return out;
 }
 
@@ -144,8 +149,78 @@ export default {
   },
 };`;
 
-/** 使い捨ての Worker を立て、dev サーバの DinfDatabase を 1 回呼ぶ。 */
+const freePort = () => new Promise((resolve, reject) => {
+  const server = createServer();
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => {
+    const { port } = server.address();
+    server.close(() => resolve(port));
+  });
+});
+
+/** 利用者のプロジェクトに入っている Wrangler の実行ファイル。 */
+function wranglerBin(cwd) {
+  try {
+    let dir = dirname(createRequire(join(cwd, "package.json")).resolve("wrangler"));
+    for (let i = 0; i < 6; i++, dir = dirname(dir)) {
+      const pkg = join(dir, "package.json");
+      if (existsSync(pkg) && JSON.parse(readFileSync(pkg, "utf8")).name === "wrangler") return join(dir, "bin", "wrangler.js");
+    }
+  } catch {}
+  throw new Fail("--remote needs Wrangler in this project (npm i -D wrangler) and `wrangler login`. It uses Wrangler's remote bindings to reach the deployed Worker.");
+}
+
+/**
+ * デプロイ済みの Worker の DinfDatabase を呼ぶ。
+ * 使い捨ての Worker を手元の Wrangler の開発サーバで立て、Service Binding だけを remote にする。何もデプロイしない。
+ */
+async function callRemote(opts, op, args) {
+  const cwd = process.cwd();
+  const worker = workerName(opts, cwd);
+  const bin = wranglerBin(cwd);
+  const dir = mkdtempSync(join(tmpdir(), "dinf-console-"));
+  const port = await freePort();
+  writeFileSync(join(dir, "index.js"), CONSOLE_WORKER);
+  writeFileSync(join(dir, "wrangler.jsonc"), JSON.stringify({
+    name: "dinf-console", main: "index.js", compatibility_date: "2026-07-01",
+    services: [{ binding: "DINF_DB", service: worker, entrypoint: "DinfDatabase", remote: true }],
+  }));
+  const child = spawn(process.execPath, [bin, "dev", "-c", join(dir, "wrangler.jsonc"), "--port", String(port), "--ip", "127.0.0.1"], {
+    cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" },
+  });
+  let log = "";
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Fail(`timed out waiting for the remote binding to "${worker}".\n${log.slice(-600)}`)), 90_000);
+      const onData = (d) => {
+        log += d;
+        if (/Ready on http/.test(log)) {
+          clearTimeout(timer);
+          resolve();
+        }
+      };
+      child.stdout.on("data", onData);
+      child.stderr.on("data", onData);
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        reject(new Fail(`Wrangler could not open a remote binding to "${worker}" (exit ${code}). Is the Worker deployed, and are you logged in (\`wrangler login\`)?\n${log.slice(-600)}`));
+      });
+    });
+    const res = await fetch(`http://127.0.0.1:${port}/`, { method: "POST", body: JSON.stringify({ op, args }) });
+    const json = await res.json().catch(() => ({ error: `the throwaway Worker answered ${res.status} without JSON.\n${log.slice(-600)}` }));
+    if (json.error !== undefined) throw new Fail(json.error);
+    return json.ok;
+  } finally {
+    child.kill("SIGTERM");
+    await Promise.race([exited, new Promise((r) => setTimeout(r, 5000))]);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** 使い捨ての Worker を立て、DinfDatabase を 1 回呼ぶ。 */
 async function call(opts, op, args) {
+  if (opts.remote) return callRemote(opts, op, args);
   const cwd = process.cwd();
   const worker = workerName(opts, cwd);
   const found = registryCandidates().find((c) => existsSync(join(c.path, worker)));

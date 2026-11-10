@@ -61,7 +61,8 @@ npx cf-d-infinity status        # shards, slot ranges, autoscaler events
 ```
 
 The command starts a throwaway local Worker bound to your Worker's `DinfDatabase` and calls it; no HTTP endpoint or
-token is involved. It reaches dev servers on this machine only.
+token is involved. Add `--remote` to reach the deployed Worker through a remote binding (needs Wrangler and
+`wrangler login`; the SQL then runs on production data).
 
 ## Entry points
 

@@ -92,6 +92,12 @@ Wrangler は `~/.config/.wrangler/registry` に、cf (Cloudflare Vite plugin 2.0
 cf の miniflare は 5 系で設定の形が違うので、`convertV4MiniflareOptions` があればそれを通す。
 この仕組みは `unsafeDevRegistryPath` という非公開の設定と registry の配置に依存しており、ツールの更新で壊れ得る。
 
+`--remote` はデプロイ済みの Worker を相手にする。
+使い捨ての Worker を利用者のプロジェクトの `wrangler dev` で手元に立て、Service Binding に `"remote": true` を付ける。
+何もデプロイせず、公開の URL も作らない。認証は Wrangler のログインに任せる。
+名前付きの入口 (`DinfDatabase`) への RPC が remote binding を通ることは、本番で確かめた (2026-11-10、wrangler 4.158.0)。
+1 回の実行に約 8 秒かかる。cf だけのプロジェクトでは Wrangler も入れる必要がある。
+
 遅い文は `Db` の `onStatement` で測り、`DINF_SLOW_QUERY_MS` を超えたものを DinfMeta の `__slow` に書く。
 記録は応答を待たせない (`waitUntil`)。bound parameter は記録しない。
 直近 1,000 件だけ残し、isolate ごとに 10 秒あたり 20 件で打ち切る。
