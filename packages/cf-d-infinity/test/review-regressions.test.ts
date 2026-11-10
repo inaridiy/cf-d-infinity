@@ -88,7 +88,8 @@ describe("an autocommit read of several shards that does not include the anchor"
   const stale = async (faults: Faults) => {
     let seenStale = 0;
     let tried = 0;
-    for (let round = 0; round < 8; round++) {
+    // anchor は取引 ID で決まるので、時計の進んだシャードが anchor になるとは限らない。そうなる回が 4 回たまるまで繰り返す。
+    for (let round = 0; round < 80 && tried < 4; round++) {
       const drift = new Map<string, number>();
       const c = new SimCluster({ shards: 3, faults, skewMs: (id) => drift.get(id) ?? 0 });
       await c.client().ddl(USERS);
@@ -121,7 +122,7 @@ describe("an autocommit read of several shards that does not include the anchor"
 
   it("sees a write that was acknowledged before the read started", async () => {
     const r = await stale({});
-    expect(r.tried).toBeGreaterThan(0);
+    expect(r.tried).toBe(4);
     expect(r.seenStale).toBe(0);
   });
 
