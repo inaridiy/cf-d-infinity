@@ -10,7 +10,7 @@ import {
 import type { DdlEntry } from "../meta";
 import { slotOf } from "../routing";
 import {
-  CAPTURE_TABLES, applyChanges, asSqlError, capturedChanges, decode, deleteRow, encode, encodeKey, insertRow, q,
+  CAPTURE_TABLES, applyChanges, asSqlError, capturedChanges, decode, deleteRow, encode, encodeKey, fold, insertRow, q,
   rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore, writable,
 } from "./rows";
 
@@ -332,7 +332,7 @@ export class ShardCore implements ShardApi {
     for (const n of e.drops) this.defs.delete(n);
   }
 
-  private async ensureSchema(version: number): Promise<void> {
+  private async ensureSchema(version: number, catchUp = false): Promise<void> {
     // 古い表定義の要求を通すと、新しいグローバル index の更新が漏れる。経路と同じく取り直させる。
     if (version < this.schema) throw new NotOwner(`stale schema ${version} < ${this.schema}`);
     if (version === this.schema) {
@@ -341,12 +341,12 @@ export class ShardCore implements ShardApi {
       if (this.schemaChange) throw new NotOwner(`stale schema ${version}: a schema change is being applied`);
       return;
     }
-    this.schemaChange ??= this.applySchema().finally(() => {
+    this.schemaChange ??= this.applySchema(catchUp).finally(() => {
       this.schemaChange = null;
     });
     await this.schemaChange;
     // 待っている間に、さらに新しい DDL が出ているかもしれない。要求の版が取り消されて、古くなっていることもある。
-    await this.ensureSchema(version);
+    await this.ensureSchema(version, catchUp);
   }
 
   /**
@@ -364,7 +364,11 @@ export class ShardCore implements ShardApi {
    * 先に、このシャードが持つ intent をすべて決着させる。intent の行イメージは DDL より前の表の形なので、
    * 表や列が消えた後では適用できない。確定済みの取引がそうなると、再駆動が永久に失敗する。
    */
-  private async applySchema(): Promise<void> {
+  private async applySchema(catchUp = false): Promise<void> {
+    // 範囲の移動の途中は適用しない。親と子の版がずれると、運ぶ行と intent の形が受け取る側の表と合わなくなる。
+    // 親は intent を決着させないと DDL を適用できず、その決着は子へ転送され、子はその行を受け取れない、という行き詰まりになる。
+    // 子が親の版へ追いつく場合 (catchUp) だけは通す。届く行がその版の形だからである。
+    if (!catchUp && this.moving()) throw new ConflictError(`schema change is waiting for a shard split on ${this.id} to finish`);
     if (!this.faults.ddlIgnoresIntents) await this.settleAllIntents();
     const { ddl } = await this.deps.meta.ddlSince(this.schema);
     // 取り消された版と、それを取り消す版。このシャードがまだ適用していなければ、両方とも実行しない。
@@ -400,7 +404,7 @@ export class ShardCore implements ShardApi {
       this.schemaStuck = { version: e.version, message };
       throw new SqlError(`schema change ${e.version} cannot be applied on shard ${this.id}: ${message}`);
     }
-    return this.applySchema();
+    return this.applySchema(true);
   }
 
   /**
@@ -507,18 +511,47 @@ export class ShardCore implements ShardApi {
 
   // ---- ライブ移動 ----
 
-  async beginIncoming(req: { start: number; end: number; from: string; schema: number }): Promise<void> {
+  /** 範囲の移動の途中か。送り出し中 (fence 済みで未完了) か、受け取り中である。 */
+  private moving(): boolean {
+    return this.incoming.length > 0 || this.fenced.some((f) => !f.done);
+  }
+
+  async moves(_req: Record<string, never>): Promise<{ outgoing: { start: number; end: number; to: string }[]; incoming: { start: number; end: number; from: string }[] }> {
+    return {
+      outgoing: this.fenced.filter((f) => !f.done).map((f) => ({ start: f.start, end: f.end, to: f.to })),
+      incoming: this.incoming.map((x) => ({ start: x.start, end: x.end, from: x.from_id })),
+    };
+  }
+
+  async beginIncoming(req: { start: number; end: number; from: string; schema: number }): Promise<{ schema: number }> {
+    const same = () => this.incoming.some((x) => x.start === req.start && x.end === req.end && x.from_id === req.from);
+    if (same()) return { schema: this.schema };
     await this.ensureSchema(req.schema);
-    if (this.incoming.some((x) => x.start === req.start && x.end === req.end)) return;
+    if (same()) return { schema: this.schema };
+    // 重なる範囲を別の親から受け取ると、どちらの行が正しいのか決められない。送り出し中のシャードも子にしない。
+    const clash = this.incoming.find((x) => x.start < req.end && req.start < x.end);
+    if (clash) throw new SqlError(`shard ${this.id} is already receiving slots [${clash.start}, ${clash.end}) from ${clash.from_id}`);
+    if (this.fenced.some((f) => !f.done)) throw new ConflictError(`shard ${this.id} is still handing a range over; it cannot receive one until that finishes`);
     this.b.exec(`INSERT INTO __incoming(start, end, from_id) VALUES (?, ?, ?)`, req.start, req.end, req.from);
     this.incoming.push({ start: req.start, end: req.end, from_id: req.from });
     await this.b.sync();
+    return { schema: this.schema };
   }
 
-  async fence(req: { start: number; end: number; to: string }): Promise<void> {
-    if (this.fenced.some((x) => x.start === req.start && x.end === req.end)) return;
+  async fence(req: { start: number; end: number; to: string; schema?: number }): Promise<void> {
+    const same = () => this.fenced.some((x) => x.start === req.start && x.end === req.end && x.to === req.to);
+    if (same()) return;
+    // 子の表定義の版まで追いついてから fence する。子が先の版にいると、親の古い形の行と intent を子が受け取れない。
+    // 移動の間は、親も子も DDL を適用しない (applySchema)。
+    if (req.schema !== undefined) await this.ensureSchema(req.schema);
+    if (same()) return;
+    // 同じ範囲を 2 つの子へ送り出すと、行が両方へ分かれ、範囲表はどちらか片方しか指さない。
+    const clash = this.fenced.find((x) => x.start < req.end && req.start < x.end);
+    if (clash) throw new SqlError(`slots [${clash.start}, ${clash.end}) of shard ${this.id} ${clash.done ? "were moved" : "are being moved"} to ${clash.to}`);
+    // 受け取り中のシャードは、まだ届いていない行を持っていない。その範囲を送り出すと、届いていない行が取り残される。
+    if (this.incoming.length > 0) throw new ConflictError(`shard ${this.id} is still receiving a range; it cannot be split until that finishes`);
     this.b.exec(`INSERT INTO __fenced(start, end, "to") VALUES (?, ?, ?)`, req.start, req.end, req.to);
-    this.fenced.push({ ...req, done: 0 });
+    this.fenced.push({ start: req.start, end: req.end, to: req.to, done: 0 });
     await this.b.sync();
   }
 
@@ -555,7 +588,9 @@ export class ShardCore implements ShardApi {
         let read = 0;
         for (const r of rows) {
           read++;
-          add(encode(r));
+          // 経路と同じ規則で値を揃える。照合順序のある列 (NOCASE など) を保存された値のまま数えると、
+          // 'User1' と 'user1' が別のスロットになり、行が、範囲表の指すのとは違うシャードに残る。
+          add(encode(r.map((v, i) => fold(v, def.collation[def.shardKey[i]!]))));
           if (out.length >= req.limit) {
             // NULL を含む shard key は行の比較で絞れないので、読んだ数で続きを表す。
             const next: GroupCursor = r.every((v) => v !== null)
@@ -583,11 +618,11 @@ export class ShardCore implements ShardApi {
     let bytes = 0;
     for (const g of req.groups) {
       const f = this.fencedRange(g);
-      if (!f || f.to !== req.to) {
-        const known = this.moved.get(g);
-        if (known && known.to !== req.to) throw new NotOwner(known.to);
-        if (!f) throw new SqlError(`pull of unfenced group ${g}`);
-      }
+      const known0 = this.moved.get(g);
+      if (known0 && known0.to !== req.to) throw new NotOwner(known0.to);
+      if (!f) throw new SqlError(`pull of unfenced group ${g}`);
+      // fence の宛先でないシャードには渡さない。渡すと、行が範囲表の指さないシャードへ行く。
+      if (f.to !== req.to) throw new NotOwner(f.to);
       const rows = [...this.defs.values()].flatMap((def) =>
         selectGroup(this.b, def, g).map((row) => ({ table: def.name, row })),
       );
@@ -657,7 +692,7 @@ export class ShardCore implements ShardApi {
     // 親の表定義の版まで追いついてから受け取る。子は増設の途中で生まれるので、DDL の「全シャードへの適用」から
     // 漏れることがある。古い版のままだと、届いた行と表の形が合わず、新しい index を保守しない古い計画の書き込みも通る。
     const version = Math.max(0, ...payload.map((p) => p.schema ?? 0));
-    if (version > this.schema && !this.faults.childKeepsOldSchema) await this.ensureSchema(version);
+    if (version > this.schema && !this.faults.childKeepsOldSchema) await this.ensureSchema(version, true);
     const fresh = payload.filter((p) => !this.arrived.has(p.g));
     this.b.tx(() => {
       for (const p of fresh) {
@@ -968,8 +1003,9 @@ export class ShardCore implements ShardApi {
     }
   }
 
-  async syncSchema(req: { version: number }): Promise<void> {
+  async syncSchema(req: { version: number }): Promise<{ moving: boolean }> {
     if (req.version > this.schema) await this.ensureSchema(req.version);
+    return { moving: this.moving() };
   }
 
   async now(_req: Record<string, never>): Promise<Ts> {
@@ -1385,7 +1421,7 @@ export class ShardCore implements ShardApi {
    * UNIQUE 違反で適用できなくなり、再駆動が永久に失敗する。書き込みの経路はすべてこれを通す。
    */
   private uniquePending(txn: string, writes: Change[]): string | null {
-    const constrained = writes.filter((w) => this.def(w.table).uniques.length > 0);
+    const constrained = writes.filter((w) => this.hasUniqueBeyondKey(w.table));
     if (!constrained.some((w) => w.after)) return null;
     const tables = new Set(constrained.map((w) => w.table));
     const others = (this.b.exec(`SELECT * FROM __intents WHERE txn <> ?`, txn) as unknown as Intent[])
@@ -1419,8 +1455,13 @@ export class ShardCore implements ShardApi {
     }
   }
 
+  /** 主キーが違っても衝突し得る表か。UNIQUE index のある表である。 */
+  private hasUniqueBeyondKey(table: string): boolean {
+    return this.def(table).uniques.length > 0;
+  }
+
   private checkUnique(txn: string, writes: Change[]): string | null {
-    const constrained = writes.filter((w) => this.def(w.table).uniques.length > 0);
+    const constrained = writes.filter((w) => this.hasUniqueBeyondKey(w.table));
     if (constrained.length === 0) return null;
     const pending = this.uniquePending(txn, constrained);
     if (pending) return pending;

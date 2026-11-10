@@ -27,9 +27,14 @@ export function fold(v: Value, collation: string | undefined): Value {
   return v;
 }
 
+/**
+ * 行の同一性を表す文字列を作る。主キーも shard key も、照合順序で等しい値は同じ文字列にする。
+ * 揃えないと、'abc' と 'ABC' が SQLite では同じ行なのに、intent、ロック、検証では別の行として扱われる。
+ * 揃えた値で行を引いても、列の照合順序で比べるので当たる。
+ */
 export function encodeKey(def: TableDef, row: Row): { pk: string; sk: string } {
   return {
-    pk: encode(def.pk.map((c) => row[c] ?? null)),
+    pk: encode(def.pk.map((c) => fold(row[c] ?? null, def.collation[c]))),
     sk: encode(def.shardKey.map((c) => fold(row[c] ?? null, def.collation[c]))),
   };
 }

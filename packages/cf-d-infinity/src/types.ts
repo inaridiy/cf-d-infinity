@@ -198,9 +198,12 @@ export interface ShardApi {
   status(req: { txn: string }): Promise<TxnStatus>;
   flush(req: { upTo?: Ts }): Promise<FlushRes>;
   /** 子が受け入れの準備をする。親の fence より先に呼ぶ。 */
-  beginIncoming(req: { start: number; end: number; from: string; schema: number }): Promise<void>;
+  /** 範囲を受け取る準備をする。子の表定義の版を返す。親は、fence の前にその版まで追いつく。 */
+  beginIncoming(req: { start: number; end: number; from: string; schema: number }): Promise<{ schema: number }>;
   /** 親がスロットの受理を止める。以後は NotOwner を返す。 */
-  fence(req: { start: number; end: number; to: string }): Promise<void>;
+  fence(req: { start: number; end: number; to: string; schema?: number }): Promise<void>;
+  /** 終わっていない範囲の移動。増設をやり直すとき、同じ範囲を続けるのに使う。 */
+  moves(req: Record<string, never>): Promise<{ outgoing: { start: number; end: number; to: string }[]; incoming: { start: number; end: number; from: string }[] }>;
   listGroups(req: { start: number; end: number; limit: number; cursor?: GroupCursor | null }): Promise<{ groups: string[]; cursor: GroupCursor | null }>;
   pull(req: { groups: string[]; to: string; maxBytes: number }): Promise<GroupPayload[]>;
   ack(req: { groups: string[] }): Promise<void>;
@@ -216,7 +219,7 @@ export interface ShardApi {
   /** 取引の rollback でロックを手放す。届かなくても TTL で消える。 */
   unlock(req: { txn: string }): Promise<void>;
   /** DDL を適用する。全シャードへ適用してから DDL を完了させる。 */
-  syncSchema(req: { version: number }): Promise<void>;
+  syncSchema(req: { version: number }): Promise<{ moving: boolean }>;
   /** 現在の HLC を返す。複数シャードの読み取りの T を決めるのに使う。 */
   now(req: Record<string, never>): Promise<Ts>;
 }

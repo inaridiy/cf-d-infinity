@@ -314,7 +314,8 @@ function pkOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string | null 
   for (const col of def.pk) {
     const vs = equalities(conj, ref, col, s, values);
     if (vs?.length !== 1) return null;
-    vals.push(normalize(vs[0]!, def.affinity[col] ?? "INTEGER"));
+    // 行の同一性はシャードと同じ規則で作る (rows.ts の encodeKey)。照合順序のある列は値を揃える。
+    vals.push(fold(normalize(vs[0]!, def.affinity[col] ?? "INTEGER"), def.collation[col]));
   }
   return encode(vals);
 }
@@ -827,7 +828,7 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
     const pkVals: Value[] = [];
     for (const c of def.pk) {
       const at = outCols.findIndex((n2) => same(n2, c) || (c === "rowid" && ROWID_NAMES.has(lower(n2))));
-      pkVals.push(at < 0 ? null : normalize(await parts[at]!.value(), def.affinity[c] ?? "INTEGER"));
+      pkVals.push(at < 0 ? null : fold(normalize(await parts[at]!.value(), def.affinity[c] ?? "INTEGER"), def.collation[c]));
     }
     if (auto) {
       const v = id ?? given[i];

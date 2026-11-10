@@ -16,7 +16,7 @@ export interface Cluster {
   applyDdl(sql: string, basedOn?: number): Promise<Catalog>;
   publishIndex(table: string, name: string, basedOn?: number): Promise<Catalog>;
   allocate(table: string, n: number, min?: number): Promise<number>;
-  switchRange(move: { start: number; end: number; to: string }): Promise<Routing>;
+  switchRange(move: { start: number; end: number; to: string; from?: string }): Promise<Routing>;
 }
 
 /** 接続をまたいで渡された token を時刻にする。時刻として読めない値は「何も見ていない」として扱う。 */
@@ -65,6 +65,9 @@ const BACKFILL_RETRIES = 200;
 
 /** 表定義が古いと出る誤り。取り直すと解けることがある。 */
 const UNKNOWN_SCHEMA = /^(no such (table|column|index)|table \S+ has no column)/;
+
+/** DDL が、進行中のシャードの増設が終わるのを待つ時間。 */
+const SPLIT_WAIT_MS = 60_000;
 
 const backoff = (attempt: number) =>
   new Promise((r) => setTimeout(r, Math.random() * Math.min(50, 2 ** attempt)));
@@ -715,6 +718,8 @@ export class Db {
     readonly cluster: Cluster,
     private opts: {
       retries?: number; idPrefix?: string; token?: Ts; catalog?: Catalog; idBlock?: number;
+      /** DDL が、進行中のシャードの増設が終わるのを待つ時間 (ms)。既定は 60 秒。 */
+      splitWaitMs?: number;
       /** 取り直した表定義を呼び出し側のキャッシュへ戻す。 */
       onCatalog?: (c: Catalog) => void;
       /** 採番のブロック。要求ごとに Db を作る環境では共有しないと番号が大きく飛ぶ。 */
@@ -792,10 +797,12 @@ export class Db {
     return first;
   }
 
-  /** 全シャードに、この版までの DDL を適用させる。最初の失敗を返す。 */
-  private async syncAll(cat: Catalog): Promise<unknown> {
+  /** 全シャードに、この版までの DDL を適用させる。最初の失敗と、範囲の移動の途中のシャードがあるかを返す。 */
+  private async syncAll(cat: Catalog): Promise<{ failed: unknown; moving: boolean }> {
     const done = await Promise.allSettled(shardsOf(cat.routing).map((id) => this.shardOf(id).syncSchema({ version: cat.version })));
-    return done.find((r): r is PromiseRejectedResult => r.status === "rejected")?.reason ?? null;
+    const failed = done.find((r): r is PromiseRejectedResult => r.status === "rejected")?.reason ?? null;
+    const waiting = /waiting for a shard split/.test((failed as Error)?.message ?? "");
+    return { failed, moving: waiting || done.some((r) => r.status === "fulfilled" && r.value?.moving === true) };
   }
 
   private publish(cat: Catalog): void {
@@ -809,9 +816,18 @@ export class Db {
    * 前の版を適用していないシャードが残ったまま次の版を積むと、前の版がそのシャードで失敗したときに取り消せなくなる。
    */
   private async record(write: (basedOn: number) => Promise<Catalog>): Promise<{ before: Catalog; cat: Catalog }> {
+    const deadline = Date.now() + (this.opts.splitWaitMs ?? SPLIT_WAIT_MS);
     for (let attempt = 0; ; attempt++) {
       const before = await this.cluster.catalog();
-      const failed = await this.syncAll(before);
+      const { failed, moving } = await this.syncAll(before);
+      // シャードの増設の途中は、新しい版を記録しない。増設の間、親と子は DDL を適用しないので、記録すると、
+      // 新しい版で計画した要求がそのシャードで通らなくなる。終わるのを待つ。
+      if (moving) {
+        if (Date.now() > deadline) throw new SqlError("a shard split is in progress; retry the schema change when it finishes");
+        attempt = Math.min(attempt, 3);
+        await new Promise((r) => setTimeout(r, 20));
+        continue;
+      }
       if (failed) {
         // 失敗したシャードが、その版の取り消しを Meta に求めたのかもしれない。版が進んでいれば、取り直してやり直す。
         if (attempt < 5 && (await this.cluster.catalog()).version !== before.version) continue;
@@ -842,7 +858,15 @@ export class Db {
     }
     // 全シャードへ適用してから完了を返す。適用が遅れると、古い表定義の Worker がそのシャードへ書き、
     // 後から DROP が適用されて行が消える。適用後は古い要求を全シャードが拒否する。
-    const failed = await this.syncAll(cat);
+    let { failed, moving } = await this.syncAll(cat);
+    // 記録した直後に増設が始まると、そのシャードは増設が終わるまで適用しない。終われば適用するので、待つ。
+    for (const deadline = Date.now() + (this.opts.splitWaitMs ?? SPLIT_WAIT_MS); failed && moving; ) {
+      if (Date.now() > deadline) {
+        throw new SqlError("the schema change is recorded, but a shard split is in progress; shards being split apply it when the split finishes");
+      }
+      await new Promise((r) => setTimeout(r, 20));
+      ({ failed, moving } = await this.syncAll(cat));
+    }
     if (failed) {
       // シャードの行によっては適用できない文がある (重複のある列への UNIQUE index など)。
       // そのシャードが取り消しを求めているので、取り消しを全シャードへ行き渡らせてから、理由を返す。

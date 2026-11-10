@@ -230,7 +230,7 @@ export class DinfMeta extends DurableObject<Env> {
   revokeDdl(version: number, reason: string) {
     return this.core.revokeDdl(version, reason);
   }
-  switchRange(move: { start: number; end: number; to: string }) {
+  switchRange(move: { start: number; end: number; to: string; from?: string }) {
     return this.core.switchRange(move);
   }
   publishIndex(table: string, name: string, basedOn?: number) {

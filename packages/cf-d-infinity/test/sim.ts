@@ -214,7 +214,7 @@ export class SimCluster implements Cluster {
   applyDdl(sql: string, basedOn?: number) {
     return this.meta.applyDdl(sql, basedOn);
   }
-  switchRange(move: { start: number; end: number; to: string }) {
+  switchRange(move: { start: number; end: number; to: string; from?: string }) {
     return this.meta.switchRange(move);
   }
   publishIndex(table: string, name: string, basedOn?: number) {

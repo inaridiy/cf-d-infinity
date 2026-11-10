@@ -81,10 +81,16 @@ export class MetaCore {
   }
 
   /** 範囲表を切り替える。これが増設の線形化点である。 */
-  async switchRange(move: { start: number; end: number; to: string }): Promise<Routing> {
+  async switchRange(move: { start: number; end: number; to: string; from?: string }): Promise<Routing> {
     const current = this.routing();
     const done = current.ranges.some((x) => x.shard === move.to && x.start <= move.start && x.end >= move.end);
     if (done) return current; // 増設の手順はやり直せるので、切り替えも冪等にする。
+    // 範囲の持ち主が、呼び出し側の思っている親でなければ断る。別の増設が先に切り替えていると、その子が持つ行を
+    // 範囲表が指さなくなる。
+    const owners = [...new Set(current.ranges.filter((x) => x.start < move.end && move.start < x.end).map((x) => x.shard))];
+    if (move.from !== undefined && !(owners.length === 1 && owners[0] === move.from)) {
+      throw new SqlError(`slots [${move.start}, ${move.end}) are owned by ${owners.join(", ")}, not by ${move.from}`);
+    }
     const next = applyMove(current, move);
     this.b.exec(`INSERT INTO __routing(version, body) VALUES (?, ?)`, next.version, JSON.stringify(next));
     return next;
