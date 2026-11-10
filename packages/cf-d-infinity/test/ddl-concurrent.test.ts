@@ -677,7 +677,8 @@ describe("the checks are not vacuous", () => {
         for (const core of c.cores.values()) inner(core).syncSchema = async () => {};
       },
     };
-    expect(await detects(s, (r) => r.side.lost.length > 0)).toBe(true);
+    // 当たるかどうかは実行の間合いで変わる。seed を多めに取る。
+    expect(await detects(s, (r) => r.side.lost.length > 0, [201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212])).toBe(true);
   }, 120_000);
 
   it("index agreement: reports a missing entry, a dangling entry, a wrong index read and a leftover table", async () => {

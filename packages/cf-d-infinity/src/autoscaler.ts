@@ -95,6 +95,7 @@ export function needsFollowUp(metrics: ShardMetrics[], state: AutoscalerState, p
 export function healthProblems(shards: ShardHealth[]): string[] {
   const out: string[] = [];
   for (const h of shards) {
+    if (h.schemaError) out.push(`${h.id}: cannot apply a schema change and refuses requests: ${h.schemaError}`);
     if (h.unapplied > 0 && h.redriveErrors.length > 0) {
       out.push(`${h.id}: ${h.unapplied} committed transaction(s) cannot be applied: ${h.redriveErrors[0]}`);
     } else if (h.redriveErrors.length > 0) {

@@ -126,7 +126,10 @@ export class DinfShard extends DurableObject<Env> {
       backend: new DoBackend(ctx.storage),
       clock: { now: () => Date.now() },
       peer: (id) => shardStub(env, id),
-      meta: { ddlSince: (v) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).ddlSince(v) as never },
+      meta: {
+        ddlSince: (v) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).ddlSince(v) as never,
+        revokeDdl: (v, reason) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).revokeDdl(v, reason),
+      },
       background: (p) => ctx.waitUntil(p),
       // 予約済みの alarm は後ろへずらさない。負荷が続くと毎回ずれて、いつまでも発火しなくなる。
       scheduleRedrive: () => {
@@ -220,15 +223,18 @@ export class DinfMeta extends DurableObject<Env> {
     return sql.exec(`SELECT at, ms, plan, shards, rows, changes, attempts, error, sql FROM __slow ORDER BY seq DESC LIMIT ?`, Math.max(1, Math.min(limit, SLOW_KEEP)))
       .toArray().map((r) => ({ ...(r as unknown as SlowQuery), error: (r.error as string | null) ?? undefined }));
   }
-  applyDdl(sql: string, initial: string[]) {
+  applyDdl(sql: string, initial: string[], basedOn?: number) {
     this.core.setInitial(initial);
-    return this.core.applyDdl(sql);
+    return this.core.applyDdl(sql, basedOn);
+  }
+  revokeDdl(version: number, reason: string) {
+    return this.core.revokeDdl(version, reason);
   }
   switchRange(move: { start: number; end: number; to: string }) {
     return this.core.switchRange(move);
   }
-  publishIndex(table: string, name: string) {
-    return this.core.publishIndex(table, name);
+  publishIndex(table: string, name: string, basedOn?: number) {
+    return this.core.publishIndex(table, name, basedOn);
   }
   allocate(table: string, n: number, min?: number) {
     return this.core.allocate(table, n, min);
@@ -409,9 +415,9 @@ export function clusterOf(env: Env, count?: number, prefix = "shard"): Cluster {
   return {
     shard: (id) => shardStub(env, id),
     catalog: () => meta.catalog(initial) as unknown as Promise<Catalog>,
-    applyDdl: (sql) => meta.applyDdl(sql, initial) as unknown as Promise<Catalog>,
+    applyDdl: (sql, basedOn) => meta.applyDdl(sql, initial, basedOn) as unknown as Promise<Catalog>,
     switchRange: (move) => meta.switchRange(move) as never,
-    publishIndex: (table, name) => meta.publishIndex(table, name) as never,
+    publishIndex: (table, name, basedOn) => meta.publishIndex(table, name, basedOn) as never,
     allocate: (table, n, min) => meta.allocate(table, n, min),
   };
 }
@@ -506,6 +512,8 @@ export async function clusterStatus(env: Env, name = "shard", shards?: number) {
   const cluster = clusterOf(env, shards, name);
   const cat = await cluster.catalog();
   const ids = shardsOf(cat.routing);
+  // 適用できない DDL で止まっているシャードは、適用を試みさせないと自分では気づかない (再起動で忘れる)。
+  await Promise.all(ids.map((id) => cluster.shard(id).syncSchema({ version: cat.version }).catch(() => {})));
   // 1 つのシャードが答えなくても、ほかの状態は見せる。
   const health = await Promise.all(ids.map((id) => cluster.shard(id).health({}).catch((e): ShardHealth => ({
     id, schema: -1, format: -1, bytes: 0, intents: 0, oldestIntentMs: 0, unapplied: 0,
@@ -520,8 +528,10 @@ export async function clusterStatus(env: Env, name = "shard", shards?: number) {
 /** 利用者が実行した DDL を、実行した順に返す。論理エクスポートの先頭に置く。 */
 export async function schemaSql(env: Env, name = "shard"): Promise<string[]> {
   const { ddl } = await env.DINF_META.getByName(name).ddlSince(0);
+  // 適用できずに取り消された文と、それを取り消した文は書き出さない。
+  const reverted = new Set(ddl.flatMap((e) => (e.reverts === undefined ? [] : [e.reverts, e.version])));
   return ddl.flatMap((e) => {
-    if (typeof e.user !== "string" || e.user.trim() === "") return [];
+    if (typeof e.user !== "string" || e.user.trim() === "" || reverted.has(e.version)) return [];
     // 履歴の文面からは SHARD KEY が除かれている。取り込み先で行の置き場所が変わらないよう、表定義から書き戻す。
     const def = e.defs[0];
     const createsTable = /^\s*CREATE\s+TABLE\b/i.test(e.user) && def !== undefined && !def.name.startsWith("__");

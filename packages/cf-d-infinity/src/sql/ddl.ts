@@ -37,6 +37,17 @@ export interface ParsedDdl {
   dropTriggers?: string[];
   /** IF NOT EXISTS などで何もしない。 */
   noop?: boolean;
+  /**
+   * この文を取り消す文。シャードの持つ行によって適用に失敗し得る文にだけ付ける。
+   * 空の表では通るので、Meta での事前の検証では見つからない。失敗したシャードが取り消しを求める。
+   */
+  undo?: { sql: string[]; user: string };
+}
+
+/** 内部の表は `__` で始まる。利用者の表と名前が衝突すると、内部の状態を利用者の SQL で書き換えられる。 */
+function userName(name: string, what: string): string {
+  if (/^(__|sqlite_)/i.test(name)) throw new SqlError(`${what} name ${name} is reserved: names starting with "__" or "sqlite_" are internal`);
+  return name;
 }
 
 const NOOP: ParsedDdl = { sql: [], defs: [], drops: [], user: null, noop: true };
@@ -60,7 +71,7 @@ const specCols = (c: Node): string[] => c.columns.expr.items.map((i: Node) => id
 
 function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: string[] | null): ParsedDdl {
   if (stmt.kind?.name === "TEMP" || stmt.kind?.name === "TEMPORARY") throw new SqlError("TEMP tables are not supported");
-  const name = ident(stmt.name);
+  const name = userName(ident(stmt.name), "table");
   if (schema.tables[name] || schema.views[name]) {
     if (stmt.ifNotExistsKw) return NOOP;
     throw new SqlError(`table ${name} already exists`);
@@ -147,12 +158,14 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
 }
 
 function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
-  const name = ident(stmt.name);
+  const name = userName(ident(stmt.name), "index");
+  const table = ident(stmt.table);
   if (schema.indexes[name]) {
-    if (stmt.ifNotExistsKw) return NOOP;
+    // 既存の行で埋めている途中の index は、まだ作り終えていない。同じ文の出し直しは、続きを埋める指示として受ける。
+    const half = schema.tables[schema.indexes[name]!.table]?.globalIndexes.find((g) => g.name === name && g.state === "writeOnly");
+    if (stmt.ifNotExistsKw || (half && schema.indexes[name]!.table === table)) return NOOP;
     throw new SqlError(`index ${name} already exists`);
   }
-  const table = ident(stmt.table);
   const found = schema.tables[table];
   if (!found) throw new SqlError(`no such table: main.${table}`);
   const def = structuredClone(found);
@@ -168,7 +181,8 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
       throw new SqlError("UNIQUE partial or expression indexes must include the shard key");
     }
     if (unique && !partial) def.uniques.push(cols);
-    return { sql: [source], defs: [def], drops: [], user: source, indexes: { [name]: { table, global: false } } };
+    const drop = `DROP INDEX IF EXISTS ${q(name)}`;
+    return { sql: [source], defs: [def], drops: [], user: source, indexes: { [name]: { table, global: false } }, undo: { sql: [drop], user: drop } };
   }
   const ix: GlobalIndexDef = { name, table: `__gidx_${name}`, columns: cols, unique, state: "writeOnly" };
   const t = globalIndexTable(ix);
@@ -197,7 +211,7 @@ function triggerTables(stmt: Node): string[] {
 }
 
 function createTrigger(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
-  const name = ident(stmt.name);
+  const name = userName(ident(stmt.name), "trigger");
   if (schema.triggers[name]) {
     if (stmt.ifNotExistsKw) return NOOP;
     throw new SqlError(`trigger ${name} already exists`);
@@ -253,7 +267,7 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
   const sql: string[] = dropCaptureDdl(name);
   switch (action.type) {
     case "alter_action_rename": {
-      const to = ident(action.newName);
+      const to = userName(ident(action.newName), "table");
       if (schema.tables[to]) throw new SqlError(`there is already another table or index with this name: ${to}`);
       sql.push(`ALTER TABLE ${q(name)} RENAME TO ${q(to)}`);
       def.name = to;
@@ -266,8 +280,20 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       const col = action.column;
       col.constraints = (col.constraints ?? []).filter((c: Node) => !isFk(inner(c)));
       sql.push(`ALTER TABLE ${q(name)} ADD COLUMN ${text(col)}`);
-      def.columns.push(ident(col.name));
-      break;
+      const added = ident(col.name);
+      def.columns.push(added);
+      // 型親和性と照合順序も記録する。無いと、この列の index を引くときに値を正規化できず、行を見つけられない。
+      def.affinity[added] = affinityOf(col.dataType ? text(col.dataType) : null);
+      for (const raw of col.constraints ?? []) {
+        const c = inner(raw);
+        if (c.type !== "constraint_collate") continue;
+        def.collated.push(added);
+        def.collation[added] = ident(c.collation).toUpperCase();
+      }
+      // CHECK や NOT NULL は既存の行で検査されるので、行のあるシャードでだけ失敗し得る。
+      const drop = `ALTER TABLE ${q(name)} DROP COLUMN ${q(ident(col.name))}`;
+      sql.push(...captureDdl(def));
+      return { sql, defs: [def], drops: [], user: source, undo: { sql: [...dropCaptureDdl(name), drop, ...captureDdl(found)], user: drop } };
     }
     case "alter_action_rename_column": {
       const from = ident(action.oldName);
@@ -281,6 +307,9 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       def.uniques = def.uniques.map((u) => u.map(ren));
       if (def.rowidAlias === from) def.rowidAlias = to;
       for (const g of def.globalIndexes) g.columns = g.columns.map(ren);
+      def.affinity = Object.fromEntries(Object.entries(def.affinity).map(([c, a]) => [ren(c), a]));
+      def.collation = Object.fromEntries(Object.entries(def.collation).map(([c, a]) => [ren(c), a]));
+      def.collated = def.collated.map(ren);
       break;
     }
     case "alter_action_drop_column": {
@@ -325,7 +354,7 @@ export function parseDdl(source: string, schema: SchemaView): ParsedDdl {
       return { sql: [], defs: [], drops: [], user: null, dropTriggers: [name] };
     }
     case "create_view_stmt": {
-      const name = ident(stmt.name);
+      const name = userName(ident(stmt.name), "view");
       if (schema.views[name]) {
         if (stmt.ifNotExistsKw) return NOOP;
         throw new SqlError(`view ${name} already exists`);

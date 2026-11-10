@@ -19,7 +19,11 @@ export interface ShardDeps {
   backend: Backend;
   clock: Clock;
   peer(id: string): ShardApi;
-  meta: Pick<MetaApi, never> & { ddlSince(v: number): Promise<{ version: number; ddl: DdlEntry[] }> };
+  meta: Pick<MetaApi, never> & {
+    ddlSince(v: number): Promise<{ version: number; ddl: DdlEntry[] }>;
+    /** 適用できなかった版の取り消しを求める。取り消す版の番号か、取り消せなければ null が返る。 */
+    revokeDdl(version: number, reason: string): Promise<number | null>;
+  };
   /** 応答後も続ける処理。DO では ctx.waitUntil に渡す。 */
   background?(p: Promise<unknown>): void;
   /** phase 2 の再駆動を予約する。DO では storage.setAlarm に渡す。 */
@@ -158,7 +162,8 @@ export class ShardCore implements ShardApi {
     this.migrateStorage();
 
     for (const r of b.exec(`SELECT entry FROM __ddl ORDER BY version`)) {
-      this.loadDefs(JSON.parse(r.entry as string) as DdlEntry);
+      const e = JSON.parse(r.entry as string) as DdlEntry & { skipped?: boolean };
+      if (!e.skipped) this.loadDefs(e);
     }
     this.schema = (b.exec(`SELECT max(version) v FROM __ddl`)[0]?.v as number) ?? 0;
     this.fenced = b.exec(`SELECT * FROM __fenced`) as unknown as FencedRange[];
@@ -305,6 +310,9 @@ export class ShardCore implements ShardApi {
     this.b.exec(`INSERT INTO __meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, k, v);
   }
 
+  /** 適用に失敗し、取り消せもしなかった DDL。直るまで、このシャードは要求を受けられない。 */
+  private schemaStuck: { version: number; message: string } | null = null;
+
   private def(table: string): TableDef {
     const d = this.defs.get(table);
     if (!d) throw new SqlError(`no such table: ${table}`);
@@ -328,8 +336,8 @@ export class ShardCore implements ShardApi {
       this.schemaChange = null;
     });
     await this.schemaChange;
-    // 待っている間に、さらに新しい DDL が出ているかもしれない。
-    if (version > this.schema) await this.ensureSchema(version);
+    // 待っている間に、さらに新しい DDL が出ているかもしれない。要求の版が取り消されて、古くなっていることもある。
+    await this.ensureSchema(version);
   }
 
   /**
@@ -350,18 +358,40 @@ export class ShardCore implements ShardApi {
   private async applySchema(): Promise<void> {
     if (!this.faults.ddlIgnoresIntents) await this.settleAllIntents();
     const { ddl } = await this.deps.meta.ddlSince(this.schema);
+    // 取り消された版と、それを取り消す版。このシャードがまだ適用していなければ、両方とも実行しない。
+    const skip = new Set<number>();
+    for (const e of ddl) if (e.reverts !== undefined && e.reverts > this.schema) skip.add(e.reverts).add(e.version);
     for (const e of ddl) {
       if (e.version <= this.schema) continue;
-      this.b.tx(() => {
-        for (const s of e.sql) this.b.exec(s);
-        this.b.exec(`INSERT INTO __ddl(version, entry) VALUES (?, ?)`, e.version, JSON.stringify(e));
-      });
-      this.loadDefs(e);
+      const skipped = skip.has(e.version);
+      try {
+        this.b.tx(() => {
+          if (!skipped) for (const s of e.sql) this.b.exec(s);
+          this.b.exec(`INSERT INTO __ddl(version, entry) VALUES (?, ?)`, e.version, JSON.stringify(skipped ? { ...e, skipped } : e));
+        });
+      } catch (err) {
+        return this.schemaFailed(e, (err as Error).message);
+      }
+      this.schemaStuck = null;
+      if (!skipped) this.loadDefs(e);
       this.schema = e.version;
       // 変更ログの行イメージは DDL より前の形なので、それより古い T は読み戻せない。
       this.ddlFloor = this.issue();
       this.metaSet("ddl_floor", this.ddlFloor);
     }
+  }
+
+  /**
+   * このシャードの行では DDL を適用できなかった。重複のある列への UNIQUE index や、既存の行が CHECK に反する ADD COLUMN で起きる。
+   * 放置すると、このシャードは全要求を断り続ける。Meta に取り消しを求め、取り消す版ごと読み飛ばして先へ進む。
+   */
+  private async schemaFailed(e: DdlEntry, message: string): Promise<void> {
+    const reverted = await this.deps.meta.revokeDdl(e.version, message).catch(() => null);
+    if (reverted === null) {
+      this.schemaStuck = { version: e.version, message };
+      throw new SqlError(`schema change ${e.version} cannot be applied on shard ${this.id}: ${message}`);
+    }
+    return this.applySchema();
   }
 
   /**
@@ -707,6 +737,7 @@ export class ShardCore implements ShardApi {
       oldestIntentMs: oldest === 0 ? 0 : Math.max(0, this.deps.clock.now() - tsToPhysical(oldest)),
       unapplied: one(`SELECT count(*) v FROM __txn WHERE status = 'committed' AND done = 0`),
       redriveErrors: this.lastRedriveErrors,
+      schemaError: this.schemaStuck ? `schema change ${this.schemaStuck.version}: ${this.schemaStuck.message}` : null,
       incoming: this.incoming.length,
       outgoing: this.fenced.filter((f) => !f.done).length,
       logGenerations: this.logGens().length,

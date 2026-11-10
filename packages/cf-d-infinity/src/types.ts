@@ -263,6 +263,8 @@ export interface ShardHealth {
   unapplied: number;
   /** 直近の再駆動で失敗した理由。空でなければ、同じ失敗を繰り返している。 */
   redriveErrors: string[];
+  /** 適用に失敗し、取り消せもしなかった DDL。null でなければ、このシャードは要求を受けられない。 */
+  schemaError?: string | null;
   /** 移動の途中の範囲の数 (受け取り中、送り出し中)。 */
   incoming: number;
   outgoing: number;

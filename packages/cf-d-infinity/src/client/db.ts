@@ -12,8 +12,9 @@ import { openScratch, ScratchDb } from "../sql/scratch";
 export interface Cluster {
   shard(id: string): ShardApi;
   catalog(): Promise<Catalog>;
-  applyDdl(sql: string): Promise<Catalog>;
-  publishIndex(table: string, name: string): Promise<Catalog>;
+  /** basedOn は呼び出し側が全シャードへ適用し終えた版。現在の版と違えば `schema moved` で断られる。 */
+  applyDdl(sql: string, basedOn?: number): Promise<Catalog>;
+  publishIndex(table: string, name: string, basedOn?: number): Promise<Catalog>;
   allocate(table: string, n: number, min?: number): Promise<number>;
   switchRange(move: { start: number; end: number; to: string }): Promise<Routing>;
 }
@@ -768,17 +769,66 @@ export class Db {
     return first;
   }
 
-  async ddl(sql: string): Promise<void> {
-    await this.checkUnique(sql);
-    const before = await this.cluster.catalog();
-    const cat = await this.cluster.applyDdl(sql);
+  /** 全シャードに、この版までの DDL を適用させる。最初の失敗を返す。 */
+  private async syncAll(cat: Catalog): Promise<unknown> {
+    const done = await Promise.allSettled(shardsOf(cat.routing).map((id) => this.shardOf(id).syncSchema({ version: cat.version })));
+    return done.find((r): r is PromiseRejectedResult => r.status === "rejected")?.reason ?? null;
+  }
+
+  private publish(cat: Catalog): void {
     this.cached = cat;
     // 呼び出し側のキャッシュにも渡す。渡さないと、同じ isolate の次の要求が DDL の前の表定義で計画する。
     this.opts.onCatalog?.(cat);
+  }
+
+  /**
+   * 新しい版を記録する。先に、現在の版を全シャードへ適用させる。Meta は、その版から進んでいれば記録を断る。
+   * 前の版を適用していないシャードが残ったまま次の版を積むと、前の版がそのシャードで失敗したときに取り消せなくなる。
+   */
+  private async record(write: (basedOn: number) => Promise<Catalog>): Promise<{ before: Catalog; cat: Catalog }> {
+    for (let attempt = 0; ; attempt++) {
+      const before = await this.cluster.catalog();
+      const failed = await this.syncAll(before);
+      if (failed) {
+        // 失敗したシャードが、その版の取り消しを Meta に求めたのかもしれない。版が進んでいれば、取り直してやり直す。
+        if (attempt < 5 && (await this.cluster.catalog()).version !== before.version) continue;
+        throw failed;
+      }
+      try {
+        return { before, cat: await write(before.version) };
+      } catch (e) {
+        if (attempt < 5 && /schema moved to version/.test((e as Error)?.message ?? "")) continue;
+        throw e;
+      }
+    }
+  }
+
+  async ddl(sql: string): Promise<void> {
+    await this.checkUnique(sql);
+    const { before, cat } = await this.record((basedOn) => this.cluster.applyDdl(sql, basedOn));
+    this.publish(cat);
     this.ids.clear();
+    if (cat.version === before.version) {
+      // 何も記録されなかった。同じ index を作る文の出し直しなら、前回の要求が途中で終わっているので、埋める作業を再開する。
+      const name = /^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"((?:[^"]|"")+)"|([^\s(]+))/i.exec(sql);
+      const wanted = name?.[1]?.replaceAll('""', '"') ?? name?.[2];
+      for (const def of Object.values(cat.tables)) {
+        for (const ix of def.globalIndexes) if (ix.state === "writeOnly" && ix.name === wanted) await this.backfill(def, ix);
+      }
+      return;
+    }
     // 全シャードへ適用してから完了を返す。適用が遅れると、古い表定義の Worker がそのシャードへ書き、
     // 後から DROP が適用されて行が消える。適用後は古い要求を全シャードが拒否する。
-    await Promise.all(shardsOf(cat.routing).map((id) => this.shardOf(id).syncSchema({ version: cat.version })));
+    const failed = await this.syncAll(cat);
+    if (failed) {
+      // シャードの行によっては適用できない文がある (重複のある列への UNIQUE index など)。
+      // そのシャードが取り消しを求めているので、取り消しを全シャードへ行き渡らせてから、理由を返す。
+      const now = await this.cluster.catalog();
+      if (now.revoked?.version !== cat.version) throw failed;
+      this.publish(now);
+      await this.syncAll(now);
+      throw new SqlError(now.revoked.reason);
+    }
     for (const def of Object.values(cat.tables)) {
       for (const ix of def.globalIndexes) {
         const known = before.tables[def.name]?.globalIndexes.some((g) => g.name === ix.name);
@@ -787,9 +837,12 @@ export class Db {
     }
   }
 
-  /** 重複のある列への UNIQUE は DDL の適用に失敗し、そのシャードの全要求が止まるので先に拒否する。 */
+  /**
+   * 重複のある列への UNIQUE を、記録する前に断る。記録した後でも、適用に失敗したシャードが取り消すので止まりはしないが、
+   * 版が 2 つ進み、ほかのシャードは index を作ってから捨てることになる。部分 index (WHERE 付き) はここでは調べない。
+   */
   private async checkUnique(sql: string): Promise<void> {
-    const m = /^\s*CREATE\s+UNIQUE\s+INDEX\s+\S+\s+ON\s+"?(\w+)"?\s*\(([^)]*)\)/i.exec(sql);
+    const m = /^\s*CREATE\s+UNIQUE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?\S+\s+ON\s+"?(\w+)"?\s*\(([^)]*)\)\s*;?\s*$/i.exec(sql);
     if (!m) return;
     const cat = await this.cluster.catalog();
     const def = findTable(cat, m[1]!);
@@ -833,13 +886,13 @@ export class Db {
     } catch (e) {
       // 作りかけの index を消した表定義を、呼び出し側のキャッシュにも戻す。
       // 戻さないと、同じ isolate の次の要求が、消えた index を保守する計画を立てて失敗する。
-      const without = await this.cluster.applyDdl(`DROP INDEX "${ix.name}"`);
-      this.cached = without;
-      this.opts.onCatalog?.(without);
+      const { cat: without } = await this.record((basedOn) => this.cluster.applyDdl(`DROP INDEX IF EXISTS ${q(ix.name)}`, basedOn));
+      this.publish(without);
+      await this.syncAll(without);
       throw e;
     }
-    this.cached = await this.cluster.publishIndex(def.name, ix.name);
-    this.opts.onCatalog?.(this.cached);
+    const { cat } = await this.record((basedOn) => this.cluster.publishIndex(def.name, ix.name, basedOn));
+    this.publish(cat);
   }
 
   /** 1 シャードの行を主キーの順に少しずつ読み、index の項目を書く。途中で範囲が移ったら true を返す。 */
