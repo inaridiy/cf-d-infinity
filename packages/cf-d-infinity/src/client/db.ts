@@ -1,7 +1,7 @@
 import type {
   Change, CommitRes, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
 } from "../types";
-import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isWideSpan } from "../types";
+import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isWideSpan, utf8Length } from "../types";
 import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, fold, q, selectList } from "../shard/rows";
 import type { Catalog } from "../meta";
 import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
@@ -17,6 +17,11 @@ export interface Cluster {
   publishIndex(table: string, name: string, basedOn?: number): Promise<Catalog>;
   allocate(table: string, n: number, min?: number): Promise<number>;
   switchRange(move: { start: number; end: number; to: string }): Promise<Routing>;
+}
+
+/** 接続をまたいで渡された token を時刻にする。時刻として読めない値は「何も見ていない」として扱う。 */
+export function cleanToken(token: unknown): Ts {
+  return typeof token === "number" && Number.isSafeInteger(token) && token > 0 ? token : 0;
 }
 
 export class QueryResult {
@@ -218,7 +223,7 @@ class ReadScope {
         if (total > this.db.rowBudget) {
           throw new SqlError(`query reads more than ${this.db.rowBudget} rows; narrow it or use the analytics tier`);
         }
-        w.load(s.table.name, columns, rows);
+        w.load(s.table.name, columns, rows, s.table.generated);
       }
       return w;
     } catch (e) {
@@ -630,7 +635,7 @@ export class Txn extends ReadScope {
     // 大きすぎる取引は、シャードへ送る前にここで断る。シャードも同じ検査をするが、そちらの拒否は競合と同じ扱いで再試行される。
     for (const changes of this.writes.values()) {
       let bytes = 0;
-      for (const c of changes.values()) bytes += encode(c).length;
+      for (const c of changes.values()) bytes += utf8Length(encode(c));
       if (bytes > this.db.writeSetBudget) {
         await this.unlockAll().catch(() => undefined);
         throw new SqlError(`transaction too large: it changes more than ${this.db.writeSetBudget} bytes of rows on one shard; split it into smaller transactions`);
@@ -702,7 +707,7 @@ export class Db {
       onStatement?: (s: StatementStat) => void;
     } = {},
   ) {
-    this.token = opts.token ?? 0;
+    this.token = cleanToken(opts.token);
     this.cached = opts.catalog ?? null;
     this.ids = opts.ids ?? new Map();
   }
@@ -1039,7 +1044,7 @@ export class Db {
   }
 
   async restore(d: { token: Ts; tx: TxnDump | null }): Promise<void> {
-    this.token = d.token;
+    this.token = cleanToken(d.token);
     this.current = d.tx ? Txn.load(this, await this.catalog(), d.tx) : null;
   }
 

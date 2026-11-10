@@ -81,6 +81,7 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
   const types = new Map<string, string | null>();
   const collated = new Set<string>();
   const collation: Record<string, string> = {};
+  const generated: string[] = [];
   let pk: string[] = [];
   const uniqueSets: string[][] = [];
   for (const item of items) {
@@ -101,6 +102,7 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
         collated.add(col);
         collation[col] = ident(c.collation).toUpperCase();
       }
+      if (c.type === "constraint_generated") generated.push(col);
     }
   }
   const withoutRowid = (stmt.options?.items ?? stmt.options?.options?.items ?? []).some((o: Node) => /WITHOUT/i.test(text(o)));
@@ -141,6 +143,7 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
     affinity: Object.fromEntries(columns.map((c) => [c, affinityOf(types.get(c) ?? null)])),
     collated: [...collated],
     collation,
+    ...(generated.length ? { generated } : {}),
   };
   const sql = [text(stmt), ...captureDdl(def)];
   const defs: TableDef[] = [];
@@ -180,7 +183,8 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
     if (unique && !(plain && def.shardKey.every((c) => cols.includes(c)))) {
       throw new SqlError("UNIQUE partial or expression indexes must include the shard key");
     }
-    if (unique && !partial) def.uniques.push(cols);
+    // 部分 index も記録する。記録しないと、書き込みの UNIQUE の検査がこの表を飛ばし、確定した後の適用で初めて違反になる。
+    if (unique) def.uniques.push(cols);
     const drop = `DROP INDEX IF EXISTS ${q(name)}`;
     return { sql: [source], defs: [def], drops: [], user: source, indexes: { [name]: { table, global: false } }, undo: { sql: [drop], user: drop } };
   }
@@ -286,6 +290,7 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       def.affinity[added] = affinityOf(col.dataType ? text(col.dataType) : null);
       for (const raw of col.constraints ?? []) {
         const c = inner(raw);
+        if (c.type === "constraint_generated") def.generated = [...(def.generated ?? []), added];
         if (c.type !== "constraint_collate") continue;
         def.collated.push(added);
         def.collation[added] = ident(c.collation).toUpperCase();
@@ -310,6 +315,7 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       def.affinity = Object.fromEntries(Object.entries(def.affinity).map(([c, a]) => [ren(c), a]));
       def.collation = Object.fromEntries(Object.entries(def.collation).map(([c, a]) => [ren(c), a]));
       def.collated = def.collated.map(ren);
+      if (def.generated) def.generated = def.generated.map(ren);
       break;
     }
     case "alter_action_drop_column": {
@@ -319,6 +325,10 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       if (def.globalIndexes.some((g) => g.columns.includes(col))) throw new SqlError(`cannot drop indexed column: "${col}"`);
       sql.push(`ALTER TABLE ${q(name)} DROP COLUMN ${q(col)}`);
       def.columns = def.columns.filter((c) => c !== col);
+      if (def.generated) def.generated = def.generated.filter((c) => c !== col);
+      delete def.affinity[col];
+      delete def.collation[col];
+      def.collated = def.collated.filter((c) => c !== col);
       break;
     }
     default:

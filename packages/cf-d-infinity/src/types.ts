@@ -32,8 +32,10 @@ export interface TableDef {
   collated: string[];
   /** 列の照合順序。 */
   collation: Record<string, string>;
-  /** シャード内の UNIQUE (shard key を含むもの)。 */
+  /** シャード内の UNIQUE (shard key を含むもの)。部分 index (WHERE 付き) の列も含む。 */
   uniques: string[][];
+  /** 生成列。値は SQLite が計算するので、行イメージを書き戻すときは除く。 */
+  generated?: string[];
   globalIndexes: GlobalIndexDef[];
 }
 
@@ -412,6 +414,22 @@ export class Migrating extends Error {
  * 確定した後の適用で初めて上限に当たると、その取引は永久に適用できない。必ず確定の前に拒否する。
  */
 export const MAX_WRITE_SET_BYTES = 1_000_000;
+
+/** 文字列を UTF-8 にしたときのバイト数。DO の上限はバイトで決まるので、文字数 (UTF-16 の単位数) では測れない。 */
+export function utf8Length(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c < 0xdc00) {
+      // サロゲートの対は 4 バイトになる。
+      n += 4;
+      i++;
+    } else n += 3;
+  }
+  return n;
+}
 
 /**
  * Durable Object に保存しているデータの形式の版。内部の表の形や意味を、互換でない形で変えるときに上げる。

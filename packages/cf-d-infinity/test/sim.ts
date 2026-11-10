@@ -115,6 +115,7 @@ export interface SimOptions {
   logRetainMs?: number;
   logGenMs?: number;
   txnRetainMs?: number;
+  recentMax?: number;
 }
 
 /** Worker と DO の間の RPC だけをシミュレートしたクラスタ。ShardCore は本物を動かす。 */
@@ -165,6 +166,7 @@ export class SimCluster implements Cluster {
       logRetainMs: this.o.logRetainMs,
       logGenMs: this.o.logGenMs,
       txnRetainMs: this.o.txnRetainMs,
+      recentMax: this.o.recentMax,
     }));
   }
 
