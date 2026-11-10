@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { healthProblems } from "../src/autoscaler";
 import { Db } from "../src/client/db";
+import { spanFaults } from "../src/client/spans";
 import { MetaCore } from "../src/meta";
 import { STORAGE_FORMAT, type ShardHealth } from "../src/types";
 import { quiescentProblems } from "./invariants";
@@ -74,7 +75,8 @@ describe("shard health", () => {
 
   it("a real shard reports a stuck transaction through its health", async () => {
     // 欠陥スイッチで「確定したのに適用できない取引」を作り、健全性の報告に現れることを確かめる。
-    const c = new SimCluster({ shards: 2, faults: { autoIgnoresUniqueIntents: true } });
+    spanFaults.rowSpanDespiteUnique = true;
+    const c = new SimCluster({ shards: 2, faults: { autoIgnoresUniqueIntents: true }, noSpanCheck: true });
     const db = c.client();
     await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
     await db.ddl(`CREATE UNIQUE INDEX p_code ON p(tenant_id, code)`);
@@ -85,6 +87,7 @@ describe("shard health", () => {
     for (const t of [1, 2, 3, 4, 5, 6]) await w.query("INSERT INTO p VALUES (?, 5, 'x')", [t]);
     await w.commit();
     for (const t of [1, 2, 3, 4, 5, 6]) await new Db(c, { retries: 0 }).query("INSERT INTO p VALUES (?, 6, 'x')", [t]).catch(() => undefined);
+    spanFaults.rowSpanDespiteUnique = false;
     c.net.gate = () => undefined;
     release();
     expect((await quiescentProblems(c)).length).toBeGreaterThan(0);

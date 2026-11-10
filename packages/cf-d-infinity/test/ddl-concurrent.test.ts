@@ -657,15 +657,14 @@ describe("the checks are not vacuous", () => {
         }
       },
     };
-    const seen = { missing: false, wrongRead: false, indexReadsMissing: false };
+    // index は読みの経路に使わないので、欠けた項目は読みの結果には現れない。index の中身の照合 (missing) だけが見つける。
+    const seen = { missing: false };
     // 実行中の読みが欠落に当たるのは seed の半分ほどなので、3 種類とも出るまで seed を進める。
-    for (let seed = 201; seed < 241 && !(seen.missing && seen.wrongRead && seen.indexReadsMissing); seed++) {
+    for (let seed = 201; seed < 241 && !seen.missing; seed++) {
       const v = violations(await runScenario(seed, s));
       seen.missing ||= v.missing.length > 0;
-      seen.wrongRead ||= v.wrongRead.length > 0;
-      seen.indexReadsMissing ||= v.indexReadsMissing.length > 0;
     }
-    expect(seen).toEqual({ missing: true, wrongRead: true, indexReadsMissing: true });
+    expect(seen).toEqual({ missing: true });
   }, 120_000);
 
   it("lost-write check: detects a DDL that returns before every shard applied it", async () => {
@@ -695,7 +694,8 @@ describe("the checks are not vacuous", () => {
     const broken = await indexAgreement(c, "t", "ix");
     expect(broken.missing).toEqual([`[7] -> [${A},1]`]);
     expect(broken.dangling).toEqual([`[5] -> [9,9]`]);
-    expect(broken.wrongRead).toEqual([`v=7: index read [], table has ["[${A},1]"]`]);
+    // index の列で引く読みは index を使わず、全シャードの表を条件で読む。index が壊れていても、読みの結果は変わらない。
+    expect(broken.wrongRead).toEqual([]);
     // catalog から index を消しても、シャードに表が残っていれば報告する。
     await c.applyDdl("DROP INDEX ix");
     expect((await indexAgreement(c, "t", "ix")).leftover).toEqual(["s0", "s1"]);

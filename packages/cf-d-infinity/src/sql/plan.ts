@@ -10,7 +10,6 @@ import { isInternalName } from "./ddl";
 
 export type Route =
   | { by: "sk"; sks: string[] }
-  | { by: "gidx"; index: GlobalIndexDef; key: string }
   | { by: "all" };
 
 /** シャードから行を集める 1 回の走査。 */
@@ -22,8 +21,6 @@ export interface Scan {
   sks: string[] | null;
   /** 押し下げた条件。取引の検証は、この条件に関わる変更だけを競合にする。 */
   where?: { alias: string; sql: string; params: Value[] };
-  /** sks はシャードを選ぶためだけに使い、span はシャードの表全体にする。index 経由の読みで立てる。 */
-  wideSpans?: boolean;
 }
 
 export interface WriteTarget {
@@ -32,11 +29,6 @@ export interface WriteTarget {
   params: Value[];
   write: WritePlan;
   pk: string | null;
-  /**
-   * 文を shard key に絞らずに送るときの、表ごとの走査。index 経由の UPDATE と DELETE に付く。
-   * 文はシャードの表を広く読むので、span も index が挙げた shard key に絞らず、この走査の条件にする。
-   */
-  wide?: Scan[];
 }
 
 export type Plan =
@@ -44,8 +36,6 @@ export type Plan =
       kind: "shard"; route: Route; sql: string; params: Value[]; tables: TableDef[]; pk: string | null;
       /** DO の SQLite が拒否する文 (6 項以上の複合 SELECT) を、Worker の SQLite で実行し直すための計画。 */
       wasm?: Extract<Plan, { kind: "gather" }>;
-      /** グローバル index が 1 シャード以外に当たったときの実行計画。文をシャードごとに流すと集計が割れる。 */
-      fallback?: Extract<Plan, { kind: "gather" }>;
     }
   | { kind: "gather"; scans: Scan[]; sql: string; params: Value[] }
   | { kind: "partial"; scan: Scan; columns: string[]; mergeSql: string; mergeParams: Value[] }
@@ -401,26 +391,6 @@ function statementPin(scopes: Scope[], values: Value[]): string | null {
   return key;
 }
 
-function gidxRoute(s: Scope, values: Value[]): Route | null {
-  if (s.refs.length !== 1 || !s.refs[0]!.def) return null;
-  // `x IN t` の t は FROM に現れないが、別のシャードの行も読む。index が挙げたシャードだけで実行すると行が欠ける。
-  if (hasTableOperand(s.node)) return null;
-  const ref = s.refs[0]!;
-  const def = ref.def!;
-  const conj = conjuncts(s.where);
-  for (const ix of def.globalIndexes) {
-    if (ix.state !== "public" || ix.columns.some((c) => def.collated.includes(c))) continue;
-    const vals: Value[] = [];
-    for (const c of ix.columns) {
-      const v = equalities(conj, ref, c, s, values);
-      if (v?.length !== 1 || v[0] === null) break;
-      vals.push(normalize(v[0]!, def.affinity[c] ?? "BLOB"));
-    }
-    if (vals.length === ix.columns.length) return { by: "gidx", index: ix, key: encode(vals) };
-  }
-  return null;
-}
-
 // ---- 条件の押し下げ ----
 
 /**
@@ -706,12 +676,9 @@ function planRead(stmt: Node, values: Value[], cat: Catalog): Plan {
       const wasm = { kind: "gather" as const, scans: scansFor(scopes, n, values), sql, params };
       return { kind: "shard", route: { by: "sk", sks: [key] }, sql, params, tables: defs, pk, wasm };
     }
+    // グローバル index は、読み書きの経路には使わない (一意性の保証にだけ使う)。index が挙げた shard key でシャードを選び、
+    // 文を絞らずに送る経路は、読む範囲と検証する範囲がずれやすかった。index の列で引く文は、全シャードへ条件を押し下げて集める。
     if (scopes.length === 1) {
-      const route = gidxRoute(scopes[0]!, values);
-      if (route) {
-        const fallback = { kind: "gather" as const, scans: scansFor(scopes, n, values), sql, params };
-        return { kind: "shard", route, sql, params, tables: defs, pk: null, fallback };
-      }
       const partial = partialAggregate(stmt, scopes[0]!, values);
       if (partial) return partial;
     }
@@ -916,10 +883,6 @@ function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog): Plan {
     if (key !== null) {
       const pk = scopes.length === 1 && top.refs.length === 1 ? pkOf(conjuncts(top.where), ref, top, values) : null;
       return { kind: "write", def, tables: defs, lastRowid: null, targets: [{ route: { by: "sk", sks: [key] }, sql, params, write: { sk: key, capture: captureOf(stmt, pk) }, pk }] };
-    }
-    if (scopes.length === 1 && top.refs.length === 1) {
-      const route = gidxRoute(top, values);
-      if (route) return { kind: "write", def, lastRowid: null, targets: [{ route, sql, params, write: { sk: null }, pk: null, wide: scansFor(scopes, n, values) }] };
     }
   }
   return { kind: "wasmWrite", scans: scansFor(scopes, n, values), sql, params, tables: defs };

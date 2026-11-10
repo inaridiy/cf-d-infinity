@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { Db, type Cluster } from "../src/client/db";
 import { MetaCore } from "../src/meta";
-import { ShardCore } from "../src/shard/core";
+import { ShardCore, type SpanEscape } from "../src/shard/core";
 import type { Backend, Faults, Row, ShardApi, Value } from "../src/types";
 
 /**
@@ -116,9 +116,14 @@ export interface SimOptions {
   logGenMs?: number;
   txnRetainMs?: number;
   recentMax?: number;
+  /** 範囲の検査 (ShardDeps.spanEscape) を切る。既定では掛ける。 */
+  noSpanCheck?: boolean;
 }
 
 /** Worker と DO の間の RPC だけをシミュレートしたクラスタ。ShardCore は本物を動かす。 */
+/** このプロセスの全クラスタで見つかった、範囲の外の行に依存する文。test/setup.ts が試験ごとに確かめて空にする。 */
+export const allSpanEscapes: SpanEscape[] = [];
+
 export class SimCluster implements Cluster {
   /** 起動時のシャード。増設後の一覧は catalog の routing を見る。 */
   shardIds: string[];
@@ -127,6 +132,8 @@ export class SimCluster implements Cluster {
   /** 全シャードの時計をまとめて進める量 (ms)。時計の出所が実時間でも効く。 */
   ahead = 0;
   cores = new Map<string, ShardCore>();
+  /** 宣言した範囲の外の行に依存していた文。空でなければ、取引の検証が成り立っていない。 */
+  spanEscapes: SpanEscape[] = [];
   backends = new Map<string, SqliteBackend>();
   meta: MetaCore;
   background = new Set<Promise<unknown>>();
@@ -167,6 +174,10 @@ export class SimCluster implements Cluster {
       logGenMs: this.o.logGenMs,
       txnRetainMs: this.o.txnRetainMs,
       recentMax: this.o.recentMax,
+      spanEscape: this.o.noSpanCheck ? undefined : (e) => {
+        this.spanEscapes.push(e);
+        allSpanEscapes.push(e);
+      },
     }));
   }
 

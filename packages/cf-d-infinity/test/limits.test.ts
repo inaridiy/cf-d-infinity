@@ -19,7 +19,7 @@ const count = async (c: SimCluster, where = "1") => (await new Db(c).query(`SELE
 
 describe("the size of a result", () => {
   it("is cut off by the shard at the row budget, before the rows are sent", async () => {
-    const c = new SimCluster({ shards: 2 });
+    const c = new SimCluster({ shards: 2, noSpanCheck: true });
     await c.client().ddl(DOCS);
     for (let t = 1; t <= 40; t++) await new Db(c).query("INSERT INTO docs VALUES (?, 1, 'a')", [t]);
     let sent = 0;
