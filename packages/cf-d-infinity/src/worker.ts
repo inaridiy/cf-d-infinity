@@ -1,12 +1,12 @@
 import { DurableObject, RpcTarget } from "cloudflare:workers";
 import { Db, type Cluster, type StatementStat } from "./client/db";
-import { collectMetrics, decide, DEFAULTS, needsFollowUp, nextShardNumber, split, type AutoscalerState, type Thresholds } from "./autoscaler";
+import { collectMetrics, decide, DEFAULTS, healthProblems, needsFollowUp, nextShardNumber, split, type AutoscalerState, type Thresholds } from "./autoscaler";
 import { MetaCore, type Catalog } from "./meta";
 import { planSplit, shardsOf } from "./routing";
 import { ShardCore } from "./shard/core";
 import { batonSealer, handlePipeline, serveHranaSocket, type PipelineReq } from "./client/hrana";
 import { setSqlWasm } from "./sql/scratch";
-import { checkProtocol, PROTOCOL_VERSION, type Backend, type Row, type ShardApi, type Value } from "./types";
+import { checkProtocol, PROTOCOL_VERSION, type Backend, type Row, type ShardApi, type ShardHealth, type Value } from "./types";
 // @ts-expect-error wrangler と esbuild がバンドル時に解決する
 import sqlWasm from "./sql-wasm.wasm";
 
@@ -21,6 +21,11 @@ export interface Env {
   DINF_API_TOKEN?: string;
   /** 運用の操作 (/admin) の認証トークン。未設定なら運用の経路を全部拒否する。 */
   DINF_ADMIN_TOKEN?: string;
+  /**
+   * 自動増設の動作。"split" なら閾値を超えたシャードを実際に割る。それ以外 (既定) は、割るべきだと記録するだけである。
+   * 増設は取り消せず、途中でやめる手順もないので、明示的に有効にしたときだけ行う。
+   */
+  DINF_AUTOSCALE?: string;
   /** 負荷が続いている間だけ回す Autoscaler の周期 (ms)。既定は 5000。 */
   DINF_AUTOSCALE_TICK_MS?: string;
   /** 増設の閾値の上書き (JSON)。省略した項目は既定値になる。 */
@@ -65,6 +70,26 @@ class DoBackend implements Backend {
       rowStats.set(k, e);
     }
     return { columns: cur.columnNames, values };
+  }
+  iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
+    const cur = this.storage.sql.exec(sql, ...(params as never[]));
+    const record = () => {
+      if (cur.rowsWritten === 0 && cur.rowsRead === 0) return;
+      const k = statKey(sql);
+      const e = rowStats.get(k) ?? { calls: 0, rowsWritten: 0, rowsRead: 0 };
+      e.calls++;
+      e.rowsWritten += cur.rowsWritten;
+      e.rowsRead += cur.rowsRead;
+      rowStats.set(k, e);
+    };
+    const rows = (function* () {
+      try {
+        for (const r of cur.raw()) yield r.map((v) => (v instanceof ArrayBuffer ? new Uint8Array(v) : v)) as Value[];
+      } finally {
+        record();
+      }
+    })();
+    return { columns: cur.columnNames, rows };
   }
   tx<T>(fn: () => T): T {
     return this.storage.transactionSync(fn);
@@ -227,8 +252,12 @@ export interface AutoscaleConfig {
   initial: number;
   tickMs: number;
   thresholds?: Partial<Thresholds>;
+  /** "split" なら実際に割る。"notify" (既定) は記録するだけ。 */
+  mode?: "notify" | "split";
 }
-type SavedConfig = Omit<AutoscaleConfig, "thresholds"> & { thresholds: Thresholds; next: number; pending: SplitJob[]; pinned?: boolean };
+type SavedConfig = Omit<AutoscaleConfig, "thresholds" | "mode"> & {
+  thresholds: Thresholds; next: number; pending: SplitJob[]; pinned?: boolean; mode: "notify" | "split";
+};
 
 /**
  * 運用者の手作業なしに増設を起動する制御ループ。
@@ -260,12 +289,13 @@ export class DinfAutoscaler extends DurableObject<Env> {
     const prev = this.conf();
     const same = prev?.cluster === c.cluster ? prev : null;
     const thresholds = { ...DEFAULTS, ...c.thresholds };
-    if (same && same.initial === c.initial && same.tickMs === c.tickMs && !!same.pinned === pinned
+    const mode = c.mode ?? "notify";
+    if (same && same.initial === c.initial && same.tickMs === c.tickMs && !!same.pinned === pinned && same.mode === mode
       && JSON.stringify(same.thresholds) === JSON.stringify(thresholds)) return same;
     const { routing } = await clusterOf(this.env, c.initial, c.cluster).catalog();
     // 起動し直しでも、番号の再利用と途中の増設の取りこぼしを起こさない。
     const next = nextShardNumber(routing, c.cluster, Math.max(c.initial, same?.next ?? 0));
-    const saved: SavedConfig = { cluster: c.cluster, initial: c.initial, tickMs: c.tickMs, thresholds, next, pending: same?.pending ?? [], pinned };
+    const saved: SavedConfig = { cluster: c.cluster, initial: c.initial, tickMs: c.tickMs, thresholds, next, pending: same?.pending ?? [], pinned, mode };
     this.save(saved);
     return saved;
   }
@@ -328,6 +358,12 @@ export class DinfAutoscaler extends DurableObject<Env> {
       }
       const range = planSplit(routing, d.shard);
       if (!range) continue;
+      if (c.mode !== "split") {
+        // 割るべきだと記録するだけにする。cooldown を進めるので、同じシャードについては 10 分に 1 回しか記録しない。
+        this.state.lastSplit[d.shard] = Date.now();
+        this.event("would-split", d);
+        continue;
+      }
       const job: SplitJob = { parent: d.shard, child: `${c.cluster}-${c.next++}`, range };
       c.pending.push(job);
       this.save(c);
@@ -467,8 +503,48 @@ async function dbOn(cluster: Cluster, token: number, onStatement?: (s: Statement
 
 /** シャード、範囲表、Autoscaler の履歴。 */
 export async function clusterStatus(env: Env, name = "shard", shards?: number) {
-  const cat = await clusterOf(env, shards, name).catalog();
-  return { routing: cat.routing, shards: shardsOf(cat.routing), scaler: await env.DINF_AUTOSCALER.getByName(name).status() };
+  const cluster = clusterOf(env, shards, name);
+  const cat = await cluster.catalog();
+  const ids = shardsOf(cat.routing);
+  // 1 つのシャードが答えなくても、ほかの状態は見せる。
+  const health = await Promise.all(ids.map((id) => cluster.shard(id).health({}).catch((e): ShardHealth => ({
+    id, schema: -1, format: -1, bytes: 0, intents: 0, oldestIntentMs: 0, unapplied: 0,
+    redriveErrors: [`does not answer: ${String((e as Error)?.message ?? e).slice(0, 200)}`], incoming: 0, outgoing: 0, logGenerations: 0,
+  }))));
+  return {
+    routing: cat.routing, shards: ids, schema: cat.version, health, problems: healthProblems(health),
+    scaler: await env.DINF_AUTOSCALER.getByName(name).status(),
+  };
+}
+
+/** 利用者が実行した DDL を、実行した順に返す。論理エクスポートの先頭に置く。 */
+export async function schemaSql(env: Env, name = "shard"): Promise<string[]> {
+  const { ddl } = await env.DINF_META.getByName(name).ddlSince(0);
+  return ddl.flatMap((e) => {
+    if (typeof e.user !== "string" || e.user.trim() === "") return [];
+    // 履歴の文面からは SHARD KEY が除かれている。取り込み先で行の置き場所が変わらないよう、表定義から書き戻す。
+    const def = e.defs[0];
+    const createsTable = /^\s*CREATE\s+TABLE\b/i.test(e.user) && def !== undefined && !def.name.startsWith("__");
+    return [createsTable ? `${e.user} SHARD KEY (${def.shardKey.map((c) => `"${c.replaceAll('"', '""')}"`).join(", ")})` : e.user];
+  });
+}
+
+/** 表の行を、シャードの順、主キーの順に少しずつ返す。cursor が null になったら終わりである。 */
+export async function exportRows(
+  env: Env, table: string, cursor: { shard: number; after: Value[] | null } | null, limit = 1000, name = "shard",
+): Promise<{ columns: string[]; rows: Value[][]; cursor: { shard: number; after: Value[] | null } | null }> {
+  const cluster = clusterOf(env, undefined, name);
+  const ids = shardsOf((await cluster.catalog()).routing);
+  let at = cursor ?? { shard: 0, after: null };
+  for (;;) {
+    if (at.shard >= ids.length) return { columns: [], rows: [], cursor: null };
+    const page = await cluster.shard(ids[at.shard]!).exportRows({ table, after: at.after, limit });
+    if (page.rows.length > 0) {
+      const last = page.rows[page.rows.length - 1]!;
+      return { columns: page.columns, rows: page.rows, cursor: { shard: at.shard, after: page.pk.map((i) => last[i] ?? null) } };
+    }
+    at = { shard: at.shard + 1, after: null };
+  }
 }
 
 /** 遅い文の記録を新しい順に返す。 */
@@ -588,6 +664,7 @@ export function autoscaleConfig(env: Env, cluster = "shard"): AutoscaleConfig {
     cluster,
     initial: Number(env.DINF_SHARD_COUNT ?? 8),
     tickMs: Number(env.DINF_AUTOSCALE_TICK_MS ?? 5000),
+    mode: env.DINF_AUTOSCALE === "split" ? "split" : "notify",
     thresholds: env.DINF_AUTOSCALE_THRESHOLDS ? (JSON.parse(env.DINF_AUTOSCALE_THRESHOLDS) as Partial<Thresholds>) : undefined,
   };
 }

@@ -15,6 +15,7 @@ const run = promisify(execFile);
 const CLI = resolve("bin/cli.js");
 let logged: Miniflare;
 let quiet: Miniflare;
+let empty: Miniflare;
 const registry = mkdtempSync(join(tmpdir(), "dinf-registry-"));
 
 const worker = (name: string, vars: Record<string, string>) => new Miniflare({
@@ -63,7 +64,9 @@ beforeAll(async () => {
   await build({ ...workerBundle, entryPoints: { "ops-db": "src/cloudflare.ts" }, outdir: "dist", logLevel: "error", external: ["cloudflare:workers", "*.wasm"] });
   logged = worker("ops-db", { DINF_SLOW_QUERY_MS: "0" });
   quiet = worker("ops-quiet", { DINF_SLOW_QUERY_MS: "off" });
+  empty = worker("ops-empty", { DINF_SLOW_QUERY_MS: "off" });
   await logged.ready;
+  await empty.ready;
   for (const mf of [logged, quiet]) {
     await sql(mf, "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER NOT NULL, note TEXT)");
     await sql(mf, "INSERT INTO t(id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70), (8, 80)");
@@ -72,6 +75,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await logged?.dispose();
   await quiet?.dispose();
+  await empty?.dispose();
 });
 
 describe("the slow statement log", () => {
@@ -148,7 +152,7 @@ describe("the cf-d-infinity command", () => {
     const wrangler = project("wrangler.jsonc", `{\n  // a comment with "name": "wrong"\n  "name": "ops-db", /* trailing */\n  "main": "src/index.ts",\n}\n`);
     expect((await cli(["sql", "SELECT 1 AS one"], { cwd: wrangler })).stdout).toContain("(1 row)");
     const cf = project("cloudflare.config.ts", `import { defineConfig } from "cf/config";\nexport default defineConfig({ worker: { name: "ops-db", compatibilityDate: "2026-11-04" } });\n`);
-    expect((await cli(["status"], { cwd: cf })).stdout).toMatch(/^4 shards, routing version \d+\n/);
+    expect((await cli(["status"], { cwd: cf })).stdout).toMatch(/^4 shards, schema version \d+, routing version \d+\n/);
     const none = await cli(["sql", "SELECT 1"], { cwd: mkdtempSync(join(tmpdir(), "dinf-cli-")) });
     expect(none.code).toBe(1);
     expect(none.stderr).toMatch(/pass --worker/);
@@ -164,6 +168,48 @@ describe("the cf-d-infinity command", () => {
     expect((await cli(["status", ...to])).stdout).toContain("shard-0");
     expect((await cli(["slow", "--worker", "ops-quiet"])).stdout).toMatch(/No slow statements recorded/);
   });
+
+  it("reports each shard's health, and exits 0 when nothing needs attention", async () => {
+    const r = await cli(["status", ...to]);
+    expect(r.code).toBe(0);
+    expect(r.stdout.split("\n")[1]).toMatch(/^shard\s+slots\s+size\s+waiting\s+unapplied\s+moving$/);
+    expect(r.stdout).toMatch(/shard-0\s+0-1023\s+\d+ kB\s+0\s+0\s+-/);
+    expect(r.stdout).toContain("No problems found.");
+    const json = JSON.parse((await cli(["status", "--json", ...to])).stdout);
+    expect(json.problems).toEqual([]);
+    expect(json.health).toHaveLength(4);
+    expect(json.health[0]).toMatchObject({ format: 1, intents: 0, unapplied: 0, redriveErrors: [] });
+  });
+
+  it("exports schema and rows as SQL, and imports them into an empty database with the same contents", async () => {
+    await cli(["sql", "CREATE TABLE things(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, label TEXT, data BLOB, score REAL, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)", ...to]);
+    await cli(["sql", "CREATE TABLE people(id INTEGER PRIMARY KEY, email TEXT UNIQUE)", ...to]);
+    await sql(logged, "INSERT INTO things VALUES (1, 1, ?, x'00ff10', 1.5), (1, 2, NULL, NULL, -2), (2, 1, ?, x'', 0)", ["it's a 'quoted'\nline\r\nwith breaks", "日本語; -- not a comment"]);
+    for (let i = 1; i <= 30; i++) await sql(logged, "INSERT INTO people(id, email) VALUES (?, ?)", [i, `p${i}@example.test`]);
+    const dir = mkdtempSync(join(tmpdir(), "dinf-cli-"));
+    const file = join(dir, "dump.sql");
+    const exported = await cli(["export", "--out", file, ...to]);
+    expect([exported.code, exported.stderr]).toEqual([0, ""]);
+    const dump = readFileSync(file, "utf8");
+    // 1 文が 1 行。文字列の中の改行は char() の連結になっている。
+    expect(dump.split("\n").filter((l) => l && !l.startsWith("--")).every((l) => l.endsWith(";"))).toBe(true);
+    expect(dump).toContain('SHARD KEY ("tenant_id")');
+    expect(dump).toContain("|| char(10) ||");
+    expect(dump).toContain("X'00ff10'");
+
+    const imported = await cli(["import", file, "--worker", "ops-empty"]);
+    expect([imported.code, imported.stderr]).toEqual([0, ""]);
+    for (const q of [
+      "SELECT tenant_id, id, label, hex(data) AS data, score FROM things ORDER BY tenant_id, id",
+      "SELECT id, email FROM people ORDER BY id",
+      "SELECT id, n, note FROM t ORDER BY id",
+    ]) {
+      expect((await sql(empty, q)).json.rows, q).toEqual((await sql(logged, q)).json.rows);
+    }
+    // UNIQUE のグローバル index も取り込み先で効いている。
+    expect((await sql(empty, "INSERT INTO people(id, email) VALUES (99, 'p1@example.test')")).status).toBe(400);
+    expect((await sql(empty, "SELECT id FROM people WHERE email = 'p7@example.test'")).json.rows).toEqual([{ id: 7 }]);
+  }, 60000);
 
   it("exits with 1 and a readable message on a SQL error, a Worker that is not running, and unusable flags", async () => {
     const err = await cli(["sql", "SELECT * FROM nope", ...to]);
@@ -188,7 +234,8 @@ describe("the slow statement log under a burst", () => {
     for (let i = 0; i < 60; i++) await sql(logged, `SELECT ${i} AS burst FROM t WHERE id = 1`);
     await new Promise((r) => setTimeout(r, 300));
     const added = (await slow(logged)).length - before;
-    expect(added).toBeGreaterThan(0);
+    // 記録の予算は 10 秒あたり 20 件である。前のテストが同じ 10 秒の中で予算を使い切っていれば、ここでは 1 件も増えない。
+    // 確かめたいのは、60 文の集中が 60 件の記録にならないことである。
     expect(added).toBeLessThan(60);
 
     await sql(quiet, "SELECT n FROM t WHERE id = 3");

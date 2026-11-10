@@ -76,7 +76,10 @@ phase 2 と refresh は「intent がある DO」ではなく「`__moved` が示�
 Autoscaler DO が全シャードの metrics を集めて判断する。
 平常時は Cron Trigger が毎分 1 回起こすだけで、閾値を超えたシャードか進行中の増設がある間だけ 5 秒の alarm で判断を続ける。
 常に 5 秒周期で問い合わせると、負荷のないシャードも起きたままになり、Duration の課金が止まらないからである。
-自動増設の有効と無効は `wrangler.jsonc` の `triggers.crons` で決まり、起動のための HTTP 呼び出しはない。
+Autoscaler を起こすかどうかは `wrangler.jsonc` の `triggers.crons` で決まり、起動のための HTTP 呼び出しはない。
+既定では割るべきシャードを記録するだけで、変数 `DINF_AUTOSCALE` を `split` にしたときだけ実際に割る。
+増設は取り消せず、途中でやめる手順もないからである。
+1 グループ (同じ shard key の行) は 1 回の RPC で運ぶので、16 MB を超えるグループは運べない。その場合はグループを名指しした誤りで止まる。
 次の条件のいずれかが連続して成り立てば増設する。
 
 | 条件 | 閾値 | 根拠 |

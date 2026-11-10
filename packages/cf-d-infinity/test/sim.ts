@@ -9,9 +9,19 @@ import type { Backend, Faults, Row, ShardApi, Value } from "../src/types";
  * UNION、INTERSECT、EXCEPT で 6 項以上の複合 SELECT は「too many terms in compound SELECT」になる。
  */
 export const DO_COMPOUND_SELECT_LIMIT = 5;
-function checkDoLimits(sql: string): void {
+/** DO の SQLite の公表されている制限。node:sqlite の既定はどれもこれより緩いので、ここで模す。 */
+export const DO_MAX_SQL_BYTES = 100_000;
+export const DO_MAX_BOUND_PARAMS = 100;
+export const DO_MAX_VALUE_BYTES = 2_000_000;
+function checkDoLimits(sql: string, params: Value[] = []): void {
   const terms = 1 + (sql.replace(/'(?:[^']|'')*'/g, "''").match(/\b(UNION|INTERSECT|EXCEPT)\b/gi)?.length ?? 0);
   if (terms > DO_COMPOUND_SELECT_LIMIT) throw new Error("too many terms in compound SELECT: SQLITE_ERROR");
+  if (Buffer.byteLength(sql) > DO_MAX_SQL_BYTES) throw new Error("statement too long: SQLITE_TOOBIG");
+  if (params.length > DO_MAX_BOUND_PARAMS) throw new Error("too many SQL variables: SQLITE_ERROR");
+  for (const p of params) {
+    const bytes = typeof p === "string" ? Buffer.byteLength(p) : p instanceof Uint8Array ? p.byteLength : 0;
+    if (bytes > DO_MAX_VALUE_BYTES) throw new Error("string or blob too big: SQLITE_TOOBIG");
+  }
 }
 
 /** node:sqlite の Backend。fence() 後の操作は失敗する (DO 基盤が旧 instance を止めるのと同じ)。 */
@@ -21,13 +31,25 @@ export class SqliteBackend implements Backend {
   constructor(readonly db = new DatabaseSync(":memory:")) {}
   exec(sql: string, ...params: Value[]): Row[] {
     if (this.fenced) throw new Error("fenced instance");
-    checkDoLimits(sql);
+    checkDoLimits(sql, params);
     const st = this.db.prepare(sql);
     return st.columns().length > 0 ? (st.all(...params) as Row[]).map((r) => ({ ...r })) : (st.run(...params), []);
   }
+  iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
+    if (this.fenced) throw new Error("fenced instance");
+    checkDoLimits(sql, params);
+    const st = this.db.prepare(sql);
+    const columns = st.columns().map((c) => c.name);
+    if (columns.length === 0) {
+      st.run(...params);
+      return { columns, rows: [] };
+    }
+    st.setReturnArrays(true);
+    return { columns, rows: st.iterate(...params) as unknown as Iterable<Value[]> };
+  }
   raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] } {
     if (this.fenced) throw new Error("fenced instance");
-    checkDoLimits(sql);
+    checkDoLimits(sql, params);
     const st = this.db.prepare(sql);
     const columns = st.columns().map((c) => c.name);
     if (columns.length === 0) {
@@ -95,6 +117,8 @@ export class SimCluster implements Cluster {
   shardIds: string[];
   net = new SimNet();
   time = 1_000_000;
+  /** 全シャードの時計をまとめて進める量 (ms)。時計の出所が実時間でも効く。 */
+  ahead = 0;
   cores = new Map<string, ShardCore>();
   backends = new Map<string, SqliteBackend>();
   meta: MetaCore;
@@ -121,7 +145,7 @@ export class SimCluster implements Cluster {
     this.cores.set(id, new ShardCore({
       id,
       backend: this.backends.get(id)!,
-      clock: { now: () => (this.o.now?.() ?? this.time) + (this.o.skewMs?.(id) ?? 0) },
+      clock: { now: () => (this.o.now?.() ?? this.time) + this.ahead + (this.o.skewMs?.(id) ?? 0) },
       peer: (to) => this.stub(id, to),
       meta: { ddlSince: (v) => this.meta.ddlSince(v) },
       background: (p) => {

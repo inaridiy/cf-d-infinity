@@ -1,9 +1,11 @@
 import { Hlc, SECOND, physicalToTs, tsToPhysical } from "../hlc";
 import type {
-  Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupPayload, LockOwner, MetaApi,
-  Participant, PrepareReq, PrepareRes, Row, ShardApi, ShardMetrics, Span, TableDef, Ts, TxnStatus, Value,
+  Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, GroupPayload, LockOwner, MetaApi,
+  Participant, PrepareReq, PrepareRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts, TxnStatus, Value,
 } from "../types";
-import { ConflictError, Migrating, NotOwner, ReadTooOld, SqlError, spanCovers, unprotectedSpans } from "../types";
+import {
+  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, checkStorageFormat, spanCovers, unprotectedSpans,
+} from "../types";
 import type { DdlEntry } from "../meta";
 import { slotOf } from "../routing";
 import {
@@ -39,6 +41,18 @@ export const LOG_GEN_MS = 2 * 60_000;
 export const TXN_RETAIN_MS = 60 * 60_000;
 /** この時間を過ぎた intent は、anchor に問い合わせて決着させる。 */
 export const ORPHAN_AGE_MS = 2000;
+/**
+ * 1 回の要求でシャードが返す結果の上限。要求が小さい値を指定すればそちらが効く。
+ * 上限がないと、絞り込みのない SELECT が全行を送り返し、シャードと Worker の両方がメモリを使い切る。
+ * バイト数は DO の RPC の上限 (32 MiB) より十分小さくしてある。
+ */
+/** 移動できる 1 グループ (同じ shard key の行の集まり) の大きさの上限。分割転送がないので、これより大きいと移動が終わらない。 */
+export const GROUP_MAX_BYTES = 16_000_000;
+export const SHARD_MAX_ROWS = 200_000;
+export const SHARD_MAX_BYTES = 16_000_000;
+/** 値のおおよその大きさ (バイト)。上限の判定に使うだけで、正確である必要はない。 */
+const sizeOf = (v: Value): number =>
+  typeof v === "string" ? v.length * 2 : v instanceof Uint8Array ? v.byteLength : 8;
 
 interface Intent {
   tbl: string; pk: string; sk: string; txn: string; anchor: string; prepare_ts: Ts; change: string;
@@ -69,6 +83,8 @@ const LOCK_WAIT_MS = 5000;
  * 奪う時期を遅らせても閉路はいずれ解ける。ロックはいつ消えてもよいので安全性は変わらない。
  */
 const WOUND_DELAY_MS = 200;
+/** DDL の適用が、進行中の取引の決着を待つ上限。超えたら再試行できる誤りを返す。 */
+const SCHEMA_WAIT_MS = 5000;
 
 interface RowLock extends LockOwner {
   expires: number;
@@ -86,6 +102,8 @@ export class ShardCore implements ShardApi {
   private ceiling: Ts = 0;
   private defs = new Map<string, TableDef>();
   private schema = 0;
+  /** 進行中の DDL の適用。同時に来た要求は同じ適用を待つ。 */
+  private schemaChange: Promise<void> | null = null;
   /** 直近の write の索引。キーごとの最新 commit 時刻だけを持ち、検査を O(1) にする。 */
   private recent = new Map<string, Ts>();
   private recentLowWater: Ts = 0;
@@ -122,6 +140,8 @@ export class ShardCore implements ShardApi {
   private boot(): void {
     const b = this.b;
     b.exec(`CREATE TABLE IF NOT EXISTS __meta(k TEXT PRIMARY KEY, v)`);
+    // ほかの表に触る前に確かめる。新しい形式の DO を、古いコードが作り変えてしまわないようにする。
+    checkStorageFormat(b, "__meta", "shard");
     b.exec(`CREATE TABLE IF NOT EXISTS __ddl(version INTEGER PRIMARY KEY, entry TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __intents(
       tbl TEXT NOT NULL, pk TEXT NOT NULL, sk TEXT NOT NULL, txn TEXT NOT NULL, anchor TEXT NOT NULL,
@@ -158,11 +178,10 @@ export class ShardCore implements ShardApi {
 
     // 直近 write の索引はメモリにしかないので __log から作り直す。GC で消えた commit は logLowWater 以下にある。
     this.maxCommit = this.logLowWater;
-    for (const r of this.logScan("", [])) {
-      const ts = r.commit_ts as Ts;
+    this.logEach("", [], (ts, _txn, blob) => {
       this.maxCommit = Math.max(this.maxCommit, ts);
-      for (const c of decode<Change[]>(r.blob as string)) this.touch(c.table, c.pk, c.sk, ts);
-    }
+      for (const c of decode<Change[]>(blob)) this.touch(c.table, c.pk, c.sk, ts);
+    });
     const maxPrepare = (b.exec(`SELECT max(prepare_ts) v FROM __intents`)[0]?.v as number) ?? 0;
     // 再起動の前に予約した alarm がなくても、残った intent と phase 2 を片付ける。
     const pendingWork = b.exec(`SELECT (SELECT count(*) FROM __intents) + (SELECT count(*) FROM __txn WHERE status = 'committed' AND done = 0) n`)[0]?.n as number;
@@ -208,6 +227,19 @@ export class ShardCore implements ShardApi {
       if (limit !== undefined && out.length >= limit) break;
     }
     return out;
+  }
+
+  /**
+   * 変更ログを commit 時刻の順に 1 行ずつ読む。fn が false を返したらそこでやめる。
+   * 保持窓の全行を配列にすると、書き込みの多いシャードでは起動と過去時点の読みがメモリを使い切る。
+   */
+  private logEach(where: string, params: Value[], fn: (commitTs: Ts, txn: string, blob: string) => boolean | void): void {
+    for (const g of this.logGens()) {
+      const { rows } = this.b.iterate(`SELECT commit_ts, txn, blob FROM __log_g${g} ${where} ORDER BY commit_ts`, ...params);
+      for (const r of rows) {
+        if (fn(r[0] as Ts, r[1] as string, r[2] as string) === false) return;
+      }
+    }
   }
 
   /** commit の変更ログを、c の世代の表へ書く。必ず書き込みの取引の中で呼ぶ。 */
@@ -285,7 +317,27 @@ export class ShardCore implements ShardApi {
   private async ensureSchema(version: number): Promise<void> {
     // 古い表定義の要求を通すと、新しいグローバル index の更新が漏れる。経路と同じく取り直させる。
     if (version < this.schema) throw new NotOwner(`stale schema ${version} < ${this.schema}`);
-    if (version === this.schema) return;
+    if (version === this.schema) {
+      // DDL の適用が intent の決着を待っている間は、古い表定義の新しい要求を受けない。
+      // 受けると intent が増え続けて、DDL がいつまでも適用できない。呼び出し側は表定義を取り直して、同じ待ちに合流する。
+      if (this.schemaChange) throw new NotOwner(`stale schema ${version}: a schema change is being applied`);
+      return;
+    }
+    this.schemaChange ??= this.applySchema().finally(() => {
+      this.schemaChange = null;
+    });
+    await this.schemaChange;
+    // 待っている間に、さらに新しい DDL が出ているかもしれない。
+    if (version > this.schema) await this.ensureSchema(version);
+  }
+
+  /**
+   * Meta から DDL を取り、順に適用する。
+   * 先に、このシャードが持つ intent をすべて決着させる。intent の行イメージは DDL より前の表の形なので、
+   * 表や列が消えた後では適用できない。確定済みの取引がそうなると、再駆動が永久に失敗する。
+   */
+  private async applySchema(): Promise<void> {
+    if (!this.faults.ddlIgnoresIntents) await this.settleAllIntents();
     const { ddl } = await this.deps.meta.ddlSince(this.schema);
     for (const e of ddl) {
       if (e.version <= this.schema) continue;
@@ -298,6 +350,28 @@ export class ShardCore implements ShardApi {
       // 変更ログの行イメージは DDL より前の形なので、それより古い T は読み戻せない。
       this.ddlFloor = this.issue();
       this.metaSet("ddl_floor", this.ddlFloor);
+    }
+  }
+
+  /**
+   * 持っている intent を、anchor に尋ねて全部決着させる。進行中の取引は終わるまで待つ。
+   * 待っている間、新しい prepare は ensureSchema が断るので、intent は増えない。
+   */
+  private async settleAllIntents(): Promise<void> {
+    const deadline = this.deps.clock.now() + SCHEMA_WAIT_MS;
+    for (;;) {
+      const pending = this.b.exec(`SELECT DISTINCT txn, anchor FROM __intents`) as unknown as Intent[];
+      if (pending.length === 0) return;
+      for (const i of pending) {
+        const res = await this.ask(i.anchor, i.txn, 0);
+        if (res.status === "committed") await this.finalize({ txn: i.txn, c: res.c });
+        else if (res.status === "aborted") await this.abort({ txn: i.txn });
+      }
+      if ((this.b.exec(`SELECT count(*) n FROM __intents`)[0]!.n as number) === 0) return;
+      if (this.deps.clock.now() > deadline) {
+        throw new ConflictError("schema change is waiting for transactions on this shard to finish");
+      }
+      await new Promise((r) => setTimeout(r, 5));
     }
   }
 
@@ -382,22 +456,52 @@ export class ShardCore implements ShardApi {
    * 範囲のグループを列挙する。fence の後に呼べば取り残しはない。
    * ack されていないグループは移動済みでも返す。子が受け取る前に落ちると応答が失われるからである。
    */
-  async listGroups(req: { start: number; end: number; limit: number }): Promise<string[]> {
-    const out = new Set<string>();
+  async listGroups(req: { start: number; end: number; limit: number; cursor?: GroupCursor | null }): Promise<{ groups: string[]; cursor: GroupCursor | null }> {
+    const out: string[] = [];
+    const seen = new Set<string>();
     const add = (g: string) => {
       const slot = slotOf(g);
-      if (slot >= req.start && slot < req.end && !this.moved.get(g)?.acked) out.add(g);
-    };
-    for (const def of this.defs.values()) {
-      const cols = def.shardKey.map(q).join(", ");
-      for (const r of this.b.exec(`SELECT DISTINCT ${cols} FROM ${q(def.name)}`)) {
-        add(encode(def.shardKey.map((c) => r[c] ?? null)));
-        if (out.size >= req.limit) return [...out];
+      if (slot >= req.start && slot < req.end && !this.moved.get(g)?.acked && !seen.has(g)) {
+        seen.add(g);
+        out.push(g);
       }
+    };
+    // 表は名前の順に、表の中は shard key の順に読み、前回の続きから始める。
+    // 毎回先頭から読むと、行ごとに shard key が違う表 (既定の `id INTEGER PRIMARY KEY`) では、
+    // 呼ぶたびに全行を読み直し、全部を配列に持つことになる。
+    const tables = [...this.defs.keys()].sort();
+    let cursor: GroupCursor = req.cursor ?? { table: tables[0] ?? null, after: null };
+    while (cursor.table !== null) {
+      const def = this.defs.get(cursor.table);
+      if (def) {
+        const cols = def.shardKey.map(q).join(", ");
+        const keyset = cursor.after !== null && cursor.after.every((v) => v !== null);
+        const where = keyset ? `WHERE (${cols}) > (${def.shardKey.map(() => "?").join(", ")})` : "";
+        const skip = keyset ? 0 : (cursor.skip ?? 0);
+        const { rows } = this.b.iterate(
+          `SELECT DISTINCT ${cols} FROM ${q(def.name)} ${where} ORDER BY ${cols} LIMIT -1 OFFSET ${skip}`,
+          ...(keyset ? cursor.after! : []),
+        );
+        let read = 0;
+        for (const r of rows) {
+          read++;
+          add(encode(r));
+          if (out.length >= req.limit) {
+            // NULL を含む shard key は行の比較で絞れないので、読んだ数で続きを表す。
+            const next: GroupCursor = r.every((v) => v !== null)
+              ? { table: cursor.table, after: r }
+              : { table: cursor.table, after: null, skip: skip + read };
+            return { groups: out, cursor: next };
+          }
+        }
+      }
+      const name: string = cursor.table;
+      cursor = { table: tables.find((t) => t > name) ?? null, after: null };
     }
+    // 行のないグループも運ぶ。intent だけがある場合と、ack が届いていない場合である。
     for (const r of this.b.exec(`SELECT DISTINCT sk FROM __intents`)) add(r.sk as string);
     for (const [g] of this.moved) add(g);
-    return [...out].slice(0, req.limit);
+    return { groups: out, cursor: null };
   }
 
   /**
@@ -419,6 +523,11 @@ export class ShardCore implements ShardApi {
       );
       const intents = this.faults.dropIntentsOnMove ? [] : this.b.exec(`SELECT * FROM __intents WHERE sk = ?`, g);
       const size = encode(rows).length + encode(intents).length;
+      // 1 グループは 1 回の RPC で運ぶ。RPC の上限 (32 MiB) を超える大きさは運べないので、はっきり断る。
+      // 断らないと、運べないまま再試行を続け、原因が見えない。
+      if (size > GROUP_MAX_BYTES) {
+        throw new SqlError(`group too large to move: shard key ${g} holds ${size} bytes (limit ${GROUP_MAX_BYTES}); this split cannot finish`);
+      }
       if (out.length > 0 && bytes + size > req.maxBytes) break;
       bytes += size;
       let known = this.moved.get(g);
@@ -518,22 +627,35 @@ export class ShardCore implements ShardApi {
     if (!range) return { groups: 0, rows: 0, bytes: 0 };
     const parent = this.deps.peer(range.from_id);
     const total = { groups: 0, rows: 0, bytes: 0 };
-    for (;;) {
-      const listed = await parent.listGroups({ ...req, limit: 256 });
-      if (listed.length === 0) return total;
-      // 受け取り済みで親に ack が届いていないグループは、ack だけを送り直す。
-      const done = listed.filter((g) => this.arrived.has(g));
-      if (done.length) await parent.ack({ groups: done });
-      const groups = listed.filter((g) => !this.arrived.has(g));
-      if (groups.length === 0) continue;
-      const payload = await parent.pull({ groups, to: this.id, maxBytes: 1_000_000 });
-      await this.receive(payload);
-      await parent.ack({ groups: payload.map((p) => p.g) });
-      total.groups += payload.length;
-      for (const p of payload) {
-        total.rows += p.rows.length;
-        total.bytes += encode(p.rows).length;
-      }
+    // 親のグループを先頭から順に列挙して運ぶ。最後まで行ったら、もう一度先頭から列挙して、取り残しがないことを確かめる。
+    // ack 済みのグループは親から消えているので、2 周目は残る側のグループを読むだけである。
+    for (let pass = 0; ; pass++) {
+      let cursor: GroupCursor | null | undefined = undefined;
+      let moved = 0;
+      do {
+        const page: { groups: string[]; cursor: GroupCursor | null } = await parent.listGroups({ ...req, limit: 256, cursor });
+        cursor = page.cursor;
+        // 受け取り済みで親に ack が届いていないグループは、ack だけを送り直す。
+        const done = page.groups.filter((g) => this.arrived.has(g));
+        if (done.length) await parent.ack({ groups: done });
+        let rest = page.groups.filter((g) => !this.arrived.has(g));
+        moved += page.groups.length;
+        // pull は大きさの上限で途中までしか返さないことがある。残りを取り終えるまで繰り返す。
+        while (rest.length) {
+          const payload = await parent.pull({ groups: rest, to: this.id, maxBytes: 1_000_000 });
+          await this.receive(payload);
+          await parent.ack({ groups: payload.map((p) => p.g) });
+          total.groups += payload.length;
+          for (const p of payload) {
+            total.rows += p.rows.length;
+            total.bytes += encode(p.rows).length;
+          }
+          const got = new Set(payload.map((p) => p.g));
+          rest = rest.filter((g) => !got.has(g));
+        }
+      } while (cursor !== null);
+      if (moved === 0) return total;
+      if (pass > 100) throw new SqlError("drain does not converge");
     }
   }
 
@@ -545,6 +667,47 @@ export class ShardCore implements ShardApi {
   async finishIncoming(req: { start: number; end: number }): Promise<void> {
     this.b.exec(`DELETE FROM __incoming WHERE start = ? AND end = ?`, req.start, req.end);
     this.incoming = this.incoming.filter((x) => !(x.start === req.start && x.end === req.end));
+  }
+
+  async health(_req: Record<string, never>): Promise<ShardHealth> {
+    const one = (sql: string, ...params: Value[]) => (this.b.exec(sql, ...params)[0]?.v as number | null) ?? 0;
+    const oldest = one(`SELECT min(prepare_ts) v FROM __intents`);
+    return {
+      id: this.id, schema: this.schema, format: STORAGE_FORMAT, bytes: this.b.size(),
+      intents: one(`SELECT count(*) v FROM __intents`),
+      oldestIntentMs: oldest === 0 ? 0 : Math.max(0, this.deps.clock.now() - tsToPhysical(oldest)),
+      unapplied: one(`SELECT count(*) v FROM __txn WHERE status = 'committed' AND done = 0`),
+      redriveErrors: this.lastRedriveErrors,
+      incoming: this.incoming.length,
+      outgoing: this.fenced.filter((f) => !f.done).length,
+      logGenerations: this.logGens().length,
+    };
+  }
+
+  /**
+   * 表の行を主キーの順に、after より後から limit 行まで返す。pk は columns の中の主キーの列の位置である。
+   * 最新の確定済みの状態を読むだけで、時点はそろえない。移動の途中のシャードでは、同じ行が親と子の両方にあるので断る。
+   */
+  async exportRows(req: { table: string; after: Value[] | null; limit: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }> {
+    if (this.incoming.length > 0 || this.fenced.some((f) => !f.done)) throw new Migrating();
+    const def = this.defs.get(req.table);
+    if (!def) throw new SqlError(`no such table: ${req.table}`);
+    const cols = def.pk.map(q).join(", ");
+    const keyset = req.after !== null && req.after.every((v) => v !== null);
+    const where = keyset ? `WHERE (${cols}) > (${def.pk.map(() => "?").join(", ")})` : "";
+    const limit = Math.max(1, Math.min(req.limit, 5000));
+    const { columns, rows } = this.b.iterate(
+      `SELECT ${selectList(def)} FROM ${q(def.name)} ${where} ORDER BY ${cols} LIMIT ${limit}`, ...(keyset ? req.after! : []),
+    );
+    const out: Value[][] = [];
+    let bytes = 0;
+    for (const r of rows) {
+      out.push(r);
+      for (const v of r) bytes += sizeOf(v);
+      // 1 回の応答が大きくなりすぎないよう、行数の上限より先にバイト数で切る。続きは次の呼び出しで読む。
+      if (bytes > 4_000_000) break;
+    }
+    return { columns, rows: out, pk: def.pk.map((c) => columns.indexOf(c)) };
   }
 
   async metrics(_req: Record<string, never>): Promise<ShardMetrics> {
@@ -837,13 +1000,15 @@ export class ShardCore implements ShardApi {
     const floor = Math.max(this.logLowWater, this.ddlFloor);
     if (T < floor) throw new ReadTooOld(`moved at ${floor}`);
     const seen = new Map<string, { table: string; pk: string; image: Row | null }>();
-    for (const r of this.logScan(`WHERE commit_ts > ?`, [T])) {
-      for (const c of decode<Change[]>(r.blob as string)) {
+    // K を超えた時点で読むのをやめる。T 以降の全ログを読んでから数えると、古い T の読みが来るたびに保持窓の全行を読む。
+    this.logEach(`WHERE commit_ts > ?`, [T], (_ts, _txn, blob) => {
+      for (const c of decode<Change[]>(blob)) {
         const key = `${c.table}\0${c.pk}`;
         if (!seen.has(key) && this.defs.has(c.table)) seen.set(key, { table: c.table, pk: c.pk, image: c.before });
       }
-    }
-    if (seen.size > this.K) throw new ReadTooOld(`delta ${seen.size} exceeds K=${this.K}`);
+      return seen.size <= this.K;
+    });
+    if (seen.size > this.K) throw new ReadTooOld(`delta exceeds K=${this.K}`);
     return [...seen.values()];
   }
 
@@ -860,7 +1025,7 @@ export class ShardCore implements ShardApi {
    * INSERT ... SELECT のような構文でも Worker 側で解析する必要がない。
    */
   private run(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[] } {
-    if (!req.write) return { ...this.b.raw(req.sql, ...req.params), changes: [] };
+    if (!req.write) return { ...this.readLimited(req), changes: [] };
     const captured = this.runCaptured(req);
     if (captured) return captured;
     // REPLACE が暗黙に消す行は recursive_triggers がないと DELETE trigger を発火しない。
@@ -875,6 +1040,22 @@ export class ShardCore implements ShardApi {
       }
     }
     return { ...out, changes };
+  }
+
+  /** 読み取りの文を実行し、上限を超えた時点で打ち切る。全行を集めてから数えると、数える前にメモリが尽きる。 */
+  private readLimited(req: ExecReq): { columns: string[]; values: Value[][] } {
+    const maxRows = Math.min(req.maxRows ?? SHARD_MAX_ROWS, SHARD_MAX_ROWS);
+    const maxBytes = Math.min(req.maxBytes ?? SHARD_MAX_BYTES, SHARD_MAX_BYTES);
+    const { columns, rows } = this.b.iterate(req.sql, ...req.params);
+    const values: Value[][] = [];
+    let bytes = 0;
+    for (const row of rows) {
+      values.push(row);
+      for (const v of row) bytes += sizeOf(v);
+      if (values.length > maxRows) throw new SqlError(`result too large: more than ${maxRows} rows from one shard; narrow the query`);
+      if (bytes > maxBytes) throw new SqlError(`result too large: more than ${maxBytes} bytes from one shard; narrow the query or select fewer columns`);
+    }
+    return { columns, values };
   }
 
   /** 時刻 T の状態 (と自分の未 commit write) の上で文を実行し、ROLLBACK する。 */
@@ -970,6 +1151,7 @@ export class ShardCore implements ShardApi {
       // 同じ主キーでなくても、他の取引の intent が同じ UNIQUE の値を持っていれば確定できない。
       const pending = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, dry.changes);
       if (pending) throw new ConflictError(pending);
+      this.assertWriteSetFits(dry.changes);
       const c = this.issue();
       if (dry.changes.length) this.b.tx(() => this.applyAndLog(`auto-${c}`, c, dry.changes));
       return { ...dry, T: c, hlc: this.hlc.value, epoch: this.epoch };
@@ -1039,6 +1221,7 @@ export class ShardCore implements ShardApi {
             if (hit.key !== null) throw BLOCKED;
             pending.reason = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, r.changes);
             if (pending.reason) throw PENDING_UNIQUE;
+            this.assertWriteSetFits(r.changes);
             const c = this.issue();
             if (r.changes.length) this.logChanges(`auto-${c}`, c, r.changes);
             return { changes: r.changes, c };
@@ -1131,6 +1314,18 @@ export class ShardCore implements ShardApi {
     return null;
   }
 
+  /** 取引がこのシャードに書く変更が、変更ログの 1 行に収まるか。収まらなければ確定の前に拒否する。 */
+  private assertWriteSetFits(writes: Change[]): void {
+    if (this.faults.noWriteSetLimit || writes.length === 0) return;
+    let bytes = 0;
+    for (const w of writes) {
+      bytes += encode(w).length;
+      if (bytes > MAX_WRITE_SET_BYTES) {
+        throw new SqlError(`transaction too large: it changes more than ${MAX_WRITE_SET_BYTES} bytes of rows on one shard; split it into smaller transactions`);
+      }
+    }
+  }
+
   private checkUnique(txn: string, writes: Change[]): string | null {
     const constrained = writes.filter((w) => this.def(w.table).uniques.length > 0);
     if (constrained.length === 0) return null;
@@ -1175,6 +1370,12 @@ export class ShardCore implements ShardApi {
     await this.ensureArrived(this.sksOf(req.spans, req.writes));
     this.observe(req.T);
     this.assertOwned(req.spans, req.writes, req.T);
+    try {
+      this.assertWriteSetFits(req.writes);
+    } catch (e) {
+      this.releaseLocks(req.txn);
+      throw e;
+    }
     const reason = this.validate(req.txn, req.T, req.writes, req.spans);
     if (reason) {
       this.releaseLocks(req.txn); // 失敗した取引のロックを残すと、TTL まで全員が待つ
@@ -1196,6 +1397,13 @@ export class ShardCore implements ShardApi {
   private prepareSync(req: PrepareReq): PrepareRes {
     const dup = this.b.exec(`SELECT prepare_ts FROM __intents WHERE txn = ? LIMIT 1`, req.txn)[0];
     if (dup) return { ok: true, prepareTs: dup.prepare_ts as Ts };
+    // phase 2 で初めて上限に当たると、確定した取引が適用できなくなる。intent を置く前に拒否する。
+    try {
+      this.assertWriteSetFits(req.writes);
+    } catch (e) {
+      this.releaseLocks(req.txn);
+      return { ok: false, reason: (e as Error).message };
+    }
     this.observe(req.T);
     try {
       this.assertOwned(req.spans, req.writes, req.T);

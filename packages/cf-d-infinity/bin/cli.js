@@ -6,7 +6,7 @@
 // 使い捨ての Worker を miniflare で立て、DinfDatabase への Service Binding を dev registry 経由で張る。
 // HTTP の入口もトークンも使わない。binding を張れることが権限である。
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
@@ -19,7 +19,10 @@ Commands:
   sql [SQL]     run SQL and print the result. SQL comes from the argument, --file, or standard input.
                 Several statements separated by ";" run in order; the last result is printed.
   slow          list recorded slow statements, newest first (threshold: DINF_SLOW_QUERY_MS, default 500 ms)
-  status        list the shards, the slot ranges they own, and recent autoscaler events
+  status        list the shards with their health, and anything that needs attention; exits 2 if there is a problem
+  export        write the schema and every row as SQL to standard output or --out. It is not a consistent
+                snapshot: stop writes first if you need one. It refuses while a shard split is moving data.
+  import <FILE> run a file written by export, one statement per line, in batches
 
 Options:
   --local         target the dev server running on this machine (the default)
@@ -28,6 +31,7 @@ Options:
   --file <PATH>   sql: read the statements from a file
   --param <V>     sql: a bound parameter for "?" placeholders; repeat for more (numbers and null are typed)
   --limit <N>     slow: number of entries (default 20)
+  --out <PATH>    export: write to this file instead of standard output
   --json          print JSON instead of a table
   -h, --help      show this help
 
@@ -51,6 +55,7 @@ function parseArgs(argv) {
     else if (a === "--file") out.file = value();
     else if (a === "--param") out.params.push(typed(value()));
     else if (a === "--limit") out.limit = Number(value());
+    else if (a === "--out") out.out = value();
     else if (a === "--json") out.json = true;
     else if (a === "--local") out.local = true;
     else if (a === "--remote") out.remote = true;
@@ -136,7 +141,7 @@ async function loadMiniflare(cwd, tool) {
 }
 
 const CONSOLE_WORKER = `
-const OPS = new Set(["query", "slowQueries", "status"]);
+const OPS = new Set(["query", "slowQueries", "status", "schemaSql", "tables", "exportRows"]);
 export default {
   async fetch(request, env) {
     const { op, args } = await request.json();
@@ -305,22 +310,111 @@ async function slow(opts) {
   ));
 }
 
+const bytes = (n) => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.ceil(n / 1e3)} kB`);
+
 async function status(opts) {
   const s = await call(opts, "status", []);
-  if (opts.json) return console.log(JSON.stringify(s, null, 2));
-  const slots = new Map();
-  for (const r of s.routing.ranges) slots.set(r.shard, [...(slots.get(r.shard) ?? []), `${r.start}-${r.end - 1}`]);
-  console.log(`${s.shards.length} shards, routing version ${s.routing.version}`);
-  console.log(table(["shard", "slots"], s.shards.map((id) => [id, (slots.get(id) ?? []).join(", ")])));
-  const events = s.scaler.events.filter((e) => e.kind !== "tick").slice(-10);
-  const ticks = s.scaler.events.filter((e) => e.kind === "tick");
-  console.log(ticks.length === 0 ? "\nAutoscaler: no tick recorded yet (it runs on the Cron Trigger)."
-    : `\nAutoscaler: last tick ${new Date(ticks.at(-1).at).toISOString()}`);
-  if (events.length > 0) {
-    console.log(table(["time", "event", "detail"], events.map((e) => [
-      new Date(e.at).toISOString().replace("T", " ").slice(0, 19), e.kind, JSON.stringify(e.detail).slice(0, 100),
-    ])));
+  if (opts.json) console.log(JSON.stringify(s, null, 2));
+  else {
+    const slots = new Map();
+    for (const r of s.routing.ranges) slots.set(r.shard, [...(slots.get(r.shard) ?? []), `${r.start}-${r.end - 1}`]);
+    const health = new Map(s.health.map((h) => [h.id, h]));
+    console.log(`${s.shards.length} shards, schema version ${s.schema}, routing version ${s.routing.version}`);
+    console.log(table(["shard", "slots", "size", "waiting", "unapplied", "moving"], s.shards.map((id) => {
+      const h = health.get(id);
+      return [id, (slots.get(id) ?? []).join(", "), h ? bytes(h.bytes) : "?", h?.intents ?? "?", h?.unapplied ?? "?",
+        h && h.incoming + h.outgoing > 0 ? `in ${h.incoming}, out ${h.outgoing}` : "-"];
+    })));
+    const events = s.scaler.events.filter((e) => e.kind !== "tick").slice(-10);
+    const ticks = s.scaler.events.filter((e) => e.kind === "tick");
+    console.log(ticks.length === 0 ? "\nAutoscaler: no tick recorded yet (it runs on the Cron Trigger)."
+      : `\nAutoscaler: last tick ${new Date(ticks.at(-1).at).toISOString()}`);
+    if (events.length > 0) {
+      console.log(table(["time", "event", "detail"], events.map((e) => [
+        new Date(e.at).toISOString().replace("T", " ").slice(0, 19), e.kind, JSON.stringify(e.detail).slice(0, 100),
+      ])));
+    }
+    console.log(s.problems.length === 0 ? "\nNo problems found." : `\nProblems:\n${s.problems.map((p) => `  - ${p}`).join("\n")}`);
   }
+  // 問題があれば終了コードで知らせる。監視のスクリプトから使える。
+  if (s.problems.length > 0) process.exitCode = 2;
+}
+
+/** 値を SQL のリテラルにする。1 文が 1 行に収まるよう、改行は char() の連結にする。 */
+function literal(v) {
+  if (v === null || v === undefined) return "NULL";
+  if (typeof v === "number") return Number.isFinite(v) ? String(v) : Number.isNaN(v) ? "NULL" : v > 0 ? "9e999" : "-9e999";
+  if (typeof v === "object" && typeof v.$blob === "string") return `X'${v.$blob}'`;
+  const quoted = `'${String(v).replaceAll("'", "''")}'`;
+  return quoted.replace(/[\n\r\0]/g, (c) => `' || char(${c.charCodeAt(0)}) || '`);
+}
+
+async function exportAll(opts) {
+  const s = await call(opts, "status", []);
+  const moving = s.health.filter((h) => h.incoming + h.outgoing > 0).map((h) => h.id);
+  if (moving.length > 0) throw new Fail(`a shard split is moving data (${moving.join(", ")}); rows would be exported twice or missed. Try again when it has finished.`);
+  const out = opts.out ? createWriteStream(opts.out) : process.stdout;
+  const write = (line) => new Promise((resolve, reject) => out.write(`${line}\n`, (e) => (e ? reject(e) : resolve())));
+  await write("-- cf-d-infinity logical export. One statement per line. Not a consistent snapshot unless writes were stopped.");
+  await write("-- Load it into an empty database with: npx cf-d-infinity import <this file>");
+  for (const ddl of await call(opts, "schemaSql", [])) await write(`${ddl.replace(/\s*\n\s*/g, " ").replace(/;\s*$/, "")};`);
+  let total = 0;
+  for (const name of await call(opts, "tables", [])) {
+    let cursor = null;
+    do {
+      const page = await call(opts, "exportRows", [name, cursor, 1000]);
+      cursor = page.cursor;
+      const cols = page.columns.map((c) => `"${c.replaceAll('"', '""')}"`).join(", ");
+      // 1 文を小さく保つ。大きな行は 1 行で 1 文になる。
+      let batch = [];
+      let size = 0;
+      const flush = async () => {
+        if (batch.length === 0) return;
+        await write(`INSERT INTO "${name.replaceAll('"', '""')}"(${cols}) VALUES ${batch.join(", ")};`);
+        batch = [];
+        size = 0;
+      };
+      for (const row of page.rows) {
+        const tuple = `(${row.map(literal).join(", ")})`;
+        if (size + tuple.length > 64_000 || batch.length >= 100) await flush();
+        batch.push(tuple);
+        size += tuple.length;
+        total++;
+      }
+      await flush();
+    } while (cursor !== null);
+  }
+  if (opts.out) {
+    await new Promise((resolve) => out.end(resolve));
+    console.log(`Exported ${total} rows to ${opts.out}`);
+  }
+}
+
+async function importFile(opts) {
+  const file = opts.positional[0];
+  if (!file) throw new Fail("import needs a file written by export");
+  const lines = readFileSync(file, "utf8").split("\n").map((l) => l.trim()).filter((l) => l !== "" && !l.startsWith("--"));
+  let done = 0;
+  let batch = [];
+  let size = 0;
+  const flush = async () => {
+    if (batch.length === 0) return;
+    await call(opts, "query", [batch.join("\n"), []]);
+    done += batch.length;
+    batch = [];
+    size = 0;
+  };
+  for (const line of lines) {
+    if (!line.endsWith(";")) throw new Fail(`import expects one complete statement per line (as export writes); line starts: ${line.slice(0, 60)}`);
+    // DDL は 1 文ずつ送る。行の挿入はまとめて送る。
+    const ddl = !/^INSERT\b/i.test(line);
+    if (ddl || size + line.length > 256_000) await flush();
+    batch.push(line);
+    size += line.length;
+    if (ddl) await flush();
+  }
+  await flush();
+  console.log(`Imported ${done} statements from ${file}`);
 }
 
 async function main(argv) {
@@ -329,6 +423,8 @@ async function main(argv) {
   if (opts.command === "sql") return sql(opts);
   if (opts.command === "slow") return slow(opts);
   if (opts.command === "status") return status(opts);
+  if (opts.command === "export") return exportAll(opts);
+  if (opts.command === "import") return importFile(opts);
   throw new Fail(`unknown command ${opts.command}; see --help`);
 }
 

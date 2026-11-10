@@ -1,5 +1,6 @@
 // 本番の黒箱検査と同じ負荷 (src/listappend.ts) と検査器 (bench/elle.mjs) を、シミュレータの上で回す。
 // 欠陥スイッチを入れた実装で異常を検出できることで、本番での合格に意味があることを確かめる。
+import { expectQuiescent } from "./invariants";
 import { describe, expect, it } from "vitest";
 // @ts-expect-error -- JavaScript のモジュール
 import { check } from "../bench/elle.mjs";
@@ -70,6 +71,7 @@ async function run(seed: number, o: { faults?: Faults; restarts?: boolean; split
   await c.settle();
   for (const core of c.cores.values()) await core.redrive();
   await c.settle();
+  if (!o.faults) await expectQuiescent(c);
   const keys = [...new Set(out.history.flatMap((t) => t.ops.map((op) => op[1])))];
   const finalReads: Record<string, string[]> = {};
   for (const k of keys) {

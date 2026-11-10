@@ -111,6 +111,12 @@ export interface ExecReq {
    * T を指定した読みで、決着させた取引の commit 時刻が T を超えていたら、T を取り直させる。
    */
   realtime?: boolean;
+  /**
+   * この要求が返してよい行数とバイト数の上限。超えたら、送り返す前にシャードが拒否する。
+   * 未指定ならシャードの既定の上限だけが効く。
+   */
+  maxRows?: number;
+  maxBytes?: number;
   /** 悲観的な DML。最新の状態で実行し、変更行のロックを取る。 */
   lock?: LockOwner;
   /** 読み取りでロックを取る行。BEGIN IMMEDIATE の主キー読みに使う。 */
@@ -182,7 +188,7 @@ export interface ShardApi {
   beginIncoming(req: { start: number; end: number; from: string; schema: number }): Promise<void>;
   /** 親がスロットの受理を止める。以後は NotOwner を返す。 */
   fence(req: { start: number; end: number; to: string }): Promise<void>;
-  listGroups(req: { start: number; end: number; limit: number }): Promise<string[]>;
+  listGroups(req: { start: number; end: number; limit: number; cursor?: GroupCursor | null }): Promise<{ groups: string[]; cursor: GroupCursor | null }>;
   pull(req: { groups: string[]; to: string; maxBytes: number }): Promise<GroupPayload[]>;
   ack(req: { groups: string[] }): Promise<void>;
   /** 子が背景で全グループを引き取る。 */
@@ -190,6 +196,10 @@ export interface ShardApi {
   finishMove(req: { start: number; end: number }): Promise<void>;
   finishIncoming(req: { start: number; end: number }): Promise<void>;
   metrics(req: Record<string, never>): Promise<ShardMetrics>;
+  /** このシャードが健全かを運用者に見せるための状態。 */
+  health(req: Record<string, never>): Promise<ShardHealth>;
+  /** 表の行を主キーの順に返す。論理エクスポートに使う。 */
+  exportRows(req: { table: string; after: Value[] | null; limit: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }>;
   /** 取引の rollback でロックを手放す。届かなくても TTL で消える。 */
   unlock(req: { txn: string }): Promise<void>;
   /** DDL を適用する。全シャードへ適用してから DDL を完了させる。 */
@@ -213,6 +223,38 @@ export interface GroupPayload {
   m: Ts;
   rows: { table: string; row: Row }[];
   intents: Row[];
+}
+
+/**
+ * グループの列挙の続きの位置。表の名前の順に、表の中は shard key の順に進む。
+ * table が null なら、表は読み終えている。
+ */
+export interface GroupCursor {
+  table: string | null;
+  /** この shard key より後から読む。 */
+  after: Value[] | null;
+  /** shard key に NULL があって after で絞れないときの読み飛ばしの数。 */
+  skip?: number;
+}
+
+/** シャードの健全性。0 でない項目があれば、運用者が見るべき状態である。 */
+export interface ShardHealth {
+  id: string;
+  schema: number;
+  format: number;
+  bytes: number;
+  /** 適用待ちの intent の数と、最も古いものの年齢 (ms)。数秒を超えて残るなら、決着が届いていない。 */
+  intents: number;
+  oldestIntentMs: number;
+  /** 確定したが全参加者に適用しきれていない取引の数。 */
+  unapplied: number;
+  /** 直近の再駆動で失敗した理由。空でなければ、同じ失敗を繰り返している。 */
+  redriveErrors: string[];
+  /** 移動の途中の範囲の数 (受け取り中、送り出し中)。 */
+  incoming: number;
+  outgoing: number;
+  /** 変更ログの世代の数。 */
+  logGenerations: number;
 }
 
 export interface ShardMetrics {
@@ -241,6 +283,11 @@ export interface Backend {
   exec(sql: string, ...params: Value[]): Row[];
   /** 同名の列を潰さないよう、列名と値の配列で返す。 */
   raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] };
+  /**
+   * 結果を 1 行ずつ返す。全行を配列にしないので、途中でやめれば残りは読まない。
+   * 読み終えるか break するまで、同じ Backend への他の文を挟まないこと。
+   */
+  iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> };
   /** fn が throw したら ROLLBACK し、その値を再送出する。 */
   tx<T>(fn: () => T): T;
   /** 保留中の write の永続化を待つ。 */
@@ -253,6 +300,10 @@ export interface Backend {
 export interface Faults {
   /** autocommit の書き込みが、他の取引の intent との UNIQUE を照合しない (2026-11 のレビューで見つかった欠陥)。 */
   autoIgnoresUniqueIntents?: boolean;
+  /** DDL を、持っている intent を決着させずに適用する。表や列が消えた後では、確定済みの取引の intent を適用できない。 */
+  ddlIgnoresIntents?: boolean;
+  /** 取引の変更の大きさを確定の前に検査しない。変更ログの 1 行が DO の行の上限を超え、確定後の適用が失敗する。 */
+  noWriteSetLimit?: boolean;
   /** 複数シャードの autocommit の読みが、決着させた取引の c > T でも T を取り直さない (同上)。 */
   noRealtimeBump?: boolean;
   anchorNoAbsorb?: boolean;
@@ -334,6 +385,33 @@ export class Migrating extends Error {
     this.name = "Migrating";
   }
 }
+/**
+ * 1 つの取引が 1 シャードに書ける変更の合計 (変更前と変更後の行を JSON にした大きさ)。
+ * 変更ログは 1 commit を 1 行に入れるので、DO の行の上限 (2 MB) に収まる必要がある。
+ * 確定した後の適用で初めて上限に当たると、その取引は永久に適用できない。必ず確定の前に拒否する。
+ */
+export const MAX_WRITE_SET_BYTES = 1_000_000;
+
+/**
+ * Durable Object に保存しているデータの形式の版。内部の表の形や意味を、互換でない形で変えるときに上げる。
+ * 新しいコードが書いた DO を古いコードが開くと、黙って壊すおそれがある。版が新しすぎれば起動を拒否する。
+ */
+export const STORAGE_FORMAT = 1;
+
+/** 保存形式の版を確かめる。初めて開く DO と、版の印がまだない DO には現在の版を書く。 */
+export function checkStorageFormat(b: Backend, table: string, what: string): void {
+  const have = b.exec(`SELECT v FROM ${table} WHERE k = 'format'`)[0]?.v as number | undefined;
+  if (have !== undefined && have > STORAGE_FORMAT) {
+    throw new Error(
+      `storage format too new: this ${what} was written by a newer cf-d-infinity (format ${have}); this code understands up to ${STORAGE_FORMAT}. ` +
+      `Deploy the newer version again; an older release must not open this data.`,
+    );
+  }
+  if (have !== STORAGE_FORMAT) {
+    b.exec(`INSERT INTO ${table}(k, v) VALUES ('format', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, STORAGE_FORMAT);
+  }
+}
+
 export class SqlError extends Error {
   constructor(message: string) {
     super(message);

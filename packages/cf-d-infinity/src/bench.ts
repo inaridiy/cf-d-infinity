@@ -305,7 +305,7 @@ export default {
         const b = (await request.json()) as { cluster?: string; shards?: number; tickMs?: number; thresholds?: Partial<Thresholds> };
         const cluster = b.cluster ?? "shard";
         const scaler = env.DINF_AUTOSCALER.getByName(cluster);
-        if (path.endsWith("/start")) await scaler.start({ cluster, initial: b.shards ?? 8, tickMs: b.tickMs ?? 5000, thresholds: b.thresholds });
+        if (path.endsWith("/start")) await scaler.start({ cluster, initial: b.shards ?? 8, tickMs: b.tickMs ?? 5000, thresholds: b.thresholds, mode: "split" });
         else await scaler.stop();
         return Response.json({ ok: true });
       } catch (e) {
