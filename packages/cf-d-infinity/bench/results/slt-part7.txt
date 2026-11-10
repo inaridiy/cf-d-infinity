@@ -1,0 +1,14 @@
+
+ RUN  v3.2.7 <repo>/prototype
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > index/commute_slt_good_0.test
+RES index/commute_slt_good_0.test oracle 10000/10000+34/34 ours 10000/10000+34/34 
+
+ ✓ test/slt-more.test.ts (31 tests | 30 skipped) 12626ms
+   ✓ sqllogictest, the rest > index/commute_slt_good_0.test  12625ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 30 skipped (31)
+   Start at  16:43:12
+   Duration  13.44s (transform 183ms, setup 0ms, collect 253ms, tests 12.63s, environment 0ms, prepare 174ms)
+

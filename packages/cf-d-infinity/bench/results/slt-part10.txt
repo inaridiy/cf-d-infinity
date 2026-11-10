@@ -1,0 +1,14 @@
+
+ RUN  v3.2.7 <repo>/prototype
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > index/orderby_slt_good_0.test
+RES index/orderby_slt_good_0.test oracle 10020/10020+33/33 ours 10020/10020+33/33 
+
+ ✓ test/slt-more.test.ts (31 tests | 30 skipped) 9087ms
+   ✓ sqllogictest, the rest > index/orderby_slt_good_0.test  9086ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 30 skipped (31)
+   Start at  16:49:47
+   Duration  9.87s (transform 173ms, setup 0ms, collect 240ms, tests 9.09s, environment 0ms, prepare 140ms)
+

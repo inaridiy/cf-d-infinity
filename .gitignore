@@ -1,0 +1,12 @@
+node_modules/
+dist/
+lib/
+*.tgz
+.wrangler/
+specs/.tools/
+specs/traces/
+packages/cf-d-infinity/test/slt/**/*.test
+specs/_apalache-out/
+specs/tmp/
+packages/cf-d-infinity/bench/results/*.history.json.gz
+.DS_Store

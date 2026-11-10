@@ -1,0 +1,60 @@
+
+ RUN  v3.2.7 <repo>/prototype
+
+ ↓ test/contention.test.ts (1 test | 1 skipped)
+ ✓ test/analytics.test.ts (1 test) 219ms
+ ✓ test/d1.test.ts (3 tests) 116ms
+ ✓ test/migration.test.ts (22 tests) 604ms
+ ✓ test/basic.test.ts (23 tests) 665ms
+
+  dist/worker.js  3.2mb ⚠️
+
+⚡ Done in 195ms
+ ✓ test/compat.test.ts (16 tests) 900ms
+ ✓ test/counterexamples.test.ts (36 tests) 1164ms
+ ✓ test/rollback-read.test.ts (9 tests) 1904ms
+   ✓ rollback-read reconstructs every past state > with random inserts, deletes, updates and UNIQUE swaps (seed 1)  481ms
+ ✓ test/workerd.test.ts (13 tests) 1508ms
+   ✓ on workerd with real Durable Objects > moves money atomically across shards under concurrency  382ms
+ ✓ test/fuzz.test.ts (12 tests) 3417ms
+   ✓ random statements against real SQLite > seed 1  717ms
+   ✓ random statements against real SQLite > seed 2  325ms
+   ✓ random statements against real SQLite > seed 10  322ms
+ ✓ test/history.test.ts (32 tests) 94832ms
+   ✓ history checker on the real shard code > stays serializable with clock skew (seed 1)  853ms
+   ✓ history checker on the real shard code > stays serializable with clock skew (seed 2)  484ms
+   ✓ history checker on the real shard code > stays serializable with clock skew (seed 3)  424ms
+   ✓ history checker on the real shard code > stays serializable with clock skew (seed 4)  422ms
+   ✓ history checker on the real shard code > stays serializable with clock skew (seed 5)  432ms
+   ✓ history checker on the real shard code > stays serializable with clock skew (seed 6)  390ms
+   ✓ history checker on the real shard code > stays serializable with restarts (seed 11)  378ms
+   ✓ history checker on the real shard code > stays serializable with restarts (seed 12)  372ms
+   ✓ history checker on the real shard code > stays serializable with restarts (seed 13)  405ms
+   ✓ history checker on the real shard code > stays serializable with restarts (seed 14)  401ms
+   ✓ history checker across live splits > stays serializable while shards are added (seed 21)  603ms
+   ✓ history checker across live splits > stays serializable while shards are added (seed 22)  604ms
+   ✓ history checker across live splits > stays serializable while shards are added (seed 23)  588ms
+   ✓ history checker across live splits > stays serializable while shards are added (seed 24)  579ms
+   ✓ history checker across live splits > stays serializable while shards are added (seed 25)  592ms
+   ✓ history checker across live splits > stays serializable while shards are added (seed 26)  580ms
+   ✓ history checker across live splits > stays serializable with splits and restarts together (seed 31)  518ms
+   ✓ history checker across live splits > stays serializable with splits and restarts together (seed 32)  560ms
+   ✓ history checker across live splits > stays serializable with splits and restarts together (seed 33)  605ms
+   ✓ history checker across live splits > stays serializable with splits and restarts together (seed 34)  614ms
+   ✓ history checker with pessimistic transactions > stays serializable (seed 41)  5457ms
+   ✓ history checker with pessimistic transactions > stays serializable (seed 42)  507ms
+   ✓ history checker with pessimistic transactions > stays serializable (seed 43)  5278ms
+   ✓ history checker with pessimistic transactions > stays serializable (seed 44)  10174ms
+   ✓ history checker with pessimistic transactions > stays serializable (seed 45)  10240ms
+   ✓ history checker with pessimistic transactions > stays serializable (seed 46)  5263ms
+   ✓ history checker with pessimistic transactions > stays serializable with splits and restarts (seed 51)  10717ms
+   ✓ history checker with pessimistic transactions > stays serializable with splits and restarts (seed 52)  20204ms
+   ✓ history checker with pessimistic transactions > stays serializable with splits and restarts (seed 53)  10629ms
+   ✓ history checker with pessimistic transactions > stays serializable with splits and restarts (seed 54)  5361ms
+   ✓ the checker is not vacuous > detects a reader that passes pending intents  329ms
+
+ Test Files  10 passed | 1 skipped (11)
+      Tests  167 passed | 1 skipped (168)
+   Start at  16:20:56
+   Duration  95.32s (transform 518ms, setup 0ms, collect 3.62s, tests 105.33s, environment 2ms, prepare 645ms)
+

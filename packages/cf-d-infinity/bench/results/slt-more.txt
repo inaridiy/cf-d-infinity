@@ -1,0 +1,81 @@
+
+ RUN  v3.2.7 <repo>/prototype
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > evidence/in1.test
+RES evidence/in1.test oracle 187/187+27/27 ours 187/187+27/27 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > evidence/in2.test
+RES evidence/in2.test oracle 45/45+8/8 ours 45/45+8/8 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > evidence/slt_lang_aggfunc.test
+RES evidence/slt_lang_aggfunc.test oracle 63/67+13/13 ours 63/67+13/13 4x mismatch: got N values -N.N
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > evidence/slt_lang_createtrigger.test
+RES evidence/slt_lang_createtrigger.test oracle 0/0+26/26 ours 0/0+26/26 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > evidence/slt_lang_createview.test
+RES evidence/slt_lang_createview.test oracle 2/2+21/21 ours 2/2+21/21 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > evidence/slt_lang_dropindex.test
+RES evidence/slt_lang_dropindex.test oracle 0/0+8/8 ours 0/0+8/8 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > evidence/slt_lang_droptable.test
+RES evidence/slt_lang_droptable.test oracle 0/0+12/12 ours 0/0+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > evidence/slt_lang_droptrigger.test
+RES evidence/slt_lang_droptrigger.test oracle 0/0+12/12 ours 0/0+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > evidence/slt_lang_dropview.test
+RES evidence/slt_lang_dropview.test oracle 2/2+11/11 ours 2/2+11/11 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > evidence/slt_lang_reindex.test
+RES evidence/slt_lang_reindex.test oracle 0/0+7/7 ours 0/0+7/7 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > evidence/slt_lang_replace.test
+RES evidence/slt_lang_replace.test oracle 6/6+8/8 ours 6/6+8/8 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > evidence/slt_lang_update.test
+RES evidence/slt_lang_update.test oracle 9/9+18/18 ours 9/9+18/18 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/aggregates_slt_good_0.test
+RES random/aggregates_slt_good_0.test oracle 10000/10000+12/12 ours 10000/10000+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/aggregates_slt_good_1.test
+RES random/aggregates_slt_good_1.test oracle 10000/10000+12/12 ours 10000/10000+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/aggregates_slt_good_10.test
+RES random/aggregates_slt_good_10.test oracle 10000/10000+12/12 ours 10000/10000+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/expr_slt_good_0.test
+RES random/expr_slt_good_0.test oracle 10000/10000+12/12 ours 10000/10000+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/expr_slt_good_1.test
+RES random/expr_slt_good_1.test oracle 10000/10000+12/12 ours 10000/10000+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/expr_slt_good_10.test
+RES random/expr_slt_good_10.test oracle 10000/10000+12/12 ours 10000/10000+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/groupby_slt_good_0.test
+RES random/groupby_slt_good_0.test oracle 10000/10000+12/12 ours 10000/10000+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/groupby_slt_good_1.test
+RES random/groupby_slt_good_1.test oracle 10000/10000+12/12 ours 10000/10000+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/groupby_slt_good_10.test
+RES random/groupby_slt_good_10.test oracle 10000/10000+12/12 ours 10000/10000+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/select_slt_good_0.test
+RES random/select_slt_good_0.test oracle 10000/10000+12/12 ours 10000/10000+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/select_slt_good_1.test
+RES random/select_slt_good_1.test oracle 10000/10000+12/12 ours 10000/10000+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/select_slt_good_10.test
+RES random/select_slt_good_10.test oracle 9999/9999+12/12 ours 9999/9999+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > index/between_slt_good_0.test
+RES index/between_slt_good_0.test oracle 10000/10000+22/22 ours 10000/10000+22/22 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > index/commute_slt_good_0.test
+RES index/commute_slt_good_0.test oracle 10000/10000+34/34 ours 10000/10000+34/34 
+

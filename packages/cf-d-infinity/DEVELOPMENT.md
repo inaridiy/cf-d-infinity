@@ -1,0 +1,193 @@
+# 実装メモ
+
+npm パッケージ `cf-d-infinity` の実装と、その開発手順の覚え書きである。
+利用者向けの説明は [README.md](./README.md) とリポジトリの [README.md](../../README.md) にある。
+
+Cloudflare Workers と Durable Objects の上で動く、SQLite 互換の分散 DB である。
+Worker からは Service Binding (`DinfDatabase`) と `connect()` で使い、外からは既存の `@libsql/client` の接続先を変えるだけで使える。
+
+```ts
+import { createClient } from "@libsql/client";
+
+const db = createClient({ url: "https://<worker>.workers.dev", authToken: "<DINF_API_TOKEN>" });
+await db.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)");
+await db.execute({ sql: "INSERT INTO users(name) VALUES (?)", args: ["alice"] });
+```
+
+シャードの本体 `src/shard/core.ts` は DO に依存しないので、同じコードが node:sqlite (`test/sim.ts`) と workerd (`src/worker.ts`) の両方で動く。
+SQLite との差分は [docs/sql-language.md](../../docs/sql-language.md) にある。
+
+## 動かす
+
+```sh
+npm install
+npm test                      # 全テスト。workerd の結合テストと @libsql/client の確認を含む
+npm run typecheck
+test/slt/fetch.sh             # sqllogictest の select1〜5 を取得する
+SLT_LIMIT=1000000 npx vitest run test/slt.test.ts     # 全件を流す
+FUZZ_SEEDS=200 FUZZ_LENGTH=150 npx vitest run test/fuzz.test.ts
+```
+
+デプロイの前に、2 つのトークンを secret として登録する。
+
+```sh
+npx wrangler secret put DINF_API_TOKEN     # データの読み書き
+npx wrangler secret put DINF_ADMIN_TOKEN   # 運用の操作 (/admin)
+npx wrangler deploy
+```
+
+トークンが未設定の経路は全要求を拒否する。
+`DINF_BATON_SECRET` を設定すると Hrana の baton の署名鍵になる。未設定なら `DINF_API_TOKEN` から導く。
+
+| パス | トークン | 本文 | 内容 |
+|---|---|---|---|
+| `POST /v3/pipeline` | API | Hrana over HTTP | `@libsql/client` の `https://` の入口 |
+| WebSocket の upgrade | API (hello の jwt) | Hrana over WebSocket (hrana2) | `@libsql/client` の `wss://` の入口 |
+| `POST /ddl` | API | `{ sql }` | DDL を実行する |
+| `POST /sql` | API | `{ sql, params, token }` | 1 文を autocommit で実行する |
+| `POST /batch` | API | `{ statements, token }` | 全文を 1 取引で実行する |
+| `POST /admin/split` | ADMIN | `{ cluster, parent, child }` | 手動で増設する |
+| `POST /admin/status` | ADMIN | `{ cluster }` | 範囲表と Autoscaler の履歴を返す |
+| `POST /admin/rowstats` | ADMIN | `{ cluster }` | 文の種類ごとの課金行数を返し、0 に戻す |
+
+### 自動増設
+
+自動増設は `wrangler.jsonc` の Cron Trigger で動く。
+起動と停止のための HTTP の入口はない。
+
+```jsonc
+"vars": { "DINF_SHARD_COUNT": "8" },
+"triggers": { "crons": ["* * * * *"] }
+```
+
+Cron が毎分 Autoscaler DO を起こし、Autoscaler は全シャードの metrics を 1 回集めて判断する。
+閾値を超えたシャード、移動中のシャード、未完了の増設のどれかがある間だけ、`DINF_AUTOSCALE_TICK_MS` (既定 5000) の alarm で判断を続ける。
+どれもなくなれば alarm をやめ、次の Cron まで待つ。
+負荷が始まってから最初の検出までは最大で約 1 分かかり、その後は 5 秒ごとに追う。
+
+| 変数 | 既定 | 内容 |
+|---|---|---|
+| `DINF_SHARD_COUNT` | 8 | 最初のシャード数 |
+| `DINF_AUTOSCALE_TICK_MS` | 5000 | 負荷が続いている間の判断の周期 (ms) |
+| `DINF_AUTOSCALE_THRESHOLDS` | なし | 閾値の上書き (JSON)。項目は `src/autoscaler.ts` の `Thresholds` |
+
+`triggers` の行を消してデプロイすると止まる。
+ローカルの `wrangler dev` は Cron を自動では発火しない。
+確かめるときは `wrangler dev --test-scheduled` で起動し、`curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"` を呼ぶ。
+
+全シャードへの問い合わせは DO を起こすので、Duration の課金がかかる。
+常に 5 秒周期で回すと待機中のシャードも起きたままになるため、平常時は毎分 1 回に抑えている。
+
+### 公開する形
+
+`npm run build` (`scripts/build.mjs`) が `lib/` を作る。`npm pack` と `npm publish` は `prepack` でこれを実行する。
+
+| 入口 | ファイル | 内容 |
+|---|---|---|
+| `cf-d-infinity/cloudflare` | `lib/cloudflare.js` | DO のクラス、`DinfDatabase`、`autoscale`、HTTP と Cron の入口 |
+| `cf-d-infinity/client` | `lib/client.js` | `connect()` だけ。DB のコードを含まない |
+
+sql.js は `lib/cloudflare.js` に束ねる。
+sql.js の Node 向けの分岐が `fs`、`path`、`crypto` を参照するので、束ねずに出すと利用者の `wrangler.jsonc` に `alias` が要るからである。
+`src/sql-wasm.wasm` は sql.js 1.13.0 の `dist/sql-wasm.wasm` の写しで、ビルドが一致を検査する。
+`sql-parser-cst` (GPL-2.0-or-later) は束ねず、依存として参照する。束ねると配布物そのものが GPL の結合著作物になる。
+
+利用者の Worker に入る名前には、衝突を避けるために接頭辞を付けている。
+binding と変数は `DINF_`、クラスは `Dinf` で始まる。
+DO のクラス名はデプロイ後に変えると利用者の側で `renamed_classes` の移行が要るので、変えない。
+
+公開は `alpha` の dist-tag で行う。
+npm 11.12 の `npm publish --dry-run` は `publishConfig.tag` を無視して `latest` と表示したので、tag は必ず明示する。
+
+```sh
+npm publish --tag alpha          # packages/cf-d-infinity と packages/create-cf-d-infinity の両方で実行する
+```
+
+2 つのパッケージの版は揃える。CLI は自分と同じ版の `cf-d-infinity` を利用者の `package.json` に書くからである。
+セットアップ用の CLI は [packages/create-cf-d-infinity](../create-cf-d-infinity/README.md) にある。
+
+### 計測用の構成
+
+ベンチマークと障害注入の経路は、本番の Worker に含めない。
+`wrangler.bench.jsonc` (`src/bench.ts`) が本番の入口に `/bench` と DO のプローブを足した別の Worker である。
+
+```sh
+npx wrangler deploy -c wrangler.bench.jsonc --var DINF_API_TOKEN:<t> --var DINF_ADMIN_TOKEN:<a> --durable-objects-code-update-mode immediate
+URL=https://... TOKEN=<t> ADMIN_TOKEN=<a> node bench/run.mjs <suite>
+URL=https://... TOKEN=<t> ADMIN_TOKEN=<a> node bench/jepsen.mjs        # 本番での黒箱検査 (約 11 分)
+```
+
+計測用の構成は Cron Trigger を持たない。
+`POST /admin/autoscale/start` (`{ cluster, shards, tickMs, thresholds }`) で負荷によらず一定の周期で判断させ、`POST /admin/autoscale/stop` で止める。
+どちらも ADMIN のトークンが要る。
+
+結果は [docs/benchmarks.md](../../docs/benchmarks.md) にある。
+
+### 版を上げるデプロイ
+
+Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 秒動かす。
+要求の形式を互換でない形に変えるときは、`src/types.ts` の `PROTOCOL_VERSION` を 2 段階で上げる。
+1 段目で受け付ける版の上限を上げたコードを出し、全 DO が入れ替わってから、2 段目で送る版を上げる。
+訓練には `DINF_PROTOCOL_ACCEPT` と `DINF_PROTOCOL_SEND` の変数を使う (`bench/jepsen.mjs` が実行中に行う)。
+
+## 構成
+
+| パス | 内容 |
+|---|---|
+| `src/shard/core.ts` | シャードのプロトコル (rollback-read、検証、anchor 2PC、回復、ライブ移動) |
+| `src/shard/rows.ts` | 行の適用と set-based undo |
+| `src/client/db.ts` | Worker 側の入口。OCC の取引、経路決定、scatter |
+| `src/client/d1.ts` | D1 互換 API |
+| `src/client/hrana.ts` | Hrana over HTTP と WebSocket、baton の署名 |
+| `src/sql/plan.ts` | 文の実行場所の決定、条件の押し下げ |
+| `src/sql/ddl.ts` | DDL の解釈、index の配置 |
+| `src/sql/scratch.ts` | Worker の中の SQLite (sql.js) |
+| `src/sql/cst.ts` | パーサのラッパー |
+| `src/meta.ts` | 表定義、DDL 履歴、範囲表 |
+| `src/routing.ts` | 4,096 スロットの範囲表 |
+| `src/autoscaler.ts` | 増設の判断と手順 |
+| `src/analytics.ts` | 変更ログの収集と watermark |
+| `src/worker.ts` | 本番の入口。DO への配線、認証、HTTP と WebSocket、Cron |
+| `src/entrypoint.ts` | Service Binding の入口 `DinfDatabase`。文、batch、対話的な取引を RPC で受ける |
+| `src/binding.ts` | アプリ側のクライアント `connect()`。D1 互換 API と取引 |
+| `src/cloudflare.ts` | 公開する入口。Worker に組み込むものをまとめて export する |
+| `src/bench.ts` | 計測用の入口。ベンチマーク、DO のプローブ、障害注入 |
+| `src/listappend.ts` | 黒箱検査の負荷 (リストへの追記) |
+| `bench/elle.mjs` | 黒箱の直列化可能性の検査器 (Elle の list-append 方式) |
+
+## テスト
+
+| ファイル | 検査すること |
+|---|---|
+| `test/basic.test.ts` | SQL の機能、経路決定、取引、グローバル index |
+| `test/compat.test.ts` | 本物の SQLite との差分テスト (手書き) |
+| `test/fuzz.test.ts` | 本物の SQLite との差分テスト (乱数) |
+| `test/slt.test.ts`、`test/slt-more.test.ts` | SQLite の sqllogictest |
+| `test/prod.test.ts` | 本番の Worker への確認。`PROD_URL` があるときだけ動く |
+| `test/counterexamples.test.ts` | 設計レビューと形式モデルの反例。欠陥スイッチを入れると壊れ、外すと直ることを確かめる |
+| `test/history.test.ts` | ランダムな並行実行が commit 時刻順の直列実行と一致すること (時計のずれ、遅延、再起動あり)。チェッカが欠陥を検出できることも確かめる |
+| `test/rollback-read.test.ts` | どの過去時点も正確に再構成できること |
+| `test/migration.test.ts` | ライブ移動、`m5b` の反例、Autoscaler の判断 |
+| `test/workerd.test.ts` | 本物の workerd と DO の SQLite での結合テスト |
+| `test/binding.test.ts` | `DinfDatabase` と `connect()` を workerd の RPC で通す。同じ Worker の中の binding と、別の Worker からの binding の両方 |
+| `test/autoscale-cron.test.ts` | Cron から起こした Autoscaler が、負荷のある間だけ alarm で追い、増設し、負荷が止まると静まること |
+| `test/d1.test.ts` | D1 互換 API と Drizzle |
+| `test/contention.test.ts` | 競合時の取引の失敗率。`CONTENTION=1` のときだけ動く |
+| `test/gc.test.ts` | 変更ログと取引記録の GC。窓の外を必要とする読みが黙って間違えないこと、古い COMMIT の拒否 |
+| `test/rowcost.test.ts` | 1 操作あたりの課金行数を workerd で数え、上限を検査する。`ROWCOST=1` のときだけ動く |
+| `test/protocol.test.ts` | 新旧コードが混在するときの版の検査 |
+| `test/elle.test.ts` | 黒箱の検査器が既知の異常 (G0、G1a、G1c、G2、消失、順序の矛盾) を検出すること |
+| `test/elle-sim.test.ts` | 黒箱検査をシミュレータで回す。欠陥スイッチを入れた実装で異常を検出すること |
+| `test/bench-build.test.ts` | 計測用の構成。障害注入を挟んだ負荷と黒箱検査 |
+| `test/analytics.test.ts` | 変更ログから DuckDB まで |
+
+`Faults` 型のスイッチは検証済みの欠陥を再導入する。
+本番の DO は `faults` を渡さないので、すべて無効のまま動く。
+反例の再現テストと検査器の検出力の確認に使うので、本体から外していない。
+
+## 未実装
+
+merge、R2 と Container への接続、全シャード復元、follower DO、8 シャードを超える scatter の階層化、semijoin、複数 DB は未実装である。
+増設の手順は Autoscaler DO が直接動かしており、Workflows は使っていない。
+1 グループは 1 回の RPC で運ぶので、巨大なグループの分割転送も未実装である。
+要求の形式を変えるデプロイは、上記の 2 段階の手順に従う。

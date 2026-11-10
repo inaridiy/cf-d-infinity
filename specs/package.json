@@ -1,0 +1,1 @@
+{ "name": "cf-d-infinity-specs", "private": true, "type": "module", "devDependencies": { "@informalsystems/quint": "0.33.1" } }

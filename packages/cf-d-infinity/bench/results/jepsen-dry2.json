@@ -1,0 +1,211 @@
+{
+ "cluster": "dry2",
+ "durationS": 40,
+ "valid": true,
+ "anomalies": {},
+ "stats": {
+  "txns": 10824,
+  "ok": 9667,
+  "fail": 1157,
+  "info": 0,
+  "infoCommitted": 0,
+  "keys": 96,
+  "elements": 10522,
+  "edges": 21739
+ },
+ "byMode": {
+  "optimistic": {
+   "ok": 4171,
+   "fail": 374,
+   "info": 0
+  },
+  "auto": {
+   "ok": 1509,
+   "fail": 0,
+   "info": 0
+  },
+  "pessimistic": {
+   "ok": 3987,
+   "fail": 783,
+   "info": 0
+  }
+ },
+ "lostInvocations": 5,
+ "finalKeys": {
+  "total": 96,
+  "read": 96,
+  "errors": {}
+ },
+ "shardsAfter": {
+  "dry2-0": {
+   "gens": 2,
+   "gensSample": "[14951951,14951952]",
+   "tables": 2,
+   "tableSample": [
+    "__log_g14951951",
+    "__log_g14951952"
+   ],
+   "view": "Error: no such table: __log: SQLITE_ERROR",
+   "lowWater": null,
+   "intents": {
+    "n": 0,
+    "p": null
+   },
+   "txn": {
+    "n": 731
+   }
+  },
+  "dry2-1": {
+   "gens": 2,
+   "gensSample": "[14951951,14951952]",
+   "tables": 2,
+   "tableSample": [
+    "__log_g14951951",
+    "__log_g14951952"
+   ],
+   "view": "Error: no such table: __log: SQLITE_ERROR",
+   "lowWater": null,
+   "intents": {
+    "n": 0,
+    "p": null
+   },
+   "txn": {
+    "n": 960
+   }
+  },
+  "dry2-2": {
+   "gens": 2,
+   "gensSample": "[14951951,14951952]",
+   "tables": 2,
+   "tableSample": [
+    "__log_g14951951",
+    "__log_g14951952"
+   ],
+   "view": "Error: no such table: __log: SQLITE_ERROR",
+   "lowWater": null,
+   "intents": {
+    "n": 0,
+    "p": null
+   },
+   "txn": {
+    "n": 473
+   }
+  },
+  "dry2-5": {
+   "gens": 2,
+   "gensSample": "[14951951,14951952]",
+   "tables": 2,
+   "tableSample": [
+    "__log_g14951951",
+    "__log_g14951952"
+   ],
+   "view": "Error: no such table: __log: SQLITE_ERROR",
+   "lowWater": null,
+   "intents": {
+    "n": 0,
+    "p": null
+   },
+   "txn": {
+    "n": 158
+   }
+  },
+  "dry2-4": {
+   "gens": 2,
+   "gensSample": "[14951951,14951952]",
+   "tables": 2,
+   "tableSample": [
+    "__log_g14951951",
+    "__log_g14951952"
+   ],
+   "view": "Error: no such table: __log: SQLITE_ERROR",
+   "lowWater": null,
+   "intents": {
+    "n": 0,
+    "p": null
+   },
+   "txn": {
+    "n": 341
+   }
+  },
+  "dry2-3": {
+   "gens": 2,
+   "gensSample": "[14951951,14951952]",
+   "tables": 2,
+   "tableSample": [
+    "__log_g14951951",
+    "__log_g14951952"
+   ],
+   "view": "Error: no such table: __log: SQLITE_ERROR",
+   "lowWater": null,
+   "intents": {
+    "n": 0,
+    "p": null
+   },
+   "txn": {
+    "n": 815
+   }
+  }
+ },
+ "failures": {
+  "conflict: write after T on [89711710028,1]": 1,
+  "conflict: write after T on [89711710026,1]": 1,
+  "conflict: row locked by t-31c4290c-0": 2,
+  "conflict: row locked by t-9effc09e-0": 3,
+  "injected crash": 3,
+  "conflict: lock wait timeout": 1,
+  "not owner: dry2-4": 435,
+  "conflict: refresh: span changed": 2,
+  "invocation: TypeError: fetch failed": 5,
+  "not owner: dry2-5": 340
+ },
+ "events": [
+  {
+   "t": 5,
+   "kind": "crash",
+   "detail": {
+    "target": "dry2-1"
+   }
+  },
+  {
+   "t": 10,
+   "kind": "crash",
+   "detail": {
+    "target": "dry2-3"
+   }
+  },
+  {
+   "t": 10,
+   "kind": "split",
+   "detail": {
+    "parent": "dry2-2",
+    "child": "dry2-4",
+    "ms": 14,
+    "groups": 3
+   }
+  },
+  {
+   "t": 15,
+   "kind": "crash",
+   "detail": {
+    "target": "dry2-3"
+   }
+  },
+  {
+   "t": 22,
+   "kind": "crash",
+   "detail": {
+    "target": "dry2-3"
+   }
+  },
+  {
+   "t": 22,
+   "kind": "split",
+   "detail": {
+    "parent": "dry2-2",
+    "child": "dry2-5",
+    "ms": 14,
+    "groups": 5
+   }
+  }
+ ]
+}

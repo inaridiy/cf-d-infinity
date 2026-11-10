@@ -1,0 +1,86 @@
+{"t":8,"shards":2,"perSec":2346,"p50":438,"p99":2504,"failures":0,"failuresByMessage":{},"skipped":3268,"rejected":0}
+{"t":14,"shards":2,"perSec":1646,"p50":600,"p99":2788,"failures":0,"failuresByMessage":{},"skipped":6771,"rejected":0}
+{"t":20,"shards":2,"perSec":1907,"p50":581,"p99":2688,"failures":483,"failuresByMessage":{"Durable Object is overloaded. Requests queued for too long.":483},"skipped":4982,"rejected":0}
+{"t":26,"shards":2,"perSec":1982,"p50":580,"p99":3160,"failures":0,"failuresByMessage":{},"skipped":5088,"rejected":0}
+{"t":35,"shards":4,"perSec":1778,"p50":670,"p99":5332,"failures":0,"failuresByMessage":{},"skipped":6110,"rejected":0}
+{"t":41,"shards":4,"perSec":2909,"p50":47,"p99":1222,"failures":0,"failuresByMessage":{},"skipped":453,"rejected":0}
+{"t":59,"shards":4,"perSec":3000,"p50":70,"p99":676,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":67,"shards":4,"perSec":3000,"p50":99,"p99":1314,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":74,"shards":4,"perSec":2871,"p50":60,"p99":2372,"failures":0,"failuresByMessage":{},"skipped":646,"rejected":0}
+{"t":80,"shards":4,"perSec":2726,"p50":133,"p99":2066,"failures":0,"failuresByMessage":{},"skipped":1372,"rejected":0}
+{"t":88,"shards":4,"perSec":2830,"p50":112,"p99":2105,"failures":0,"failuresByMessage":{},"skipped":850,"rejected":0}
+{"t":95,"shards":4,"perSec":2962,"p50":107,"p99":1796,"failures":0,"failuresByMessage":{},"skipped":192,"rejected":0}
+{"t":102,"shards":4,"perSec":2864,"p50":118,"p99":1541,"failures":0,"failuresByMessage":{},"skipped":679,"rejected":0}
+{"t":110,"shards":8,"perSec":3000,"p50":95,"p99":1330,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":118,"shards":8,"perSec":3000,"p50":22,"p99":230,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":124,"shards":8,"perSec":3000,"p50":23,"p99":85,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":131,"shards":8,"perSec":3000,"p50":23,"p99":119,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":137,"shards":8,"perSec":3000,"p50":21,"p99":82,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":144,"shards":8,"perSec":3000,"p50":21,"p99":91,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":150,"shards":8,"perSec":3000,"p50":22,"p99":108,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":158,"shards":8,"perSec":3000,"p50":23,"p99":84,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":165,"shards":8,"perSec":3000,"p50":23,"p99":90,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":171,"shards":8,"perSec":3000,"p50":21,"p99":126,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":178,"shards":8,"perSec":3000,"p50":23,"p99":81,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":184,"shards":8,"perSec":3000,"p50":21,"p99":89,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":190,"shards":8,"perSec":3000,"p50":21,"p99":126,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":197,"shards":8,"perSec":3000,"p50":22,"p99":147,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":204,"shards":8,"perSec":3000,"p50":23,"p99":92,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":210,"shards":8,"perSec":3000,"p50":23,"p99":98,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":216,"shards":8,"perSec":3000,"p50":23,"p99":98,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":222,"shards":8,"perSec":3000,"p50":23,"p99":117,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":228,"shards":8,"perSec":3000,"p50":23,"p99":151,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":235,"shards":8,"perSec":3000,"p50":23,"p99":96,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":241,"shards":8,"perSec":3000,"p50":22,"p99":112,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":247,"shards":8,"perSec":3000,"p50":23,"p99":164,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":253,"shards":8,"perSec":3000,"p50":21,"p99":127,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":259,"shards":8,"perSec":3000,"p50":21,"p99":101,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":265,"shards":8,"perSec":3000,"p50":23,"p99":91,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":271,"shards":8,"perSec":3000,"p50":22,"p99":110,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":277,"shards":8,"perSec":3000,"p50":21,"p99":110,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":283,"shards":8,"perSec":3000,"p50":21,"p99":116,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":290,"shards":8,"perSec":3000,"p50":23,"p99":110,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":296,"shards":8,"perSec":3000,"p50":23,"p99":104,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":302,"shards":8,"perSec":3000,"p50":22,"p99":121,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":308,"shards":8,"perSec":3000,"p50":23,"p99":153,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":314,"shards":8,"perSec":3000,"p50":21,"p99":200,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":320,"shards":8,"perSec":3000,"p50":21,"p99":101,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":326,"shards":8,"perSec":3000,"p50":22,"p99":101,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":333,"shards":8,"perSec":3000,"p50":21,"p99":93,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":339,"shards":8,"perSec":3000,"p50":22,"p99":147,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":346,"shards":8,"perSec":2987,"p50":22,"p99":2144,"failures":0,"failuresByMessage":{},"skipped":66,"rejected":0}
+{"t":353,"shards":8,"perSec":3000,"p50":22,"p99":92,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":359,"shards":8,"perSec":3000,"p50":21,"p99":111,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":365,"shards":8,"perSec":3000,"p50":22,"p99":110,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":373,"shards":8,"perSec":3000,"p50":22,"p99":146,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":380,"shards":8,"perSec":3000,"p50":21,"p99":101,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":385,"shards":8,"perSec":3000,"p50":21,"p99":87,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":391,"shards":8,"perSec":3000,"p50":21,"p99":89,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":397,"shards":8,"perSec":3000,"p50":21,"p99":119,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":405,"shards":8,"perSec":3000,"p50":22,"p99":114,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":411,"shards":8,"perSec":3000,"p50":22,"p99":83,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":417,"shards":8,"perSec":3000,"p50":22,"p99":118,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":423,"shards":8,"perSec":3000,"p50":22,"p99":89,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":430,"shards":8,"perSec":3000,"p50":21,"p99":128,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":436,"shards":8,"perSec":3000,"p50":21,"p99":90,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":443,"shards":8,"perSec":3000,"p50":22,"p99":114,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":450,"shards":8,"perSec":3000,"p50":24,"p99":156,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":456,"shards":8,"perSec":3000,"p50":21,"p99":130,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":462,"shards":8,"perSec":3000,"p50":21,"p99":90,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":479,"shards":8,"perSec":3000,"p50":21,"p99":117,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":485,"shards":8,"perSec":3000,"p50":22,"p99":100,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+{"t":492,"shards":8,"perSec":3000,"p50":24,"p99":110,"failures":0,"failuresByMessage":{},"skipped":0,"rejected":0}
+VERIFY {"successfulWrites":1049040,"count":1024,"sum":1049040,"tenants":1024,"exact":true}
+split-start {"kind":"split","shard":"open1-0","reason":"saturated, probe 797 ms at 388% load","child":"open1-2"}
+split-start {"kind":"split","shard":"open1-1","reason":"writes 938/s","child":"open1-3"}
+split-done {"parent":"open1-1","child":"open1-3","start":3072,"end":4096,"groups":256,"rows":256,"bytes":14568,"ms":4596}
+split-done {"parent":"open1-1","child":"open1-3","start":3072,"end":4096,"groups":0,"rows":0,"bytes":0,"ms":163}
+split-done {"parent":"open1-0","child":"open1-2","start":1024,"end":2048,"groups":244,"rows":244,"bytes":13886,"ms":7050}
+split-start {"kind":"split","shard":"open1-0","reason":"saturated, probe 280 ms at 117% load","child":"open1-4"}
+split-start {"kind":"split","shard":"open1-2","reason":"saturated, probe 283 ms at 89% load","child":"open1-5"}
+split-start {"kind":"split","shard":"open1-1","reason":"writes 503/s","child":"open1-6"}
+split-start {"kind":"split","shard":"open1-3","reason":"writes 541/s","child":"open1-7"}
+split-done {"parent":"open1-1","child":"open1-6","start":2560,"end":3072,"groups":128,"rows":128,"bytes":7407,"ms":916}
+split-done {"parent":"open1-3","child":"open1-7","start":3584,"end":4096,"groups":135,"rows":135,"bytes":7818,"ms":1329}
+split-done {"parent":"open1-0","child":"open1-4","start":512,"end":1024,"groups":134,"rows":134,"bytes":7767,"ms":2437}
+split-done {"parent":"open1-2","child":"open1-5","start":1536,"end":2048,"groups":127,"rows":127,"bytes":7356,"ms":2655}

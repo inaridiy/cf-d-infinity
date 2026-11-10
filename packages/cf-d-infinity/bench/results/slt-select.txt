@@ -1,0 +1,30 @@
+
+ RUN  v3.2.7 <repo>/prototype
+
+stdout | test/slt.test.ts > sqllogictest > select1 on 4 shards
+shards select1: queries 1000/1000, statements 31/31
+
+stdout | test/slt.test.ts > sqllogictest > select2 on 4 shards
+shards select2: queries 1000/1000, statements 31/31
+
+stdout | test/slt.test.ts > sqllogictest > select3 on 4 shards
+shards select3: queries 3320/3320, statements 31/31
+
+stdout | test/slt.test.ts > sqllogictest > select4 on 4 shards
+shards select4: queries 2832/2832, statements 1025/1025
+
+stdout | test/slt.test.ts > sqllogictest > select5 on 4 shards
+shards select5: queries 732/732, statements 704/704
+
+ ✓ test/slt.test.ts (10 tests | 5 skipped) 46360ms
+   ✓ sqllogictest > select1 on 4 shards  1255ms
+   ✓ sqllogictest > select2 on 4 shards  975ms
+   ✓ sqllogictest > select3 on 4 shards  3262ms
+   ✓ sqllogictest > select4 on 4 shards  12351ms
+   ✓ sqllogictest > select5 on 4 shards  28517ms
+
+ Test Files  1 passed (1)
+      Tests  5 passed | 5 skipped (10)
+   Start at  16:42:03
+   Duration  46.77s (transform 128ms, setup 0ms, collect 205ms, tests 46.36s, environment 0ms, prepare 52ms)
+

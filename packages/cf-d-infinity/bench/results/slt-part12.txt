@@ -1,0 +1,13 @@
+
+ RUN  v3.2.7 <repo>/prototype
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > index/view_slt_good_0.test
+RES index/view_slt_good_0.test oracle 0/0+0/0 ours 0/0+0/0 
+
+ ✓ test/slt-more.test.ts (31 tests | 30 skipped) 4ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 30 skipped (31)
+   Start at  16:49:47
+   Duration  758ms (transform 158ms, setup 0ms, collect 238ms, tests 4ms, environment 0ms, prepare 100ms)
+

@@ -1,0 +1,19 @@
+{
+  "name": "cf-d-infinity",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-07-01",
+  // sql.js の Node 向けの分岐が参照するだけで、Workers では実行されない。
+  "alias": { "fs": "./src/empty.js", "path": "./src/empty.js", "crypto": "./src/empty.js" },
+  // DINF_SHARD_COUNT は最初のシャード数。閾値は DINF_AUTOSCALE_THRESHOLDS (JSON)、追いかける周期は DINF_AUTOSCALE_TICK_MS で上書きできる。
+  "vars": { "DINF_SHARD_COUNT": "8" },
+  // 自動増設のスイッチ。毎分 Autoscaler を起こす。この行を消してデプロイすると止まる。
+  "triggers": { "crons": ["* * * * *"] },
+  "durable_objects": {
+    "bindings": [
+      { "name": "DINF_SHARD", "class_name": "DinfShard" },
+      { "name": "DINF_META", "class_name": "DinfMeta" },
+      { "name": "DINF_AUTOSCALER", "class_name": "DinfAutoscaler" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DinfShard", "DinfMeta", "DinfAutoscaler"] }]
+}

@@ -1,0 +1,18 @@
+{
+  // 計測用の構成。本番の入口に /bench と障害注入のプローブを足す。本番には使わない。
+  "name": "cf-d-infinity-bench",
+  "main": "src/bench.ts",
+  "compatibility_date": "2026-07-01",
+  // sql.js の Node 向けの分岐が参照するだけで、Workers では実行されない。
+  "alias": { "fs": "./src/empty.js", "path": "./src/empty.js", "crypto": "./src/empty.js" },
+  "vars": { "DINF_SHARD_COUNT": "8" },
+  // Cron Trigger は置かない。計測は /admin/autoscale/start で、負荷によらず一定の周期で判断させる。
+  "durable_objects": {
+    "bindings": [
+      { "name": "DINF_SHARD", "class_name": "DinfShard" },
+      { "name": "DINF_META", "class_name": "DinfMeta" },
+      { "name": "DINF_AUTOSCALER", "class_name": "DinfAutoscaler" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DinfShard", "DinfMeta", "DinfAutoscaler"] }]
+}

@@ -1,0 +1,89 @@
+{
+ "cluster": "dry",
+ "durationS": 40,
+ "valid": true,
+ "anomalies": {},
+ "stats": {
+  "txns": 10075,
+  "ok": 9552,
+  "fail": 523,
+  "info": 0,
+  "infoCommitted": 0,
+  "keys": 96,
+  "elements": 10100,
+  "edges": 21671
+ },
+ "byMode": {
+  "auto": {
+   "ok": 1412,
+   "fail": 0,
+   "info": 0
+  },
+  "optimistic": {
+   "ok": 4105,
+   "fail": 146,
+   "info": 0
+  },
+  "pessimistic": {
+   "ok": 4035,
+   "fail": 377,
+   "info": 0
+  }
+ },
+ "lostInvocations": 5,
+ "failures": {
+  "invocation: TypeError: fetch failed": 5,
+  "not owner: dry-4": 375,
+  "conflict: refresh: span changed": 2
+ },
+ "events": [
+  {
+   "t": 10,
+   "kind": "crash-failed",
+   "detail": {
+    "error": "TypeError: fetch failed"
+   }
+  },
+  {
+   "t": 15,
+   "kind": "crash",
+   "detail": {
+    "target": "dry-3"
+   }
+  },
+  {
+   "t": 15,
+   "kind": "split",
+   "detail": {
+    "parent": "dry-1",
+    "child": "dry-4",
+    "ms": 15,
+    "groups": 7
+   }
+  },
+  {
+   "t": 16,
+   "kind": "crash",
+   "detail": {
+    "target": "dry-4"
+   }
+  },
+  {
+   "t": 25,
+   "kind": "crash-failed",
+   "detail": {
+    "error": "TypeError: fetch failed"
+   }
+  },
+  {
+   "t": 30,
+   "kind": "split",
+   "detail": {
+    "parent": "dry-1",
+    "child": "dry-5",
+    "ms": 28,
+    "groups": 5
+   }
+  }
+ ]
+}

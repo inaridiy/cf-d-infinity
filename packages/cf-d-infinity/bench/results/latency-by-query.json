@@ -1,0 +1,67 @@
+{
+ "baseline SELECT 1 (no shard)": {
+  "p50": 17.087300999992294,
+  "p90": 22.107529999993858,
+  "n": 25
+ },
+ "point read by primary key": {
+  "p50": 30.584034999992582,
+  "p90": 42.30664700000489,
+  "n": 25
+ },
+ "point write (autocommit, no index)": {
+  "p50": 41.3037869999971,
+  "p90": 52.09179900000163,
+  "n": 25
+ },
+ "join inside one shard": {
+  "p50": 33.271549999990384,
+  "p90": 45.237865000002785,
+  "n": 25
+ },
+ "lookup through a global index": {
+  "p50": 32.345996999996714,
+  "p90": 44.88363599999866,
+  "n": 25
+ },
+ "insert with a global UNIQUE (2PC)": {
+  "p50": 104.62509100000898,
+  "p90": 131.49306700000307,
+  "n": 15
+ },
+ "all shards: count(*) (partial aggregate)": {
+  "p50": 63.45197699998971,
+  "p90": 80.75934899999993,
+  "n": 25
+ },
+ "all shards: GROUP BY (partial aggregate)": {
+  "p50": 68.43515799999295,
+  "p90": 77.58850399999938,
+  "n": 25
+ },
+ "all shards: ORDER BY LIMIT (top N)": {
+  "p50": 66.59339900000487,
+  "p90": 96.02228600000672,
+  "n": 25
+ },
+ "all shards: HAVING (Worker SQLite, 2,000 rows)": {
+  "p50": 76.74814199999673,
+  "p90": 94.08742500000517,
+  "n": 15
+ },
+ "cross-shard JOIN (Worker SQLite)": {
+  "p50": 95.34188100000028,
+  "p90": 134.89565599999332,
+  "n": 15
+ },
+ "batch: 2 shards in one transaction": {
+  "p50": 136.64390199999616,
+  "p90": 142.94297400000505,
+  "n": 15
+ },
+ "interactive transaction (3 statements)": {
+  "p50": 117.74763099999109,
+  "p90": 129.04937999999675,
+  "n": 15
+ }
+}

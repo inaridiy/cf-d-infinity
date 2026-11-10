@@ -1,0 +1,22 @@
+
+ RUN  v3.2.7 <repo>/prototype
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/select_slt_good_0.test
+RES random/select_slt_good_0.test oracle 10000/10000+12/12 ours 10000/10000+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/select_slt_good_1.test
+RES random/select_slt_good_1.test oracle 10000/10000+12/12 ours 10000/10000+12/12 
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > random/select_slt_good_10.test
+RES random/select_slt_good_10.test oracle 9999/9999+12/12 ours 9999/9999+12/12 
+
+ ✓ test/slt-more.test.ts (31 tests | 28 skipped) 22058ms
+   ✓ sqllogictest, the rest > random/select_slt_good_0.test  9849ms
+   ✓ sqllogictest, the rest > random/select_slt_good_1.test  6237ms
+   ✓ sqllogictest, the rest > random/select_slt_good_10.test  5970ms
+
+ Test Files  1 passed (1)
+      Tests  3 passed | 28 skipped (31)
+   Start at  16:43:12
+   Duration  22.89s (transform 232ms, setup 0ms, collect 303ms, tests 22.06s, environment 0ms, prepare 232ms)
+

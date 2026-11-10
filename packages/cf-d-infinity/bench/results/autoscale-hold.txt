@@ -1,0 +1,46 @@
+{"t":6,"shards":33,"perSec":4325,"p50":53,"p99":1446,"failures":459}
+{"t":14,"shards":33,"perSec":9740,"p50":31,"p99":174,"failures":428}
+{"t":21,"shards":33,"perSec":10021,"p50":31,"p99":180,"failures":0}
+{"t":27,"shards":33,"perSec":9689,"p50":32,"p99":214,"failures":0}
+{"t":33,"shards":33,"perSec":11056,"p50":28,"p99":256,"failures":0}
+{"t":40,"shards":33,"perSec":11189,"p50":27,"p99":257,"failures":0}
+{"t":47,"shards":33,"perSec":10915,"p50":26,"p99":372,"failures":0}
+{"t":53,"shards":33,"perSec":11146,"p50":26,"p99":370,"failures":0}
+{"t":59,"shards":33,"perSec":11093,"p50":27,"p99":361,"failures":0}
+{"t":66,"shards":33,"perSec":10887,"p50":26,"p99":383,"failures":0}
+{"t":74,"shards":33,"perSec":10997,"p50":27,"p99":363,"failures":0}
+{"t":81,"shards":33,"perSec":9457,"p50":26,"p99":375,"failures":1025}
+{"t":87,"shards":33,"perSec":10697,"p50":27,"p99":351,"failures":90}
+{"t":93,"shards":33,"perSec":10865,"p50":27,"p99":382,"failures":0}
+{"t":100,"shards":33,"perSec":10461,"p50":27,"p99":411,"failures":0}
+{"t":106,"shards":33,"perSec":10579,"p50":26,"p99":364,"failures":6}
+{"t":114,"shards":33,"perSec":6100,"p50":24,"p99":234,"failures":435}
+{"t":121,"shards":33,"perSec":5866,"p50":24,"p99":262,"failures":444}
+{"t":129,"shards":33,"perSec":5741,"p50":24,"p99":254,"failures":455}
+{"t":137,"shards":33,"perSec":5959,"p50":23,"p99":324,"failures":445}
+{"t":145,"shards":33,"perSec":6111,"p50":24,"p99":213,"failures":445}
+{"t":153,"shards":33,"perSec":5512,"p50":24,"p99":324,"failures":444}
+{"t":161,"shards":33,"perSec":5844,"p50":24,"p99":298,"failures":462}
+{"t":169,"shards":33,"perSec":5700,"p50":25,"p99":211,"failures":444}
+{"t":177,"shards":33,"perSec":5713,"p50":24,"p99":262,"failures":456}
+{"t":185,"shards":33,"perSec":5407,"p50":24,"p99":322,"failures":428}
+{"t":192,"shards":33,"perSec":5558,"p50":24,"p99":272,"failures":433}
+{"t":199,"shards":33,"perSec":4477,"p50":24,"p99":444,"failures":368}
+{"t":207,"shards":33,"perSec":6149,"p50":24,"p99":196,"failures":477}
+{"t":215,"shards":33,"perSec":5830,"p50":24,"p99":271,"failures":445}
+{"t":223,"shards":33,"perSec":5848,"p50":24,"p99":241,"failures":448}
+{"t":231,"shards":33,"perSec":5745,"p50":23,"p99":258,"failures":424}
+{"t":239,"shards":33,"perSec":5577,"p50":24,"p99":303,"failures":442}
+{"t":247,"shards":33,"perSec":5594,"p50":23,"p99":257,"failures":494}
+{"t":255,"shards":33,"perSec":5973,"p50":23,"p99":252,"failures":483}
+{"t":263,"shards":33,"perSec":5338,"p50":23,"p99":277,"failures":446}
+file:///<repo>/prototype/bench/run.mjs:9
+  if (!r.ok) throw new Error(`${r.status} ${text.slice(0, 200)}`);
+                   ^
+
+Error: 400 {"error":"migrating: a whole-table read must wait for the move to finish"}
+    at post (file:///<repo>/prototype/bench/run.mjs:9:20)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async hold.mjs:14:11
+
+Node.js v24.15.0

@@ -1,0 +1,15 @@
+{
+  "name": "create-cf-d-infinity",
+  "version": "0.1.0-alpha.0",
+  "description": "Sets up cf-d-infinity, an unofficial sharded SQLite database for Cloudflare Workers, in a Workers project: bindings, migration, Cron Trigger and the re-export module.",
+  "license": "MIT",
+  "type": "module",
+  "repository": { "type": "git", "url": "git+https://github.com/inaridiy/cf-d-infinity.git", "directory": "packages/create-cf-d-infinity" },
+  "keywords": ["cloudflare", "workers", "durable-objects", "sqlite", "d1", "cf-d-infinity"],
+  "bin": { "create-cf-d-infinity": "bin.js" },
+  "files": ["bin.js", "src"],
+  "engines": { "node": ">=20" },
+  "publishConfig": { "access": "public", "tag": "alpha" },
+  "scripts": { "test": "node --test test/*.test.js" },
+  "dependencies": { "jsonc-parser": "^3.3.1" }
+}

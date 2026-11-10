@@ -1,0 +1,85 @@
+[
+ {
+  "name": "write, 1000 rows",
+  "clients": 20,
+  "perSec": 128,
+  "busyPct": 0.1,
+  "p50": 123,
+  "p99": 511,
+  "ok": 1021,
+  "sum": 1021,
+  "exact": true,
+  "reasons": {
+   "SERVER_ERROR: Server returned HTTP status 40": 1
+  }
+ },
+ {
+  "name": "write, 100 hot rows",
+  "clients": 20,
+  "perSec": 129,
+  "busyPct": 0,
+  "p50": 114,
+  "p99": 1087,
+  "ok": 1030,
+  "sum": 1030,
+  "exact": true,
+  "reasons": {}
+ },
+ {
+  "name": "write, 10 hot rows",
+  "clients": 20,
+  "perSec": 92,
+  "busyPct": 0.7,
+  "p50": 183,
+  "p99": 634,
+  "ok": 737,
+  "sum": 737,
+  "exact": true,
+  "reasons": {
+   "SQLITE_BUSY: not owner: stale schema 4 < 6": 5
+  }
+ },
+ {
+  "name": "write, 1 hot row",
+  "clients": 20,
+  "perSec": 13,
+  "busyPct": 1.9,
+  "p50": 1740,
+  "p99": 2110,
+  "ok": 106,
+  "sum": 106,
+  "exact": true,
+  "reasons": {
+   "SQLITE_BUSY: not owner: stale schema 6 < 8": 2
+  }
+ },
+ {
+  "name": "deferred, 100 hot rows",
+  "clients": 20,
+  "perSec": 137,
+  "busyPct": 11.6,
+  "p50": 112,
+  "p99": 320,
+  "ok": 1093,
+  "sum": 1093,
+  "exact": true,
+  "reasons": {
+   "SQLITE_BUSY: conflict: span changed after T": 144
+  }
+ },
+ {
+  "name": "deferred, 1 hot row",
+  "clients": 20,
+  "perSec": 1,
+  "busyPct": 94.4,
+  "p50": 830,
+  "p99": 987,
+  "ok": 11,
+  "sum": 11,
+  "exact": true,
+  "reasons": {
+   "SQLITE_BUSY: conflict: span changed after T": 186,
+   "SQLITE_BUSY: not owner: stale schema 10 < 12": 1
+  }
+ }
+]

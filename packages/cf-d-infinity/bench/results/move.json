@@ -1,0 +1,70 @@
+{
+ "idle": {
+  "parent": "mv2-0",
+  "child": "mv2-1",
+  "start": 2048,
+  "end": 4096,
+  "groups": 128,
+  "rows": 51328,
+  "bytes": 55373034,
+  "ms": 13385
+ },
+ "before": {
+  "op": "write",
+  "shards": 1,
+  "clients": 12,
+  "concurrency": 4,
+  "count": 1868,
+  "perSec": 374,
+  "wall": 5.197,
+  "p50": 111,
+  "p99": 308,
+  "failures": {},
+  "rejected": 0,
+  "colos": [
+   "NRT"
+  ]
+ },
+ "hot": {
+  "parent": "mv3-0",
+  "child": "mv3-1",
+  "start": 2048,
+  "end": 4096,
+  "groups": 9,
+  "rows": 3609,
+  "bytes": 3891335,
+  "ms": 10623
+ },
+ "during": {
+  "op": "write",
+  "shards": 1,
+  "clients": 12,
+  "concurrency": 4,
+  "count": 3251,
+  "perSec": 217,
+  "wall": 15.268,
+  "p50": 117,
+  "p99": 1748,
+  "failures": {},
+  "rejected": 0,
+  "colos": [
+   "NRT"
+  ]
+ },
+ "after": {
+  "op": "write",
+  "shards": 1,
+  "clients": 12,
+  "concurrency": 4,
+  "count": 2806,
+  "perSec": 561,
+  "wall": 5.287,
+  "p50": 63,
+  "p99": 365,
+  "failures": {},
+  "rejected": 0,
+  "colos": [
+   "NRT"
+  ]
+ }
+}

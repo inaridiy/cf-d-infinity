@@ -1,0 +1,14 @@
+
+ RUN  v3.2.7 <repo>/prototype
+
+stdout | test/slt-more.test.ts > sqllogictest, the rest > index/random_slt_good_0.test
+RES index/random_slt_good_0.test oracle 10000/10000+32/32 ours 10000/10000+32/32 
+
+ ✓ test/slt-more.test.ts (31 tests | 30 skipped) 7279ms
+   ✓ sqllogictest, the rest > index/random_slt_good_0.test  7278ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 30 skipped (31)
+   Start at  16:49:47
+   Duration  8.08s (transform 160ms, setup 0ms, collect 243ms, tests 7.28s, environment 0ms, prepare 102ms)
+

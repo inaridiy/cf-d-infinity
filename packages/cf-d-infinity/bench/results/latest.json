@@ -1,0 +1,717 @@
+{
+ "at": "2026-11-06T09:03:33.226Z",
+ "probes": {
+  "sync": {
+   "n": 60,
+   "p50": 10,
+   "p90": 12,
+   "max": 13
+  },
+  "peer": {
+   "n": 60,
+   "p50": 13,
+   "p90": 18,
+   "max": 367
+  },
+  "clockSpreadMs": {
+   "n": 5,
+   "p50": 23,
+   "p90": 45,
+   "max": 45
+  },
+  "clockRtt": {
+   "n": 40,
+   "p50": 17,
+   "p90": 24,
+   "max": 75
+  }
+ },
+ "ceiling": [
+  {
+   "op": "ping",
+   "shards": 1,
+   "clients": 4,
+   "concurrency": 6,
+   "count": 6217,
+   "perSec": 1243,
+   "wall": 5.626,
+   "p50": 17,
+   "p99": 56,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "ping",
+   "shards": 1,
+   "clients": 16,
+   "concurrency": 6,
+   "count": 8467,
+   "perSec": 1693,
+   "wall": 5.593,
+   "p50": 55,
+   "p99": 159,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "ping",
+   "shards": 1,
+   "clients": 48,
+   "concurrency": 6,
+   "count": 11938,
+   "perSec": 2388,
+   "wall": 5.507,
+   "p50": 108,
+   "p99": 203,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "rawRead",
+   "shards": 1,
+   "clients": 4,
+   "concurrency": 6,
+   "count": 6313,
+   "perSec": 1263,
+   "wall": 5.153,
+   "p50": 18,
+   "p99": 50,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "rawRead",
+   "shards": 1,
+   "clients": 16,
+   "concurrency": 6,
+   "count": 9512,
+   "perSec": 1902,
+   "wall": 5.644,
+   "p50": 35,
+   "p99": 309,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "rawRead",
+   "shards": 1,
+   "clients": 48,
+   "concurrency": 6,
+   "count": 10234,
+   "perSec": 2047,
+   "wall": 5.432,
+   "p50": 118,
+   "p99": 288,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "rawWrite",
+   "shards": 1,
+   "clients": 4,
+   "concurrency": 6,
+   "count": 6020,
+   "perSec": 1204,
+   "wall": 5.1,
+   "p50": 18,
+   "p99": 61,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "rawWrite",
+   "shards": 1,
+   "clients": 16,
+   "concurrency": 6,
+   "count": 9194,
+   "perSec": 1839,
+   "wall": 5.845,
+   "p50": 41,
+   "p99": 159,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "rawWrite",
+   "shards": 1,
+   "clients": 48,
+   "concurrency": 6,
+   "count": 9536,
+   "perSec": 1907,
+   "wall": 5.751,
+   "p50": 162,
+   "p99": 278,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "read",
+   "shards": 1,
+   "clients": 4,
+   "concurrency": 6,
+   "count": 8091,
+   "perSec": 1618,
+   "wall": 5.565,
+   "p50": 14,
+   "p99": 57,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "read",
+   "shards": 1,
+   "clients": 16,
+   "concurrency": 6,
+   "count": 11509,
+   "perSec": 2302,
+   "wall": 5.637,
+   "p50": 34,
+   "p99": 152,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "read",
+   "shards": 1,
+   "clients": 48,
+   "concurrency": 6,
+   "count": 11807,
+   "perSec": 2361,
+   "wall": 5.759,
+   "p50": 106,
+   "p99": 244,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "write",
+   "shards": 1,
+   "clients": 4,
+   "concurrency": 6,
+   "count": 3562,
+   "perSec": 712,
+   "wall": 5.18,
+   "p50": 30,
+   "p99": 103,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "write",
+   "shards": 1,
+   "clients": 16,
+   "concurrency": 6,
+   "count": 4842,
+   "perSec": 968,
+   "wall": 5.274,
+   "p50": 89,
+   "p99": 200,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "write",
+   "shards": 1,
+   "clients": 48,
+   "concurrency": 6,
+   "count": 4584,
+   "perSec": 917,
+   "wall": 5.588,
+   "p50": 341,
+   "p99": 478,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  }
+ ],
+ "fanin": [
+  {
+   "op": "ping",
+   "shards": 16,
+   "clients": 2,
+   "concurrency": 2,
+   "count": 980,
+   "perSec": 245,
+   "wall": 4.696,
+   "p50": 14,
+   "p99": 245,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "ping",
+   "shards": 16,
+   "clients": 2,
+   "concurrency": 6,
+   "count": 3863,
+   "perSec": 966,
+   "wall": 4.206,
+   "p50": 12,
+   "p99": 30,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "ping",
+   "shards": 16,
+   "clients": 2,
+   "concurrency": 12,
+   "count": 4867,
+   "perSec": 1217,
+   "wall": 4.16,
+   "p50": 19,
+   "p99": 50,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "ping",
+   "shards": 16,
+   "clients": 2,
+   "concurrency": 24,
+   "count": 4507,
+   "perSec": 1127,
+   "wall": 5.404,
+   "p50": 40,
+   "p99": 82,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "ping",
+   "shards": 16,
+   "clients": 2,
+   "concurrency": 48,
+   "count": 4949,
+   "perSec": 1237,
+   "wall": 6.195,
+   "p50": 77,
+   "p99": 121,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  }
+ ],
+ "scale": [
+  {
+   "op": "read",
+   "shards": 1,
+   "clients": 8,
+   "concurrency": 6,
+   "count": 10829,
+   "perSec": 1805,
+   "wall": 6.524,
+   "p50": 23,
+   "p99": 130,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "write",
+   "shards": 1,
+   "clients": 8,
+   "concurrency": 6,
+   "count": 5111,
+   "perSec": 852,
+   "wall": 6.37,
+   "p50": 45,
+   "p99": 164,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "read",
+   "shards": 2,
+   "clients": 12,
+   "concurrency": 6,
+   "count": 15269,
+   "perSec": 2545,
+   "wall": 6.608,
+   "p50": 20,
+   "p99": 216,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "write",
+   "shards": 2,
+   "clients": 12,
+   "concurrency": 6,
+   "count": 5755,
+   "perSec": 959,
+   "wall": 6.5,
+   "p50": 58,
+   "p99": 222,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "read",
+   "shards": 4,
+   "clients": 24,
+   "concurrency": 6,
+   "count": 21586,
+   "perSec": 3598,
+   "wall": 6.663,
+   "p50": 17,
+   "p99": 212,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "write",
+   "shards": 4,
+   "clients": 24,
+   "concurrency": 6,
+   "count": 7897,
+   "perSec": 1316,
+   "wall": 6.484,
+   "p50": 43,
+   "p99": 485,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "read",
+   "shards": 8,
+   "clients": 48,
+   "concurrency": 6,
+   "count": 46114,
+   "perSec": 7686,
+   "wall": 8.248,
+   "p50": 18,
+   "p99": 248,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "write",
+   "shards": 8,
+   "clients": 48,
+   "concurrency": 6,
+   "count": 22073,
+   "perSec": 3679,
+   "wall": 6.631,
+   "p50": 36,
+   "p99": 487,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "read",
+   "shards": 16,
+   "clients": 96,
+   "concurrency": 6,
+   "count": 78845,
+   "perSec": 13141,
+   "wall": 6.922,
+   "p50": 19,
+   "p99": 267,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "write",
+   "shards": 16,
+   "clients": 96,
+   "concurrency": 6,
+   "count": 30478,
+   "perSec": 5080,
+   "wall": 6.591,
+   "p50": 37,
+   "p99": 820,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "read",
+   "shards": 32,
+   "clients": 192,
+   "concurrency": 6,
+   "count": 169507,
+   "perSec": 28251,
+   "wall": 7.029,
+   "p50": 17,
+   "p99": 258,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "write",
+   "shards": 32,
+   "clients": 192,
+   "concurrency": 6,
+   "count": 70650,
+   "perSec": 11775,
+   "wall": 6.963,
+   "p50": 31,
+   "p99": 974,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "read",
+   "shards": 64,
+   "clients": 240,
+   "concurrency": 6,
+   "count": 207588,
+   "perSec": 34598,
+   "wall": 7.897,
+   "p50": 15,
+   "p99": 240,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "write",
+   "shards": 64,
+   "clients": 240,
+   "concurrency": 6,
+   "count": 112704,
+   "perSec": 18784,
+   "wall": 8.968,
+   "p50": 29,
+   "p99": 567,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  }
+ ],
+ "txn": [
+  {
+   "op": "txn1",
+   "shards": 8,
+   "clients": 48,
+   "concurrency": 4,
+   "count": 4475,
+   "perSec": 746,
+   "wall": 11.579,
+   "p50": 70,
+   "p99": 3311,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT",
+    "LAX"
+   ]
+  },
+  {
+   "op": "txn2",
+   "shards": 8,
+   "clients": 48,
+   "concurrency": 4,
+   "count": 2895,
+   "perSec": 483,
+   "wall": 6.654,
+   "p50": 265,
+   "p99": 1862,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "txn1",
+   "shards": 32,
+   "clients": 192,
+   "concurrency": 4,
+   "count": 25360,
+   "perSec": 4227,
+   "wall": 7.256,
+   "p50": 75,
+   "p99": 1171,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "txn2",
+   "shards": 32,
+   "clients": 192,
+   "concurrency": 4,
+   "count": 8437,
+   "perSec": 1406,
+   "wall": 9.772,
+   "p50": 315,
+   "p99": 5936,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  }
+ ],
+ "hot": [
+  {
+   "op": "hot",
+   "shards": 8,
+   "clients": 2,
+   "concurrency": 4,
+   "count": 1523,
+   "perSec": 305,
+   "wall": 5.369,
+   "p50": 26,
+   "p99": 46,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "hot",
+   "shards": 8,
+   "clients": 8,
+   "concurrency": 4,
+   "count": 3208,
+   "perSec": 642,
+   "wall": 5.18,
+   "p50": 48,
+   "p99": 90,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  },
+  {
+   "op": "hot",
+   "shards": 8,
+   "clients": 24,
+   "concurrency": 4,
+   "count": 3225,
+   "perSec": 645,
+   "wall": 5.25,
+   "p50": 150,
+   "p99": 268,
+   "failures": {},
+   "rejected": 0,
+   "colos": [
+    "NRT"
+   ]
+  }
+ ]
+}

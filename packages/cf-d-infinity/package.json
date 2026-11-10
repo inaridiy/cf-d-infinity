@@ -1,0 +1,71 @@
+{
+  "name": "cf-d-infinity",
+  "version": "0.1.0-alpha.0",
+  "description": "Unofficial, experimental SQLite database for Cloudflare Workers that scales past one Durable Object: interactive serializable transactions across shards, a D1-compatible API over a Service Binding.",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inaridiy/cf-d-infinity.git",
+    "directory": "packages/cf-d-infinity"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "durable-objects",
+    "sqlite",
+    "d1",
+    "database",
+    "sharding",
+    "newsql",
+    "libsql",
+    "drizzle"
+  ],
+  "exports": {
+    "./cloudflare": {
+      "types": "./lib/types/cloudflare.d.ts",
+      "default": "./lib/cloudflare.js"
+    },
+    "./client": {
+      "types": "./lib/types/binding.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "NOTICE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "tag": "alpha"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepack": "npm run build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "bundle": "esbuild src/worker.ts --bundle --format=esm --platform=browser --external:cloudflare:workers --external:*.wasm --alias:fs=./src/empty.js --alias:path=./src/empty.js --alias:crypto=./src/empty.js --outfile=dist/worker.js",
+    "bundle:bench": "esbuild src/bench.ts --bundle --format=esm --platform=browser --external:cloudflare:workers --external:*.wasm --alias:fs=./src/empty.js --alias:path=./src/empty.js --alias:crypto=./src/empty.js --outfile=dist/bench.js",
+    "deploy": "wrangler deploy",
+    "deploy:bench": "wrangler deploy -c wrangler.bench.jsonc",
+    "check": "tsc --noEmit && vitest run"
+  },
+  "dependencies": {
+    "sql-parser-cst": "^0.33.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261106.1",
+    "@duckdb/node-api": "2.0.0-r.1",
+    "@libsql/client": "^0.18.0",
+    "@types/node": "^24.0.0",
+    "@types/sql.js": "^1.4.11",
+    "drizzle-orm": "0.45.4",
+    "esbuild": "^0.25.0",
+    "miniflare": "4.20260730.0",
+    "sql.js": "1.13.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0",
+    "wrangler": "^4.158.0"
+  }
+}
