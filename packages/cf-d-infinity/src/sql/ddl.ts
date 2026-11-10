@@ -245,6 +245,7 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
     }
     // 部分 index も記録する。記録しないと、書き込みの UNIQUE の検査がこの表を飛ばし、確定した後の適用で初めて違反になる。
     if (unique) def.uniques.push(cols);
+    if (unique && partial) def.partialUnique = true;
     const drop = `DROP INDEX IF EXISTS ${q(name)}`;
     return { sql: [text(stmt)], defs: [def], drops: [], user: source, indexes: { [name]: { table, global: false } }, undo: { sql: [drop], user: drop } };
   }

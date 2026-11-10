@@ -1391,7 +1391,8 @@ export class ShardCore implements ShardApi {
   private runCaptured(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[] } | null {
     const capture = req.write?.capture;
     const span = req.spans[0];
-    if (!capture || this.faults.triggerCapture || !span || req.spans.length !== 1) return null;
+    // 2 つ目以降の範囲は、同じ表の、UNIQUE の検査で読む行だけである (spans.ts の規則 3)。ほかの表を読む文は、ここでは扱わない。
+    if (!capture || this.faults.triggerCapture || !span || req.spans.some((s) => s.table !== span.table)) return null;
     if (capture === "update" && span.kind !== "pk") return null;
     const def = this.def(span.table);
     const sk = req.write!.sk;

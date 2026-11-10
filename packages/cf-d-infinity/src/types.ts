@@ -34,6 +34,11 @@ export interface TableDef {
   collation: Record<string, string>;
   /** シャード内の UNIQUE (shard key を含むもの)。部分 index (WHERE 付き) の列も含む。 */
   uniques: string[][];
+  /**
+   * 条件付きの UNIQUE index (WHERE 付き) がある。条件の列を書き換えると、UNIQUE の列に触らなくても、行が index に入り、
+   * UNIQUE の検査が別の行を読む。どの列が条件に関わるかは追わないので、UPDATE は別の行を読み得るものとして扱う。
+   */
+  partialUnique?: boolean;
   /** 生成列。値は SQLite が計算するので、行イメージを書き戻すときは除く。 */
   generated?: string[];
   globalIndexes: GlobalIndexDef[];

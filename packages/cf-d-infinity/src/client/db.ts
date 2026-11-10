@@ -483,7 +483,7 @@ export class Txn extends ReadScope {
       // index 経由の UPDATE と DELETE は、文を shard key に絞らずに送る。読みと同じく、span も絞らない。
       // 絞ると、ほかの行の確定済みで適用待ちの更新が決着されず、文がその行を古い値から書き換えてしまう。
       const tables = await this.db.tablesOf(t.sql, this.cat, p.tables ?? [p.def]);
-      const spans = statementSpans({ tables, sks: target.sks, pk: t.pk, write: true });
+      const spans = statementSpans({ tables, sks: target.sks, pk: t.pk, write: true, uniqueReads: t.uniqueReads });
       const res = await this.dml(target.shard, { sql: t.sql, params: t.params, spans, write: t.write });
       if (res.columns.length) out.columns = res.columns;
       out.values.push(...res.values);
@@ -1315,7 +1315,7 @@ export class Db {
     const table = p.def.name;
     // サブクエリが読む表も span に入れる。入れないと、その表の確定済みで適用待ちの書き込みを待たずに実行してしまう。
     const tables = p.tables ?? [p.def];
-    const spans = statementSpans({ tables: await this.tablesOf(t.sql, cat, p.tables ?? [p.def]), sks: [sk], pk: t.pk, write: true });
+    const spans = statementSpans({ tables: await this.tablesOf(t.sql, cat, p.tables ?? [p.def]), sks: [sk], pk: t.pk, write: true, uniqueReads: t.uniqueReads });
     const res = await this.shardOf(ownerOf(cat.routing, sk)).execAuto({
       sql: t.sql, params: t.params, spans, write: t.write, schema: cat.version, minTs: this.token,
     });

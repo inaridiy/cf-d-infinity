@@ -29,6 +29,18 @@ export interface WriteTarget {
   params: Value[];
   write: WritePlan;
   pk: string | null;
+  /**
+   * 文が、シャード内の UNIQUE の検査で読む行。範囲を作る関数が、名指しした 1 行に加えて、これを範囲に入れる。
+   *   "none"  UNIQUE の列を書かない (DELETE、UNIQUE の列に触らない UPDATE)。別の行は読まない。
+   *   配列    書く行の UNIQUE の列の値。同じ値を持つ行を読む。
+   *   無指定  分からない。同じ shard key の値の全行を範囲にする。
+   */
+  uniqueReads?: "none" | UniqueRead[];
+}
+
+export interface UniqueRead {
+  cols: string[];
+  values: Value[];
 }
 
 export type Plan =
@@ -776,12 +788,12 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
 
   const outCols = auto && idAt < 0 ? [auto, ...names] : names;
   const skAt = def.shardKey.map((c) => outCols.findIndex((n2) => same(n2, c) || (c === "rowid" && ROWID_NAMES.has(lower(n2)))));
-  type Built = { sk: string; pk: string | null; sql: string; params: Value[] };
+  type Built = { sk: string; pk: string | null; sql: string; params: Value[]; uniq: UniqueRead[] | null };
   const built: Built[] = [];
   for (const [i, r] of rows.entries()) {
     const id = assigned.get(i);
-    const parts: { sql: string; params: Value[]; value: () => Promise<Value>; late?: () => Promise<Value> }[] = r.map((node, j) => {
-      if (j === idAt && id !== undefined) return { sql: "?", params: [id], value: async () => id };
+    const parts: { sql: string; params: Value[]; value: () => Promise<Value>; late?: () => Promise<Value>; fixed?: { value: Value } }[] = r.map((node, j) => {
+      if (j === idAt && id !== undefined) return { sql: "?", params: [id], value: async () => id, fixed: { value: id } };
       const rr = render(node, values);
       if (reads[i]![j]) {
         let v: Promise<Value> | undefined;
@@ -789,10 +801,25 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
         return { sql: "?", params: [], value, late: value };
       }
       const c = constant(node, values);
-      return { sql: rr.sql, params: rr.params, value: async () => (c ? c.value : ctx.evaluate(`SELECT ${rr.sql}`, rr.params)) };
+      return { sql: rr.sql, params: rr.params, value: async () => (c ? c.value : ctx.evaluate(`SELECT ${rr.sql}`, rr.params)), fixed: c ?? undefined };
     });
     if (auto && idAt < 0) parts.unshift({ sql: "?", params: [id!], value: async () => id! });
     for (const p of parts) if (p.late) p.params = [await p.late()];
+    // UNIQUE の列の値が、文から定数として決まるか。決まれば、UNIQUE の検査が読む行を「その値を持つ行」と言える。
+    const uniq: UniqueRead[] | null = (() => {
+      const out: UniqueRead[] = [];
+      for (const cols of def.uniques) {
+        const vals: Value[] = [];
+        for (const c of cols) {
+          const at = outCols.findIndex((n2) => same(n2, c));
+          const fixed = at < 0 ? undefined : (parts[at]!.fixed ?? (parts[at]!.late ? { value: parts[at]!.params[0] ?? null } : undefined));
+          if (!fixed) return null;
+          vals.push(fixed.value);
+        }
+        out.push({ cols, values: vals });
+      }
+      return out;
+    })();
     const skVals: Value[] = [];
     for (const [k, at] of skAt.entries()) {
       const v = at < 0 ? null : await parts[at]!.value();
@@ -811,7 +838,7 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
       }
     }
     built.push({
-      sk: encode(skVals), pk: encode(pkVals),
+      sk: encode(skVals), pk: encode(pkVals), uniq,
       sql: `(${parts.map((p) => p.sql).join(", ")})`, params: parts.flatMap((p) => p.params),
     });
   }
@@ -842,6 +869,8 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
         params: [...chunk.flatMap((b) => b.params), ...tailParams],
         write: { sk: sks.length === 1 ? sks[0]! : null, capture },
         pk: chunk.length === 1 ? chunk[0]!.pk : null,
+        // UPSERT は、衝突した行を書き換える。書き換えた後の値で、もう一度 UNIQUE の検査が走り得るので、値が決まるとは言えない。
+        uniqueReads: chunk.length === 1 && chunk[0]!.uniq && !tailClauses.some((c) => c.type === "upsert_clause") ? chunk[0]!.uniq : undefined,
       });
     }
   }
@@ -882,7 +911,10 @@ function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog): Plan {
     const key = statementPin(scopes, values);
     if (key !== null) {
       const pk = scopes.length === 1 && top.refs.length === 1 ? pkOf(conjuncts(top.where), ref, top, values) : null;
-      return { kind: "write", def, tables: defs, lastRowid: null, targets: [{ route: { by: "sk", sks: [key] }, sql, params, write: { sk: key, capture: captureOf(stmt, pk) }, pk }] };
+      // DELETE と、UNIQUE の列に触らない UPDATE は、UNIQUE の検査で別の行を読まない。
+      const touchesUnique = stmt.type === "update_stmt" && (assigned.length !== (set?.assignments?.items ?? []).length || assigned.some((c) => def.uniques.some((u) => u.some((k) => same(k, c)))));
+      const uniqueReads = stmt.type === "delete_stmt" || (!touchesUnique && !def.partialUnique) ? "none" as const : undefined;
+      return { kind: "write", def, tables: defs, lastRowid: null, targets: [{ route: { by: "sk", sks: [key] }, sql, params, write: { sk: key, capture: captureOf(stmt, pk) }, pk, uniqueReads }] };
     }
   }
   return { kind: "wasmWrite", scans: scansFor(scopes, n, values), sql, params, tables: defs };

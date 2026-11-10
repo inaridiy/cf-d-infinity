@@ -6,7 +6,8 @@
 //
 // 既定は広く取る。狭めてよいのは、下に書いた規則に当てはまる形だけである。規則を足すときは、その形の文を
 // 範囲の検査 (ShardDeps.spanEscape、試験では常に掛かる) に通してから足す。
-import type { Scan } from "../sql/plan";
+import type { Scan, UniqueRead } from "../sql/plan";
+import { q } from "../shard/rows";
 import type { Span, TableDef } from "../types";
 
 /** 1 行だけを名指しする範囲。 */
@@ -33,6 +34,8 @@ export interface StatementShape {
   /** 1 つの表の 1 行を、主キーの等値で名指ししているとき、その主キー。 */
   pk: string | null;
   write: boolean;
+  /** 書き込みが UNIQUE の検査で読む行 (WriteTarget.uniqueReads)。無指定なら、分からないものとして扱う。 */
+  uniqueReads?: "none" | UniqueRead[];
 }
 
 /**
@@ -42,15 +45,29 @@ export interface StatementShape {
  * 狭める規則:
  *   1. 読みで、1 つの表の 1 行を主キーで名指ししている → その 1 行。
  *   2. 書き込みで、同じく 1 行を名指ししていて、その表にシャード内の UNIQUE がない → その 1 行。
- *      UNIQUE があると、文は同じ値を持つ別の行を読む (違反の検査、REPLACE や UPSERT が消す行、OR IGNORE の判定)。
- *      UNIQUE は shard key を含むので、その行は同じ shard key の値の中にある。既定の範囲で足りる。
+ *      UNIQUE があると、文は同じ値を持つ別の行を読む (違反の検査、REPLACE が消す行、OR IGNORE の判定)。
+ *   3. 書き込みで 1 行を名指ししていて、UNIQUE の検査で読む行が分かっている → その 1 行と、読む行。
+ *      UNIQUE の列を書かない文 (DELETE、UNIQUE の列に触らない UPDATE) は、別の行を読まない。
+ *      UNIQUE の列の値が定数で決まる INSERT は、その値を持つ行を読む。値が決まらなければ、既定の範囲のままにする。
+ *      UNIQUE は shard key を含むので、読む行は同じ shard key の値の中にある。
  */
 export function statementSpans(shape: StatementShape): Span[] {
   const { tables, sks, pk, write } = shape;
   if (sks === null) return tables === null ? [tableSpan("*")] : tables.map((t) => tableSpan(t.name));
   if (tables === null) return sks.map((sk) => groupSpan("*", sk));
   const only = tables.length === 1 ? tables[0]! : null;
-  if (pk !== null && only && sks.length === 1 && (!write || only.uniques.length === 0 || spanFaults.rowSpanDespiteUnique)) return [rowSpan(only.name, pk, sks[0]!)];
+  if (pk !== null && only && sks.length === 1) {
+    const row = rowSpan(only.name, pk, sks[0]!);
+    if (!write || only.uniques.length === 0 || spanFaults.rowSpanDespiteUnique || shape.uniqueReads === "none") return [row];
+    if (shape.uniqueReads) {
+      // 値に NULL があれば、どの行とも衝突しない (UNIQUE は NULL を互いに別の値として扱う)。`=` は列の照合順序で比べる。
+      const reads = shape.uniqueReads.filter((u) => u.values.every((v) => v !== null));
+      return [row, ...reads.map((u): Span => ({
+        kind: "pred", table: only.name, alias: only.name, sk: sks[0]!,
+        where: u.cols.map((c) => `${q(only.name)}.${q(c)} = ?`).join(" AND "), params: u.values,
+      }))];
+    }
+  }
   return tables.flatMap((t) => sks.map((sk) => groupSpan(t.name, sk)));
 }
 
