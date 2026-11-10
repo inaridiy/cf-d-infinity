@@ -1,7 +1,7 @@
 import type {
   Change, CommitRes, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
 } from "../types";
-import { ConflictError, ReadTooOld, SqlError } from "../types";
+import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError } from "../types";
 import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, fold, q, selectList } from "../shard/rows";
 import type { Catalog } from "../meta";
 import { hashKey, ownerOf, shardsOf, type Routing } from "../routing";
@@ -76,6 +76,8 @@ function groupByShard(routing: Routing, sks: string[]): Target[] {
 
 /** 1 回の読み取りで Worker へ集める行の上限。メモリからの推定で、本番で調整する。 */
 export const ROW_BUDGET = 200_000;
+/** 1 文で Worker へ集めてよいバイト数。isolate のメモリは 128 MB で、集めた行は wasm の SQLite にも入る。 */
+export const BYTE_BUDGET = 32_000_000;
 
 /** 読み取りのコンテキスト。autocommit と Txn で実行経路を共有する。 */
 class ReadScope {
@@ -159,8 +161,11 @@ class ReadScope {
     const targets = await this.resolve(s.sks ? { by: "sk", sks: s.sks } : { by: "all" });
     if (targets.length === 0) return { columns: [], rows: [] };
     await this.pickT(targets.map((t) => t.shard));
+    // 上限はシャードの側で打ち切らせる。全行が届いてから数えると、数える前に Worker のメモリが尽きる。
+    // バイト数は対象のシャードで等分する。偏りがあると早めに拒否するが、合計が予算を超えることはない。
+    const maxBytes = Math.max(1_000_000, Math.floor(this.db.byteBudget / targets.length));
     const parts = await Promise.all(targets.map((t) =>
-      this.call(t.shard, { sql: s.sql, params: s.params, spans: this.scanSpans(s, t.sks) }),
+      this.call(t.shard, { sql: s.sql, params: s.params, spans: this.scanSpans(s, t.sks), maxRows: this.db.rowBudget, maxBytes }),
     ));
     return { columns: parts[0]!.columns, rows: parts.flatMap((r) => r.values) };
   }
@@ -181,8 +186,8 @@ class ReadScope {
       for (const s of scans) {
         const { columns, rows } = await this.scan(s);
         total += rows.length;
-        if (total > ROW_BUDGET) {
-          throw new SqlError(`query reads more than ${ROW_BUDGET} rows; narrow it or use the analytics tier`);
+        if (total > this.db.rowBudget) {
+          throw new SqlError(`query reads more than ${this.db.rowBudget} rows; narrow it or use the analytics tier`);
         }
         w.load(s.table.name, columns, rows);
       }
@@ -577,6 +582,15 @@ export class Txn extends ReadScope {
   }
 
   async commit(): Promise<void> {
+    // 大きすぎる取引は、シャードへ送る前にここで断る。シャードも同じ検査をするが、そちらの拒否は競合と同じ扱いで再試行される。
+    for (const changes of this.writes.values()) {
+      let bytes = 0;
+      for (const c of changes.values()) bytes += encode(c).length;
+      if (bytes > this.db.writeSetBudget) {
+        await this.unlockAll().catch(() => undefined);
+        throw new SqlError(`transaction too large: it changes more than ${this.db.writeSetBudget} bytes of rows on one shard; split it into smaller transactions`);
+      }
+    }
     const shards = new Set([...this.writes.keys()].filter((s) => this.writes.get(s)!.size > 0));
     // 読み取りだけなら T の snapshot で完結する。ただしロックを取って最新を読んだ取引は、
     // 読みの時刻が揃っていないので検証が要る。検証でロックも手放す。
@@ -637,6 +651,8 @@ export class Db {
       onCatalog?: (c: Catalog) => void;
       /** 採番のブロック。要求ごとに Db を作る環境では共有しないと番号が大きく飛ぶ。 */
       ids?: Map<string, { next: number; end: number }>;
+      /** 上限の上書き。試験と、上限を下げたい利用者のためにある。既定は ROW_BUDGET、BYTE_BUDGET、MAX_WRITE_SET_BYTES。 */
+      limits?: { rows?: number; bytes?: number; writeSetBytes?: number };
       /** 文が終わるたびに呼ぶ。失敗した文でも呼ぶ。 */
       onStatement?: (s: StatementStat) => void;
     } = {},
@@ -789,6 +805,16 @@ export class Db {
     // UUID を丸ごと使う。anchor は同じ ID の記録があればその決着を返すので、ID が衝突すると、
     // 後の取引は何も書かずに「確定」と応答される。先頭 8 桁 (32 bit) では、負荷があれば 1 時間に何度か衝突する。
     return `${this.opts.idPrefix ?? "t"}-${crypto.randomUUID()}-${this.seq++}`;
+  }
+
+  get rowBudget(): number {
+    return this.opts.limits?.rows ?? ROW_BUDGET;
+  }
+  get byteBudget(): number {
+    return this.opts.limits?.bytes ?? BYTE_BUDGET;
+  }
+  get writeSetBudget(): number {
+    return this.opts.limits?.writeSetBytes ?? MAX_WRITE_SET_BYTES;
   }
 
   /** シャードを呼ぶ。呼んだ先は文の記録のために覚える。 */

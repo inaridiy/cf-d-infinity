@@ -33,6 +33,10 @@ function sqlJs(): Promise<SqlJsStatic> {
 
 export class ScratchDb implements Backend {
   constructor(private db: Database) {}
+  iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
+    const { columns, values } = this.raw(sql, ...params);
+    return { columns, rows: values };
+  }
   raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] } {
     const st = this.db.prepare(sql);
     try {

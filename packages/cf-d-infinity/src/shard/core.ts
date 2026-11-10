@@ -3,7 +3,7 @@ import type {
   Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupPayload, LockOwner, MetaApi,
   Participant, PrepareReq, PrepareRes, Row, ShardApi, ShardMetrics, Span, TableDef, Ts, TxnStatus, Value,
 } from "../types";
-import { ConflictError, Migrating, NotOwner, ReadTooOld, SqlError, spanCovers, unprotectedSpans } from "../types";
+import { ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, SqlError, spanCovers, unprotectedSpans } from "../types";
 import type { DdlEntry } from "../meta";
 import { slotOf } from "../routing";
 import {
@@ -39,6 +39,16 @@ export const LOG_GEN_MS = 2 * 60_000;
 export const TXN_RETAIN_MS = 60 * 60_000;
 /** この時間を過ぎた intent は、anchor に問い合わせて決着させる。 */
 export const ORPHAN_AGE_MS = 2000;
+/**
+ * 1 回の要求でシャードが返す結果の上限。要求が小さい値を指定すればそちらが効く。
+ * 上限がないと、絞り込みのない SELECT が全行を送り返し、シャードと Worker の両方がメモリを使い切る。
+ * バイト数は DO の RPC の上限 (32 MiB) より十分小さくしてある。
+ */
+export const SHARD_MAX_ROWS = 200_000;
+export const SHARD_MAX_BYTES = 16_000_000;
+/** 値のおおよその大きさ (バイト)。上限の判定に使うだけで、正確である必要はない。 */
+const sizeOf = (v: Value): number =>
+  typeof v === "string" ? v.length * 2 : v instanceof Uint8Array ? v.byteLength : 8;
 
 interface Intent {
   tbl: string; pk: string; sk: string; txn: string; anchor: string; prepare_ts: Ts; change: string;
@@ -158,11 +168,10 @@ export class ShardCore implements ShardApi {
 
     // 直近 write の索引はメモリにしかないので __log から作り直す。GC で消えた commit は logLowWater 以下にある。
     this.maxCommit = this.logLowWater;
-    for (const r of this.logScan("", [])) {
-      const ts = r.commit_ts as Ts;
+    this.logEach("", [], (ts, _txn, blob) => {
       this.maxCommit = Math.max(this.maxCommit, ts);
-      for (const c of decode<Change[]>(r.blob as string)) this.touch(c.table, c.pk, c.sk, ts);
-    }
+      for (const c of decode<Change[]>(blob)) this.touch(c.table, c.pk, c.sk, ts);
+    });
     const maxPrepare = (b.exec(`SELECT max(prepare_ts) v FROM __intents`)[0]?.v as number) ?? 0;
     // 再起動の前に予約した alarm がなくても、残った intent と phase 2 を片付ける。
     const pendingWork = b.exec(`SELECT (SELECT count(*) FROM __intents) + (SELECT count(*) FROM __txn WHERE status = 'committed' AND done = 0) n`)[0]?.n as number;
@@ -208,6 +217,19 @@ export class ShardCore implements ShardApi {
       if (limit !== undefined && out.length >= limit) break;
     }
     return out;
+  }
+
+  /**
+   * 変更ログを commit 時刻の順に 1 行ずつ読む。fn が false を返したらそこでやめる。
+   * 保持窓の全行を配列にすると、書き込みの多いシャードでは起動と過去時点の読みがメモリを使い切る。
+   */
+  private logEach(where: string, params: Value[], fn: (commitTs: Ts, txn: string, blob: string) => boolean | void): void {
+    for (const g of this.logGens()) {
+      const { rows } = this.b.iterate(`SELECT commit_ts, txn, blob FROM __log_g${g} ${where} ORDER BY commit_ts`, ...params);
+      for (const r of rows) {
+        if (fn(r[0] as Ts, r[1] as string, r[2] as string) === false) return;
+      }
+    }
   }
 
   /** commit の変更ログを、c の世代の表へ書く。必ず書き込みの取引の中で呼ぶ。 */
@@ -837,13 +859,15 @@ export class ShardCore implements ShardApi {
     const floor = Math.max(this.logLowWater, this.ddlFloor);
     if (T < floor) throw new ReadTooOld(`moved at ${floor}`);
     const seen = new Map<string, { table: string; pk: string; image: Row | null }>();
-    for (const r of this.logScan(`WHERE commit_ts > ?`, [T])) {
-      for (const c of decode<Change[]>(r.blob as string)) {
+    // K を超えた時点で読むのをやめる。T 以降の全ログを読んでから数えると、古い T の読みが来るたびに保持窓の全行を読む。
+    this.logEach(`WHERE commit_ts > ?`, [T], (_ts, _txn, blob) => {
+      for (const c of decode<Change[]>(blob)) {
         const key = `${c.table}\0${c.pk}`;
         if (!seen.has(key) && this.defs.has(c.table)) seen.set(key, { table: c.table, pk: c.pk, image: c.before });
       }
-    }
-    if (seen.size > this.K) throw new ReadTooOld(`delta ${seen.size} exceeds K=${this.K}`);
+      return seen.size <= this.K;
+    });
+    if (seen.size > this.K) throw new ReadTooOld(`delta exceeds K=${this.K}`);
     return [...seen.values()];
   }
 
@@ -860,7 +884,7 @@ export class ShardCore implements ShardApi {
    * INSERT ... SELECT のような構文でも Worker 側で解析する必要がない。
    */
   private run(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[] } {
-    if (!req.write) return { ...this.b.raw(req.sql, ...req.params), changes: [] };
+    if (!req.write) return { ...this.readLimited(req), changes: [] };
     const captured = this.runCaptured(req);
     if (captured) return captured;
     // REPLACE が暗黙に消す行は recursive_triggers がないと DELETE trigger を発火しない。
@@ -875,6 +899,22 @@ export class ShardCore implements ShardApi {
       }
     }
     return { ...out, changes };
+  }
+
+  /** 読み取りの文を実行し、上限を超えた時点で打ち切る。全行を集めてから数えると、数える前にメモリが尽きる。 */
+  private readLimited(req: ExecReq): { columns: string[]; values: Value[][] } {
+    const maxRows = Math.min(req.maxRows ?? SHARD_MAX_ROWS, SHARD_MAX_ROWS);
+    const maxBytes = Math.min(req.maxBytes ?? SHARD_MAX_BYTES, SHARD_MAX_BYTES);
+    const { columns, rows } = this.b.iterate(req.sql, ...req.params);
+    const values: Value[][] = [];
+    let bytes = 0;
+    for (const row of rows) {
+      values.push(row);
+      for (const v of row) bytes += sizeOf(v);
+      if (values.length > maxRows) throw new SqlError(`result too large: more than ${maxRows} rows from one shard; narrow the query`);
+      if (bytes > maxBytes) throw new SqlError(`result too large: more than ${maxBytes} bytes from one shard; narrow the query or select fewer columns`);
+    }
+    return { columns, values };
   }
 
   /** 時刻 T の状態 (と自分の未 commit write) の上で文を実行し、ROLLBACK する。 */
@@ -970,6 +1010,7 @@ export class ShardCore implements ShardApi {
       // 同じ主キーでなくても、他の取引の intent が同じ UNIQUE の値を持っていれば確定できない。
       const pending = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, dry.changes);
       if (pending) throw new ConflictError(pending);
+      this.assertWriteSetFits(dry.changes);
       const c = this.issue();
       if (dry.changes.length) this.b.tx(() => this.applyAndLog(`auto-${c}`, c, dry.changes));
       return { ...dry, T: c, hlc: this.hlc.value, epoch: this.epoch };
@@ -1039,6 +1080,7 @@ export class ShardCore implements ShardApi {
             if (hit.key !== null) throw BLOCKED;
             pending.reason = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, r.changes);
             if (pending.reason) throw PENDING_UNIQUE;
+            this.assertWriteSetFits(r.changes);
             const c = this.issue();
             if (r.changes.length) this.logChanges(`auto-${c}`, c, r.changes);
             return { changes: r.changes, c };
@@ -1131,6 +1173,18 @@ export class ShardCore implements ShardApi {
     return null;
   }
 
+  /** 取引がこのシャードに書く変更が、変更ログの 1 行に収まるか。収まらなければ確定の前に拒否する。 */
+  private assertWriteSetFits(writes: Change[]): void {
+    if (this.faults.noWriteSetLimit || writes.length === 0) return;
+    let bytes = 0;
+    for (const w of writes) {
+      bytes += encode(w).length;
+      if (bytes > MAX_WRITE_SET_BYTES) {
+        throw new SqlError(`transaction too large: it changes more than ${MAX_WRITE_SET_BYTES} bytes of rows on one shard; split it into smaller transactions`);
+      }
+    }
+  }
+
   private checkUnique(txn: string, writes: Change[]): string | null {
     const constrained = writes.filter((w) => this.def(w.table).uniques.length > 0);
     if (constrained.length === 0) return null;
@@ -1175,6 +1229,12 @@ export class ShardCore implements ShardApi {
     await this.ensureArrived(this.sksOf(req.spans, req.writes));
     this.observe(req.T);
     this.assertOwned(req.spans, req.writes, req.T);
+    try {
+      this.assertWriteSetFits(req.writes);
+    } catch (e) {
+      this.releaseLocks(req.txn);
+      throw e;
+    }
     const reason = this.validate(req.txn, req.T, req.writes, req.spans);
     if (reason) {
       this.releaseLocks(req.txn); // 失敗した取引のロックを残すと、TTL まで全員が待つ
@@ -1196,6 +1256,13 @@ export class ShardCore implements ShardApi {
   private prepareSync(req: PrepareReq): PrepareRes {
     const dup = this.b.exec(`SELECT prepare_ts FROM __intents WHERE txn = ? LIMIT 1`, req.txn)[0];
     if (dup) return { ok: true, prepareTs: dup.prepare_ts as Ts };
+    // phase 2 で初めて上限に当たると、確定した取引が適用できなくなる。intent を置く前に拒否する。
+    try {
+      this.assertWriteSetFits(req.writes);
+    } catch (e) {
+      this.releaseLocks(req.txn);
+      return { ok: false, reason: (e as Error).message };
+    }
     this.observe(req.T);
     try {
       this.assertOwned(req.spans, req.writes, req.T);

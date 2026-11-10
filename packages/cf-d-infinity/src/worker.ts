@@ -66,6 +66,26 @@ class DoBackend implements Backend {
     }
     return { columns: cur.columnNames, values };
   }
+  iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
+    const cur = this.storage.sql.exec(sql, ...(params as never[]));
+    const record = () => {
+      if (cur.rowsWritten === 0 && cur.rowsRead === 0) return;
+      const k = statKey(sql);
+      const e = rowStats.get(k) ?? { calls: 0, rowsWritten: 0, rowsRead: 0 };
+      e.calls++;
+      e.rowsWritten += cur.rowsWritten;
+      e.rowsRead += cur.rowsRead;
+      rowStats.set(k, e);
+    };
+    const rows = (function* () {
+      try {
+        for (const r of cur.raw()) yield r.map((v) => (v instanceof ArrayBuffer ? new Uint8Array(v) : v)) as Value[];
+      } finally {
+        record();
+      }
+    })();
+    return { columns: cur.columnNames, rows };
+  }
   tx<T>(fn: () => T): T {
     return this.storage.transactionSync(fn);
   }

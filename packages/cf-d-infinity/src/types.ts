@@ -111,6 +111,12 @@ export interface ExecReq {
    * T を指定した読みで、決着させた取引の commit 時刻が T を超えていたら、T を取り直させる。
    */
   realtime?: boolean;
+  /**
+   * この要求が返してよい行数とバイト数の上限。超えたら、送り返す前にシャードが拒否する。
+   * 未指定ならシャードの既定の上限だけが効く。
+   */
+  maxRows?: number;
+  maxBytes?: number;
   /** 悲観的な DML。最新の状態で実行し、変更行のロックを取る。 */
   lock?: LockOwner;
   /** 読み取りでロックを取る行。BEGIN IMMEDIATE の主キー読みに使う。 */
@@ -241,6 +247,11 @@ export interface Backend {
   exec(sql: string, ...params: Value[]): Row[];
   /** 同名の列を潰さないよう、列名と値の配列で返す。 */
   raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] };
+  /**
+   * 結果を 1 行ずつ返す。全行を配列にしないので、途中でやめれば残りは読まない。
+   * 読み終えるか break するまで、同じ Backend への他の文を挟まないこと。
+   */
+  iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> };
   /** fn が throw したら ROLLBACK し、その値を再送出する。 */
   tx<T>(fn: () => T): T;
   /** 保留中の write の永続化を待つ。 */
@@ -253,6 +264,8 @@ export interface Backend {
 export interface Faults {
   /** autocommit の書き込みが、他の取引の intent との UNIQUE を照合しない (2026-11 のレビューで見つかった欠陥)。 */
   autoIgnoresUniqueIntents?: boolean;
+  /** 取引の変更の大きさを確定の前に検査しない。変更ログの 1 行が DO の行の上限を超え、確定後の適用が失敗する。 */
+  noWriteSetLimit?: boolean;
   /** 複数シャードの autocommit の読みが、決着させた取引の c > T でも T を取り直さない (同上)。 */
   noRealtimeBump?: boolean;
   anchorNoAbsorb?: boolean;
@@ -334,6 +347,13 @@ export class Migrating extends Error {
     this.name = "Migrating";
   }
 }
+/**
+ * 1 つの取引が 1 シャードに書ける変更の合計 (変更前と変更後の行を JSON にした大きさ)。
+ * 変更ログは 1 commit を 1 行に入れるので、DO の行の上限 (2 MB) に収まる必要がある。
+ * 確定した後の適用で初めて上限に当たると、その取引は永久に適用できない。必ず確定の前に拒否する。
+ */
+export const MAX_WRITE_SET_BYTES = 1_000_000;
+
 export class SqlError extends Error {
   constructor(message: string) {
     super(message);
