@@ -49,6 +49,21 @@ export { DinfAutoscaler, DinfDatabase, DinfMeta, DinfShard } from "./dinf";
 
 Drizzle's D1 driver takes the same object: `drizzle(connect(env.DINF_DB))`.
 
+## Command line
+
+With `wrangler dev` or `cf dev` running:
+
+```sh
+npx cf-d-infinity sql "SELECT id, balance FROM accounts ORDER BY id"
+npx cf-d-infinity sql --file schema.sql
+npx cf-d-infinity slow          # slow statements: SQL, duration, where it ran, shards touched
+npx cf-d-infinity status        # shards, slot ranges, autoscaler events
+```
+
+The command starts a throwaway local Worker bound to your Worker's `DinfDatabase` and calls it; no HTTP endpoint or
+token is involved. Add `--remote` to reach the deployed Worker through a remote binding (needs Wrangler and
+`wrangler login`; the SQL then runs on production data).
+
 ## Entry points
 
 | Import | Contents |
@@ -58,7 +73,7 @@ Drizzle's D1 driver takes the same object: `drizzle(connect(env.DINF_DB))`.
 
 ## Configuration
 
-All of it lives in `wrangler.jsonc`.
+All of it lives in `wrangler.jsonc`, or in `cloudflare.config.ts` if you use the `cf` CLI (the repository README shows that form).
 
 | Name | Kind | Meaning |
 |---|---|---|
@@ -67,6 +82,7 @@ All of it lives in `wrangler.jsonc`.
 | `DINF_SHARD_COUNT` | var | Number of shards the database starts with (default 8) |
 | `triggers.crons` | Cron Trigger | `* * * * *` turns autoscaling on; remove it to turn it off |
 | `DINF_AUTOSCALE_TICK_MS`, `DINF_AUTOSCALE_THRESHOLDS` | vars | Optional overrides for the autoscaler |
+| `DINF_SLOW_QUERY_MS` | var | Statements slower than this are recorded (default 500; `0` records all; `off` disables). Bound parameters are never recorded |
 | `DINF_API_TOKEN`, `DINF_ADMIN_TOKEN` | secrets | Only for the HTTP endpoint: SQL over Hrana, and `/admin/*`. A route whose token is not set rejects every request. The binding needs no token |
 
 ## License

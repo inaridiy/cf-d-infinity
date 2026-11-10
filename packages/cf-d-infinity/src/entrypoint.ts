@@ -3,7 +3,7 @@ import { RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import type { RemoteResult, RemoteStatement, TransactionMode } from "./binding";
 import type { Db, QueryResult } from "./client/db";
 import type { Value } from "./types";
-import { dbFor, handle, type Env } from "./worker";
+import { clusterStatus, dbFor, handle, slowQueries, type Env, type SlowQuery } from "./worker";
 
 const toValue = (v: unknown): Value =>
   v === undefined || v === null ? null : typeof v === "boolean" ? Number(v) : (v as Value);
@@ -39,13 +39,14 @@ class RemoteTx extends RpcTarget {
  * アプリからは `connect(env.DINF_DB)` で使う。
  */
 export class DinfDatabase extends WorkerEntrypoint<Env> {
+  private background = (p: Promise<unknown>) => this.ctx.waitUntil(p);
   async query(sql: string, params?: unknown[], token = 0): Promise<RemoteResult> {
-    const db = await dbFor(this.env, token);
+    const db = await dbFor(this.env, token, this.background);
     return pack(await db.query(sql, values(params)), db);
   }
   /** 全文を 1 取引で実行する。競合は内部でやり直す。 */
   async batch(statements: RemoteStatement[], token = 0): Promise<RemoteResult[]> {
-    const db = await dbFor(this.env, token);
+    const db = await dbFor(this.env, token, this.background);
     const out = await db.transaction(async (tx) => {
       const results: QueryResult[] = [];
       for (const s of statements) results.push(await tx.query(s.sql, values(s.params)));
@@ -54,12 +55,20 @@ export class DinfDatabase extends WorkerEntrypoint<Env> {
     return out.map((r) => pack(r, db));
   }
   async begin(mode: TransactionMode = "write", token = 0): Promise<RemoteTx> {
-    const db = await dbFor(this.env, token);
+    const db = await dbFor(this.env, token, this.background);
     await db.query(mode === "write" ? "BEGIN IMMEDIATE" : "BEGIN");
     return new RemoteTx(db);
   }
+  /** 遅い文の記録を新しい順に返す。下限は DINF_SLOW_QUERY_MS で決まる。 */
+  slowQueries(limit = 50): Promise<SlowQuery[]> {
+    return slowQueries(this.env, limit);
+  }
+  /** シャード、範囲表、Autoscaler の履歴を返す。 */
+  status() {
+    return clusterStatus(this.env);
+  }
   /** `env.DB.fetch()` は HTTP の入口 (Hrana、/sql、/admin) と同じで、トークンを検査する。 */
   override fetch(request: Request): Promise<Response> {
-    return handle(request, this.env);
+    return handle(request, this.env, this.ctx);
   }
 }

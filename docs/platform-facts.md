@@ -100,6 +100,17 @@
 
 - PITR はローカルでは動かない。`getBookmarkForTime` と `onNextSessionRestoreBookmark` は「This Durable Object's storage back-end does not implement point-in-time recovery.」で失敗する (miniflare 4.20260730.0、2026-11-10)。`getCurrentBookmark` は 0 だけの値を返す。全シャード復元は本番でしか開発と検証ができない。
 
+## 本番で確かめたもの (2026-11-10)
+
+検証用の Worker と DO を一時的にデプロイして確かめた。確認後に削除した。
+
+- `getCurrentBookmark()` は、直前の書き込みを含む bookmark を返す。書き込みがなければ同じ値を返し続ける。
+- `onNextSessionRestoreBookmark(bookmark)` の後に `ctx.abort()` すると、呼び出しは abort の誤りで終わり、次の起動でその bookmark の状態になる。それより後の行だけが消える。
+- 復元で捨てた側の bookmark へも戻れる。復元した後に、捨てられた時点の bookmark を指定して復元すると、その時点の状態になる。復元は取り消せる。
+- alarm の予約は bookmark の時点のものに戻る。その時点で予約がなければ、復元後は予約なしになる。復元の後で alarm を仕掛け直す必要がある。
+- `getBookmarkForTime()` は現在の bookmark と異なる値を返す。どちらへずれるかは確かめていない。
+- Service Binding の remote binding (`"remote": true`) は、名前付きの入口 (WorkerEntrypoint) への RPC を通す。手元の `wrangler dev` から、デプロイ済みの Worker の RPC メソッドを呼べる (wrangler 4.158.0)。
+
 ## 公式情報が見つからず実測が必要なもの
 
 - Worker から DO への RPC の往復時間 (同一リージョン・別リージョン)

@@ -145,6 +145,37 @@ test("creates a database Worker in an empty directory, and refuses to overwrite 
   assert.throws(() => plan(taken), /already exist: package\.json/);
 });
 
+test("in a cf project it leaves cloudflare.config.ts alone, prepares the code, and prints the configuration to add", () => {
+  const CONFIG = `import { bindings, defineConfig } from "cf/config";
+import * as entrypoint from "./src/worker.ts" with { type: "cf-worker" };
+
+export default defineConfig({
+\tworker: { name: "shop", compatibilityDate: "2026-11-04", entrypoint, env: { WORLD: bindings.text("World") } },
+});
+`;
+  const files = { ...APP, "cloudflare.config.ts": CONFIG, "src/worker.ts": APP["src/index.ts"] };
+  delete files["wrangler.jsonc"];
+  delete files["src/index.ts"];
+  const d = dir(files);
+  const r = run(d);
+  assert.equal(r.mode, "cf");
+  assert.equal(read(d, "cloudflare.config.ts"), CONFIG);
+  assert.match(read(d, "src/dinf.ts"), /from "cf-d-infinity\/cloudflare"/);
+  assert.match(read(d, "src/worker.ts"), /export \{ DinfAutoscaler, DinfDatabase, DinfMeta, DinfShard \} from "\.\/dinf";/);
+  assert.equal(JSON.parse(read(d, "package.json")).dependencies["cf-d-infinity"], "^0.1.0-alpha.0");
+  const snippet = r.next.find((n) => n.includes("exports.durableObject"));
+  assert.match(snippet, /DINF_DB: bindings\.worker\(\{ worker: "shop", exportName: "DinfDatabase" \}\)/);
+  assert.match(snippet, /DinfMeta: exports\.durableObject\(\{ storage: "sqlite" \}\)/);
+  assert.match(snippet, /triggers\.scheduled\(\{ schedule: "\* \* \* \* \*" \}\)/);
+  assert.ok(r.next.some((n) => n.includes("npx cf dev")));
+
+  // 設定に足し終えた後の 2 回目は、何も書かず、足す内容も出さない。
+  writeFileSync(join(d, "cloudflare.config.ts"), CONFIG.replace("env: {", "exports: { DinfShard: 1 }, env: {"));
+  const again = run(d);
+  assert.equal(again.writes.length, 0);
+  assert.ok(!again.next.some((n) => n.includes("exports.durableObject")));
+});
+
 test("the command line prints the plan, exits non-zero on a conflict, and supports --dry-run", () => {
   const bin = new URL("../bin.js", import.meta.url).pathname;
   const d = dir(APP);

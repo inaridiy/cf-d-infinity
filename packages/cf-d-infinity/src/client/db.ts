@@ -37,6 +37,22 @@ const isRetryable = (e: unknown) =>
   e instanceof ConflictError || e instanceof ReadTooOld || (e as { retryable?: boolean })?.retryable === true ||
   /^(conflict|read too old|not owner|migrating|upgrading):/.test((e as Error)?.message ?? "");
 
+/** 1 文の実行の記録。遅い文の一覧に使う。 */
+export interface StatementStat {
+  sql: string;
+  /** 文を受けてから結果を返すまでの時間 (ms)。リトライと待ちを含む。 */
+  ms: number;
+  /** 文の実行場所。shard は 1 シャードで完結、gather と partial は複数シャードから Worker へ集めた読み取りである。 */
+  plan: string;
+  /** 文の実行中に呼んだシャードの数。 */
+  shards: number;
+  rows: number;
+  changes: number;
+  /** 競合や経路の変化でやり直した回数を含む、試行の数。 */
+  attempts: number;
+  error?: string;
+}
+
 /** 表定義が古いと出る誤り。取り直すと解けることがある。 */
 const UNKNOWN_SCHEMA = /^(no such (table|column|index)|table \S+ has no column)/;
 
@@ -77,7 +93,7 @@ class ReadScope {
     const full: ExecReq = {
       ...req, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), fresh: this.wantsFresh,
     };
-    const res = await this.db.cluster.shard(shard).exec(full);
+    const res = await this.db.shardOf(shard).exec(full);
     this.T ??= res.T;
     this.db.observe(res.hlc);
     this.record(shard, req.spans);
@@ -126,7 +142,7 @@ class ReadScope {
    */
   protected async pickT(shards: string[]): Promise<void> {
     if (this.T !== undefined || shards.length < 2) return;
-    const clocks = await Promise.all(shards.map((id) => this.db.cluster.shard(id).now({})));
+    const clocks = await Promise.all(shards.map((id) => this.db.shardOf(id).now({})));
     this.T = Math.max(this.db.token, ...clocks);
   }
 
@@ -254,6 +270,8 @@ export class Txn extends ReadScope {
   /** BEGIN IMMEDIATE。主キーの読みでもロックを取る。 */
   lockReads = false;
   private lockOwner: LockOwner | null = null;
+  /** この取引で実行した文。遅い取引の記録に使う。 */
+  readonly sqls: string[] = [];
   constructor(db: Db, cat: Catalog, private id: string) {
     super(db, cat);
   }
@@ -290,7 +308,7 @@ export class Txn extends ReadScope {
   private async refreshTo(to: Ts): Promise<boolean> {
     const from = this.T!;
     const res = await Promise.all([...this.spans].map(([shard, spans]) =>
-      this.db.cluster.shard(shard).refresh({ txn: this.id, spans, from, to }),
+      this.db.shardOf(shard).refresh({ txn: this.id, spans, from, to }),
     ));
     if (res.some((r) => !r.ok)) return false;
     this.T = Math.max(from, to);
@@ -345,6 +363,7 @@ export class Txn extends ReadScope {
   }
 
   async query(sql: string, params: Params = []): Promise<QueryResult> {
+    this.sqls.push(sql);
     let last = new QueryResult([], []);
     for (const stmt of parseStatements(sql)) last = await this.statement(stmt, params);
     return last;
@@ -371,7 +390,7 @@ export class Txn extends ReadScope {
   private async dml(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "overlay">): Promise<ExecRes> {
     if (!this.pessimistic) return this.call(shard, req);
     this.lockOwner ??= { txn: this.txnId, start: this.db.startStamp() };
-    const res = await this.db.cluster.shard(shard).exec({
+    const res = await this.db.shardOf(shard).exec({
       ...req, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), lock: this.lockOwner,
     });
     this.T ??= res.T;
@@ -383,7 +402,7 @@ export class Txn extends ReadScope {
   /** rollback でロックを手放す。届かなくても TTL で消える。 */
   async unlockAll(): Promise<void> {
     if (!this.lockOwner) return;
-    await Promise.allSettled([...this.spans.keys()].map((id) => this.db.cluster.shard(id).unlock({ txn: this.txnId })));
+    await Promise.allSettled([...this.spans.keys()].map((id) => this.db.shardOf(id).unlock({ txn: this.txnId })));
   }
 
   /** 文の途中で失敗したら、その文の変更だけを取り消す。SQLite の文の原子性と同じである。 */
@@ -572,13 +591,13 @@ export class Txn extends ReadScope {
     let res: CommitRes;
     if (parts.length === 1) {
       const p = parts[0]!;
-      res = await this.db.cluster.shard(p.shard).commitLocal({ txn: this.id, T, writes: p.writes, spans: p.spans, schema });
+      res = await this.db.shardOf(p.shard).commitLocal({ txn: this.id, T, writes: p.writes, spans: p.spans, schema });
     } else {
       // anchor は最後に prepare するので refresh が要らない。未保護の span が多い参加者を選ぶ。
       const score = (p: (typeof parts)[number]) =>
         p.spans.filter((s) => !(s.kind === "pk" && p.writes.some((w) => w.table === s.table && w.pk === s.pk))).length;
       const sorted = [...parts].sort((a, b) => score(b) - score(a) || hashKey(this.id + a.shard) - hashKey(this.id + b.shard));
-      const anchor = this.db.cluster.shard(sorted[0]!.shard);
+      const anchor = this.db.shardOf(sorted[0]!.shard);
       try {
         res = await anchor.commit({ txn: this.id, T, participants: parts, schema });
       } catch (e) {
@@ -604,6 +623,9 @@ export class Db {
   private cached: Catalog | null;
   private current: Txn | null = null;
   private ids: Map<string, { next: number; end: number }>;
+  private touched = new Set<string>();
+  /** 文の中から呼んだ transaction は、文の記録に含める。 */
+  private inStatement = false;
   constructor(
     readonly cluster: Cluster,
     private opts: {
@@ -612,6 +634,8 @@ export class Db {
       onCatalog?: (c: Catalog) => void;
       /** 採番のブロック。要求ごとに Db を作る環境では共有しないと番号が大きく飛ぶ。 */
       ids?: Map<string, { next: number; end: number }>;
+      /** 文が終わるたびに呼ぶ。失敗した文でも呼ぶ。 */
+      onStatement?: (s: StatementStat) => void;
     } = {},
   ) {
     this.token = opts.token ?? 0;
@@ -691,7 +715,7 @@ export class Db {
     this.ids.clear();
     // 全シャードへ適用してから完了を返す。適用が遅れると、古い表定義の Worker がそのシャードへ書き、
     // 後から DROP が適用されて行が消える。適用後は古い要求を全シャードが拒否する。
-    await Promise.all(shardsOf(cat.routing).map((id) => this.cluster.shard(id).syncSchema({ version: cat.version })));
+    await Promise.all(shardsOf(cat.routing).map((id) => this.shardOf(id).syncSchema({ version: cat.version })));
     for (const def of Object.values(cat.tables)) {
       for (const ix of def.globalIndexes) {
         const known = before.tables[def.name]?.globalIndexes.some((g) => g.name === ix.name);
@@ -711,7 +735,7 @@ export class Db {
     if (!def.shardKey.every((c) => cols.includes(c))) return;
     const list = cols.map(q).join(", ");
     for (const shard of shardsOf(cat.routing)) {
-      const res = await this.cluster.shard(shard).exec({
+      const res = await this.shardOf(shard).exec({
         sql: `SELECT 1 x FROM ${q(def.name)} GROUP BY ${list} HAVING count(*) > 1 LIMIT 1`,
         params: [], spans: [{ kind: "table", table: def.name }], schema: cat.version,
       });
@@ -727,7 +751,7 @@ export class Db {
     try {
       const cat = await this.catalog();
       for (const shard of shardsOf(cat.routing)) {
-        const res = await this.cluster.shard(shard).exec({
+        const res = await this.shardOf(shard).exec({
           sql: `SELECT ${selectList(def)} FROM ${q(def.name)}`, params: [],
           spans: [{ kind: "table", table: def.name }], schema: cat.version,
         });
@@ -759,6 +783,20 @@ export class Db {
     return `${this.opts.idPrefix ?? "t"}-${crypto.randomUUID().slice(0, 8)}-${this.seq++}`;
   }
 
+  /** シャードを呼ぶ。呼んだ先は文の記録のために覚える。 */
+  shardOf(id: string): ReturnType<Cluster["shard"]> {
+    this.touched.add(id);
+    return this.cluster.shard(id);
+  }
+
+  private report(sql: string, t0: number, info: { plan: string; attempts: number }, r: QueryResult | null, e?: unknown): void {
+    this.opts.onStatement?.({
+      sql, ms: Date.now() - t0, plan: info.plan, shards: this.touched.size,
+      rows: r?.values.length ?? 0, changes: r?.changes ?? 0, attempts: info.attempts,
+      ...(e === undefined ? {} : { error: (e as Error)?.message ?? String(e) }),
+    });
+  }
+
   /** リトライしない取引を開始する。commit の失敗は呼び出し側に見える。 */
   async begin(): Promise<Txn> {
     return new Txn(this, await this.catalog(), this.nextTxnId());
@@ -768,13 +806,21 @@ export class Db {
   async transaction<T>(fn: (tx: Txn) => Promise<T>): Promise<T> {
     const retries = this.opts.retries ?? 12;
     let refreshed = false;
+    const observed = this.opts.onStatement && !this.inStatement;
+    const t0 = Date.now();
+    if (observed) this.touched.clear();
     for (let attempt = 0; ; attempt++) {
       const tx = new Txn(this, await this.catalog(), this.nextTxnId());
+      const done = (e?: unknown) => {
+        if (observed) this.report(`BEGIN; ${tx.sqls.join("; ")}; COMMIT`, t0, { plan: "transaction", attempts: attempt + 1 }, null, e);
+      };
       try {
         const out = await fn(tx);
         await tx.commit();
+        done();
         return out;
       } catch (e) {
+        if (!(!refreshed && UNKNOWN_SCHEMA.test((e as Error)?.message ?? "")) && (!isRetryable(e) || attempt >= retries)) done(e);
         // 別の isolate の DDL を知らないだけかもしれないので、表定義を取り直して 1 度だけやり直す。
         if (!refreshed && UNKNOWN_SCHEMA.test((e as Error)?.message ?? "")) {
           refreshed = true;
@@ -820,16 +866,36 @@ export class Db {
   }
 
   private async statement(stmt: Node, params: Params): Promise<QueryResult> {
+    if (!this.opts.onStatement) return this.attemptStatement(stmt, params, { plan: "", attempts: 0 });
+    const info = { plan: "", attempts: 0 };
+    const t0 = Date.now();
+    this.touched.clear();
+    this.inStatement = true;
+    try {
+      const r = await this.attemptStatement(stmt, params, info);
+      this.report(text(stmt), t0, info, r);
+      return r;
+    } catch (e) {
+      this.report(text(stmt), t0, info, null, e);
+      throw e;
+    } finally {
+      this.inStatement = false;
+    }
+  }
+
+  private async attemptStatement(stmt: Node, params: Params, info: { plan: string; attempts: number }): Promise<QueryResult> {
     const retries = this.opts.retries ?? 12;
     const source = text(stmt);
     let refreshed = false;
     for (let attempt = 0; ; attempt++) {
+      info.attempts = attempt + 1;
       const cat = await this.catalog();
       // 失敗した文の採番を戻す。SQLite でも失敗した INSERT は rowid を消費しない。
       const saved = new Map([...this.ids].map(([k, v]) => [k, { ...v }]));
       try {
         const fresh = attempt === 0 ? stmt : parseStatements(source)[0];
         const p = await planStatement(fresh, params, cat, this.planContext(cat));
+        info.plan = p.kind;
         return await this.dispatch(p, cat);
       } catch (e) {
         for (const [k, v] of saved) if (this.ids.get(k)?.end === v.end) this.ids.get(k)!.next = v.next;
@@ -936,7 +1002,7 @@ export class Db {
     const sk = (t.route as { sks: string[] }).sks[0]!;
     const table = p.def.name;
     const spans: Span[] = t.pk ? [{ kind: "pk", table, pk: t.pk, sk }] : [{ kind: "sk", table, sk }];
-    const res = await this.cluster.shard(ownerOf(cat.routing, sk)).execAuto({
+    const res = await this.shardOf(ownerOf(cat.routing, sk)).execAuto({
       sql: t.sql, params: t.params, spans, write: t.write, schema: cat.version, minTs: this.token,
     });
     this.observe(res.hlc);
