@@ -194,3 +194,39 @@ describe("a connection whose range table is from before a split", () => {
     await db.query("COMMIT");
   });
 });
+
+describe("a transaction that reads through a global index and then writes", () => {
+  // index 経由の読みは、index が挙げた shard key に絞らずに文を送るので、そのシャードの表を広く読む。
+  // 読んだ範囲を「表全体」として検証すると、条件に関係のない行への書き込みとも競合する。
+  // 読んだのは条件に合う行だけなので、検証もその条件に関わる変更だけを競合にする。
+  const setup = async () => {
+    const c = new SimCluster({ shards: 2 });
+    const db = c.client();
+    await db.ddl(`CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, n INTEGER NOT NULL, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+    await db.ddl(`CREATE INDEX ix ON t(v)`);
+    const { routing } = await c.catalog();
+    const onS1: number[] = [];
+    for (let t = 1; onS1.length < 2; t++) if (ownerOf(routing, JSON.stringify([t])) === "s1") onS1.push(t);
+    const [P, Q] = onS1 as [number, number];
+    await db.query("INSERT INTO t VALUES (?, 1, 7, 0)", [P]);
+    await db.query("INSERT INTO t VALUES (?, 1, 8, 0)", [Q]);
+    const tx = await new Db(c).begin();
+    expect((await tx.query("SELECT tenant_id FROM t WHERE v = 7")).rows).toEqual([{ tenant_id: P }]);
+    return { c, tx, P, Q };
+  };
+
+  it("commits when another connection wrote a row of the same table that the condition does not involve", async () => {
+    const { c, tx, P, Q } = await setup();
+    await new Db(c).query("UPDATE t SET n = n + 1 WHERE tenant_id = ? AND id = 1", [Q]);
+    await tx.query("UPDATE t SET n = 100 WHERE tenant_id = ? AND id = 1", [P]);
+    await expect(tx.commit()).resolves.toBeUndefined();
+    expect((await new Db(c).query("SELECT tenant_id, n FROM t ORDER BY n")).rows).toEqual([{ tenant_id: Q, n: 1 }, { tenant_id: P, n: 100 }]);
+  });
+
+  it("still fails when another connection made a different row match the condition", async () => {
+    const { c, tx, P, Q } = await setup();
+    await new Db(c).query("UPDATE t SET v = 7 WHERE tenant_id = ? AND id = 1", [Q]);
+    await tx.query("UPDATE t SET n = 100 WHERE tenant_id = ? AND id = 1", [P]);
+    await expect(tx.commit()).rejects.toThrow(/conflict|SQLITE_BUSY/i);
+  });
+});

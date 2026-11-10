@@ -152,8 +152,19 @@ class ReadScope {
   }
 
   protected shardRead(p: Extract<Plan, { kind: "shard" }>, t: Target, wide = false): Promise<ExecRes> {
-    const spans = this.spansFor(p.tables, p.pk, t.sks);
-    return this.call(t.shard, { sql: p.sql, params: p.params, spans: wide && t.sks !== null ? [...spans, ...this.spansFor(p.tables, null, null)] : spans });
+    const spans = wide && t.sks !== null && p.fallback ? this.wideSpans(p.fallback.scans, t.sks) : this.spansFor(p.tables, p.pk, t.sks);
+    return this.call(t.shard, { sql: p.sql, params: p.params, spans });
+  }
+
+  /**
+   * shard key でシャードを選んだが、文はその shard key に絞らずに送る読みの span。index 経由の読みで使う。
+   * 文はシャードの表を広く読むので、span も shard key に絞らない。絞ると、シャードはほかの行の intent を決着させない。
+   * ただし表全体にはしない。文が読むのは押し下げた条件に合う行だけなので、その条件の span にする。
+   * 表全体にすると、取引の検証で、条件に関わらない行への書き込みとも競合する。条件を押し下げられない表だけ、表全体になる。
+   * shard key の span も付ける。範囲が別のシャードへ移っていれば、それで NotOwner になり、経路を取り直せる。
+   */
+  private wideSpans(scans: Scan[], sks: string[]): Span[] {
+    return scans.flatMap((s) => [...this.scanSpans(s, sks), ...this.scanSpans(s, null)]);
   }
 
   /**
@@ -182,7 +193,7 @@ class ReadScope {
     // バイト数は対象のシャードで等分する。偏りがあると早めに拒否するが、合計が予算を超えることはない。
     const maxBytes = Math.max(1_000_000, Math.floor(this.db.byteBudget / targets.length));
     const parts = await Promise.all(targets.map((t) =>
-      this.call(t.shard, { sql: s.sql, params: s.params, spans: s.wideSpans && t.sks !== null ? [...this.scanSpans(s, t.sks), ...this.scanSpans(s, null)] : this.scanSpans(s, t.sks), maxRows: this.db.rowBudget, maxBytes }),
+      this.call(t.shard, { sql: s.sql, params: s.params, spans: s.wideSpans && t.sks !== null ? this.wideSpans([s], t.sks) : this.scanSpans(s, t.sks), maxRows: this.db.rowBudget, maxBytes }),
     ));
     return { columns: parts[0]!.columns, rows: parts.flatMap((r) => r.values) };
   }
@@ -230,9 +241,8 @@ class ReadScope {
       case "shard": {
         const targets = await this.resolve(p.route);
         // index 経由の読みは、index が挙げた shard key でシャードを選ぶが、文はその shard key に絞らずに送る。
-        // そのシャードの表全体を読むので、表全体の span も付ける。shard key だけを span にすると、シャードはほかの行の
-        // intent を決着させない。確定済みで適用待ちの更新が見えず、条件に合わなくなったはずの行が古い値のまま返る。
-        // shard key の span も残す。範囲が別のシャードへ移っていれば、それで NotOwner になり、経路を取り直せる。
+        // shard key だけを span にすると、シャードはほかの行の intent を決着させない。確定済みで適用待ちの更新が見えず、
+        // 条件に合わなくなったはずの行が古い値のまま返る。span の作り方は wideSpans を見よ。
         const wide = p.route.by === "gidx";
         if (p.fallback && targets.length !== 1) {
           const sks = targets.flatMap((t) => t.sks ?? []);
