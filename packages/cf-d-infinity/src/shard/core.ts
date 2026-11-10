@@ -1,6 +1,6 @@
 import { Hlc, SECOND, physicalToTs, tsToPhysical } from "../hlc";
 import type {
-  Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupPayload, LockOwner, MetaApi,
+  Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, GroupPayload, LockOwner, MetaApi,
   Participant, PrepareReq, PrepareRes, Row, ShardApi, ShardMetrics, Span, TableDef, Ts, TxnStatus, Value,
 } from "../types";
 import { ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, SqlError, spanCovers, unprotectedSpans } from "../types";
@@ -44,6 +44,8 @@ export const ORPHAN_AGE_MS = 2000;
  * 上限がないと、絞り込みのない SELECT が全行を送り返し、シャードと Worker の両方がメモリを使い切る。
  * バイト数は DO の RPC の上限 (32 MiB) より十分小さくしてある。
  */
+/** 移動できる 1 グループ (同じ shard key の行の集まり) の大きさの上限。分割転送がないので、これより大きいと移動が終わらない。 */
+export const GROUP_MAX_BYTES = 16_000_000;
 export const SHARD_MAX_ROWS = 200_000;
 export const SHARD_MAX_BYTES = 16_000_000;
 /** 値のおおよその大きさ (バイト)。上限の判定に使うだけで、正確である必要はない。 */
@@ -450,22 +452,52 @@ export class ShardCore implements ShardApi {
    * 範囲のグループを列挙する。fence の後に呼べば取り残しはない。
    * ack されていないグループは移動済みでも返す。子が受け取る前に落ちると応答が失われるからである。
    */
-  async listGroups(req: { start: number; end: number; limit: number }): Promise<string[]> {
-    const out = new Set<string>();
+  async listGroups(req: { start: number; end: number; limit: number; cursor?: GroupCursor | null }): Promise<{ groups: string[]; cursor: GroupCursor | null }> {
+    const out: string[] = [];
+    const seen = new Set<string>();
     const add = (g: string) => {
       const slot = slotOf(g);
-      if (slot >= req.start && slot < req.end && !this.moved.get(g)?.acked) out.add(g);
-    };
-    for (const def of this.defs.values()) {
-      const cols = def.shardKey.map(q).join(", ");
-      for (const r of this.b.exec(`SELECT DISTINCT ${cols} FROM ${q(def.name)}`)) {
-        add(encode(def.shardKey.map((c) => r[c] ?? null)));
-        if (out.size >= req.limit) return [...out];
+      if (slot >= req.start && slot < req.end && !this.moved.get(g)?.acked && !seen.has(g)) {
+        seen.add(g);
+        out.push(g);
       }
+    };
+    // 表は名前の順に、表の中は shard key の順に読み、前回の続きから始める。
+    // 毎回先頭から読むと、行ごとに shard key が違う表 (既定の `id INTEGER PRIMARY KEY`) では、
+    // 呼ぶたびに全行を読み直し、全部を配列に持つことになる。
+    const tables = [...this.defs.keys()].sort();
+    let cursor: GroupCursor = req.cursor ?? { table: tables[0] ?? null, after: null };
+    while (cursor.table !== null) {
+      const def = this.defs.get(cursor.table);
+      if (def) {
+        const cols = def.shardKey.map(q).join(", ");
+        const keyset = cursor.after !== null && cursor.after.every((v) => v !== null);
+        const where = keyset ? `WHERE (${cols}) > (${def.shardKey.map(() => "?").join(", ")})` : "";
+        const skip = keyset ? 0 : (cursor.skip ?? 0);
+        const { rows } = this.b.iterate(
+          `SELECT DISTINCT ${cols} FROM ${q(def.name)} ${where} ORDER BY ${cols} LIMIT -1 OFFSET ${skip}`,
+          ...(keyset ? cursor.after! : []),
+        );
+        let read = 0;
+        for (const r of rows) {
+          read++;
+          add(encode(r));
+          if (out.length >= req.limit) {
+            // NULL を含む shard key は行の比較で絞れないので、読んだ数で続きを表す。
+            const next: GroupCursor = r.every((v) => v !== null)
+              ? { table: cursor.table, after: r }
+              : { table: cursor.table, after: null, skip: skip + read };
+            return { groups: out, cursor: next };
+          }
+        }
+      }
+      const name: string = cursor.table;
+      cursor = { table: tables.find((t) => t > name) ?? null, after: null };
     }
+    // 行のないグループも運ぶ。intent だけがある場合と、ack が届いていない場合である。
     for (const r of this.b.exec(`SELECT DISTINCT sk FROM __intents`)) add(r.sk as string);
     for (const [g] of this.moved) add(g);
-    return [...out].slice(0, req.limit);
+    return { groups: out, cursor: null };
   }
 
   /**
@@ -487,6 +519,11 @@ export class ShardCore implements ShardApi {
       );
       const intents = this.faults.dropIntentsOnMove ? [] : this.b.exec(`SELECT * FROM __intents WHERE sk = ?`, g);
       const size = encode(rows).length + encode(intents).length;
+      // 1 グループは 1 回の RPC で運ぶ。RPC の上限 (32 MiB) を超える大きさは運べないので、はっきり断る。
+      // 断らないと、運べないまま再試行を続け、原因が見えない。
+      if (size > GROUP_MAX_BYTES) {
+        throw new SqlError(`group too large to move: shard key ${g} holds ${size} bytes (limit ${GROUP_MAX_BYTES}); this split cannot finish`);
+      }
       if (out.length > 0 && bytes + size > req.maxBytes) break;
       bytes += size;
       let known = this.moved.get(g);
@@ -586,22 +623,35 @@ export class ShardCore implements ShardApi {
     if (!range) return { groups: 0, rows: 0, bytes: 0 };
     const parent = this.deps.peer(range.from_id);
     const total = { groups: 0, rows: 0, bytes: 0 };
-    for (;;) {
-      const listed = await parent.listGroups({ ...req, limit: 256 });
-      if (listed.length === 0) return total;
-      // 受け取り済みで親に ack が届いていないグループは、ack だけを送り直す。
-      const done = listed.filter((g) => this.arrived.has(g));
-      if (done.length) await parent.ack({ groups: done });
-      const groups = listed.filter((g) => !this.arrived.has(g));
-      if (groups.length === 0) continue;
-      const payload = await parent.pull({ groups, to: this.id, maxBytes: 1_000_000 });
-      await this.receive(payload);
-      await parent.ack({ groups: payload.map((p) => p.g) });
-      total.groups += payload.length;
-      for (const p of payload) {
-        total.rows += p.rows.length;
-        total.bytes += encode(p.rows).length;
-      }
+    // 親のグループを先頭から順に列挙して運ぶ。最後まで行ったら、もう一度先頭から列挙して、取り残しがないことを確かめる。
+    // ack 済みのグループは親から消えているので、2 周目は残る側のグループを読むだけである。
+    for (let pass = 0; ; pass++) {
+      let cursor: GroupCursor | null | undefined = undefined;
+      let moved = 0;
+      do {
+        const page: { groups: string[]; cursor: GroupCursor | null } = await parent.listGroups({ ...req, limit: 256, cursor });
+        cursor = page.cursor;
+        // 受け取り済みで親に ack が届いていないグループは、ack だけを送り直す。
+        const done = page.groups.filter((g) => this.arrived.has(g));
+        if (done.length) await parent.ack({ groups: done });
+        let rest = page.groups.filter((g) => !this.arrived.has(g));
+        moved += page.groups.length;
+        // pull は大きさの上限で途中までしか返さないことがある。残りを取り終えるまで繰り返す。
+        while (rest.length) {
+          const payload = await parent.pull({ groups: rest, to: this.id, maxBytes: 1_000_000 });
+          await this.receive(payload);
+          await parent.ack({ groups: payload.map((p) => p.g) });
+          total.groups += payload.length;
+          for (const p of payload) {
+            total.rows += p.rows.length;
+            total.bytes += encode(p.rows).length;
+          }
+          const got = new Set(payload.map((p) => p.g));
+          rest = rest.filter((g) => !got.has(g));
+        }
+      } while (cursor !== null);
+      if (moved === 0) return total;
+      if (pass > 100) throw new SqlError("drain does not converge");
     }
   }
 

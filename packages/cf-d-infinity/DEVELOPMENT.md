@@ -69,6 +69,7 @@ Cron が毎分 Autoscaler DO を起こし、Autoscaler は全シャードの met
 | 変数 | 既定 | 内容 |
 |---|---|---|
 | `DINF_SHARD_COUNT` | 8 | 最初のシャード数 |
+| `DINF_AUTOSCALE` | なし | `split` なら閾値を超えたシャードを実際に割る。未指定なら `would-split` を記録するだけ。増設は取り消せないので既定は記録だけにしている |
 | `DINF_AUTOSCALE_TICK_MS` | 5000 | 負荷が続いている間の判断の周期 (ms) |
 | `DINF_AUTOSCALE_THRESHOLDS` | なし | 閾値の上書き (JSON)。項目は `src/autoscaler.ts` の `Thresholds` |
 | `DINF_SLOW_QUERY_MS` | 500 | これより遅い文を DinfMeta に記録する。`0` は全部、`off` は記録しない |

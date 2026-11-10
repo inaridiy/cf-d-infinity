@@ -201,7 +201,7 @@ function planExisting(cwd, configName, opts) {
   else if (crons.includes(CRON)) kept.push(`Cron Trigger ${CRON}`);
   else {
     doc.push(["triggers", "crons"], CRON);
-    done.push(`Cron Trigger "${CRON}" (wakes the autoscaler once a minute; delete it to turn autoscaling off)`);
+    done.push(`Cron Trigger "${CRON}" (wakes the autoscaler once a minute; it only watches until you set the var DINF_AUTOSCALE to "split")`);
   }
 
   const writes = [];
@@ -232,7 +232,7 @@ function planCf(cwd, opts) {
   const worker = name ?? "<your Worker's name>";
   if (/\bDinfShard\b/.test(text)) kept.push(`${configName} already declares the Durable Object classes`);
   else {
-    const cron = opts.autoscale ? `\n      triggers: [triggers.scheduled({ schedule: "${CRON}" })],   // the autoscaler; leave it out to turn autoscaling off` : "";
+    const cron = opts.autoscale ? `\n      triggers: [triggers.scheduled({ schedule: "${CRON}" })],   // wakes the autoscaler; add DINF_AUTOSCALE: bindings.text("split") to env to let it split shards` : "";
     next.push(`Add this to the worker in ${configName} (import bindings, exports and triggers from "cf/config"; merge with what is there):
       exports: {
 ${CLASSES.map((c) => `        ${c}: exports.durableObject({ storage: "sqlite" }),`).join("\n")}
@@ -251,7 +251,7 @@ ${DO_BINDINGS.map((b) => `        ${b.name}: bindings.durableObject({ worker: "$
 /** 空のディレクトリに、DB だけの Worker を作る計画を立てる。 */
 function planNew(cwd, opts) {
   const name = (opts.name ?? basename(cwd)).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "my-db";
-  const crons = opts.autoscale ? `\n  // Wakes the autoscaler once a minute. Delete this line and deploy to turn autoscaling off.\n  "triggers": { "crons": ["${CRON}"] },` : "";
+  const crons = opts.autoscale ? `\n  // Wakes the autoscaler once a minute. It records shards that should be split; add "DINF_AUTOSCALE": "split" to vars to let it split them.\n  "triggers": { "crons": ["${CRON}"] },` : "";
   const files = {
     "package.json": `${JSON.stringify({
       name, private: true, type: "module",

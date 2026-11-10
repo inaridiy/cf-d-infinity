@@ -1,8 +1,10 @@
 // シャード側の上限。結果の大きさは送り返す前に、取引の大きさは確定する前に断る。
 // どちらも、後で断ると手遅れになる。前者は数える前にメモリが尽き、後者は確定した取引が適用できなくなる。
 import { describe, expect, it } from "vitest";
+import { split } from "../src/autoscaler";
 import { Db } from "../src/client/db";
 import { ownerOf } from "../src/routing";
+import { GROUP_MAX_BYTES } from "../src/shard/core";
 import { MAX_WRITE_SET_BYTES } from "../src/types";
 import { quiescentProblems } from "./invariants";
 import { DO_MAX_BOUND_PARAMS, DO_MAX_VALUE_BYTES, SimCluster, SqliteBackend } from "./sim";
@@ -132,6 +134,48 @@ describe("the size of a transaction", () => {
     expect(broken.outcome).toBe("committed");
     expect(broken.problems.some((p) => /never fully applied|intents remain|redrive keeps failing/.test(p))).toBe(true);
   });
+});
+
+describe("a shard split", () => {
+  it("walks the groups of a table once per pass, even when every row is its own group", async () => {
+    // 既定の shard key は主キーの先頭列なので、`id INTEGER PRIMARY KEY` の表は 1 行が 1 グループになる。
+    const ROWS = 3000;
+    const c = new SimCluster({ shards: 1 });
+    await c.client().ddl("CREATE TABLE items(id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
+    for (let i = 1; i <= ROWS; i += 50) {
+      await new Db(c).query(`INSERT INTO items(id, n) VALUES ${Array.from({ length: 50 }, (_, k) => `(${i + k}, ${i + k})`).join(", ")}`);
+    }
+    const parent = c.backends.get("s0")!;
+    const iterate = parent.iterate.bind(parent);
+    let listed = 0;
+    parent.iterate = (sql, ...params) => {
+      const r = iterate(sql, ...params);
+      if (!/SELECT DISTINCT "id" FROM "items"/.test(sql)) return r;
+      return { columns: r.columns, rows: (function* () { for (const row of r.rows) { listed++; yield row; } })() };
+    };
+    const moved = await split(c, "s0", "s1");
+    expect(moved!.groups).toBeGreaterThan(ROWS / 4);
+    // 先頭から読み直す作りだと、256 グループごとに全行を読むので、ここは数万になる。
+    expect(listed).toBeLessThan(ROWS * 3);
+    expect((await new Db(c).query("SELECT count(*) AS n, sum(n) AS s FROM items")).rows).toEqual([{ n: ROWS, s: (ROWS * (ROWS + 1)) / 2 }]);
+    expect(await quiescentProblems(c)).toEqual([]);
+  }, 60000);
+
+  it("refuses, by name, a group that is too large to move in one message", async () => {
+    const c = new SimCluster({ shards: 1 });
+    await c.client().ddl(DOCS);
+    const { routing } = await c.catalog();
+    const range = { start: 0, end: 4096 };
+    void routing;
+    const rows = Math.ceil(GROUP_MAX_BYTES / 900_000) + 1;
+    for (let i = 1; i <= rows; i++) await new Db(c).query("INSERT INTO docs VALUES (7, ?, ?)", [i, text(900_000)]);
+    await expect(c.shard("s0").pull({ groups: [JSON.stringify([7])], to: "s1", maxBytes: 1_000_000 }).catch(async (e: Error) => {
+      // fence していない範囲の pull は別の理由で断られるので、fence してから試す。
+      if (!/unfenced/.test(e.message)) throw e;
+      await c.shard("s0").fence({ ...range, to: "s1" });
+      return c.shard("s0").pull({ groups: [JSON.stringify([7])], to: "s1", maxBytes: 1_000_000 });
+    })).rejects.toThrow(/group too large to move: shard key \[7\]/);
+  }, 60000);
 });
 
 describe("the simulator's storage", () => {

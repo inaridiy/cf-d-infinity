@@ -14,7 +14,7 @@ Read the name as "D-infinity": the D1 API your Worker already speaks, without th
 
 - **Interactive transactions, across shards.** `BEGIN`, read, decide, write, `COMMIT`, serializable by default, with no central timestamp oracle. D1 offers `batch()` only.
 - **Works with the SQLite clients you have.** `@libsql/client` over HTTP or WebSocket, Drizzle, and a D1-compatible API. You change the URL.
-- **Scales past one database.** Tables are spread over up to 4,096 hash slots; an autoscaler splits hot or large shards online. One shard takes ~950 single-shard writes/s; 64 shards reached 18,784 writes/s. Transactions that span shards are far slower: about 44–60 per second per shard (see [When not to use it](#when-not-to-use-it)).
+- **Scales past one database.** Tables are spread over up to 4,096 hash slots, and a shard can be split online. The autoscaler watches every shard and, once you opt in with `DINF_AUTOSCALE = "split"`, splits hot or large ones itself. One shard takes ~950 single-shard writes/s; 64 shards reached 18,784 writes/s. Transactions that span shards are far slower: about 44–60 per second per shard (see [When not to use it](#when-not-to-use-it)).
 - **SQLite semantics, not a reimplementation.** Each shard is SQLite, and cross-shard statements re-run the original SQL in a WebAssembly SQLite inside the Worker. All 8,884 queries of sqllogictest `select1`–`select5` match.
 - **Pay per row, no instance to size.** Durable Object pricing: 2 billed rows per single-row `UPDATE`, $0.20 per GB-month. When nothing is happening, the only activity is the autoscaler waking each shard once a minute.
 - **Checked, not only claimed.** Eleven formal models, a fault-injecting simulator, and Elle-style black-box checks against production Cloudflare while Durable Objects crash and shards split.
@@ -29,7 +29,7 @@ npm install
 npx wrangler dev
 ```
 
-`init` adds three Durable Object classes, their migration, a Service Binding that points back at this Worker's `DinfDatabase` entrypoint, and a one-minute Cron Trigger that drives the autoscaler. Comments in the file are kept, nothing is written if a name is already taken, and a second run changes nothing. It appends one line to your main module that re-exports the classes; the only change left to you is the `scheduled` line shown below.
+`init` adds three Durable Object classes, their migration, a Service Binding that points back at this Worker's `DinfDatabase` entrypoint, and a one-minute Cron Trigger that wakes the autoscaler. Comments in the file are kept, nothing is written if a name is already taken, and a second run changes nothing. It appends one line to your main module that re-exports the classes; the only change left to you is the `scheduled` line shown below.
 
 ```jsonc
 // wrangler.jsonc (added by init; "my-app" is this Worker's own name)
@@ -41,7 +41,7 @@ npx wrangler dev
 "migrations": [{ "tag": "cf-d-infinity-v1", "new_sqlite_classes": ["DinfShard", "DinfMeta", "DinfAutoscaler"] }],
 "services": [{ "binding": "DINF_DB", "service": "my-app", "entrypoint": "DinfDatabase" }],
 "vars": { "DINF_SHARD_COUNT": "8" },
-"triggers": { "crons": ["* * * * *"] }    // autoscaling is on; delete this line to turn it off
+"triggers": { "crons": ["* * * * *"] }    // the autoscaler watches the shards; add "DINF_AUTOSCALE": "split" to vars to let it split them
 ```
 
 Use it through the binding. The binding is the credential; no token crosses it.
@@ -126,7 +126,7 @@ env: {
   DINF_DB: bindings.worker({ worker: "my-app", exportName: "DinfDatabase" }),
   DINF_SHARD_COUNT: bindings.text("8"),
 },
-triggers: [triggers.scheduled({ schedule: "* * * * *" })],
+triggers: [triggers.scheduled({ schedule: "* * * * *" })],   // add DINF_AUTOSCALE: bindings.text("split") to env to let it split shards
 ```
 
 `cf` is in beta and its configuration can change; this was checked with `cf` 1.0.0-beta.28 (`cf dev`, `cf build` and the generated types).
@@ -253,7 +253,7 @@ None of the following is a proof of the implementation:
 - **Scale limits.** At most 200,000 rows gathered into the Worker per statement; no hierarchical fan-out beyond 8 shards; a single hot row tops out around 650 writes/s; shards are never merged; the autoscaler notices new load within about a minute, then follows it every 5 seconds.
 - **No region control.** A shard is created near the Worker that first reaches it and never moves, so latency grows with distance from there.
 - **No stability promise.** Storage format, wire protocol and admin API may change between commits. The stored data carries no format version yet, so rolling your application back to an older release of this package is not checked and not safe.
-- **Autoscaling is on by default and cannot be undone or cancelled.** It has been measured with 128 shard-key groups per shard. A table whose shard key is its primary key (`id INTEGER PRIMARY KEY`, the default) has one group per row; splitting such a shard at millions of rows has not been run and is expected to be slow. A statement that reads a whole table is retried for under a second and then fails while a split is still moving data. Remove the Cron Trigger to turn autoscaling off.
+- **Splitting a shard cannot be undone or cancelled, so automatic splitting is opt-in.** By default the autoscaler only records that a shard should be split (`npx cf-d-infinity status` shows `would-split`); set the var `DINF_AUTOSCALE` to `"split"` to let it act. Splitting has been measured with 128 shard-key groups per shard, not with millions. A shard-key group larger than 16 MB cannot be moved, and a split that meets one stops with an error naming it. A statement that reads a whole table is retried for under a second and then fails while a split is still moving data.
 - **The schema is fetched from one Durable Object.** Each Worker isolate caches it for 2 seconds and refetches on the request path, so that object is a dependency of every request.
 
 ## Develop

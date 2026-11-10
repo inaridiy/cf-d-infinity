@@ -13,7 +13,7 @@ Run it in the directory that holds `wrangler.jsonc` (or `wrangler.json`). It add
 
 | File | Change |
 |---|---|
-| `wrangler.jsonc` | Comments kept. Adds the Durable Object bindings `DINF_SHARD`, `DINF_META`, `DINF_AUTOSCALER`, the migration `cf-d-infinity-v1` for their SQLite-backed classes, a Service Binding `DINF_DB` to this Worker's `DinfDatabase` entrypoint, the var `DINF_SHARD_COUNT`, and the Cron Trigger `* * * * *` that wakes the autoscaler |
+| `wrangler.jsonc` | Comments kept. Adds the Durable Object bindings `DINF_SHARD`, `DINF_META`, `DINF_AUTOSCALER`, the migration `cf-d-infinity-v1` for their SQLite-backed classes, a Service Binding `DINF_DB` to this Worker's `DinfDatabase` entrypoint, the var `DINF_SHARD_COUNT`, and the Cron Trigger `* * * * *` that wakes the autoscaler. The autoscaler only watches until you add the var `DINF_AUTOSCALE` = `"split"` |
 | `src/dinf.ts` | New. Re-exports the classes, `connect` and `autoscale`. Placed next to your `main` module |
 | your `main` module | One line appended that re-exports the Durable Object classes; wrangler refers to them by name |
 | `package.json` | Adds the `cf-d-infinity` dependency |

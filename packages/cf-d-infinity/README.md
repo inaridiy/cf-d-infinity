@@ -80,7 +80,8 @@ All of it lives in `wrangler.jsonc`, or in `cloudflare.config.ts` if you use the
 | `DINF_SHARD`, `DINF_META`, `DINF_AUTOSCALER` | Durable Object bindings | Required. The class names are `DinfShard`, `DinfMeta`, `DinfAutoscaler` |
 | `DINF_DB` | Service Binding to `DinfDatabase` | What your code passes to `connect()`. The name is yours to choose (`init --binding`) |
 | `DINF_SHARD_COUNT` | var | Number of shards the database starts with (default 8) |
-| `triggers.crons` | Cron Trigger | `* * * * *` turns autoscaling on; remove it to turn it off |
+| `triggers.crons` | Cron Trigger | `* * * * *` wakes the autoscaler, which watches the shards |
+| `DINF_AUTOSCALE` | var | `"split"` lets the autoscaler split shards. Unset, it only records that a shard should be split (splits cannot be undone) |
 | `DINF_AUTOSCALE_TICK_MS`, `DINF_AUTOSCALE_THRESHOLDS` | vars | Optional overrides for the autoscaler |
 | `DINF_SLOW_QUERY_MS` | var | Statements slower than this are recorded (default 500; `0` records all; `off` disables). Bound parameters are never recorded |
 | `DINF_API_TOKEN`, `DINF_ADMIN_TOKEN` | secrets | Only for the HTTP endpoint: SQL over Hrana, and `/admin/*`. A route whose token is not set rejects every request. The binding needs no token |

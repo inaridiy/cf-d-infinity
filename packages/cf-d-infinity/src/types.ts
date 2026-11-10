@@ -188,7 +188,7 @@ export interface ShardApi {
   beginIncoming(req: { start: number; end: number; from: string; schema: number }): Promise<void>;
   /** 親がスロットの受理を止める。以後は NotOwner を返す。 */
   fence(req: { start: number; end: number; to: string }): Promise<void>;
-  listGroups(req: { start: number; end: number; limit: number }): Promise<string[]>;
+  listGroups(req: { start: number; end: number; limit: number; cursor?: GroupCursor | null }): Promise<{ groups: string[]; cursor: GroupCursor | null }>;
   pull(req: { groups: string[]; to: string; maxBytes: number }): Promise<GroupPayload[]>;
   ack(req: { groups: string[] }): Promise<void>;
   /** 子が背景で全グループを引き取る。 */
@@ -219,6 +219,18 @@ export interface GroupPayload {
   m: Ts;
   rows: { table: string; row: Row }[];
   intents: Row[];
+}
+
+/**
+ * グループの列挙の続きの位置。表の名前の順に、表の中は shard key の順に進む。
+ * table が null なら、表は読み終えている。
+ */
+export interface GroupCursor {
+  table: string | null;
+  /** この shard key より後から読む。 */
+  after: Value[] | null;
+  /** shard key に NULL があって after で絞れないときの読み飛ばしの数。 */
+  skip?: number;
 }
 
 export interface ShardMetrics {

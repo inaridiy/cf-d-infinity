@@ -6,7 +6,7 @@
   "alias": { "fs": "./src/empty.js", "path": "./src/empty.js", "crypto": "./src/empty.js" },
   // DINF_SHARD_COUNT は最初のシャード数。閾値は DINF_AUTOSCALE_THRESHOLDS (JSON)、追いかける周期は DINF_AUTOSCALE_TICK_MS で上書きできる。
   "vars": { "DINF_SHARD_COUNT": "8" },
-  // 自動増設のスイッチ。毎分 Autoscaler を起こす。この行を消してデプロイすると止まる。
+  // 毎分 Autoscaler を起こす。既定では割るべきシャードを記録するだけで、vars に "DINF_AUTOSCALE": "split" を足すと実際に割る。
   "triggers": { "crons": ["* * * * *"] },
   "durable_objects": {
     "bindings": [

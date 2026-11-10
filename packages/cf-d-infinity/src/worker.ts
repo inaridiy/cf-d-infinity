@@ -21,6 +21,11 @@ export interface Env {
   DINF_API_TOKEN?: string;
   /** 運用の操作 (/admin) の認証トークン。未設定なら運用の経路を全部拒否する。 */
   DINF_ADMIN_TOKEN?: string;
+  /**
+   * 自動増設の動作。"split" なら閾値を超えたシャードを実際に割る。それ以外 (既定) は、割るべきだと記録するだけである。
+   * 増設は取り消せず、途中でやめる手順もないので、明示的に有効にしたときだけ行う。
+   */
+  DINF_AUTOSCALE?: string;
   /** 負荷が続いている間だけ回す Autoscaler の周期 (ms)。既定は 5000。 */
   DINF_AUTOSCALE_TICK_MS?: string;
   /** 増設の閾値の上書き (JSON)。省略した項目は既定値になる。 */
@@ -247,8 +252,12 @@ export interface AutoscaleConfig {
   initial: number;
   tickMs: number;
   thresholds?: Partial<Thresholds>;
+  /** "split" なら実際に割る。"notify" (既定) は記録するだけ。 */
+  mode?: "notify" | "split";
 }
-type SavedConfig = Omit<AutoscaleConfig, "thresholds"> & { thresholds: Thresholds; next: number; pending: SplitJob[]; pinned?: boolean };
+type SavedConfig = Omit<AutoscaleConfig, "thresholds" | "mode"> & {
+  thresholds: Thresholds; next: number; pending: SplitJob[]; pinned?: boolean; mode: "notify" | "split";
+};
 
 /**
  * 運用者の手作業なしに増設を起動する制御ループ。
@@ -280,12 +289,13 @@ export class DinfAutoscaler extends DurableObject<Env> {
     const prev = this.conf();
     const same = prev?.cluster === c.cluster ? prev : null;
     const thresholds = { ...DEFAULTS, ...c.thresholds };
-    if (same && same.initial === c.initial && same.tickMs === c.tickMs && !!same.pinned === pinned
+    const mode = c.mode ?? "notify";
+    if (same && same.initial === c.initial && same.tickMs === c.tickMs && !!same.pinned === pinned && same.mode === mode
       && JSON.stringify(same.thresholds) === JSON.stringify(thresholds)) return same;
     const { routing } = await clusterOf(this.env, c.initial, c.cluster).catalog();
     // 起動し直しでも、番号の再利用と途中の増設の取りこぼしを起こさない。
     const next = nextShardNumber(routing, c.cluster, Math.max(c.initial, same?.next ?? 0));
-    const saved: SavedConfig = { cluster: c.cluster, initial: c.initial, tickMs: c.tickMs, thresholds, next, pending: same?.pending ?? [], pinned };
+    const saved: SavedConfig = { cluster: c.cluster, initial: c.initial, tickMs: c.tickMs, thresholds, next, pending: same?.pending ?? [], pinned, mode };
     this.save(saved);
     return saved;
   }
@@ -348,6 +358,12 @@ export class DinfAutoscaler extends DurableObject<Env> {
       }
       const range = planSplit(routing, d.shard);
       if (!range) continue;
+      if (c.mode !== "split") {
+        // 割るべきだと記録するだけにする。cooldown を進めるので、同じシャードについては 10 分に 1 回しか記録しない。
+        this.state.lastSplit[d.shard] = Date.now();
+        this.event("would-split", d);
+        continue;
+      }
       const job: SplitJob = { parent: d.shard, child: `${c.cluster}-${c.next++}`, range };
       c.pending.push(job);
       this.save(c);
@@ -608,6 +624,7 @@ export function autoscaleConfig(env: Env, cluster = "shard"): AutoscaleConfig {
     cluster,
     initial: Number(env.DINF_SHARD_COUNT ?? 8),
     tickMs: Number(env.DINF_AUTOSCALE_TICK_MS ?? 5000),
+    mode: env.DINF_AUTOSCALE === "split" ? "split" : "notify",
     thresholds: env.DINF_AUTOSCALE_THRESHOLDS ? (JSON.parse(env.DINF_AUTOSCALE_THRESHOLDS) as Partial<Thresholds>) : undefined,
   };
 }
