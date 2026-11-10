@@ -129,3 +129,42 @@ describe("an autocommit read of several shards that does not include the anchor"
     expect(r.seenStale).toBeGreaterThan(0);
   });
 });
+
+describe("a schema change while a committed transaction is waiting to be applied", () => {
+  // 取引は確定したが、phase 2 がまだ参加者に届いていない。そこへ別の接続が表を DROP する。
+  // intent の行は DROP の前の表の形なので、DROP を先に適用すると、後から届く適用が永久に失敗する。
+  const run = async (faults: Faults) => {
+    const c = new SimCluster({ shards: 2, faults });
+    await c.client().ddl(USERS);
+    await c.client().ddl(`CREATE TABLE notes(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+    const tenants = [await tenantOn(c, "s0"), await tenantOn(c, "s1")];
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    c.net.gate = (m) => (m.method === "finalize" ? held : undefined);
+    const w = await new Db(c).begin();
+    for (const t of tenants) await w.query("INSERT INTO notes VALUES (?, 1, 'x')", [t]);
+    for (const t of tenants) await w.query("INSERT INTO users(tenant_id,id,n) VALUES (?,1,7)", [t]);
+    await w.commit();
+    const drop = await new Db(c).ddl("DROP TABLE notes").then(() => "dropped", (e: Error) => e.message);
+    c.net.gate = () => undefined;
+    release();
+    const problems = await quiescentProblems(c);
+    const users = await new Db(c).query("SELECT count(*) AS n FROM users WHERE n = 7").then((r) => r.rows[0]!.n, (e: Error) => e.message);
+    return { drop, problems, users };
+  };
+
+  it("applies the transaction first, then the schema change", async () => {
+    const r = await run({});
+    expect(r.drop).toBe("dropped");
+    expect(r.problems).toEqual([]);
+    // 同じ取引が別の表に書いた行は、両方のシャードに残っている。
+    expect(r.users).toBe(2);
+  });
+
+  it("without settling intents first, the committed transaction is stuck forever (the bug)", async () => {
+    const r = await run({ ddlIgnoresIntents: true });
+    expect(r.problems.some((p) => /intents remain|never fully applied|redrive keeps failing/.test(p))).toBe(true);
+    // 同じ取引が別の表に書いた行も読めない。読み手が intent を決着させようとして、同じ失敗に当たる。
+    expect(r.users).toMatch(/no such table: notes/);
+  });
+});

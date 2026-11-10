@@ -79,6 +79,8 @@ const LOCK_WAIT_MS = 5000;
  * 奪う時期を遅らせても閉路はいずれ解ける。ロックはいつ消えてもよいので安全性は変わらない。
  */
 const WOUND_DELAY_MS = 200;
+/** DDL の適用が、進行中の取引の決着を待つ上限。超えたら再試行できる誤りを返す。 */
+const SCHEMA_WAIT_MS = 5000;
 
 interface RowLock extends LockOwner {
   expires: number;
@@ -96,6 +98,8 @@ export class ShardCore implements ShardApi {
   private ceiling: Ts = 0;
   private defs = new Map<string, TableDef>();
   private schema = 0;
+  /** 進行中の DDL の適用。同時に来た要求は同じ適用を待つ。 */
+  private schemaChange: Promise<void> | null = null;
   /** 直近の write の索引。キーごとの最新 commit 時刻だけを持ち、検査を O(1) にする。 */
   private recent = new Map<string, Ts>();
   private recentLowWater: Ts = 0;
@@ -307,7 +311,27 @@ export class ShardCore implements ShardApi {
   private async ensureSchema(version: number): Promise<void> {
     // 古い表定義の要求を通すと、新しいグローバル index の更新が漏れる。経路と同じく取り直させる。
     if (version < this.schema) throw new NotOwner(`stale schema ${version} < ${this.schema}`);
-    if (version === this.schema) return;
+    if (version === this.schema) {
+      // DDL の適用が intent の決着を待っている間は、古い表定義の新しい要求を受けない。
+      // 受けると intent が増え続けて、DDL がいつまでも適用できない。呼び出し側は表定義を取り直して、同じ待ちに合流する。
+      if (this.schemaChange) throw new NotOwner(`stale schema ${version}: a schema change is being applied`);
+      return;
+    }
+    this.schemaChange ??= this.applySchema().finally(() => {
+      this.schemaChange = null;
+    });
+    await this.schemaChange;
+    // 待っている間に、さらに新しい DDL が出ているかもしれない。
+    if (version > this.schema) await this.ensureSchema(version);
+  }
+
+  /**
+   * Meta から DDL を取り、順に適用する。
+   * 先に、このシャードが持つ intent をすべて決着させる。intent の行イメージは DDL より前の表の形なので、
+   * 表や列が消えた後では適用できない。確定済みの取引がそうなると、再駆動が永久に失敗する。
+   */
+  private async applySchema(): Promise<void> {
+    if (!this.faults.ddlIgnoresIntents) await this.settleAllIntents();
     const { ddl } = await this.deps.meta.ddlSince(this.schema);
     for (const e of ddl) {
       if (e.version <= this.schema) continue;
@@ -320,6 +344,28 @@ export class ShardCore implements ShardApi {
       // 変更ログの行イメージは DDL より前の形なので、それより古い T は読み戻せない。
       this.ddlFloor = this.issue();
       this.metaSet("ddl_floor", this.ddlFloor);
+    }
+  }
+
+  /**
+   * 持っている intent を、anchor に尋ねて全部決着させる。進行中の取引は終わるまで待つ。
+   * 待っている間、新しい prepare は ensureSchema が断るので、intent は増えない。
+   */
+  private async settleAllIntents(): Promise<void> {
+    const deadline = this.deps.clock.now() + SCHEMA_WAIT_MS;
+    for (;;) {
+      const pending = this.b.exec(`SELECT DISTINCT txn, anchor FROM __intents`) as unknown as Intent[];
+      if (pending.length === 0) return;
+      for (const i of pending) {
+        const res = await this.ask(i.anchor, i.txn, 0);
+        if (res.status === "committed") await this.finalize({ txn: i.txn, c: res.c });
+        else if (res.status === "aborted") await this.abort({ txn: i.txn });
+      }
+      if ((this.b.exec(`SELECT count(*) n FROM __intents`)[0]!.n as number) === 0) return;
+      if (this.deps.clock.now() > deadline) {
+        throw new ConflictError("schema change is waiting for transactions on this shard to finish");
+      }
+      await new Promise((r) => setTimeout(r, 5));
     }
   }
 
