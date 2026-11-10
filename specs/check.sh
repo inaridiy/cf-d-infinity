@@ -158,6 +158,30 @@ red     $f m10_red_gc_undone safe         # 適用前の committed 記録を消�
 red     $f m10_red_guard_too_long safe    # 受け付ける年齢 G が保持時間 R 以上
 witness $f m10_green witnessGc
 
+echo "== M11 表定義の変更 (DDL) と取引の並行"
+f=m11_schema_change.qnt
+for m in m11_green m11_green_unique m11_green_unique_colocated m11_green_recreate; do green $f $m schemaSafe; done
+green   $f m11_fix_recheck_only schemaSafe   # index の DDL は、anchor の確認し直しだけでも 2PC の途中の取引を止められる
+green   $f m11_fix_drain_only schemaSafe     # 適用前に intent を決着させるだけでも止められる
+green   $f m11_index_no_sync schemaSafe      # index の DDL は、全シャードへの先行適用を外しても破れない
+red     $f m11_impl schemaSafe               # 実装どおり (修正案をすべて外す)
+red     $f m11_impl_wait schemaSafe          # BUG-3: autocommit がロック待ちの後で版を確かめ直さない
+red     $f m11_impl_inflight schemaSafe      # BUG-4: 2PC の途中の取引が public の後に確定する
+red     $f m11_impl_backfill schemaSafe      # BUG-2: backfill の読みと書きの間の更新で古い項目が残る
+red     $f m11_impl_chunk schemaSafe         # BUG-1: UNIQUE の backfill が同じシャードの重複を上書きする
+red     $f m11_impl_drop schemaSafe          # BUG-5: 確定済みの intent が作り直した表へ適用される
+red     $f m11_red_no_reject schemaSafe      # シャードが古い版の要求を拒否しない
+red     $f m11_red_early_public schemaSafe   # backfill の前に public にする
+red     $f m11_red_no_write_only schemaSafe  # write-only の index を書き込みが更新しない
+red     $f m11_red_no_sync schemaSafe        # 全シャードへ適用する前に DDL が完了を返す
+witness $f m11_green witnessPublicWithWriters
+witness $f m11_green witnessStaleRejected
+witness $f m11_green witnessCrossDuringDdl
+witness $f m11_green_unique witnessUniqueFailed
+witness $f m11_green_unique witnessUniquePublic
+witness $f m11_green_recreate witnessRecreateWritten
+for m in m11_green m11_impl_wait m11_impl_inflight m11_impl_backfill m11_impl_chunk m11_impl_drop m11_red_no_reject m11_red_early_public m11_red_no_write_only m11_red_no_sync; do tests $f $m; done
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect

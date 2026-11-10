@@ -53,6 +53,10 @@ export interface StatementStat {
   error?: string;
 }
 
+/** index の backfill が 1 回に読む行数と、競合や移動でやり直す回数の上限。 */
+const BACKFILL_PAGE = 50;
+const BACKFILL_RETRIES = 200;
+
 /** 表定義が古いと出る誤り。取り直すと解けることがある。 */
 const UNKNOWN_SCHEMA = /^(no such (table|column|index)|table \S+ has no column)/;
 
@@ -135,8 +139,9 @@ class ReadScope {
     );
   }
 
-  protected shardRead(p: Extract<Plan, { kind: "shard" }>, t: Target): Promise<ExecRes> {
-    return this.call(t.shard, { sql: p.sql, params: p.params, spans: this.spansFor(p.tables, p.pk, t.sks) });
+  protected shardRead(p: Extract<Plan, { kind: "shard" }>, t: Target, wide = false): Promise<ExecRes> {
+    const spans = this.spansFor(p.tables, p.pk, t.sks);
+    return this.call(t.shard, { sql: p.sql, params: p.params, spans: wide && t.sks !== null ? [...spans, ...this.spansFor(p.tables, null, null)] : spans });
   }
 
   /**
@@ -165,7 +170,7 @@ class ReadScope {
     // バイト数は対象のシャードで等分する。偏りがあると早めに拒否するが、合計が予算を超えることはない。
     const maxBytes = Math.max(1_000_000, Math.floor(this.db.byteBudget / targets.length));
     const parts = await Promise.all(targets.map((t) =>
-      this.call(t.shard, { sql: s.sql, params: s.params, spans: this.scanSpans(s, t.sks), maxRows: this.db.rowBudget, maxBytes }),
+      this.call(t.shard, { sql: s.sql, params: s.params, spans: s.wideSpans && t.sks !== null ? [...this.scanSpans(s, t.sks), ...this.scanSpans(s, null)] : this.scanSpans(s, t.sks), maxRows: this.db.rowBudget, maxBytes }),
     ));
     return { columns: parts[0]!.columns, rows: parts.flatMap((r) => r.values) };
   }
@@ -212,13 +217,19 @@ class ReadScope {
       }
       case "shard": {
         const targets = await this.resolve(p.route);
+        // index 経由の読みは、index が挙げた shard key でシャードを選ぶが、文はその shard key に絞らずに送る。
+        // そのシャードの表全体を読むので、表全体の span も付ける。shard key だけを span にすると、シャードはほかの行の
+        // intent を決着させない。確定済みで適用待ちの更新が見えず、条件に合わなくなったはずの行が古い値のまま返る。
+        // shard key の span も残す。範囲が別のシャードへ移っていれば、それで NotOwner になり、経路を取り直せる。
+        const wide = p.route.by === "gidx";
         if (p.fallback && targets.length !== 1) {
           const sks = targets.flatMap((t) => t.sks ?? []);
-          return this.read({ ...p.fallback, scans: p.fallback.scans.map((s) => ({ ...s, sks })) });
+          return this.read({ ...p.fallback, scans: p.fallback.scans.map((s) => ({ ...s, sks, wideSpans: wide })) });
         }
+
         await this.pickT(targets.map((t) => t.shard));
         try {
-          const parts = await Promise.all(targets.map((t) => this.shardRead(p, t)));
+          const parts = await Promise.all(targets.map((t) => this.shardRead(p, t, wide)));
           return new QueryResult(parts[0]!.columns, parts.flatMap((r) => r.values), 0, null, this.T);
         } catch (e) {
           // DO の SQLite は UNION などの複合 SELECT を 5 項までしか受け付けない (公式の制限表にない実測値)。
@@ -293,6 +304,16 @@ export class Txn extends ReadScope {
   }
   protected override record(shard: string, spans: Span[]): void {
     this.spans.set(shard, [...(this.spans.get(shard) ?? []), ...spans]);
+  }
+
+  /**
+   * 取引の外で時刻 T に読んだ範囲を、この取引が読んだものとして扱う。
+   * commit の検証が T より後の変更を見つけるので、読んだ後に変わった行をもとに書くことがない。
+   */
+  assume(shard: string, spans: Span[], T: Ts): void {
+    if (this.T !== undefined && this.T !== T) throw new SqlError("assume: the transaction already has a read timestamp");
+    this.T = T;
+    this.record(shard, spans);
   }
 
   /**
@@ -386,8 +407,8 @@ export class Txn extends ReadScope {
    * BEGIN IMMEDIATE の主キー読みはロックを取って最新を読む。本物の SQLite も先に書き込みロックを取る。
    * 楽観の読みのまま後で同じ行を書くと、検証で競合になるのが正しい動きなので、ホットな行が崩壊する。
    */
-  protected override shardRead(p: Extract<Plan, { kind: "shard" }>, t: Target): Promise<ExecRes> {
-    if (!this.lockReads || !p.pk || p.tables.length !== 1) return super.shardRead(p, t);
+  protected override shardRead(p: Extract<Plan, { kind: "shard" }>, t: Target, wide = false): Promise<ExecRes> {
+    if (!this.lockReads || !p.pk || p.tables.length !== 1) return super.shardRead(p, t, wide);
     return this.dml(t.shard, {
       sql: p.sql, params: p.params, spans: this.spansFor(p.tables, p.pk, t.sks),
       lockRows: [{ table: p.tables[0]!.name, pk: p.pk }],
@@ -562,7 +583,7 @@ export class Txn extends ReadScope {
   }
 
   /** SQLite と同じく文の時点で検査する。commit の検証だけだと、文が成功した後で COMMIT が失敗する。 */
-  private async assertUnique(def: TableDef, ix: GlobalIndexDef, k: string, pk: string): Promise<void> {
+  async assertUnique(def: TableDef, ix: GlobalIndexDef, k: string, pk: string): Promise<void> {
     const sk = encode([k]);
     const res = await this.call(ownerOf(this.cat.routing, sk), {
       sql: `SELECT "pk" FROM ${q(ix.table)} WHERE "k" = ?`, params: [k],
@@ -766,28 +787,25 @@ export class Db {
    * F1 の write-only 状態の index を既存の行で埋めて public にする。
    * 書き込みは DDL の時点から index を更新しているので、埋め終われば全行が揃う。
    */
+  /**
+   * 既存の行から、新しいグローバル index の項目を作る。index は書き込み専用の状態で、並行する書き込みは自分で index を保守する。
+   *
+   * 走査と書き込みは別々に行うので、その間に行が変わり得る。変わった行の古い値を index に書くと、行のない項目が残る。
+   * そこで、走査した行を「取引が時刻 T に読んだ」ものとして扱い、commit の検証に掛ける。変わっていれば競合になり、読み直す。
+   * UNIQUE は、すでにある項目と、同じ取引で書く項目の両方と照合する。
+   * 増設が挟まると行が別のシャードへ移るので、範囲表が変わらなくなるまで全体を繰り返す。
+   */
   private async backfill(def: TableDef, ix: GlobalIndexDef): Promise<void> {
     try {
-      const cat = await this.catalog();
-      for (const shard of shardsOf(cat.routing)) {
-        const res = await this.shardOf(shard).exec({
-          sql: `SELECT ${selectList(def)} FROM ${q(def.name)}`, params: [],
-          spans: [{ kind: "table", table: def.name }], schema: cat.version,
-        });
-        const rows = new QueryResult(res.columns, res.values).rows;
-        for (let at = 0; at < rows.length; at += 100) {
-          const chunk = rows.slice(at, at + 100);
-          await this.transaction(async (tx) => {
-            for (const row of chunk) {
-              const vals = ix.columns.map((c) => row[c] ?? null);
-              if (vals.some((v) => v === null)) continue;
-              const key = encodeKey(def, row);
-              const k = encode(vals);
-              const seen = await tx.query(`SELECT "pk" FROM ${q(ix.table)} WHERE "k" = ? AND "pk" = ?`, [k, key.pk]);
-              if (seen.values.length === 0) tx.indexWrite(ix, { k, pk: key.pk, sk: key.sk }, false);
-            }
-          });
-        }
+      for (let round = 0; ; round++) {
+        const cat = await this.cluster.catalog();
+        this.cached = cat;
+        this.opts.onCatalog?.(cat);
+        let moved = false;
+        for (const shard of shardsOf(cat.routing)) moved = (await this.backfillShard(def, ix, shard, cat)) || moved;
+        const after = await this.cluster.catalog();
+        if (!moved && after.routing.version === cat.routing.version) break;
+        if (round >= 20) throw new SqlError(`CREATE INDEX ${ix.name}: shards kept splitting during the backfill`);
       }
     } catch (e) {
       // 作りかけの index を消した表定義を、呼び出し側のキャッシュにも戻す。
@@ -799,6 +817,65 @@ export class Db {
     }
     this.cached = await this.cluster.publishIndex(def.name, ix.name);
     this.opts.onCatalog?.(this.cached);
+  }
+
+  /** 1 シャードの行を主キーの順に少しずつ読み、index の項目を書く。途中で範囲が移ったら true を返す。 */
+  private async backfillShard(def: TableDef, ix: GlobalIndexDef, shard: string, cat: Catalog): Promise<boolean> {
+    const pkCols = def.pk.map(q).join(", ");
+    let after: Value[] | null = null;
+    for (let attempt = 0; ; ) {
+      let res: ExecRes;
+      try {
+        res = await this.shardOf(shard).exec({
+          sql: `SELECT ${selectList(def)} FROM ${q(def.name)} ${after ? `WHERE (${pkCols}) > (${def.pk.map(() => "?").join(", ")})` : ""} ORDER BY ${pkCols} LIMIT ${BACKFILL_PAGE}`,
+          params: after ?? [], spans: [{ kind: "table", table: def.name }], schema: cat.version,
+        });
+      } catch (e) {
+        const m = (e as Error)?.message ?? "";
+        // 範囲の持ち主が変わった。呼び出し側が範囲表を取り直して、全体をやり直す。
+        if (/^not owner|stale schema/.test(m)) return true;
+        // 移動の途中は表全体を読めない。終わるのを待つ。
+        if (/^migrating|group not arrived|read too old/.test(m) && attempt++ < BACKFILL_RETRIES) {
+          await backoff(attempt);
+          continue;
+        }
+        throw e;
+      }
+      const rows = new QueryResult(res.columns, res.values).rows;
+      if (rows.length === 0) return false;
+      const tx = new Txn(this, cat, this.nextTxnId());
+      try {
+        const keys = rows.map((row) => encodeKey(def, row));
+        tx.assume(shard, keys.map((key) => ({ kind: "pk" as const, table: def.name, pk: key.pk, sk: key.sk })), res.T);
+        const inBatch = new Map<string, string>();
+        for (const [i, row] of rows.entries()) {
+          const vals = ix.columns.map((col) => fold(row[col] ?? null, def.collation[col]));
+          if (vals.some((v) => v === null)) continue;
+          const k = encode(vals);
+          const key = keys[i]!;
+          if (ix.unique) {
+            // 同じ取引の中の 2 件目は、バッファの上で 1 件目を上書きするだけで、シャードには届かない。ここで照合する。
+            const prior = inBatch.get(k);
+            if (prior !== undefined && prior !== key.pk) throw new SqlError(`UNIQUE constraint failed: ${def.name}.${ix.columns.join(", ")}`);
+            inBatch.set(k, key.pk);
+            await tx.assertUnique(def, ix, k, key.pk);
+          }
+          const seen = await tx.query(`SELECT "pk" FROM ${q(ix.table)} WHERE "k" = ? AND "pk" = ?`, [k, key.pk]);
+          if (seen.values.length === 0) tx.indexWrite(ix, { k, pk: key.pk, sk: key.sk }, false);
+        }
+        await tx.commit();
+      } catch (e) {
+        await tx.unlockAll().catch(() => undefined);
+        // 走査の後で行が変わった、などの競合。同じ位置から読み直す。
+        if (!isRetryable(e) || attempt++ >= BACKFILL_RETRIES) throw e;
+        this.onRetry(e);
+        await backoff(attempt);
+        continue;
+      }
+      attempt = 0;
+      const last = rows[rows.length - 1]!;
+      after = def.pk.map((col) => last[col] ?? null);
+    }
   }
 
   private nextTxnId(): string {

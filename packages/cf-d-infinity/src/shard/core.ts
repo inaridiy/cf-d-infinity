@@ -332,6 +332,16 @@ export class ShardCore implements ShardApi {
   }
 
   /**
+   * 待ちを挟んだ後で、要求の表定義がまだ現行かを確かめ直す。
+   * 入口で確かめた後、行ロックや intent の決着を待っている間に DDL が適用されることがある。
+   * そのまま書くと、新しいグローバル index を保守しない古い計画が通ってしまう。
+   */
+  private requireSchema(version: number): void {
+    if (this.faults.noSchemaRecheck) return;
+    if (version !== this.schema) throw new NotOwner(`stale schema ${version} < ${this.schema}`);
+  }
+
+  /**
    * Meta から DDL を取り、順に適用する。
    * 先に、このシャードが持つ intent をすべて決着させる。intent の行イメージは DDL より前の表の形なので、
    * 表や列が消えた後では適用できない。確定済みの取引がそうなると、再駆動が永久に失敗する。
@@ -358,7 +368,8 @@ export class ShardCore implements ShardApi {
    * 待っている間、新しい prepare は ensureSchema が断るので、intent は増えない。
    */
   private async settleAllIntents(): Promise<void> {
-    const deadline = this.deps.clock.now() + SCHEMA_WAIT_MS;
+    // 待ちは実時間のタイマーなので、期限も実時間で測る。
+    const deadline = Date.now() + SCHEMA_WAIT_MS;
     for (;;) {
       const pending = this.b.exec(`SELECT DISTINCT txn, anchor FROM __intents`) as unknown as Intent[];
       if (pending.length === 0) return;
@@ -368,7 +379,7 @@ export class ShardCore implements ShardApi {
         else if (res.status === "aborted") await this.abort({ txn: i.txn });
       }
       if ((this.b.exec(`SELECT count(*) n FROM __intents`)[0]!.n as number) === 0) return;
-      if (this.deps.clock.now() > deadline) {
+      if (Date.now() > deadline) {
         throw new ConflictError("schema change is waiting for transactions on this shard to finish");
       }
       await new Promise((r) => setTimeout(r, 5));
@@ -541,7 +552,7 @@ export class ShardCore implements ShardApi {
           }
         });
       }
-      out.push({ g, m: known.m, rows, intents });
+      out.push({ g, m: known.m, rows, intents, schema: this.schema });
     }
     await this.b.sync();
     return out;
@@ -584,6 +595,10 @@ export class ShardCore implements ShardApi {
   }
 
   private async receive(payload: GroupPayload[]): Promise<void> {
+    // 親の表定義の版まで追いついてから受け取る。子は増設の途中で生まれるので、DDL の「全シャードへの適用」から
+    // 漏れることがある。古い版のままだと、届いた行と表の形が合わず、新しい index を保守しない古い計画の書き込みも通る。
+    const version = Math.max(0, ...payload.map((p) => p.schema ?? 0));
+    if (version > this.schema && !this.faults.childKeepsOldSchema) await this.ensureSchema(version);
     const fresh = payload.filter((p) => !this.arrived.has(p.g));
     this.b.tx(() => {
       for (const p of fresh) {
@@ -1120,6 +1135,7 @@ export class ShardCore implements ShardApi {
     const now = this.issue();
     this.assertOwned(req.spans, [], null);
     await this.settleIntents(req.spans, now);
+    this.requireSchema(req.schema);
     this.assertOwned(req.spans, [], null);
     this.count("writes", req.spans);
     // 読む範囲に未決着の intent があると commit 時刻の順序を保証できないので no-wait で返す。
@@ -1141,6 +1157,7 @@ export class ShardCore implements ShardApi {
         for (let key = this.blockedBy(dry.changes, me); key !== null; key = this.blockedBy(dry.changes, me)) {
           await this.waitForRow(key, me, deadline);
           woken.add(key);
+          this.requireSchema(req.schema);
           this.assertOwned(req.spans, [], null);
           if (this.overlapping(req.spans, Number.MAX_SAFE_INTEGER).length > 0) throw new ConflictError("pending intent");
           dry = this.rollback(() => this.run(req));
@@ -1152,6 +1169,7 @@ export class ShardCore implements ShardApi {
       const pending = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, dry.changes);
       if (pending) throw new ConflictError(pending);
       this.assertWriteSetFits(dry.changes);
+      this.requireSchema(req.schema);
       const c = this.issue();
       if (dry.changes.length) this.b.tx(() => this.applyAndLog(`auto-${c}`, c, dry.changes));
       return { ...dry, T: c, hlc: this.hlc.value, epoch: this.epoch };
@@ -1234,6 +1252,7 @@ export class ShardCore implements ShardApi {
         if (out) return { columns: [], values: [], changes: out.changes, T: out.c, hlc: this.hlc.value, epoch: this.epoch };
         await this.waitForRow(hit.key!, me, deadline);
         woken.add(hit.key!);
+        this.requireSchema(req.schema);
         this.assertOwned(req.spans, [], null);
         if (this.overlapping(req.spans, Number.MAX_SAFE_INTEGER).length > 0) throw new ConflictError("pending intent");
       }
@@ -1368,6 +1387,8 @@ export class ShardCore implements ShardApi {
   async commitLocal(req: Omit<PrepareReq, "anchor">): Promise<CommitRes> {
     await this.ensureSchema(req.schema);
     await this.ensureArrived(this.sksOf(req.spans, req.writes));
+    // グループの到着を待っている間に DDL が適用されることがある。古い計画のまま書かない。
+    this.requireSchema(req.schema);
     this.observe(req.T);
     this.assertOwned(req.spans, req.writes, req.T);
     try {
@@ -1391,6 +1412,7 @@ export class ShardCore implements ShardApi {
   async prepare(req: PrepareReq): Promise<PrepareRes> {
     await this.ensureSchema(req.schema);
     await this.ensureArrived(this.sksOf(req.spans, req.writes));
+    this.requireSchema(req.schema);
     return this.prepareSync(req);
   }
 
@@ -1498,6 +1520,10 @@ export class ShardCore implements ShardApi {
     const stamps = acks.map((a) => (a as { prepareTs: Ts }).prepareTs);
 
     // ここから c の確定までは await を挟まない。
+    // 参加者の応答を待っている間に、この anchor に DDL が適用されていれば、取引は古い表定義で計画されている。
+    if (!this.faults.noSchemaRecheck && req.schema !== this.schema) {
+      return this.decideAbort(req, `not owner: stale schema ${req.schema} < ${this.schema}`);
+    }
     if (!this.faults.anchorNoAbsorb) this.observe(Math.max(0, ...stamps, flight.pushed));
     const mine = this.prepareSync({
       txn: req.txn, T: req.T, writes: self.writes, spans: self.spans, anchor: this.id, schema: req.schema,

@@ -21,6 +21,8 @@ export interface Scan {
   sks: string[] | null;
   /** 押し下げた条件。取引の検証は、この条件に関わる変更だけを競合にする。 */
   where?: { alias: string; sql: string; params: Value[] };
+  /** sks はシャードを選ぶためだけに使い、span はシャードの表全体にする。index 経由の読みで立てる。 */
+  wideSpans?: boolean;
 }
 
 export interface WriteTarget {

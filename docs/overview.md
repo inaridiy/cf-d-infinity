@@ -120,8 +120,19 @@ statement into something else silently.
 
 DDL goes through `DinfMeta`, which versions the schema. The change is applied on every shard before the statement
 returns, and every request carries the schema version it was planned with; a shard rejects a request planned
-against an older schema, so a Worker with a stale cache cannot write through a dropped table. A new global index is
-written first, backfilled, and only then used for reads.
+against an older schema, so a Worker with a stale cache cannot write through a dropped table.
+
+Four rules keep a schema change from tearing a transaction that is under way:
+
+- A shard resolves every intent it holds before it applies DDL. An intent carries row images in the old table shape,
+  and a committed one could never be applied after its table or column is gone.
+- A write rechecks the schema version after any wait (a row lock, a group still arriving, the prepare round at the
+  anchor), because DDL may have been applied meanwhile.
+- A new global index is written first, backfilled, and only then used for reads. The backfill treats the rows it
+  scanned as read at the scan's timestamp, so commit-time validation rejects an entry for a row that changed since.
+- A shard born from a split catches up to its parent's schema before it accepts the parent's rows.
+
+These came out of randomized tests and a model (M11) that found six ways the first implementation got it wrong.
 
 ## Growing
 
@@ -139,7 +150,7 @@ for a bulk copy first. See [scaling.md](./scaling.md) for the timestamp rules th
 
 ## How it is checked
 
-1. **Formal models.** Eleven Quint models cover the risky parts (commit and snapshot reads, read refresh, 2PC
+1. **Formal models.** Twelve Quint models cover the risky parts (schema changes under concurrent transactions, commit and snapshot reads, read refresh, 2PC
    recovery, HLC across restarts, split fencing, live migration, garbage collection of transaction records, and the
    integrated protocol). TLC explores them exhaustively on small instances. Each model has variants with a known bug
    put back, and the checker must find every one.

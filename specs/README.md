@@ -64,6 +64,15 @@ red と green は同じ core モジュールを `const` フラグで切り替え
 | M9 `m9_impl_wake` / `m9_red_leave_silent` | `noLostWakeup` | 実装どおりの起こし方 / 去るとき起こさない (3 txn) | 反例 | | 反例 (実装の欠陥) |
 | M10 `m10_green` | `safe` (= noCommitAfterIgnored ∧ noLostCommit) | 取引 2 件、時計 0〜6、保持 R = 3、受付年齢 G = 1、anchor 再起動と COMMIT の再配送あり | 94,653 | 25 | No violation |
 | M10 `m10_red_*` (3 本) | `safe` | 年齢の検査なし / 適用前の記録を消す / G ≥ R | 反例 | | 反例 |
+| M11 `m11_green` | `schemaSafe` (= indexComplete ∧ noDangling ∧ uniqueSafe ∧ noLostWrite ∧ noResurrect) | shard 2、行 2、値 0〜2、取引 2 件、DDL は CREATE INDEX (グローバル) 1 本、修正案あり | 790,150 (生成 2,564,343、7 s) | 21 | No violation |
+| M11 `m11_green_unique` | `schemaSafe` | 同上、DDL は CREATE UNIQUE INDEX | 643,171 (生成 2,143,445、5 s) | 21 | No violation |
+| M11 `m11_green_unique_colocated` | `schemaSafe` | 同上、2 行とも S1 (取引は 1 シャードだけ) | 36,495 (生成 118,777、2 s) | 15 | No violation |
+| M11 `m11_green_recreate` | `schemaSafe` | DDL は DROP TABLE と CREATE TABLE (作り直し) | 175,899 (生成 447,925、3 s) | 17 | No violation |
+| M11 `m11_fix_recheck_only` / `m11_fix_drain_only` | `schemaSafe` | `m11_green` から修正案を 1 つ外す (適用前の決着 / anchor の確認し直し) | 1,046,920 / 834,214 (8 s / 7 s) | 21 | No violation (index の DDL はどちらか一方で足りる) |
+| M11 `m11_index_no_sync` | `schemaSafe` | `m11_green` から全シャードへの先行適用を外す | 886,050 (生成 3,652,387、11 s) | 21 | No violation (index の DDL では先行適用がなくても安全) |
+| M11 `m11_impl` | `schemaSafe` | 実装どおり (修正案を 5 つとも外す)、取引 2 件 | 約 15 万で反例 | 反例は 12 状態 | 反例 (実装の欠陥) |
+| M11 `m11_impl_wait` / `_inflight` / `_backfill` / `_chunk` / `_drop` | `schemaSafe` | 修正案を 1 つずつ外す、取引 1 件 | 各 約 700〜3,900 で反例 | 反例は 12 / 13 / 11 / 12 / 8 状態 | 反例 (5 本すべて、実装の欠陥) |
+| M11 `m11_red_no_reject` / `_early_public` / `_no_write_only` / `_no_sync` | `schemaSafe` | 実装にある防御を 1 つずつ外す、取引 1 件 | 各 約 80〜3,000 で反例 | 反例は 12 / 3 / 11 / 7 状態 | 反例 (4 本すべて) |
 
 witness (vacuous でないことの確認。`not(到達したい状態)` を invariant にして違反 = 到達可能):
 
@@ -82,6 +91,11 @@ witness (vacuous でないことの確認。`not(到達したい状態)` を inv
 | M5b | `witnessIntentMovedThenApplied` | 親で prepare した intent が子へ移り、子で適用された |
 | M7 | `witnessRestoredNonEmpty` | 全シャードを復元し、復元結果が空でない |
 | M9 | `witnessPessWaitedCommit` / `witnessWoundTaken` / `witnessImmROValidated` / `witnessSecondDml` | 待った悲観取引が commit、wound で奪う、IMMEDIATE 読み取り専用が検証を通して commit、2 回目の DML を経て commit |
+| M11 | `witnessPublicWithWriters` | DDL の途中に、index を知らない計画の取引と write-only の計画の取引が 1 件ずつ確定し、index が 2 行とも持って public になる |
+| M11 | `witnessStaleRejected` | 古い catalog の要求がシャードに拒否され、index は public になる |
+| M11 | `witnessCrossDuringDdl` | 2PC の取引が DDL の途中で確定し、両方のシャードに適用された後で public になる |
+| M11 | `witnessUniqueFailed` / `witnessUniquePublic` | 重複があって UNIQUE index の作成が失敗する。重複がなければ 2 行を持って public になる |
+| M11 | `witnessRecreateWritten` | 表を作り直した後に書いた行が残る |
 
 ## 新しく見つかった設計バグ (M1、green が破れた)
 
@@ -239,6 +253,58 @@ GC の時点では tombstone の作成から R が経ち、tombstone は取引�
 `T` の物理時刻と anchor の時計のずれが R/2 (30 分) より小さいこと。
 適用済みの参加者に届いた prepare の重複は intent を置かないこと。`validate` が書き込み行の `T` (悲観的な取引では F) 以降の変更を調べ、自分の commit がそれに当たるので拒否する。窓が GC されていれば `T older than conflict window` で拒否する (コードで確認、テストはない)。
 
+### M11 `m11_schema_change.qnt` — 取引と並行に進む表定義の変更
+
+2026-11-10 追記：このモデルの修正案は実装に入れた。
+待ちの後の版の確かめ直し、anchor での確かめ直し、DDL の適用前の intent の決着、backfill の走査の検証、同じ取引の中の重複の検出である。
+以下で「実装どおり」と呼ぶ `m11_impl` と `m11_impl_*` は、修正前の実装を表す。対応する再現テストは `test/ddl-concurrent.test.ts` にあり、いまは通常のテストとして通る。
+分割と index の作成が重なる場合 (BUG-6) はモデルに入っていない。実装は backfill を範囲表が変わらなくなるまで繰り返すが、作成直後の読みが稀に 1 行を取りこぼす現象が残っている。
+
+DDL の仕組みを実装のとおりに写した。
+Meta が表定義の版を上げ、DDL を実行した Worker が全シャードへ適用してから先へ進む。
+要求は計画に使った catalog の版を持ち、シャードは自分より古い版の要求を拒否する。
+グローバル index は write-only で作り、既存の行を 1 シャードずつ埋め、最後に public にする。
+Worker は古い catalog (index を知らない、write-only、public) で計画できる。
+取引は 1 シャードの autocommit と 2 シャードの 2PC で、DDL のどの段階とも交互に進む。
+DDL は 1 本で、CREATE INDEX、CREATE UNIQUE INDEX、表の作り直し (DROP TABLE と CREATE TABLE) を定数で選ぶ。
+
+invariant は 5 つである。
+
+- `indexComplete`: public な index は、すべての行の項目を持つ。
+- `noDangling`: public な index に、行のない項目がない。
+- `uniqueSafe`: public な UNIQUE index があるなら、同じ値の行が 2 つない。
+- `noLostWrite`: DDL が完了を返した後に成功を返した書き込みは、DDL の適用で消えない。
+- `noResurrect`: DDL の発行前に確定した書き込みは、作り直した表に現れない。
+
+実装どおりの `m11_impl` は `schemaSafe` を破る。
+green は実装そのものではなく、次の 5 つの修正案を入れた版である。
+修正案を外したインスタンスは、それぞれ `packages/cf-d-infinity/test/ddl-concurrent.test.ts` の再現テスト (BUG-1 から BUG-5) に対応する。
+
+| 修正案 (定数) | 外したインスタンス | 反例 | 実装での再現 |
+|---|---|---|---|
+| autocommit の書き込みが、待ちの後で版を確かめ直す (`RECHECK_AUTO`) | `m11_impl_wait` | 版を確かめた書き込みが待つ間に DDL が public まで進み、その後で index を更新せずに書く。行が index から見えない | BUG-3 |
+| anchor が、参加者の応答を待った後で版を確かめ直す (`RECHECK_ANCHOR`)。または、シャードが intent を持つ間は DDL を適用しない (`DRAIN`) | `m11_impl_inflight` (両方を外す) | 参加者が intent を置いた後に DDL が進み、backfill は未確定の intent を読み飛ばす。取引は public の後で確定する | BUG-4 |
+| backfill の書き込みが、読んだ後に行が変わっていないことを確かめる (`BF_VALIDATE`) | `m11_impl_backfill` | backfill が読んだ後に行の値が変わり、古い値の項目が後から書かれて残る | BUG-2 |
+| UNIQUE の backfill が、同じ取引の中の重複を失敗にする (`CHUNK_DEDUP`) | `m11_impl_chunk` | 同じシャードの 2 行が同じ値を持つのに、2 件目が 1 件目の項目を上書きして public になる | BUG-1 |
+| シャードが intent を持つ間は DDL を適用しない (`DRAIN`) | `m11_impl_drop` | 確定済みで未適用の intent が DROP の後に残り、作り直した表へ適用される | BUG-5 |
+
+BUG-4 は、anchor の確認し直しと適用前の決着のどちらか一方で塞がる (`m11_fix_recheck_only` と `m11_fix_drain_only` がどちらも No violation)。
+表の作り直しでは適用前の決着が要る。確認し直しだけでは、発行前に確定して未適用の intent が残るからである。
+`m11_fix_drain_only` が通るのは、2PC の取引が commit の検証 (計画の後に同じ行へ確定した書き込みがあれば中止) を受けるからで、この検証をモデルから抜くと破れる。
+破れる経路は、write-only の計画の書き込みが index に項目を足した後で、古い計画の取引が同じ行を index を更新せずに消すものである。
+
+実装にある防御を 1 つずつ外した red は 4 本で、どれも反例が出る。
+`m11_red_no_reject` はシャードが古い版の要求を拒否しない、`m11_red_early_public` は backfill の前に public にする、
+`m11_red_no_write_only` は write-only の index を書き込みが更新しない、`m11_red_no_sync` は全シャードへ適用する前に DDL が完了を返す。
+`m11_red_no_sync` の反例は 7 状態で、`test/migration.test.ts` の「DROP and CREATE」の消失と同じ経路である。
+全シャードへの先行適用が効くのは表の作り直しである。
+index の作成では、先行適用を外しても破れない (`m11_index_no_sync`)。
+backfill の読みが新しい版の要求なので、読まれたシャードは必ず適用を済ませているからである。
+
+モデルが示し、実装にないものは修正案の 5 つである。
+このほか、分割と DDL の並行 (BUG-6) と、index で引いた読み取りの span の不足 (BUG-7) はテストで見つけたが、このモデルにはない。
+シャードの数と範囲表が固定で、読み取りの取引がないからである。
+
 ### M5b `m5b_live_migration.qnt` — pull 型ライブ再構成 (S2 + S3)
 
 - 親 P と子 C、移動する範囲に shard key グループ 2 個。Meta の経路切替 (`switchRoute`)、親の受理停止 (`fence`、任意の順序で起きる)、
@@ -276,5 +342,11 @@ GC の時点では tombstone の作成から R が経ち、tombstone は取引�
 - M5b: 書き込みは blind write (検証無し)。移動の単位はグループ 1 個 = 行 1 個 (チャンク分割は扱わない)。親の行イメージの GC、
   子の再 split (連鎖) は扱わない。pull の応答喪失で親と子の再起動を表す (永続状態以外は持たない)。
 - M7: 時計ずれ無し、intent 無し。bookmark の概算は「時刻 b の commit 集合」で表す。
+- M11: index の項目は取引の確定と同時に変わる (index の表への 2PC と、その途中を読む読み手は M1 と M9 に任せる)。時刻はなく、
+  backfill の読みは「確定済みの intent は適用後の値を読み、未確定の intent は読み飛ばす」で表す。
+  2PC の取引の検証は「計画の後に別の取引が確定していれば中止」だけで、行ロック、wound-wait、Worker のリトライは扱わない (取引の数が固定)。
+  autocommit の待ちは、原因 (行ロックか intent の決着) を問わず「版の確認と書き込みの間に他の出来事が入る」で表す。
+  シャードは 2 個で固定し、分割と再起動は扱わない。publish と backfill 失敗時の DROP INDEX がシャードへ押し出されないことは、版を 0 と 1 に畳んだので表れない。
+  DROP INDEX と、表を消すだけの DROP TABLE (別の表への書き込みを巻き込む BUG-5 の形) は扱わず、同じ名前で作り直す場合だけを見る。
 - 有限化のための定数は各ファイルのインスタンスに明示した。取引 3 件 (`m1_green3`) は `HEAVY=1` で回すが、25 分・2.4 億状態で打ち切っても
   完了しなかった (深さ 19 まで違反なし)。完全探索は 2 件の結果だけである。

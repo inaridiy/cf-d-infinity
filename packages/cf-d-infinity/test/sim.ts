@@ -97,6 +97,12 @@ export class SimNet {
   drop: (m: Rpc) => boolean = () => false;
   log: Rpc[] = [];
   jitter: (() => number) | null = null;
+  /**
+   * 応答の配送を止める。処理は終わっていて、結果だけが呼び出し側へ届かない状態を作る。
+   * 本番の RPC の応答は output gate と網の遅延を経るので、この間に別の要求が同じシャードで処理される。
+   * 既定では何もしない。
+   */
+  reply: (m: Rpc) => Promise<void> | void = () => {};
 }
 
 export interface SimOptions {
@@ -190,6 +196,8 @@ export class SimCluster implements Cluster {
         // JSON を通して、DO の RPC と同じく参照を共有しないようにする。
         const core = this.core(to);
         const out = await (core[method] as (r: unknown) => Promise<unknown>).call(core, structuredClone(req));
+        const hold = this.net.reply(m);
+        if (hold) await hold;
         return out === undefined ? undefined : structuredClone(out);
       },
     });
