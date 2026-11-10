@@ -99,6 +99,14 @@ export function globalIndexTable(ix: Pick<GlobalIndexDef, "name" | "unique">): {
   };
 }
 
+/**
+ * シャードをまたぐ UNIQUE の列には、各シャードの表にも同じ列の (一意でない) index を作る。
+ * 一意性は index の表 (`__gidx_*`) が守る。こちらは、行のシャードがその列で行を引くための、ただの索引である。
+ */
+const rowIndexName = (ix: Pick<GlobalIndexDef, "name">): string => `__gidx_${ix.name}__rows`;
+const rowIndexSql = (ix: Pick<GlobalIndexDef, "name" | "columns">, table: string): string =>
+  `CREATE INDEX ${q(rowIndexName(ix))} ON ${q(table)} (${ix.columns.map(q).join(", ")})`;
+
 const isFk = (c: Node) => c.type === "references_specification" || c.type === "constraint_foreign_key";
 const inner = (item: Node) => (item.type === "constraint" ? item.constraint : item);
 const specCols = (c: Node): string[] => c.columns.expr.items.map((i: Node) => ident(i.type === "index_specification" ? i.expr : i));
@@ -197,7 +205,7 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
       const ix: GlobalIndexDef = { name: `${name}_${i}_key`, table: `__gidx_${name}_${i}_key`, columns: cols, unique: true, state: "public" };
       const t = globalIndexTable(ix);
       def.globalIndexes.push(ix);
-      sql.push(t.sql);
+      sql.push(t.sql, rowIndexSql(ix, name));
       defs.push(t.def);
     } else def.uniques.push(cols);
   });
@@ -227,7 +235,10 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
   const partial = !!(stmt.clauses ?? []).some((c: Node) => c.type === "where_clause");
   const cols = plain ? specs.map((s) => ident(s.expr)) : [];
   for (const c of cols) if (!def.columns.includes(c) && c !== "rowid") throw new SqlError(`no such column: ${c}`);
-  const local = (plain && def.shardKey.every((c) => cols.includes(c))) || !plain || partial;
+  // 一意でない index は、shard key を含まなくても、各シャードの中の index にする。行の置き場所を変えず、書き込みの費用も増やさない。
+  // shard key で絞れない検索は全シャードへ送られるが、各シャードはこの index で引ける。
+  // シャードをまたいで保守する index は、一意性の保証に必要な UNIQUE だけにする。
+  const local = (plain && def.shardKey.every((c) => cols.includes(c))) || !plain || partial || !unique;
   if (local) {
     if (unique && !(plain && def.shardKey.every((c) => cols.includes(c)))) {
       throw new SqlError("UNIQUE partial or expression indexes must include the shard key");
@@ -242,7 +253,7 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
   const ix: GlobalIndexDef = { name, table: `__gidx_${name}`, columns: cols, unique, state: "writeOnly" };
   const t = globalIndexTable(ix);
   def.globalIndexes.push(ix);
-  return { sql: [t.sql], defs: [def, t.def], drops: [], user: source, indexes: { [name]: { table, global: true } } };
+  return { sql: [t.sql, rowIndexSql(ix, table)], defs: [def, t.def], drops: [], user: source, indexes: { [name]: { table, global: true } } };
 }
 
 function triggerTables(stmt: Node): string[] {
@@ -313,7 +324,7 @@ function dropIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
   const def = structuredClone(schema.tables[info.table]!);
   const ix = def.globalIndexes.find((g) => g.name === name)!;
   def.globalIndexes = def.globalIndexes.filter((g) => g.name !== name);
-  return { sql: [`DROP TABLE IF EXISTS ${q(ix.table)}`], defs: [def], drops: [ix.table], user: source, dropIndexes: [name] };
+  return { sql: [`DROP TABLE IF EXISTS ${q(ix.table)}`, `DROP INDEX IF EXISTS ${q(rowIndexName(ix))}`], defs: [def], drops: [ix.table], user: source, dropIndexes: [name] };
 }
 
 function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {

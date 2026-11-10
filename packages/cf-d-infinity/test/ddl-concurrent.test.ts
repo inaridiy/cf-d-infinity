@@ -217,10 +217,12 @@ function each(name: keyof typeof CASES, title: string, extra: (r: Report) => voi
 }
 const all = (name: keyof typeof CASES) => Promise.all(CASES[name].seeds.map((seed) => run(name, seed)));
 
-describe("1. CREATE INDEX (global, backfilled) while transactions write the table", () => {
-  each("createIndex", "keeps every row readable through the index", (r) => {
+// 一意でない index は、各シャードの中の index になった。シャードをまたいで保守する index は UNIQUE だけで、
+// その作成と書き込みの競合は 2 の場面が確かめる。ここは、index を作る DDL が書き込みと並行しても、検索の結果が変わらないことを見る。
+describe("1. CREATE INDEX (a local index on every shard) while transactions write the table", () => {
+  each("createIndex", "keeps every row readable by the indexed column", (r) => {
     expect(r.ddlLog).toEqual(["CREATE INDEX acct_v ON acct(v) => ok"]);
-    expect(r.index.state).toBe("public");
+    expect(r.index.state).toBe(null);
   });
   // BUG-2 の乱択での姿。seed ごとの当たりは 16 回中 15 回だった。
   it("BUG-2 (randomized) (fixed): leaves no index entry without a matching row", async () => {
@@ -344,12 +346,6 @@ describe("known bugs, as deterministic interleavings", () => {
     h.release();
     return { c, A, A2, ddl: await ddl };
   };
-  it("BUG-2 (fixed): backfill leaves no entry for a row updated or deleted after it was scanned", async () => {
-    const { c, ddl } = await backfillRace(false);
-    const ix = await indexAgreement(c, "t", "ix");
-    expect({ ddl, state: ix.state, missing: ix.missing, dangling: ix.dangling })
-      .toEqual({ ddl: "ok", state: "public", missing: [], dangling: [] });
-  });
   /** 観測: 表に v = 7 と v = 8 の行はないのに、どちらの INSERT も `UNIQUE constraint failed: t.v` で拒否される。 */
   it("BUG-2b (fixed): a UNIQUE index built during writes accepts values that no row holds", async () => {
     const { c, ddl } = await backfillRace(true);
@@ -370,8 +366,9 @@ describe("known bugs, as deterministic interleavings", () => {
    *   syncSchema が版を進めても、起きた後は版を確かめ直さずに書く。Worker は index のない計画 (db.ts:938-940 の高速経路)
    *   で送ったので、index の項目は誰も書かない。
    */
-  it("BUG-3 (fixed): an autocommit write that waited on a lock across CREATE INDEX stays visible through the index", async () => {
-    const { c, db, A } = await two();
+  /** BUG-3 の台本。古い catalog の autocommit の UPDATE が、行ロックを待っている間に index が作られる。 */
+  const lockWaitAcrossIndex = async (faults?: Faults) => {
+    const { c, db, A } = await two(faults);
     await db.query("INSERT INTO t VALUES (?, 1, 7, 0)", [A]);
     const holder = new Db(c);
     await holder.query("BEGIN");
@@ -380,7 +377,7 @@ describe("known bugs, as deterministic interleavings", () => {
     await stale.query("SELECT 1 FROM t WHERE tenant_id = ?", [A]); // index のない catalog を持たせる
     const waited = hold(c, "gate", (m) => m.method === "syncSchema"); // UPDATE がロック待ちに入ってから DDL を進める
     const update = outcome(stale.query("UPDATE t SET v = 99 WHERE tenant_id = ? AND id = 1", [A]));
-    const ddl = outcome(db.ddl("CREATE INDEX ix ON t(v)"));
+    const ddl = outcome(db.ddl("CREATE UNIQUE INDEX ix ON t(v)"));
     await waited.reached;
     await new Promise((r) => setTimeout(r, 20));
     waited.release();
@@ -388,7 +385,18 @@ describe("known bugs, as deterministic interleavings", () => {
     await holder.query("ROLLBACK");
     expect(await update).toBe("ok");
     await c.settle();
-    expect({ table: await tableRows(c), read: await byIndex(c, 99) }).toEqual({ table: [`${A}/1 v=99`], read: [`${A}/1`] });
+    const ix = await indexAgreement(c, "t", "ix");
+    return { table: await tableRows(c), read: await byIndex(c, 99), missing: ix.missing, dangling: ix.dangling, A };
+  };
+  it("BUG-3 (fixed): an autocommit write that waited on a lock across CREATE UNIQUE INDEX is in the index", async () => {
+    const r = await lockWaitAcrossIndex();
+    expect(r).toEqual({ table: [`${r.A}/1 v=99`], read: [`${r.A}/1`], missing: [], dangling: [], A: r.A });
+  });
+  // 待ちの後の確かめ直しを外すと、index を保守しない古い計画の書き込みが通る。index の照合がそれを見つけることを確かめる。
+  it("BUG-3 put back: the index agreement check reports the entry that the stale write did not maintain", async () => {
+    const r = await lockWaitAcrossIndex({ noSchemaRecheck: true });
+    expect(r.table).toEqual([`${r.A}/1 v=99`]);
+    expect([...r.missing, ...r.dangling].length).toBeGreaterThan(0);
   });
 
   /**
@@ -416,7 +424,7 @@ describe("known bugs, as deterministic interleavings", () => {
     const commit = outcome(tx.commit());
     await ack.reached;
     // 修正後は、intent を持つ参加者が DDL の適用を待たせる。応答が届いて取引が決着してから、DDL が進む。
-    const ddl = outcome(db.ddl("CREATE INDEX ix ON t(v)"));
+    const ddl = outcome(db.ddl("CREATE UNIQUE INDEX ix ON t(v)"));
     await new Promise((r) => setTimeout(r, 30));
     ack.release();
     expect(await ddl).toBe("ok");
@@ -480,7 +488,7 @@ describe("known bugs, as deterministic interleavings", () => {
    */
   it("BUG-5c (fixed): DROP INDEX does not lose committed rows of the indexed table", async () => {
     const { c, db, A, B } = await two();
-    await db.ddl("CREATE INDEX ix ON t(v)");
+    await db.ddl("CREATE UNIQUE INDEX ix ON t(v)");
     const release = holdFinalize(c);
     const tx = await new Db(c).begin();
     let v = 100;
@@ -507,7 +515,7 @@ describe("known bugs, as deterministic interleavings", () => {
     for (let t = 1; t <= 30; t++) await db.query("INSERT INTO t VALUES (?, 1, ?, 0)", [t, 100 + t]);
     // backfill の最初の走査を止める。走査は主キーの順に少しずつ読む文である。
     const scan = hold(c, "gate", (m) => m.from === "client" && m.method === "exec" && /FROM "t"\s+ORDER BY/.test((m.req as { sql: string }).sql));
-    const ddl = outcome(db.ddl("CREATE INDEX ix ON t(v)"));
+    const ddl = outcome(db.ddl("CREATE UNIQUE INDEX ix ON t(v)"));
     await scan.reached;
     await split(c, "s0", "s2");
     scan.release();
@@ -641,32 +649,6 @@ describe("the checks are not vacuous", () => {
     expect(await detects(s, (r) => r.history.length > 0)).toBe(true);
   }, 120_000);
 
-  it("index checks: detect a shard that accepts requests planned with an older schema", async () => {
-    // specs/m11_schema_change.qnt の red_noReject に当たる。古い catalog の Worker が index を更新せずに書く。
-    const s: Scenario = {
-      ddl: createIndexes(),
-      // 入口の検査を外すだけでは足りない。待ちの後の確かめ直しも外して、古い計画が本当に通るようにする。
-      faults: { noSchemaRecheck: true },
-      inject: (c) => {
-        for (const core of c.cores.values()) {
-          const orig = inner(core).ensureSchema;
-          inner(core).ensureSchema = async function (this: Inner, version: number) {
-            if (version < this.schema) return;
-            return orig.call(this, version);
-          };
-        }
-      },
-    };
-    // index は読みの経路に使わないので、欠けた項目は読みの結果には現れない。index の中身の照合 (missing) だけが見つける。
-    const seen = { missing: false };
-    // 実行中の読みが欠落に当たるのは seed の半分ほどなので、3 種類とも出るまで seed を進める。
-    for (let seed = 201; seed < 241 && !seen.missing; seed++) {
-      const v = violations(await runScenario(seed, s));
-      seen.missing ||= v.missing.length > 0;
-    }
-    expect(seen).toEqual({ missing: true });
-  }, 120_000);
-
   it("lost-write check: detects a DDL that returns before every shard applied it", async () => {
     // specs/m11_schema_change.qnt の red_noSync に当たる。migration.test.ts の「DROP and CREATE」の消失と同じ欠陥である。
     const s: Scenario = {
@@ -684,9 +666,9 @@ describe("the checks are not vacuous", () => {
     const { c, db, A, B } = await two();
     await db.query("INSERT INTO t VALUES (?, 1, 7, 0)", [A]);
     await db.query("INSERT INTO t VALUES (?, 1, 8, 0)", [B]);
-    await db.ddl("CREATE INDEX ix ON t(v)");
+    await db.ddl("CREATE UNIQUE INDEX ix ON t(v)");
     const clean = await indexAgreement(c, "t", "ix");
-    expect(clean).toEqual({ state: "public", unique: false, missing: [], dangling: [], wrongRead: [], leftover: [] });
+    expect(clean).toEqual({ state: "public", unique: true, missing: [], dangling: [], wrongRead: [], leftover: [] });
     const { routing } = await c.catalog();
     const home = (v: number) => c.backends.get(ownerOf(routing, encode([encode([v])])))!;
     home(7).exec(`DELETE FROM "__gidx_ix" WHERE k = '[7]'`);
@@ -723,7 +705,7 @@ describe("the checks are not vacuous", () => {
   it("schema check: shards lag after CREATE INDEX returns, and converge once a current request reaches them", async () => {
     // publishIndex は Meta の版を上げるだけで、シャードへは押し出さない (db.ts:778)。乱択の検査は touchAll の後で比べる。
     const { c, db } = await two();
-    await db.ddl("CREATE INDEX ix ON t(v)");
+    await db.ddl("CREATE UNIQUE INDEX ix ON t(v)");
     const lagging = await schemaVersions(c);
     expect(Object.values(lagging.shards).every((v) => v === lagging.meta - 1)).toBe(true);
     await touchAll(c);

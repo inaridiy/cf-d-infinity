@@ -48,10 +48,10 @@ describe("statements that loop over rows, within one Worker invocation", () => {
     await new Db(unique.cluster).query("CREATE UNIQUE INDEX people_email ON people(email)");
     expect(plain.used()).toBeLessThan(300);
     expect(unique.used()).toBeLessThan(300);
-    for (const name of ["people_city", "people_email"]) {
-      const ix = await indexAgreement(c, "people", name);
-      expect({ state: ix.state, missing: ix.missing, dangling: ix.dangling }).toEqual({ state: "public", missing: [], dangling: [] });
-    }
+    // 一意でない index は各シャードの中の index なので、埋める作業がない。
+    expect((await c.catalog()).indexes.people_city).toEqual({ table: "people", global: false });
+    const ix = await indexAgreement(c, "people", "people_email");
+    expect({ state: ix.state, missing: ix.missing, dangling: ix.dangling }).toEqual({ state: "public", missing: [], dangling: [] });
   }, 120_000);
 
   it("CREATE UNIQUE INDEX that runs out of calls says so, and the index is not used", async () => {
