@@ -39,7 +39,7 @@ const norm = (v: unknown[][], sorted: boolean) => {
   return sorted ? rows : [...rows].sort();
 };
 
-export async function diff(script: string, shards = 4, dumps: string[] = []): Promise<string[]> {
+export async function diff(script: string, shards = 4, dumps: string[] = [], unsupported?: string[]): Promise<string[]> {
   const sqlite = new DatabaseSync(":memory:");
   const c = new SimCluster({ shards });
   const db = new Db(c, { idBlock: 1000 });
@@ -48,8 +48,14 @@ export async function diff(script: string, shards = 4, dumps: string[] = []): Pr
   for (const raw of script.split(/;\s*\n/)) {
     const sql = raw.replace(/^\s*--.*$/gm, "").trim();
     if (!sql) continue;
-    const a = real(sqlite, sql);
     const b = await ours(db, sql);
+    // 対応していない文は断ることにしている。断った文は SQLite でも実行しないで、両方を同じ状態のまま先へ進める。
+    // 約束は「SQLite と同じ答えを返すか、unsupported で断るか」である。
+    if (b.error && /^unsupported:/.test(b.message ?? "")) {
+      unsupported?.push(sql);
+      continue;
+    }
+    const a = real(sqlite, sql);
     trail.push(`${sql.slice(0, 60)}${a.error ? " [E]" : ""}${b.error ? ` [e:${b.message?.slice(0, 30)}]` : ""}`);
     await c.settle();
     if (a.error !== b.error) {

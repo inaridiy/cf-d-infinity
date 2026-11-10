@@ -69,15 +69,15 @@ describe("statements that return or write a wrong answer", () => {
     expect(got).toEqual([{ id: 1 }]);
   });
 
-  it("5b. a global index on a NOCASE column after RENAME COLUMN", async () => {
+  it("5b. an index on a NOCASE column; RENAME COLUMN is refused", async () => {
     const { db } = await cluster();
     await db.ddl(`CREATE TABLE u(id INTEGER PRIMARY KEY, email TEXT COLLATE NOCASE)`);
     await db.ddl(`CREATE INDEX u_email ON u(email)`);
     await db.query("INSERT INTO u VALUES (1, 'a@x')");
     expect(await rows(db, "SELECT id FROM u WHERE email = 'A@X'")).toEqual([{ id: 1 }]);
-    await db.ddl(`ALTER TABLE u RENAME COLUMN email TO mail`);
-    const got = await rows(db, "SELECT id FROM u WHERE mail = 'A@X'");
-    expect(got).toEqual([{ id: 1 }]);
+    await expect(db.ddl(`ALTER TABLE u RENAME COLUMN email TO mail`)).rejects.toThrow(/^unsupported: ALTER TABLE ... RENAME COLUMN/);
+    await expect(db.ddl(`ALTER TABLE u DROP COLUMN email`)).rejects.toThrow(/^unsupported: ALTER TABLE ... DROP COLUMN/);
+    expect(await rows(db, "SELECT id FROM u WHERE email = 'A@X'")).toEqual([{ id: 1 }]);
   });
 
   it("6. max() of a NOCASE column written with a table qualifier", async () => {

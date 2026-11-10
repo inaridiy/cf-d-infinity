@@ -16,23 +16,14 @@ async function tenants(c: SimCluster): Promise<[number, number]> {
 }
 
 describe("a transaction acknowledged as committed can always be applied", () => {
-  for (const kind of ["STORED", "VIRTUAL"]) {
-    it(`(1) table with a ${kind} generated column, two-shard transaction`, async () => {
-      const c = new SimCluster({ shards: 2 });
-      const db = c.client();
-      await db.ddl(`CREATE TABLE g(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) ${kind})`);
-      const [A, B] = await tenants(c);
-      const tx = await new Db(c).begin();
-      await tx.query("INSERT INTO g(id, a) VALUES (?, 1)", [A]);
-      await tx.query("INSERT INTO g(id, a) VALUES (?, 1)", [B]);
-      await tx.commit(); // resolves: the client is told the transaction committed
-      await c.settle();
-      const read = await new Db(c, { retries: 2 }).query("SELECT id, a, b FROM g ORDER BY id").then((r) => r.rows, (e: Error) => e.message);
-      const problems = await quiescentProblems(c);
-      expect(problems).toEqual([]);
-      expect(read).toEqual([A, B].sort((x, y) => x - y).map((id) => ({ id, a: 1, b: 2 })));
-    });
-  }
+  it("(1) generated columns are refused: a row image holds the generated value, and writing it back fails", async () => {
+    const db = new SimCluster({ shards: 2 }).client();
+    for (const kind of ["STORED", "VIRTUAL"]) {
+      await expect(db.ddl(`CREATE TABLE g(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) ${kind})`)).rejects.toThrow(/^unsupported: generated columns/);
+    }
+    await db.ddl("CREATE TABLE g(id INTEGER PRIMARY KEY, a INTEGER)");
+    await expect(db.ddl("ALTER TABLE g ADD COLUMN b INTEGER AS (a * 2)")).rejects.toThrow(/^unsupported: generated columns/);
+  });
 
   const pending = async (name: string, table: string, index: string, first: string, second: string) => {
     const c = new SimCluster({ shards: 2 });
@@ -107,20 +98,5 @@ describe("a transaction acknowledged as committed can always be applied", () => 
     await c.settle();
     expect(await quiescentProblems(c)).toEqual([]);
     expect((await new Db(c).query("SELECT count(*) AS n FROM users WHERE name = 'x'")).rows).toEqual([{ n: 2 }]);
-  });
-
-  it("a table with a generated column reads the same through the Worker's SQLite, and exports without the column", async () => {
-    const c = new SimCluster({ shards: 2 });
-    const db = c.client();
-    await db.ddl(`CREATE TABLE g(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED)`);
-    for (let i = 1; i <= 8; i++) await db.query("INSERT INTO g(id, a) VALUES (?, ?)", [i, i]);
-    // 複数シャードの集約は、行を Worker の SQLite に集めてから実行する。
-    expect((await db.query("SELECT sum(b) AS s, count(DISTINCT b) AS n FROM g")).rows).toEqual([{ s: 72, n: 8 }]);
-    await db.transaction(async (tx) => {
-      await tx.query("UPDATE g SET a = a + 10 WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8)");
-    });
-    expect((await db.query("SELECT b FROM g WHERE id = 3")).rows).toEqual([{ b: 26 }]);
-    const page = await c.shard("s0").exportRows({ table: "g", after: null, limit: 10 });
-    expect(page.columns).toEqual(["id", "a"]);
   });
 });

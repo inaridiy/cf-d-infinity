@@ -45,10 +45,25 @@ export interface ParsedDdl {
 }
 
 /** 内部の表は `__` で始まる。利用者の表と名前が衝突すると、内部の状態を利用者の SQL で書き換えられる。 */
-export const isInternalName = (name: string): boolean => /^(__|sqlite_)/i.test(name);
+const INTERNAL_NAMES = new Set([
+  "__arrived", "__cap", "__cap_on", "__ddl", "__fenced", "__incoming", "__intents", "__meta", "__moved", "__moved_txn",
+  "__p", "__raw", "__routing", "__seq", "__slow", "__txn",
+]);
+/**
+ * 内部で使う名前か。`__` で始まる名前を全部は取らない。移行の道具が `__new_<表名>` のような名前を使うからである。
+ * 利用者の文が内部の表を名指しできないことは、名前の検査ではなく、Worker の SQLite でのコンパイルが守る
+ * (そこには利用者の表しかない。Db.tablesOf)。ここで断るのは、内部の表と物理的に衝突する名前を作ることである。
+ */
+export const isInternalName = (name: string): boolean =>
+  INTERNAL_NAMES.has(name.toLowerCase()) || /^(sqlite_|__gidx_|__cap_|__capv_|__log_g)/i.test(name);
+
+/** 対応していない機能は、黙って通さずに断る。エラーは必ず `unsupported:` で始める。 */
+const unsupported = (what: string): never => {
+  throw new SqlError(`unsupported: ${what}`);
+};
 
 function userName(name: string, what: string): string {
-  if (isInternalName(name)) throw new SqlError(`${what} name ${name} is reserved: names starting with "__" or "sqlite_" are internal`);
+  if (isInternalName(name)) throw new SqlError(`${what} name ${name} is reserved for internal use`);
   return name;
 }
 
@@ -122,7 +137,7 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
         collated.add(col);
         collation[col] = ident(c.collation).toUpperCase();
       }
-      if (c.type === "constraint_generated") generated.push(col);
+      if (c.type === "constraint_generated") unsupported("generated columns");
     }
   }
   const withoutRowid = (stmt.options?.items ?? stmt.options?.options?.items ?? []).some((o: Node) => /WITHOUT/i.test(text(o)));
@@ -133,6 +148,15 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
   const sk = shardKey ?? [pk[0]!];
   for (const c of sk) {
     if (!pk.includes(c)) throw new SqlError(`SHARD KEY column ${c} must be part of the PRIMARY KEY`);
+  }
+  // 行と shard key の同一性は、値をそのまま比べて決める。照合順序で等しい値 ('abc' と 'ABC') を同じ行として扱うには、
+  // 経路、分割、ロック、検証のすべてで同じ規則が要る。その規則を確かめきるまで、キーの列の照合順序は受け付けない。
+  for (const c of new Set([...pk, ...sk])) {
+    if ((collation[c] ?? "BINARY") !== "BINARY") unsupported(`COLLATE ${collation[c]} on the primary key or shard key column ${c}`);
+  }
+  for (const cols of uniqueSets) {
+    const bad = cols.find((c) => (collation[c] ?? "BINARY") !== "BINARY");
+    if (bad && !sk.every((c) => cols.includes(c))) unsupported(`COLLATE ${collation[bad]} on column ${bad} of a UNIQUE constraint that does not include the shard key`);
   }
 
   // 外部キーは SQLite の既定どおり強制しない。親の行が別のシャードにあるからである。
@@ -213,6 +237,8 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
     const drop = `DROP INDEX IF EXISTS ${q(name)}`;
     return { sql: [text(stmt)], defs: [def], drops: [], user: source, indexes: { [name]: { table, global: false } }, undo: { sql: [drop], user: drop } };
   }
+  const collatedCol = unique ? cols.find((c) => (def.collation[c] ?? "BINARY") !== "BINARY") : undefined;
+  if (collatedCol) unsupported(`COLLATE ${def.collation[collatedCol]} on column ${collatedCol} of a UNIQUE index that does not include the shard key`);
   const ix: GlobalIndexDef = { name, table: `__gidx_${name}`, columns: cols, unique, state: "writeOnly" };
   const t = globalIndexTable(ix);
   def.globalIndexes.push(ix);
@@ -240,6 +266,9 @@ function triggerTables(stmt: Node): string[] {
 }
 
 function createTrigger(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
+  // trigger のある表への書き込みは、行を Worker に集めて Worker の SQLite で発火させる、別の実行経路を通る。
+  // その経路の読みと検証を確かめきるまで、trigger は受け付けない。
+  unsupported("CREATE TRIGGER");
   const name = userName(ident(stmt.name), "trigger");
   if (schema.triggers[name]) {
     if (stmt.ifNotExistsKw) return NOOP;
@@ -317,7 +346,7 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       def.affinity[added] = affinityOf(col.dataType ? text(col.dataType) : null);
       for (const raw of col.constraints ?? []) {
         const c = inner(raw);
-        if (c.type === "constraint_generated") def.generated = [...(def.generated ?? []), added];
+        if (c.type === "constraint_generated") unsupported("generated columns");
         if (c.type !== "constraint_collate") continue;
         def.collated.push(added);
         def.collation[added] = ident(c.collation).toUpperCase();
@@ -328,6 +357,9 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       return { sql, defs: [def], drops: [], user: source, undo: { sql: [...dropCaptureDdl(name), drop, ...captureDdl(found)], user: drop } };
     }
     case "alter_action_rename_column": {
+      // 列の名前や数を変える DDL は、未決着の intent と変更ログの行イメージの形を変える。分割と重なる場合も含めて
+      // 確かめきるまで、受け付けない。表を作り直して移す (CREATE、INSERT ... SELECT、DROP、RENAME TO) ことはできる。
+      unsupported("ALTER TABLE ... RENAME COLUMN");
       const from = ident(action.oldName);
       const to = ident(action.newName);
       if (!def.columns.includes(from)) throw new SqlError(`no such column: "${from}"`);
@@ -346,6 +378,7 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       break;
     }
     case "alter_action_drop_column": {
+      unsupported("ALTER TABLE ... DROP COLUMN");
       const col = ident(action.column);
       if (!def.columns.includes(col)) throw new SqlError(`no such column: "${col}"`);
       if (def.pk.includes(col)) throw new SqlError(`cannot drop PRIMARY KEY column: "${col}"`);

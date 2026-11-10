@@ -213,7 +213,7 @@ function scopesOf(root: Node, n: Names): Scope[] {
     const name = lower(ident(x.table));
     // CTE の名前は文の全体で集めるので、有効範囲の外の同じ名前の参照も CTE として扱われ、文ごとシャードへ送られる。
     // 内部の表と同じ名前の CTE を認めると、その参照がシャードの内部の表を読む。
-    if (isInternalName(name)) throw new SqlError(`CTE name ${name} is reserved: names starting with "__" or "sqlite_" are internal`);
+    if (isInternalName(name)) throw new SqlError(`CTE name ${name} is reserved for internal use`);
     // 実在の表と同じ名前の CTE は、文のほかの場所では本物の表を指していることがある。view と同じ扱いにして、
     // 表を条件なしで集め、シャードへ絞り込む経路を使わない。
     if (findTable(n.cat, name)) n.views.add(name);
@@ -902,9 +902,8 @@ export async function planStatement(stmt: Node, input: Params, cat: Catalog, ctx
       return planUpdateDelete(stmt, values, cat);
     case "create_table_stmt": {
       const as = clause(stmt, "as_clause");
-      if (as) {
-        return { kind: "ctas", name: ident(stmt.name), select: planRead(as.expr, values, cat), ifNotExists: !!stmt.ifNotExistsKw };
-      }
+      // 表の作成と行の挿入を 1 文で行うと、途中で失敗したときの後始末が要る。CREATE TABLE と INSERT ... SELECT に分けて書ける。
+      if (as) throw new SqlError("unsupported: CREATE TABLE ... AS SELECT; create the table, then INSERT ... SELECT");
       return { kind: "ddl", sql: text(stmt) };
     }
     case "create_index_stmt":

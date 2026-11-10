@@ -17,8 +17,6 @@ export interface Cluster {
   /** basedOn は呼び出し側が全シャードへ適用し終えた版。現在の版と違えば `schema moved` で断られる。 */
   applyDdl(sql: string, basedOn?: number): Promise<Catalog>;
   publishIndex(table: string, name: string, basedOn?: number): Promise<Catalog>;
-  /** index を埋める作業の途中経過を保存する (value あり) か、読む。無ければ、毎回先頭から埋める。 */
-  backfillProgress?(index: string, value?: string): Promise<string | null>;
   allocate(table: string, n: number, min?: number): Promise<number>;
   switchRange(move: { start: number; end: number; to: string; from?: string }): Promise<Routing>;
 }
@@ -76,7 +74,7 @@ const BACKFILL_RETRIES = 200;
 const UNKNOWN_SCHEMA = /^(no such (table|column|index)|table \S+ has no column)/;
 
 /** 文が読む表を SQLite に尋ねた結果。キーは DDL の履歴と文の文面。null はコンパイルできなかった文。 */
-const tablesSeen = new Map<string, string[] | null>();
+const tablesSeen = new Map<string, string[]>();
 /** DDL の履歴を表す短いキー。版番号だけだと、同じ isolate の別のクラスタと混ざる。 */
 const historyKeys = new WeakMap<Catalog, string>();
 function historyKey(cat: Catalog): string {
@@ -734,25 +732,26 @@ export class Db {
   /**
    * 文が読む表を、SQLite のコンパイル結果で確かめる。構文から拾った表のほかに SQLite が開く表があれば、文を断る。
    * 手書きの解析は、サブクエリや `x IN 表` などの参照を見落とし得る。見落とした表は、経路の判断にも範囲にも入っていない。
-   * コンパイルできなければ null を返す。呼び出し側は、どの表を読むか分からないものとして、全部の表を範囲にする。
+   * コンパイルできない文は断る。Worker の SQLite には利用者の表しかないので、内部の表を名指す文もここで落ちる。
    * 結果は文の文面と表定義の版ごとに覚えておく。同じ文の 2 回目からは、Worker の SQLite を開かない。
    */
-  async tablesOf(sql: string, cat: Catalog, known: TableDef[]): Promise<TableDef[] | null> {
+  async tablesOf(sql: string, cat: Catalog, known: TableDef[]): Promise<TableDef[]> {
     const key = `${historyKey(cat)}\0${sql}`;
     let names = tablesSeen.get(key);
     if (names === undefined) {
       const w = await openScratch(cat);
       try {
         names = w.tablesUsed(sql);
-      } catch {
-        names = null;
+      } catch (e) {
+        // Worker の SQLite には利用者の表と view しかない。ここでコンパイルできない文は、内部の表を名指ししているか、
+        // SQLite が受け付けない文である。シャードへ送らずに断る。
+        throw new SqlError((e as Error)?.message ?? String(e));
       } finally {
         w.close();
       }
       if (tablesSeen.size >= 2000) tablesSeen.delete(tablesSeen.keys().next().value!);
       tablesSeen.set(key, names);
     }
-    if (names === null) return null;
     // プランナが知らない表を、SQLite が開くと答えた。プランナは、知っている表についてだけ「この文が読む行は、送り先の
     // シャードにある」と確かめている。知らない表の行は別のシャードにもあり得るので、そのまま送ると黙って行が欠ける。
     const have = new Set(known.map((d) => d.name));
@@ -951,25 +950,17 @@ export class Db {
         this.cached = cat;
         this.opts.onCatalog?.(cat);
         let moved = false;
-        // 前回の要求が途中で終わっていれば、続きから埋める。範囲表が変わっていたら、行の置き場所が違うので先頭からやり直す。
-        const shards = shardsOf(cat.routing);
-        const saved = JSON.parse((await this.cluster.backfillProgress?.(ix.name)) ?? "null") as { routing: number; shard: string; after: Value[] | null } | null;
-        const from = saved && saved.routing === cat.routing.version ? Math.max(0, shards.indexOf(saved.shard)) : 0;
-        for (const [i, shard] of shards.entries()) {
-          if (i < from) continue;
-          const start = saved && i === from && shards[from] === saved.shard && saved.routing === cat.routing.version ? saved.after : null;
-          const save = (after: Value[] | null) =>
-            this.cluster.backfillProgress?.(ix.name, JSON.stringify({ routing: cat.routing.version, shard, after })).then(() => undefined);
-          moved = (await this.backfillShard(def, ix, shard, cat, start, save)) || moved;
-        }
+        // 毎回、先頭から埋める。途中経過を保存して続きから埋める作りは、別の DDL や増設と重なったときに、
+        // 終わっていないシャードを飛ばして index を公開した。再開できる埋め込みは、状態を持つ駆動役を用意してから入れる。
+        for (const shard of shardsOf(cat.routing)) moved = (await this.backfillShard(def, ix, shard, cat)) || moved;
         const after = await this.cluster.catalog();
         if (!moved && after.routing.version === cat.routing.version) break;
         if (round >= 20) throw new SqlError(`CREATE INDEX ${ix.name}: shards kept splitting during the backfill`);
       }
     } catch (e) {
-      // Worker の 1 回の呼び出しで使える要求の数を使い切った。index は消さず、途中経過を残す。同じ文を出し直せば続きから埋める。
+      // Worker の 1 回の呼び出しで使える要求の数を使い切った。後始末の DROP も通らないので、index は書き込み専用のまま残る。
       if (/too many subrequests|subrequest/i.test((e as Error)?.message ?? "")) {
-        throw new SqlError(`CREATE INDEX ${ix.name} is not finished: this request ran out of subrequests. Run the same statement again to continue where it stopped.`);
+        throw new SqlError(`CREATE INDEX ${ix.name} did not finish: the table has too many rows to index within one request. Drop the index; a UNIQUE constraint declared in CREATE TABLE needs no backfill.`);
       }
       // 作りかけの index を消した表定義を、呼び出し側のキャッシュにも戻す。
       // 戻さないと、同じ isolate の次の要求が、消えた index を保守する計画を立てて失敗する。
@@ -983,12 +974,9 @@ export class Db {
   }
 
   /** 1 シャードの行を主キーの順に少しずつ読み、index の項目を書く。途中で範囲が移ったら true を返す。 */
-  private async backfillShard(
-    def: TableDef, ix: GlobalIndexDef, shard: string, cat: Catalog,
-    start: Value[] | null = null, save?: (after: Value[] | null) => Promise<void> | undefined,
-  ): Promise<boolean> {
+  private async backfillShard(def: TableDef, ix: GlobalIndexDef, shard: string, cat: Catalog): Promise<boolean> {
     const pkCols = def.pk.map(q).join(", ");
-    let after: Value[] | null = start;
+    let after: Value[] | null = null;
     for (let attempt = 0; ; ) {
       let res: ExecRes;
       try {
@@ -1068,7 +1056,6 @@ export class Db {
       attempt = 0;
       const last = rows[rows.length - 1]!;
       after = def.pk.map((col) => last[col] ?? null);
-      await save?.(after);
     }
   }
 
