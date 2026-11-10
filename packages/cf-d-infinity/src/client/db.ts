@@ -1,10 +1,10 @@
 import type {
   Change, CommitRes, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
 } from "../types";
-import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError } from "../types";
+import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isWideSpan } from "../types";
 import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, fold, q, selectList } from "../shard/rows";
 import type { Catalog } from "../meta";
-import { hashKey, ownerOf, shardsOf, type Routing } from "../routing";
+import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
 import { parseStatements, text, type Node, type Params } from "../sql/cst";
 import { findTable, fullScan, planStatement, type Plan, type PlanContext, type Route, type Scan, type WriteTarget } from "../sql/plan";
 import { openScratch, ScratchDb } from "../sql/scratch";
@@ -78,6 +78,17 @@ function groupByShard(routing: Routing, sks: string[]): Target[] {
   return [...out].map(([shard, list]) => ({ shard, sks: list }));
 }
 
+/**
+ * shard key を絞らない span に、この範囲表で宛先のシャードが持つスロットの範囲を付ける。
+ * 全表の読みは範囲表の全シャードへ送るが、範囲表が古いと、分割で生まれたシャードには送らない。
+ * 親は自分に残った行だけを答えるので、範囲を付けないと、子へ移った行が黙って欠ける。
+ */
+function withSlots(routing: Routing, shard: string, spans: Span[]): Span[] {
+  if (!spans.some(isWideSpan)) return spans;
+  const slots = rangesOf(routing, shard);
+  return spans.map((s) => (isWideSpan(s) ? { ...s, slots } : s));
+}
+
 /** 1 回の読み取りで Worker へ集める行の上限。メモリからの推定で、本番で調整する。 */
 export const ROW_BUDGET = 200_000;
 /** 1 文で Worker へ集めてよいバイト数。isolate のメモリは 128 MB で、集めた行は wasm の SQLite にも入る。 */
@@ -98,13 +109,14 @@ class ReadScope {
   protected record(_shard: string, _spans: Span[]): void {}
 
   async call(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "overlay">): Promise<ExecRes> {
+    const spans = withSlots(this.cat.routing, shard, req.spans);
     const full: ExecReq = {
-      ...req, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), fresh: this.wantsFresh, realtime: this.realtime,
+      ...req, spans, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), fresh: this.wantsFresh, realtime: this.realtime,
     };
     const res = await this.db.shardOf(shard).exec(full);
     this.T ??= res.T;
     this.db.observe(res.hlc);
-    this.record(shard, req.spans);
+    this.record(shard, spans);
     return res;
   }
 
@@ -419,12 +431,13 @@ export class Txn extends ReadScope {
   private async dml(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "overlay">): Promise<ExecRes> {
     if (!this.pessimistic) return this.call(shard, req);
     this.lockOwner ??= { txn: this.txnId, start: this.db.startStamp() };
+    const spans = withSlots(this.cat.routing, shard, req.spans);
     const res = await this.db.shardOf(shard).exec({
-      ...req, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), lock: this.lockOwner,
+      ...req, spans, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), lock: this.lockOwner,
     });
     this.T ??= res.T;
     this.db.observe(res.hlc);
-    this.record(shard, req.spans.map((s) => ({ ...s, since: res.F })));
+    this.record(shard, spans.map((s) => ({ ...s, since: res.F })));
     return res;
   }
 
@@ -777,7 +790,7 @@ export class Db {
     for (const shard of shardsOf(cat.routing)) {
       const res = await this.shardOf(shard).exec({
         sql: `SELECT 1 x FROM ${q(def.name)} GROUP BY ${list} HAVING count(*) > 1 LIMIT 1`,
-        params: [], spans: [{ kind: "table", table: def.name }], schema: cat.version,
+        params: [], spans: withSlots(cat.routing, shard, [{ kind: "table", table: def.name }]), schema: cat.version,
       });
       if (res.values.length) throw new SqlError(`UNIQUE constraint failed: ${def.name} has duplicate values`);
     }
@@ -828,7 +841,7 @@ export class Db {
       try {
         res = await this.shardOf(shard).exec({
           sql: `SELECT ${selectList(def)} FROM ${q(def.name)} ${after ? `WHERE (${pkCols}) > (${def.pk.map(() => "?").join(", ")})` : ""} ORDER BY ${pkCols} LIMIT ${BACKFILL_PAGE}`,
-          params: after ?? [], spans: [{ kind: "table", table: def.name }], schema: cat.version,
+          params: after ?? [], spans: withSlots(cat.routing, shard, [{ kind: "table", table: def.name }]), schema: cat.version,
         });
       } catch (e) {
         const m = (e as Error)?.message ?? "";
@@ -866,6 +879,9 @@ export class Db {
         await tx.commit();
       } catch (e) {
         await tx.unlockAll().catch(() => undefined);
+        // index の項目を書く先のシャードが、範囲を手放していた。この取引は古い範囲表で組んであるので、
+        // 同じ範囲表でやり直しても同じ誤りになる。呼び出し側に範囲表を取り直させ、全体をやり直す。
+        if (/not owner/.test((e as Error)?.message ?? "")) return true;
         // 走査の後で行が変わった、などの競合。同じ位置から読み直す。
         if (!isRetryable(e) || attempt++ >= BACKFILL_RETRIES) throw e;
         this.onRetry(e);
@@ -1024,7 +1040,12 @@ export class Db {
           continue;
         }
         // COMMIT は取引を閉じた後で失敗するので再実行できない。競合は呼び出し側に見せる。
-        if (this.current || stmt.type === "commit_transaction_stmt" || !isRetryable(e) || attempt >= retries) throw e;
+        if (this.current || stmt.type === "commit_transaction_stmt" || !isRetryable(e) || attempt >= retries) {
+          // 取引の中の文はやり直さないが、古い範囲表は捨てておく。捨てないと、利用者が取引をやり直しても、
+          // 同じ接続では同じ「not owner」が続く。
+          if (isRetryable(e)) this.onRetry(e);
+          throw e;
+        }
         this.onRetry(e);
         await backoff(attempt);
       }

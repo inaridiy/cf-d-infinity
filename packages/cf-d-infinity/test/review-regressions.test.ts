@@ -1,6 +1,7 @@
 // 2026-11 の設計レビューで見つかった 3 件の欠陥の再現。
 // 欠陥スイッチを入れると壊れ、外すと直ることを確かめる (取引 ID の件は、ID の作り方そのものを検査する)。
 import { describe, expect, it, vi } from "vitest";
+import { split } from "../src/autoscaler";
 import { Db } from "../src/client/db";
 import { ownerOf } from "../src/routing";
 import type { Faults } from "../src/types";
@@ -166,5 +167,29 @@ describe("a schema change while a committed transaction is waiting to be applied
     expect(r.problems.some((p) => /intents remain|never fully applied|redrive keeps failing/.test(p))).toBe(true);
     // 同じ取引が別の表に書いた行も読めない。読み手が intent を決着させようとして、同じ失敗に当たる。
     expect(r.users).toMatch(/no such table: notes/);
+  });
+});
+
+describe("a connection whose range table is from before a split", () => {
+  // 取引の中の文はやり直さないので、古い範囲表のまま「not owner」を返す。そのとき範囲表を捨てておかないと、
+  // 利用者が取引をやり直しても、同じ接続では同じ誤りが続く。
+  it("drops it when a statement inside a transaction fails, so retrying the transaction works", async () => {
+    const c = new SimCluster({ shards: 2 });
+    await c.client().ddl(USERS);
+    for (let t = 1; t <= 40; t++) await new Db(c).query("INSERT INTO users(tenant_id,id,n) VALUES (?,1,?)", [t, t]);
+    const db = new Db(c);
+    await db.query("SELECT count(*) FROM users");
+    await split(c, "s0", "s2");
+    const { routing } = await c.catalog();
+    let moved = 1;
+    while (ownerOf(routing, JSON.stringify([moved])) !== "s2") moved++;
+
+    await db.query("BEGIN");
+    await expect(db.query("SELECT n FROM users WHERE tenant_id = ?", [moved])).rejects.toThrow(/not owner/);
+    if (db.inTransaction) await db.query("ROLLBACK");
+
+    await db.query("BEGIN");
+    expect((await db.query("SELECT n FROM users WHERE tenant_id = ?", [moved])).rows).toEqual([{ n: moved }]);
+    await db.query("COMMIT");
   });
 });

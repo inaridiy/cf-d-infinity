@@ -51,6 +51,9 @@ export function ownerOfSlot(r: Routing, slot: number): string {
 
 export const ownerOf = (r: Routing, sk: string): string => ownerOfSlot(r, slotOf(sk));
 export const shardsOf = (r: Routing): string[] => [...new Set(r.ranges.map((x) => x.shard))];
+/** シャードが持つスロットの範囲を、[start, end) の組で返す。 */
+export const rangesOf = (r: Routing, shard: string): [number, number][] =>
+  r.ranges.filter((x) => x.shard === shard).map((x) => [x.start, x.end]);
 
 /** 親の最も広い範囲を半分に割って、子へ渡す範囲を返す。幅 1 なら割れない。 */
 export function planSplit(r: Routing, parent: string): { start: number; end: number } | null {
