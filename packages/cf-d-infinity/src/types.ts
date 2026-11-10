@@ -106,6 +106,11 @@ export interface ExecReq {
   write?: WritePlan;
   /** T より後の commit があれば読まずに ReadTooOld を返す。取引が T を進めて読み直すためである。 */
   fresh?: boolean;
+  /**
+   * autocommit の読み取り。開始前に確定した書き込みを必ず見せる必要がある。
+   * T を指定した読みで、決着させた取引の commit 時刻が T を超えていたら、T を取り直させる。
+   */
+  realtime?: boolean;
   /** 悲観的な DML。最新の状態で実行し、変更行のロックを取る。 */
   lock?: LockOwner;
   /** 読み取りでロックを取る行。BEGIN IMMEDIATE の主キー読みに使う。 */
@@ -246,6 +251,10 @@ export interface Backend {
 
 /** 検証済みの欠陥を再導入するスイッチ。反例の再現テスト専用で、既定はすべて false。 */
 export interface Faults {
+  /** autocommit の書き込みが、他の取引の intent との UNIQUE を照合しない (2026-11 のレビューで見つかった欠陥)。 */
+  autoIgnoresUniqueIntents?: boolean;
+  /** 複数シャードの autocommit の読みが、決着させた取引の c > T でも T を取り直さない (同上)。 */
+  noRealtimeBump?: boolean;
   anchorNoAbsorb?: boolean;
   skipReadOnlyPrepare?: boolean;
   refreshNoBump?: boolean;

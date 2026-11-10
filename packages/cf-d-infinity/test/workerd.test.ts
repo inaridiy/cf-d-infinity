@@ -240,3 +240,23 @@ describe("on workerd with real Durable Objects", () => {
     expect((w.rows[0] as { r: number }).r).toBe(1);
   });
 });
+
+describe("DDL through the HTTP /ddl endpoint", () => {
+  it("runs the same checks as SQL DDL: a global UNIQUE index over existing duplicates is refused and removed", async () => {
+    await post("/ddl", { sql: "CREATE TABLE dup(id INTEGER PRIMARY KEY, email TEXT)" });
+    await sql("INSERT INTO dup(id, email) VALUES (1, 'a@example.test'), (2, 'a@example.test')");
+    const r = await post("/ddl", { sql: "CREATE UNIQUE INDEX dup_email ON dup(email)" });
+    expect(r.status).toBe(400);
+    // index が残っていなければ、重複する値をもう 1 行入れられる。
+    const again = await sql("INSERT INTO dup(id, email) VALUES (3, 'a@example.test')");
+    expect([again.status, again.error]).toEqual([200, undefined]);
+  });
+
+  it("backfills a global index over rows that already exist, so a lookup through it finds them", async () => {
+    await post("/ddl", { sql: "CREATE TABLE people(id INTEGER PRIMARY KEY, email TEXT)" });
+    await sql("INSERT INTO people(id, email) VALUES (1, 'x@example.test'), (2, 'y@example.test')");
+    expect((await post("/ddl", { sql: "CREATE UNIQUE INDEX people_email ON people(email)" })).status).toBe(200);
+    expect((await sql("SELECT id FROM people WHERE email = ?", ["y@example.test"])).rows).toEqual([{ id: 2 }]);
+    expect((await sql("INSERT INTO people(id, email) VALUES (3, 'x@example.test')")).status).toBe(400);
+  });
+});

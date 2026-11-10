@@ -56,6 +56,7 @@ interface IncomingRange { start: number; end: number; from_id: string }
 const ROLLBACK = Symbol("rollback");
 const FALLBACK = Symbol("fallback");
 const BLOCKED = Symbol("blocked");
+const PENDING_UNIQUE = Symbol("pending unique");
 /** 述語の検証で読む commit の上限。超えたら競合とみなす。 */
 const PRED_WINDOW = 2000;
 /** ロックの TTL。Worker の死亡に備える。文を実行するたびに延ばす。 */
@@ -792,9 +793,10 @@ export class ShardCore implements ShardApi {
    * T 以下で確定し得る intent をすべて決着させる。
    * 無視してよいのは commit 時刻が T を超えると確定した intent だけである。
    */
-  private async settleIntents(spans: Span[], T: Ts): Promise<boolean> {
+  private async settleIntents(spans: Span[], T: Ts): Promise<Ts> {
     const pushed = new Set<string>();
-    let applied = false;
+    // 適用した取引の commit 時刻の最大値。何も適用していなければ 0。
+    let applied: Ts = 0;
     for (;;) {
       const pending = this.overlapping(spans, T).filter((i) => !pushed.has(i.txn));
       if (pending.length === 0) return applied;
@@ -807,7 +809,7 @@ export class ShardCore implements ShardApi {
         const res = await this.ask(intent.anchor, txn, T);
         if (res.status === "committed") {
           await this.finalize({ txn, c: res.c });
-          applied = true;
+          applied = Math.max(applied, res.c);
         } else if (res.status === "aborted") await this.abort({ txn });
         else pushed.add(txn);
       }
@@ -900,6 +902,10 @@ export class ShardCore implements ShardApi {
       T = this.issue();
       applied = await this.settleIntents(req.spans, T);
     }
+    // T を指定した autocommit の読み (複数シャードの読み) も同じである。T は対象シャードの時計の最大値だが、
+    // phase 2 が届いていない参加者の時計は commit 時刻に追いついていない。anchor の時計が進んでいると c > T になり、
+    // そのまま T で読むと、開始前に確定して応答まで返った書き込みが見えない。T を取り直させる。
+    if (req.T !== undefined && req.realtime && applied > T && !this.faults.noRealtimeBump) throw new ReadTooOld(`moved at ${this.hlc.value}`);
     // ここから先は await を挟まない。
     this.assertOwned(req.spans, [], T);
     this.count(req.write ? "writes" : "reads", req.spans);
@@ -961,6 +967,9 @@ export class ShardCore implements ShardApi {
       } finally {
         for (const key of woken) queueMicrotask(() => this.wakeNext(key));
       }
+      // 同じ主キーでなくても、他の取引の intent が同じ UNIQUE の値を持っていれば確定できない。
+      const pending = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, dry.changes);
+      if (pending) throw new ConflictError(pending);
       const c = this.issue();
       if (dry.changes.length) this.b.tx(() => this.applyAndLog(`auto-${c}`, c, dry.changes));
       return { ...dry, T: c, hlc: this.hlc.value, epoch: this.epoch };
@@ -1020,6 +1029,7 @@ export class ShardCore implements ShardApi {
     try {
       for (;;) {
         const hit: { key: string | null } = { key: null };
+        const pending: { reason: string | null } = { reason: null };
         let out: { changes: Change[]; c: Ts } | undefined;
         try {
           out = this.b.tx(() => {
@@ -1027,12 +1037,15 @@ export class ShardCore implements ShardApi {
             if (!r) throw FALLBACK;
             hit.key = this.blockedBy(r.changes, me);
             if (hit.key !== null) throw BLOCKED;
+            pending.reason = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, r.changes);
+            if (pending.reason) throw PENDING_UNIQUE;
             const c = this.issue();
             if (r.changes.length) this.logChanges(`auto-${c}`, c, r.changes);
             return { changes: r.changes, c };
           });
         } catch (e) {
           if (e === FALLBACK) return null;
+          if (e === PENDING_UNIQUE) throw new ConflictError(pending.reason!);
           if (e !== BLOCKED) throw e;
         }
         if (out) return { columns: [], values: [], changes: out.changes, T: out.c, hlc: this.hlc.value, epoch: this.epoch };
@@ -1098,19 +1111,31 @@ export class ShardCore implements ShardApi {
   }
 
   /** シャード内 UNIQUE。本体は SQLite に試適用して、未確定の値は intent と比べて確かめる。 */
-  private checkUnique(txn: string, writes: Change[]): string | null {
-    const constrained = writes.filter((w) => this.def(w.table).uniques.length > 0);
+  /**
+   * 他の取引の intent が、同じ UNIQUE の値を持つ行を書こうとしているか。
+   * intent は本体にないので、SQLite の制約では見つからない。見逃すと、確定済みの取引の phase 2 が
+   * UNIQUE 違反で適用できなくなり、再駆動が永久に失敗する。書き込みの経路はすべてこれを通す。
+   */
+  private uniquePending(txn: string, writes: Change[]): string | null {
+    const constrained = writes.filter((w) => w.after && this.def(w.table).uniques.length > 0);
     if (constrained.length === 0) return null;
     const others = (this.b.exec(`SELECT * FROM __intents WHERE txn <> ?`, txn) as unknown as Intent[]).map(
       (i) => decode<Change>(i.change),
     );
     for (const w of constrained) {
-      if (!w.after) continue;
       for (const cols of this.def(w.table).uniques) {
         const same = others.find((o) => o.table === w.table && o.after && cols.every((c) => o.after![c] === w.after![c]));
         if (same) return `unique pending: ${w.table} ${cols.join(",")}`;
       }
     }
+    return null;
+  }
+
+  private checkUnique(txn: string, writes: Change[]): string | null {
+    const constrained = writes.filter((w) => this.def(w.table).uniques.length > 0);
+    if (constrained.length === 0) return null;
+    const pending = this.uniquePending(txn, constrained);
+    if (pending) return pending;
     try {
       this.rollback(() => applyChanges(this.b, (t) => this.def(t), constrained));
       return null;

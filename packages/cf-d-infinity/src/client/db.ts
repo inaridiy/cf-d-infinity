@@ -82,6 +82,8 @@ class ReadScope {
   T: Ts | undefined;
   /** 取引だけが T を進められる。autocommit の読み取りは最初から全シャードの最大を取る。 */
   protected wantsFresh = false;
+  /** 取引でない読み取りは、開始前に確定した書き込みを必ず見る。取引は自分のスナップショットを読み続ける。 */
+  protected realtime = true;
   constructor(protected db: Db, protected cat: Catalog) {}
 
   protected overlay(_shard: string): Change[] {
@@ -91,7 +93,7 @@ class ReadScope {
 
   async call(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "overlay">): Promise<ExecRes> {
     const full: ExecReq = {
-      ...req, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), fresh: this.wantsFresh,
+      ...req, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), fresh: this.wantsFresh, realtime: this.realtime,
     };
     const res = await this.db.shardOf(shard).exec(full);
     this.T ??= res.T;
@@ -262,6 +264,7 @@ export interface TxnDump {
 export class Txn extends ReadScope {
   commitTs: Ts | undefined;
   protected override wantsFresh = true;
+  protected override realtime = false;
   private writes = new Map<string, Map<string, Change>>();
   private spans = new Map<string, Span[]>();
   private saves = new Map<string, { writes: Map<string, Map<string, Change>>; spans: Map<string, Span[]> }>();
@@ -771,8 +774,11 @@ export class Db {
         }
       }
     } catch (e) {
-      await this.cluster.applyDdl(`DROP INDEX "${ix.name}"`);
-      this.cached = null;
+      // 作りかけの index を消した表定義を、呼び出し側のキャッシュにも戻す。
+      // 戻さないと、同じ isolate の次の要求が、消えた index を保守する計画を立てて失敗する。
+      const without = await this.cluster.applyDdl(`DROP INDEX "${ix.name}"`);
+      this.cached = without;
+      this.opts.onCatalog?.(without);
       throw e;
     }
     this.cached = await this.cluster.publishIndex(def.name, ix.name);
@@ -780,7 +786,9 @@ export class Db {
   }
 
   private nextTxnId(): string {
-    return `${this.opts.idPrefix ?? "t"}-${crypto.randomUUID().slice(0, 8)}-${this.seq++}`;
+    // UUID を丸ごと使う。anchor は同じ ID の記録があればその決着を返すので、ID が衝突すると、
+    // 後の取引は何も書かずに「確定」と応答される。先頭 8 桁 (32 bit) では、負荷があれば 1 時間に何度か衝突する。
+    return `${this.opts.idPrefix ?? "t"}-${crypto.randomUUID()}-${this.seq++}`;
   }
 
   /** シャードを呼ぶ。呼んだ先は文の記録のために覚える。 */

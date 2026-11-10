@@ -490,7 +490,12 @@ async function admin(env: Env, path: string, b: AdminReq): Promise<unknown> {
   const cluster = clusterOf(env, b.shards, name);
   const scaler = env.DINF_AUTOSCALER.getByName(name);
   switch (path) {
-    case "/admin/ddl": return (await cluster.applyDdl(b.sql!)).version;
+    case "/admin/ddl": {
+      // 上の /ddl と同じ理由で、Db の DDL を通す。
+      await new Db(cluster, { ids: sharedIds }).ddl(b.sql!);
+      if (name === "shard") cached = null;
+      return (await cluster.catalog()).version;
+    }
     case "/admin/split": return split(cluster, b.parent!, b.child!);
     case "/admin/rowstats": {
       // 全シャードの内訳を合計する。同じ isolate の DO は表を共有するので、読んだら必ず消す。
@@ -549,7 +554,9 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
     const body = (await request.json()) as Statement & { token?: number; statements?: Statement[] };
     const token = body.token ?? 0;
     if (path === "/ddl") {
-      await clusterOf(env).applyDdl(body.sql);
+      // SQL の DDL と同じ経路を通す。Meta だけを更新すると、全シャードへの適用、UNIQUE の重複検査、
+      // グローバル index の backfill が抜け、index が書き込み専用のまま残る。
+      await (await dbFor(env, token, background)).ddl(body.sql);
       cached = null;
       return Response.json({ ok: true });
     }
