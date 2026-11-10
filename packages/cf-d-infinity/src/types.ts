@@ -223,6 +223,8 @@ export interface GroupPayload {
   m: Ts;
   rows: { table: string; row: Row }[];
   intents: Row[];
+  /** 送り出した親の表定義の版。行はこの版の形をしている。 */
+  schema?: number;
 }
 
 /**
@@ -302,6 +304,10 @@ export interface Faults {
   autoIgnoresUniqueIntents?: boolean;
   /** DDL を、持っている intent を決着させずに適用する。表や列が消えた後では、確定済みの取引の intent を適用できない。 */
   ddlIgnoresIntents?: boolean;
+  /** 増設の子が、親からグループを受け取るときに表定義を追いつかせない。 */
+  childKeepsOldSchema?: boolean;
+  /** 行ロックや intent を待った後で、表定義を確かめ直さない。待ちの間に作られた index を保守しない書き込みが通る。 */
+  noSchemaRecheck?: boolean;
   /** 取引の変更の大きさを確定の前に検査しない。変更ログの 1 行が DO の行の上限を超え、確定後の適用が失敗する。 */
   noWriteSetLimit?: boolean;
   /** 複数シャードの autocommit の読みが、決着させた取引の c > T でも T を取り直さない (同上)。 */

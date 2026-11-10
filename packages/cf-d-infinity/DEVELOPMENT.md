@@ -219,6 +219,7 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `test/rollback-read.test.ts` | どの過去時点も正確に再構成できること |
 | `test/migration.test.ts` | ライブ移動、`m5b` の反例、Autoscaler の判断 |
 | `test/workerd.test.ts` | 本物の workerd と DO の SQLite での結合テスト |
+| `test/ddl-concurrent.test.ts`、`test/ddl-harness.ts` | 取引と並行する DDL。index の作成、UNIQUE、DROP、列の追加、分割との競合を乱数の作業負荷で回し、index と表の一致、確定した書き込みの残存、表定義の収束を見る。見つかった欠陥の再現も含む |
 | `test/limits.test.ts` | シャード側の上限。結果の行数とバイト数、取引の大きさ、グループの列挙と大きさ |
 | `test/health.test.ts` | 保存形式の版と、健全性の判定 |
 | `test/review-regressions.test.ts` | 設計レビューで見つかった欠陥の再現。欠陥スイッチで壊れ、外すと直る |
