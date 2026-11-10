@@ -32,8 +32,10 @@ export interface TableDef {
   collated: string[];
   /** 列の照合順序。 */
   collation: Record<string, string>;
-  /** シャード内の UNIQUE (shard key を含むもの)。 */
+  /** シャード内の UNIQUE (shard key を含むもの)。部分 index (WHERE 付き) の列も含む。 */
   uniques: string[][];
+  /** 生成列。値は SQLite が計算するので、行イメージを書き戻すときは除く。 */
+  generated?: string[];
   globalIndexes: GlobalIndexDef[];
 }
 
@@ -196,9 +198,12 @@ export interface ShardApi {
   status(req: { txn: string }): Promise<TxnStatus>;
   flush(req: { upTo?: Ts }): Promise<FlushRes>;
   /** 子が受け入れの準備をする。親の fence より先に呼ぶ。 */
-  beginIncoming(req: { start: number; end: number; from: string; schema: number }): Promise<void>;
+  /** 範囲を受け取る準備をする。子の表定義の版を返す。親は、fence の前にその版まで追いつく。 */
+  beginIncoming(req: { start: number; end: number; from: string; schema: number }): Promise<{ schema: number }>;
   /** 親がスロットの受理を止める。以後は NotOwner を返す。 */
-  fence(req: { start: number; end: number; to: string }): Promise<void>;
+  fence(req: { start: number; end: number; to: string; schema?: number }): Promise<void>;
+  /** 終わっていない範囲の移動。増設をやり直すとき、同じ範囲を続けるのに使う。 */
+  moves(req: Record<string, never>): Promise<{ outgoing: { start: number; end: number; to: string }[]; incoming: { start: number; end: number; from: string }[] }>;
   listGroups(req: { start: number; end: number; limit: number; cursor?: GroupCursor | null }): Promise<{ groups: string[]; cursor: GroupCursor | null }>;
   pull(req: { groups: string[]; to: string; maxBytes: number }): Promise<GroupPayload[]>;
   ack(req: { groups: string[] }): Promise<void>;
@@ -210,11 +215,11 @@ export interface ShardApi {
   /** このシャードが健全かを運用者に見せるための状態。 */
   health(req: Record<string, never>): Promise<ShardHealth>;
   /** 表の行を主キーの順に返す。論理エクスポートに使う。 */
-  exportRows(req: { table: string; after: Value[] | null; limit: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }>;
+  exportRows(req: { table: string; after: Value[] | null; limit: number; skip?: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }>;
   /** 取引の rollback でロックを手放す。届かなくても TTL で消える。 */
   unlock(req: { txn: string }): Promise<void>;
   /** DDL を適用する。全シャードへ適用してから DDL を完了させる。 */
-  syncSchema(req: { version: number }): Promise<void>;
+  syncSchema(req: { version: number }): Promise<{ moving: boolean }>;
   /** 現在の HLC を返す。複数シャードの読み取りの T を決めるのに使う。 */
   now(req: Record<string, never>): Promise<Ts>;
 }
@@ -263,6 +268,8 @@ export interface ShardHealth {
   unapplied: number;
   /** 直近の再駆動で失敗した理由。空でなければ、同じ失敗を繰り返している。 */
   redriveErrors: string[];
+  /** 適用に失敗し、取り消せもしなかった DDL。null でなければ、このシャードは要求を受けられない。 */
+  schemaError?: string | null;
   /** 移動の途中の範囲の数 (受け取り中、送り出し中)。 */
   incoming: number;
   outgoing: number;
@@ -410,6 +417,22 @@ export class Migrating extends Error {
  * 確定した後の適用で初めて上限に当たると、その取引は永久に適用できない。必ず確定の前に拒否する。
  */
 export const MAX_WRITE_SET_BYTES = 1_000_000;
+
+/** 文字列を UTF-8 にしたときのバイト数。DO の上限はバイトで決まるので、文字数 (UTF-16 の単位数) では測れない。 */
+export function utf8Length(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c < 0xdc00) {
+      // サロゲートの対は 4 バイトになる。
+      n += 4;
+      i++;
+    } else n += 3;
+  }
+  return n;
+}
 
 /**
  * Durable Object に保存しているデータの形式の版。内部の表の形や意味を、互換でない形で変えるときに上げる。

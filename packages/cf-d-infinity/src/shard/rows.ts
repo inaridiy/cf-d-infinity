@@ -27,9 +27,14 @@ export function fold(v: Value, collation: string | undefined): Value {
   return v;
 }
 
+/**
+ * 行の同一性を表す文字列を作る。主キーも shard key も、照合順序で等しい値は同じ文字列にする。
+ * 揃えないと、'abc' と 'ABC' が SQLite では同じ行なのに、intent、ロック、検証では別の行として扱われる。
+ * 揃えた値で行を引いても、列の照合順序で比べるので当たる。
+ */
 export function encodeKey(def: TableDef, row: Row): { pk: string; sk: string } {
   return {
-    pk: encode(def.pk.map((c) => row[c] ?? null)),
+    pk: encode(def.pk.map((c) => fold(row[c] ?? null, def.collation[c]))),
     sk: encode(def.shardKey.map((c) => fold(row[c] ?? null, def.collation[c]))),
   };
 }
@@ -46,8 +51,12 @@ export function selectRow(b: Backend, def: TableDef, pk: string): Row | null {
   return b.exec(`SELECT ${selectList(def)} FROM ${q(def.name)} WHERE ${pkWhere(def)}`, ...pkValues(pk))[0] ?? null;
 }
 
+/** 行イメージのうち、書き込める列。生成列は SQLite が計算するので、値を指定すると拒否される。 */
+export const writable = (def: Pick<TableDef, "generated">, cols: string[]): string[] =>
+  def.generated?.length ? cols.filter((c) => !def.generated!.includes(c)) : cols;
+
 export function insertRow(b: Backend, def: TableDef, row: Row): void {
-  const cols = Object.keys(row);
+  const cols = writable(def, Object.keys(row));
   b.exec(
     `INSERT INTO ${q(def.name)} (${cols.map(q).join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`,
     ...cols.map((c) => row[c] ?? null),
@@ -59,7 +68,7 @@ export function deleteRow(b: Backend, def: TableDef, pk: string): void {
 }
 
 function updateRow(b: Backend, def: TableDef, pk: string, row: Row): void {
-  const cols = Object.keys(row).filter((c) => !def.pk.includes(c));
+  const cols = writable(def, Object.keys(row)).filter((c) => !def.pk.includes(c));
   if (cols.length === 0) return;
   b.exec(
     `UPDATE ${q(def.name)} SET ${cols.map((c) => `${q(c)} = ?`).join(", ")} WHERE ${pkWhere(def)}`,

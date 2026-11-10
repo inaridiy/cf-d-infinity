@@ -95,6 +95,7 @@ export function needsFollowUp(metrics: ShardMetrics[], state: AutoscalerState, p
 export function healthProblems(shards: ShardHealth[]): string[] {
   const out: string[] = [];
   for (const h of shards) {
+    if (h.schemaError) out.push(`${h.id}: cannot apply a schema change and refuses requests: ${h.schemaError}`);
     if (h.unapplied > 0 && h.redriveErrors.length > 0) {
       out.push(`${h.id}: ${h.unapplied} committed transaction(s) cannot be applied: ${h.redriveErrors[0]}`);
     } else if (h.redriveErrors.length > 0) {
@@ -138,7 +139,17 @@ export async function split(
 ): Promise<SplitResult | null> {
   const now = opts.now ?? (() => Date.now());
   const cat = await cluster.catalog();
-  const range = opts.range ?? planSplit(cat.routing, parent);
+  // 途中で終わった増設があれば、同じ範囲を続ける。範囲表を切り替えた後で範囲を計算し直すと、別の範囲になり、
+  // 元の範囲は親も子も「移動の途中」のまま残る。
+  const [parentMoves, childMoves] = await Promise.all([cluster.shard(parent).moves({}), cluster.shard(child).moves({})]);
+  const other = parentMoves.outgoing.find((m) => m.to !== child);
+  if (other) throw new Error(`split: ${parent} is already handing slots [${other.start}, ${other.end}) to ${other.to}`);
+  if (parentMoves.incoming.length > 0) throw new Error(`split: ${parent} is still receiving a range; split it after that finishes`);
+  const unfinished = parentMoves.outgoing[0] ?? childMoves.incoming.find((m) => m.from === parent);
+  if (unfinished && opts.range && (opts.range.start !== unfinished.start || opts.range.end !== unfinished.end)) {
+    throw new Error(`split: ${parent} has an unfinished move of slots [${unfinished.start}, ${unfinished.end}) to ${child}; finish it first`);
+  }
+  const range = unfinished ? { start: unfinished.start, end: unfinished.end } : (opts.range ?? planSplit(cat.routing, parent));
   if (!range) return null;
   // 別の範囲を持つ既存のシャードを子にすると、移動が完了しないまま範囲が止まる。
   // 同じ範囲の再開は、切り替え後の子が範囲を持っているので通す。
@@ -147,9 +158,9 @@ export async function split(
     throw new Error(`split: ${child} already owns other ranges`);
   }
   const t0 = now();
-  await cluster.shard(child).beginIncoming({ ...range, from: parent, schema: cat.version });
-  await cluster.shard(parent).fence({ ...range, to: child });
-  await cluster.switchRange({ ...range, to: child });
+  const { schema } = await cluster.shard(child).beginIncoming({ ...range, from: parent, schema: cat.version });
+  await cluster.shard(parent).fence({ ...range, to: child, schema });
+  await cluster.switchRange({ ...range, to: child, from: parent });
   const moved = await cluster.shard(child).drain(range);
   await cluster.shard(parent).finishMove(range);
   await cluster.shard(child).finishIncoming(range);

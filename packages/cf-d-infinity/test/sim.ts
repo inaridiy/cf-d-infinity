@@ -115,6 +115,7 @@ export interface SimOptions {
   logRetainMs?: number;
   logGenMs?: number;
   txnRetainMs?: number;
+  recentMax?: number;
 }
 
 /** Worker と DO の間の RPC だけをシミュレートしたクラスタ。ShardCore は本物を動かす。 */
@@ -153,7 +154,7 @@ export class SimCluster implements Cluster {
       backend: this.backends.get(id)!,
       clock: { now: () => (this.o.now?.() ?? this.time) + this.ahead + (this.o.skewMs?.(id) ?? 0) },
       peer: (to) => this.stub(id, to),
-      meta: { ddlSince: (v) => this.meta.ddlSince(v) },
+      meta: { ddlSince: (v) => this.meta.ddlSince(v), revokeDdl: (v, reason) => this.meta.revokeDdl(v, reason) },
       background: (p) => {
         this.background.add(p);
         void p.finally(() => this.background.delete(p));
@@ -165,6 +166,7 @@ export class SimCluster implements Cluster {
       logRetainMs: this.o.logRetainMs,
       logGenMs: this.o.logGenMs,
       txnRetainMs: this.o.txnRetainMs,
+      recentMax: this.o.recentMax,
     }));
   }
 
@@ -209,14 +211,17 @@ export class SimCluster implements Cluster {
   catalog() {
     return this.meta.catalog();
   }
-  applyDdl(sql: string) {
-    return this.meta.applyDdl(sql);
+  applyDdl(sql: string, basedOn?: number) {
+    return this.meta.applyDdl(sql, basedOn);
   }
-  switchRange(move: { start: number; end: number; to: string }) {
+  switchRange(move: { start: number; end: number; to: string; from?: string }) {
     return this.meta.switchRange(move);
   }
-  publishIndex(table: string, name: string) {
-    return this.meta.publishIndex(table, name);
+  publishIndex(table: string, name: string, basedOn?: number) {
+    return this.meta.publishIndex(table, name, basedOn);
+  }
+  backfillProgress(index: string, value?: string) {
+    return this.meta.backfillProgress(index, value);
   }
   allocate(table: string, n: number, min?: number) {
     return this.meta.allocate(table, n, min);

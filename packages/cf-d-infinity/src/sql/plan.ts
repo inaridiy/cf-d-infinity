@@ -31,6 +31,11 @@ export interface WriteTarget {
   params: Value[];
   write: WritePlan;
   pk: string | null;
+  /**
+   * 文を shard key に絞らずに送るときの、表ごとの走査。index 経由の UPDATE と DELETE に付く。
+   * 文はシャードの表を広く読むので、span も index が挙げた shard key に絞らず、この走査の条件にする。
+   */
+  wide?: Scan[];
 }
 
 export type Plan =
@@ -54,6 +59,8 @@ export type Plan =
   | { kind: "ddl"; sql: string }
   | { kind: "ctas"; name: string; select: Plan; ifNotExists: boolean }
   | { kind: "noop" }
+  /** 文を 1 つの取引の中で計画し直す。計画の途中で表を読む必要があるときに返す。 */
+  | { kind: "inTxn" }
   | { kind: "tcl"; op: "begin" | "commit" | "rollback" | "savepoint" | "release" | "rollbackTo"; name?: string; immediate?: boolean };
 
 export interface PlanContext {
@@ -63,6 +70,11 @@ export interface PlanContext {
   sawId(table: string, id: number): void;
   /** 定数でない値を Worker の SQLite で評価する。 */
   evaluate(sql: string, params: Value[]): Promise<Value>;
+  /**
+   * 表を読む式の値を、取引の読みとして求める。読んだ範囲は commit で検証される。
+   * 取引の外では呼べないので、無いときは計画が `inTxn` を返し、呼び出し側が取引の中で計画し直す。
+   */
+  read?(sql: string, params: Value[]): Promise<Value>;
 }
 
 const lower = (s: string) => s.toLowerCase();
@@ -136,7 +148,8 @@ function classify(name: string, n: Names): TableDef | null {
     return null;
   }
   const def = findTable(n.cat, name);
-  if (def) return def;
+  // 同じ名前の CTE がある表は、この参照がどちらを指すのかを追わない。表として扱わず、全行を集めて Worker の SQLite に任せる。
+  if (def) return n.views.has(lower(name)) ? null : def;
   if (findView(n.cat, name) !== null) {
     n.views.add(lower(name));
     return null;
@@ -179,7 +192,9 @@ function fromTree(e: Node, nullable: boolean, s: Scope, n: Names): Ref[] {
         const conj = conjuncts(spec.expr);
         if (/left|right|full/.test(op)) {
           s.outer.push(...conj);
-          if (right.length === 1) right[0]!.on.push(...conj);
+          // LEFT JOIN の ON のうち右の表だけの条件は、右の走査へ押せる。合わない右の行は、どのみち結果に出ない。
+          // FULL JOIN では、合わない右の行も NULL で埋めた行として出るので、押すと行が欠ける。
+          if (right.length === 1 && !/full/.test(op)) right[0]!.on.push(...conj);
         } else s.inner.push(...conj);
       }
       return [...left, ...right];
@@ -201,7 +216,12 @@ function clause(stmt: Node, type: string): Node | null {
 
 function scopesOf(root: Node, n: Names): Scope[] {
   walk(root, (x) => {
-    if (x.type === "common_table_expr") n.ctes.add(lower(ident(x.table)));
+    if (x.type !== "common_table_expr") return;
+    const name = lower(ident(x.table));
+    // 実在の表と同じ名前の CTE は、文のほかの場所では本物の表を指していることがある。view と同じ扱いにして、
+    // 表を条件なしで集め、シャードへ絞り込む経路を使わない。
+    if (findTable(n.cat, name)) n.views.add(name);
+    else n.ctes.add(name);
   });
   const out: Scope[] = [];
   walk(root, (x) => {
@@ -294,7 +314,8 @@ function pkOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string | null 
   for (const col of def.pk) {
     const vs = equalities(conj, ref, col, s, values);
     if (vs?.length !== 1) return null;
-    vals.push(normalize(vs[0]!, def.affinity[col] ?? "INTEGER"));
+    // 行の同一性はシャードと同じ規則で作る (rows.ts の encodeKey)。照合順序のある列は値を揃える。
+    vals.push(fold(normalize(vs[0]!, def.affinity[col] ?? "INTEGER"), def.collation[col]));
   }
   return encode(vals);
 }
@@ -345,6 +366,14 @@ function scopePin(s: Scope, values: Value[]): string | null | "none" {
   return connected.size === tables.length ? key : null;
 }
 
+const hasSubquery = (root: Node): boolean => {
+  let found = false;
+  walk(root, (x) => {
+    if (x.type === "select_stmt" || x.type === "compound_select_stmt") found = true;
+  });
+  return found;
+};
+
 /** `x IN t` は右辺の表を読むが FROM に現れない。1 シャードに固定すると行が欠ける。 */
 function hasTableOperand(root: Node): boolean {
   let found = false;
@@ -368,6 +397,8 @@ function statementPin(scopes: Scope[], values: Value[]): string | null {
 
 function gidxRoute(s: Scope, values: Value[]): Route | null {
   if (s.refs.length !== 1 || !s.refs[0]!.def) return null;
+  // `x IN t` の t は FROM に現れないが、別のシャードの行も読む。index が挙げたシャードだけで実行すると行が欠ける。
+  if (hasTableOperand(s.node)) return null;
   const ref = s.refs[0]!;
   const def = ref.def!;
   const conj = conjuncts(s.where);
@@ -480,7 +511,11 @@ function viewTables(cat: Catalog, name: string, n: Names, seen = new Set<string>
   if (seen.has(lower(name))) return [];
   seen.add(lower(name));
   const sql = findView(cat, name);
-  if (sql === null) return [];
+  if (sql === null) {
+    // CTE と同じ名前の表。
+    const shadowed = findTable(cat, name);
+    return shadowed ? [shadowed] : [];
+  }
   const inner: Names = { cat, ctes: new Set(), meta: n.meta, views: new Set() };
   const stmt = parseOne(sql);
   const scopes = scopesOf(stmt, inner);
@@ -556,7 +591,12 @@ function partialAggregate(stmt: Node, s: Scope, values: Value[]): Plan | null {
       if (arg.type !== "all_columns") {
         const a = conjAliases(arg, s);
         if (!a || hasCollate(arg)) return null;
-        if (fn !== "count" && arg.type === "identifier" && def.collated.includes(colOf(arg, s)?.col ?? "")) return null;
+        // min と max は列の照合順序で比べる。集めた後の併合は BINARY で比べるので、照合順序のある列を含む式は押さない。
+        let collatedArg = false;
+        walk(arg, (x) => {
+          if (x.type === "identifier" && def.collated.some((c) => same(c, ident(x)))) collatedArg = true;
+        });
+        if (fn !== "count" && collatedArg) return null;
       }
       const argSql = arg.type === "all_columns" ? "*" : render(arg, values);
       const argText = typeof argSql === "string" ? argSql : argSql.sql;
@@ -629,9 +669,13 @@ function topN(stmt: Node, s: Scope, scan: Scan, values: Value[]): Scan {
     if ((x.type === "func_call" && (AGGREGATES.has(lower(ident(x.name))) || x.over)) || x.type === "select_stmt") unsafe = true;
   });
   const terms: Node[] = order.specifications.items;
+  // ORDER BY の名前は、SELECT の別名が列名より優先される。シャードへ送る文には別名がないので、同じ名前の列で並べてしまう。
+  const aliases = new Set((sel.columns.items as Node[]).flatMap((i) => (i.type === "alias" ? [lower(ident(i.alias))] : [])));
   for (const t of terms) {
     const c = colOf(t.expr, s);
     if (!c || scan.table.collated.includes(c.col)) unsafe = true;
+    const e = t.expr ?? t; // 方向の指定がない項は、式そのものが入っている
+    if (e.type === "identifier" && aliases.has(lower(ident(e)))) unsafe = true;
   }
   const n = constant(limit.count, values);
   const off = limit.offset ? constant(limit.offset, values) : { value: 0 };
@@ -723,6 +767,12 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
 
   const auto = def.rowidAlias ?? (def.implicitRowid ? "rowid" : null);
   const rows: Node[][] = body.type === "default_values" ? [[]] : body.values.items.map((r: Node) => r.expr.items);
+  // 値の式がサブクエリで表を読むことがある (`VALUES (?, (SELECT max(pos) + 1 FROM t ...))`)。
+  // 文をそのまま挿入先のシャードへ送ると、サブクエリはそのシャードの行しか読まず、読んだ範囲は検証もされない。
+  // 先に取引の読みとして値を求め、定数に置き換えてから送る。
+  const reads = rows.map((r) => r.map(hasSubquery));
+  if (reads.some((r) => r.some(Boolean)) && !ctx.read) return { kind: "inTxn" };
+  if (tailClauses.some(hasSubquery)) throw new SqlError("subqueries in ON CONFLICT or RETURNING of an INSERT are not supported");
   const names = cols ?? (body.type === "default_values" ? [] : [...def.columns]);
   for (const r of rows) {
     if (body.type === "values_clause" && r.length !== names.length) {
@@ -757,13 +807,19 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   const built: Built[] = [];
   for (const [i, r] of rows.entries()) {
     const id = assigned.get(i);
-    const parts: { sql: string; params: Value[]; value: () => Promise<Value> }[] = r.map((node, j) => {
+    const parts: { sql: string; params: Value[]; value: () => Promise<Value>; late?: () => Promise<Value> }[] = r.map((node, j) => {
       if (j === idAt && id !== undefined) return { sql: "?", params: [id], value: async () => id };
       const rr = render(node, values);
+      if (reads[i]![j]) {
+        let v: Promise<Value> | undefined;
+        const value = () => (v ??= ctx.read!(`SELECT ${rr.sql}`, rr.params));
+        return { sql: "?", params: [], value, late: value };
+      }
       const c = constant(node, values);
       return { sql: rr.sql, params: rr.params, value: async () => (c ? c.value : ctx.evaluate(`SELECT ${rr.sql}`, rr.params)) };
     });
     if (auto && idAt < 0) parts.unshift({ sql: "?", params: [id!], value: async () => id! });
+    for (const p of parts) if (p.late) p.params = [await p.late()];
     const skVals: Value[] = [];
     for (const [k, at] of skAt.entries()) {
       const v = at < 0 ? null : await parts[at]!.value();
@@ -772,7 +828,7 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
     const pkVals: Value[] = [];
     for (const c of def.pk) {
       const at = outCols.findIndex((n2) => same(n2, c) || (c === "rowid" && ROWID_NAMES.has(lower(n2))));
-      pkVals.push(at < 0 ? null : normalize(await parts[at]!.value(), def.affinity[c] ?? "INTEGER"));
+      pkVals.push(at < 0 ? null : fold(normalize(await parts[at]!.value(), def.affinity[c] ?? "INTEGER"), def.collation[c]));
     }
     if (auto) {
       const v = id ?? given[i];
@@ -857,7 +913,7 @@ function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog): Plan {
     }
     if (scopes.length === 1 && top.refs.length === 1) {
       const route = gidxRoute(top, values);
-      if (route) return { kind: "write", def, lastRowid: null, targets: [{ route, sql, params, write: { sk: null }, pk: null }] };
+      if (route) return { kind: "write", def, lastRowid: null, targets: [{ route, sql, params, write: { sk: null }, pk: null, wide: scansFor(scopes, n, values) }] };
     }
   }
   return { kind: "wasmWrite", scans: scansFor(scopes, n, values), sql, params, tables: defs };

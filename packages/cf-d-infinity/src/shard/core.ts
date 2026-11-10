@@ -4,14 +4,14 @@ import type {
   Participant, PrepareReq, PrepareRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts, TxnStatus, Value,
 } from "../types";
 import {
-  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, checkStorageFormat, isWideSpan, spanCovers,
+  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, checkStorageFormat, isWideSpan, spanCovers, utf8Length,
   unprotectedSpans,
 } from "../types";
 import type { DdlEntry } from "../meta";
 import { slotOf } from "../routing";
 import {
-  CAPTURE_TABLES, applyChanges, asSqlError, capturedChanges, decode, deleteRow, encode, encodeKey, insertRow, q,
-  rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore,
+  CAPTURE_TABLES, applyChanges, asSqlError, capturedChanges, decode, deleteRow, encode, encodeKey, fold, insertRow, q,
+  rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore, writable,
 } from "./rows";
 
 export interface ShardDeps {
@@ -19,7 +19,11 @@ export interface ShardDeps {
   backend: Backend;
   clock: Clock;
   peer(id: string): ShardApi;
-  meta: Pick<MetaApi, never> & { ddlSince(v: number): Promise<{ version: number; ddl: DdlEntry[] }> };
+  meta: Pick<MetaApi, never> & {
+    ddlSince(v: number): Promise<{ version: number; ddl: DdlEntry[] }>;
+    /** 適用できなかった版の取り消しを求める。取り消す版の番号か、取り消せなければ null が返る。 */
+    revokeDdl(version: number, reason: string): Promise<number | null>;
+  };
   /** 応答後も続ける処理。DO では ctx.waitUntil に渡す。 */
   background?(p: Promise<unknown>): void;
   /** phase 2 の再駆動を予約する。DO では storage.setAlarm に渡す。 */
@@ -34,7 +38,12 @@ export interface ShardDeps {
   logGenMs?: number;
   /** 決着済みの取引記録を残す時間。 */
   txnRetainMs?: number;
+  /** 直近の書き込みの索引に持つ項目の上限。超えたら索引を捨てて、それより前から続く検証を失敗させる。 */
+  recentMax?: number;
 }
+
+/** 受け取る時刻が、このシャードの時計よりこれ以上先なら断る。DO の間の時計のずれと、再起動後の先取り (1 秒) より十分に大きい。 */
+export const MAX_CLOCK_AHEAD_MS = 10 * 60_000;
 
 /** TiDB の既定の GC 窓 (10 分) に合わせる。 */
 export const LOG_RETAIN_MS = 10 * 60_000;
@@ -158,7 +167,8 @@ export class ShardCore implements ShardApi {
     this.migrateStorage();
 
     for (const r of b.exec(`SELECT entry FROM __ddl ORDER BY version`)) {
-      this.loadDefs(JSON.parse(r.entry as string) as DdlEntry);
+      const e = JSON.parse(r.entry as string) as DdlEntry & { skipped?: boolean };
+      if (!e.skipped) this.loadDefs(e);
     }
     this.schema = (b.exec(`SELECT max(version) v FROM __ddl`)[0]?.v as number) ?? 0;
     this.fenced = b.exec(`SELECT * FROM __fenced`) as unknown as FencedRange[];
@@ -187,7 +197,9 @@ export class ShardCore implements ShardApi {
     // 再起動の前に予約した alarm がなくても、残った intent と phase 2 を片付ける。
     const pendingWork = b.exec(`SELECT (SELECT count(*) FROM __intents) + (SELECT count(*) FROM __txn WHERE status = 'committed' AND done = 0) n`)[0]?.n as number;
     if (pendingWork > 0) this.deps.scheduleRedrive?.();
-    const maxMoved = Math.max(0, ...[...this.moved.values()].map((x) => x.m));
+    // 引数に展開しない。移動したグループが十数万あると、引数の数の上限を超えて、このシャードが起動できなくなる。
+    let maxMoved = 0;
+    for (const x of this.moved.values()) if (x.m > maxMoved) maxMoved = x.m;
     const resume = Math.max(this.faults.hlcNoCeiling ? 0 : this.ceiling, this.maxCommit, maxPrepare, maxMoved, this.maxArrived);
     this.hlc = new Hlc(resume);
   }
@@ -252,7 +264,7 @@ export class ShardCore implements ShardApi {
         commit_ts INTEGER NOT NULL, txn TEXT NOT NULL, blob TEXT NOT NULL, PRIMARY KEY(commit_ts, txn)) WITHOUT ROWID`);
       const next = [...gens, g].sort((a, b) => a - b);
       this.metaSet("log_gens", JSON.stringify(next));
-      this.gc();
+      this.gc(g);
     }
     this.b.exec(`INSERT OR IGNORE INTO __log_g${g}(commit_ts, txn, blob) VALUES (?, ?, ?)`, c, txn, blob);
   }
@@ -262,7 +274,7 @@ export class ShardCore implements ShardApi {
    * DROP TABLE は行の書き込みとして課金されないので、GC の費用は世代の数にしかよらない。
    * 消す前に logLowWater を上げるので、消した範囲を必要とする読みと検証は ReadTooOld か abort になる。
    */
-  private gc(): void {
+  private gc(writing?: number): void {
     const now = this.deps.clock.now();
     let water = Math.min(this.hlc.value, physicalToTs(now)) - physicalToTs(this.deps.logRetainMs ?? LOG_RETAIN_MS);
     // 未決着の intent は、その prepare 以降に commit し得る。分析へ未送出の範囲も残す。
@@ -274,7 +286,9 @@ export class ShardCore implements ShardApi {
     const drop: number[] = [];
     let low = this.logLowWater;
     for (const g of gens) {
-      if (g === current) break;
+      // 書き込もうとしている世代は消さない。遅れて届いた phase 2 は、最新より古い世代へ書くことがあり、
+      // 作ったばかりの空の表は「期限切れ」に見える。消すと、確定済みの取引がいつまでも適用できない。
+      if (g === current || g === writing) break;
       const max = (this.b.exec(`SELECT max(commit_ts) v FROM __log_g${g}`)[0]?.v as number | null) ?? 0;
       if (max > water) break;
       drop.push(g);
@@ -305,6 +319,9 @@ export class ShardCore implements ShardApi {
     this.b.exec(`INSERT INTO __meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, k, v);
   }
 
+  /** 適用に失敗し、取り消せもしなかった DDL。直るまで、このシャードは要求を受けられない。 */
+  private schemaStuck: { version: number; message: string } | null = null;
+
   private def(table: string): TableDef {
     const d = this.defs.get(table);
     if (!d) throw new SqlError(`no such table: ${table}`);
@@ -324,12 +341,31 @@ export class ShardCore implements ShardApi {
       if (this.schemaChange) throw new NotOwner(`stale schema ${version}: a schema change is being applied`);
       return;
     }
-    this.schemaChange ??= this.applySchema().finally(() => {
-      this.schemaChange = null;
-    });
-    await this.schemaChange;
-    // 待っている間に、さらに新しい DDL が出ているかもしれない。
-    if (version > this.schema) await this.ensureSchema(version);
+    await this.reachSchema(version);
+    // Meta にある版は全部適用するので、要求の版を通り越していることがある。要求の版が取り消されたときもそうなる。
+    // その場合は、この要求が古い。
+    await this.ensureSchema(version);
+  }
+
+  /**
+   * 少なくともこの版まで DDL を適用する。先の版まで進んでもよい。
+   * 要求の計画の版を確かめる ensureSchema と違い、増設の手順 (受け入れ、fence、行の受け取り) が使う。
+   * そこでは「この版より古くない」ことだけが要る。
+   */
+  private async reachSchema(version: number, catchUp = false): Promise<void> {
+    while (version > this.schema) {
+      // 追いつくための適用は、移動の途中でも通る。進行中の通常の適用 (移動の途中は断られる) には合流しない。
+      if (catchUp && this.schemaChange) {
+        await this.schemaChange.catch(() => undefined);
+        continue;
+      }
+      const before = this.schema;
+      this.schemaChange ??= this.applySchema(catchUp).finally(() => {
+        this.schemaChange = null;
+      });
+      await this.schemaChange;
+      if (this.schema === before) throw new SqlError(`schema version ${version} is not recorded yet (shard ${this.id} is at ${before})`);
+    }
   }
 
   /**
@@ -347,21 +383,47 @@ export class ShardCore implements ShardApi {
    * 先に、このシャードが持つ intent をすべて決着させる。intent の行イメージは DDL より前の表の形なので、
    * 表や列が消えた後では適用できない。確定済みの取引がそうなると、再駆動が永久に失敗する。
    */
-  private async applySchema(): Promise<void> {
+  private async applySchema(catchUp = false): Promise<void> {
+    // 範囲の移動の途中は適用しない。親と子の版がずれると、運ぶ行と intent の形が受け取る側の表と合わなくなる。
+    // 親は intent を決着させないと DDL を適用できず、その決着は子へ転送され、子はその行を受け取れない、という行き詰まりになる。
+    // 子が親の版へ追いつく場合 (catchUp) だけは通す。届く行がその版の形だからである。
+    if (!catchUp && this.moving()) throw new ConflictError(`schema change is waiting for a shard split on ${this.id} to finish`);
     if (!this.faults.ddlIgnoresIntents) await this.settleAllIntents();
     const { ddl } = await this.deps.meta.ddlSince(this.schema);
+    // 取り消された版と、それを取り消す版。このシャードがまだ適用していなければ、両方とも実行しない。
+    const skip = new Set<number>();
+    for (const e of ddl) if (e.reverts !== undefined && e.reverts > this.schema) skip.add(e.reverts).add(e.version);
     for (const e of ddl) {
       if (e.version <= this.schema) continue;
-      this.b.tx(() => {
-        for (const s of e.sql) this.b.exec(s);
-        this.b.exec(`INSERT INTO __ddl(version, entry) VALUES (?, ?)`, e.version, JSON.stringify(e));
-      });
-      this.loadDefs(e);
+      const skipped = skip.has(e.version);
+      try {
+        this.b.tx(() => {
+          if (!skipped) for (const s of e.sql) this.b.exec(s);
+          this.b.exec(`INSERT INTO __ddl(version, entry) VALUES (?, ?)`, e.version, JSON.stringify(skipped ? { ...e, skipped } : e));
+        });
+      } catch (err) {
+        return this.schemaFailed(e, (err as Error).message);
+      }
+      this.schemaStuck = null;
+      if (!skipped) this.loadDefs(e);
       this.schema = e.version;
       // 変更ログの行イメージは DDL より前の形なので、それより古い T は読み戻せない。
       this.ddlFloor = this.issue();
       this.metaSet("ddl_floor", this.ddlFloor);
     }
+  }
+
+  /**
+   * このシャードの行では DDL を適用できなかった。重複のある列への UNIQUE index や、既存の行が CHECK に反する ADD COLUMN で起きる。
+   * 放置すると、このシャードは全要求を断り続ける。Meta に取り消しを求め、取り消す版ごと読み飛ばして先へ進む。
+   */
+  private async schemaFailed(e: DdlEntry, message: string): Promise<void> {
+    const reverted = await this.deps.meta.revokeDdl(e.version, message).catch(() => null);
+    if (reverted === null) {
+      this.schemaStuck = { version: e.version, message };
+      throw new SqlError(`schema change ${e.version} cannot be applied on shard ${this.id}: ${message}`);
+    }
+    return this.applySchema(true);
   }
 
   /**
@@ -402,6 +464,12 @@ export class ShardCore implements ShardApi {
   }
   private observe(ts: Ts | undefined): void {
     if (ts === undefined) return;
+    // 時刻は呼び出し側から届く。接続をまたいで順序を保つ token は、利用者のブラウザを経由することもある。
+    // そのまま受け入れると、大きな値 1 つで時計が進みきり、以後の時刻が重複して、変更ログの行が失われる。
+    if (!Number.isSafeInteger(ts) || ts < 0) throw new SqlError(`invalid timestamp: ${ts}`);
+    if (ts > physicalToTs(this.deps.clock.now() + MAX_CLOCK_AHEAD_MS)) {
+      throw new SqlError(`timestamp is more than ${MAX_CLOCK_AHEAD_MS / 60_000} minutes ahead of shard ${this.id}'s clock; the session token is not from this database`);
+    }
     this.hlc.observe(ts);
     this.guardCeiling();
   }
@@ -462,18 +530,49 @@ export class ShardCore implements ShardApi {
 
   // ---- ライブ移動 ----
 
-  async beginIncoming(req: { start: number; end: number; from: string; schema: number }): Promise<void> {
-    await this.ensureSchema(req.schema);
-    if (this.incoming.some((x) => x.start === req.start && x.end === req.end)) return;
+  /** 範囲の移動の途中か。送り出し中 (fence 済みで未完了) か、受け取り中である。 */
+  private moving(): boolean {
+    return this.incoming.length > 0 || this.fenced.some((f) => !f.done);
+  }
+
+  async moves(_req: Record<string, never>): Promise<{ outgoing: { start: number; end: number; to: string }[]; incoming: { start: number; end: number; from: string }[] }> {
+    return {
+      outgoing: this.fenced.filter((f) => !f.done).map((f) => ({ start: f.start, end: f.end, to: f.to })),
+      incoming: this.incoming.map((x) => ({ start: x.start, end: x.end, from: x.from_id })),
+    };
+  }
+
+  async beginIncoming(req: { start: number; end: number; from: string; schema: number }): Promise<{ schema: number }> {
+    const same = () => this.incoming.some((x) => x.start === req.start && x.end === req.end && x.from_id === req.from);
+    if (same()) return { schema: this.schema };
+    // 増設を始めた側の表定義が古いこともある。このシャードが先の版にいるなら、そのままでよい。親が fence の前に追いつく。
+    await this.reachSchema(req.schema);
+    if (same()) return { schema: this.schema };
+    // 重なる範囲を別の親から受け取ると、どちらの行が正しいのか決められない。送り出し中のシャードも子にしない。
+    const clash = this.incoming.find((x) => x.start < req.end && req.start < x.end);
+    if (clash) throw new SqlError(`shard ${this.id} is already receiving slots [${clash.start}, ${clash.end}) from ${clash.from_id}`);
+    if (this.fenced.some((f) => !f.done)) throw new ConflictError(`shard ${this.id} is still handing a range over; it cannot receive one until that finishes`);
     this.b.exec(`INSERT INTO __incoming(start, end, from_id) VALUES (?, ?, ?)`, req.start, req.end, req.from);
     this.incoming.push({ start: req.start, end: req.end, from_id: req.from });
     await this.b.sync();
+    return { schema: this.schema };
   }
 
-  async fence(req: { start: number; end: number; to: string }): Promise<void> {
-    if (this.fenced.some((x) => x.start === req.start && x.end === req.end)) return;
+  async fence(req: { start: number; end: number; to: string; schema?: number }): Promise<void> {
+    const same = () => this.fenced.some((x) => x.start === req.start && x.end === req.end && x.to === req.to);
+    if (same()) return;
+    // 子の表定義の版まで追いついてから fence する。子が先の版にいると、親の古い形の行と intent を子が受け取れない。
+    // 移動の間は、親も子も DDL を適用しない (applySchema)。
+    // 親が先の版にいるなら、そのままでよい。子は、行を受け取るときに親の版まで追いつく。
+    if (req.schema !== undefined) await this.reachSchema(req.schema);
+    if (same()) return;
+    // 同じ範囲を 2 つの子へ送り出すと、行が両方へ分かれ、範囲表はどちらか片方しか指さない。
+    const clash = this.fenced.find((x) => x.start < req.end && req.start < x.end);
+    if (clash) throw new SqlError(`slots [${clash.start}, ${clash.end}) of shard ${this.id} ${clash.done ? "were moved" : "are being moved"} to ${clash.to}`);
+    // 受け取り中のシャードは、まだ届いていない行を持っていない。その範囲を送り出すと、届いていない行が取り残される。
+    if (this.incoming.length > 0) throw new ConflictError(`shard ${this.id} is still receiving a range; it cannot be split until that finishes`);
     this.b.exec(`INSERT INTO __fenced(start, end, "to") VALUES (?, ?, ?)`, req.start, req.end, req.to);
-    this.fenced.push({ ...req, done: 0 });
+    this.fenced.push({ start: req.start, end: req.end, to: req.to, done: 0 });
     await this.b.sync();
   }
 
@@ -510,7 +609,9 @@ export class ShardCore implements ShardApi {
         let read = 0;
         for (const r of rows) {
           read++;
-          add(encode(r));
+          // 経路と同じ規則で値を揃える。照合順序のある列 (NOCASE など) を保存された値のまま数えると、
+          // 'User1' と 'user1' が別のスロットになり、行が、範囲表の指すのとは違うシャードに残る。
+          add(encode(r.map((v, i) => fold(v, def.collation[def.shardKey[i]!]))));
           if (out.length >= req.limit) {
             // NULL を含む shard key は行の比較で絞れないので、読んだ数で続きを表す。
             const next: GroupCursor = r.every((v) => v !== null)
@@ -538,11 +639,11 @@ export class ShardCore implements ShardApi {
     let bytes = 0;
     for (const g of req.groups) {
       const f = this.fencedRange(g);
-      if (!f || f.to !== req.to) {
-        const known = this.moved.get(g);
-        if (known && known.to !== req.to) throw new NotOwner(known.to);
-        if (!f) throw new SqlError(`pull of unfenced group ${g}`);
-      }
+      const known0 = this.moved.get(g);
+      if (known0 && known0.to !== req.to) throw new NotOwner(known0.to);
+      if (!f) throw new SqlError(`pull of unfenced group ${g}`);
+      // fence の宛先でないシャードには渡さない。渡すと、行が範囲表の指さないシャードへ行く。
+      if (f.to !== req.to) throw new NotOwner(f.to);
       const rows = [...this.defs.values()].flatMap((def) =>
         selectGroup(this.b, def, g).map((row) => ({ table: def.name, row })),
       );
@@ -612,7 +713,7 @@ export class ShardCore implements ShardApi {
     // 親の表定義の版まで追いついてから受け取る。子は増設の途中で生まれるので、DDL の「全シャードへの適用」から
     // 漏れることがある。古い版のままだと、届いた行と表の形が合わず、新しい index を保守しない古い計画の書き込みも通る。
     const version = Math.max(0, ...payload.map((p) => p.schema ?? 0));
-    if (version > this.schema && !this.faults.childKeepsOldSchema) await this.ensureSchema(version);
+    if (!this.faults.childKeepsOldSchema) await this.reachSchema(version, true);
     const fresh = payload.filter((p) => !this.arrived.has(p.g));
     this.b.tx(() => {
       for (const p of fresh) {
@@ -707,6 +808,7 @@ export class ShardCore implements ShardApi {
       oldestIntentMs: oldest === 0 ? 0 : Math.max(0, this.deps.clock.now() - tsToPhysical(oldest)),
       unapplied: one(`SELECT count(*) v FROM __txn WHERE status = 'committed' AND done = 0`),
       redriveErrors: this.lastRedriveErrors,
+      schemaError: this.schemaStuck ? `schema change ${this.schemaStuck.version}: ${this.schemaStuck.message}` : null,
       incoming: this.incoming.length,
       outgoing: this.fenced.filter((f) => !f.done).length,
       logGenerations: this.logGens().length,
@@ -717,16 +819,22 @@ export class ShardCore implements ShardApi {
    * 表の行を主キーの順に、after より後から limit 行まで返す。pk は columns の中の主キーの列の位置である。
    * 最新の確定済みの状態を読むだけで、時点はそろえない。移動の途中のシャードでは、同じ行が親と子の両方にあるので断る。
    */
-  async exportRows(req: { table: string; after: Value[] | null; limit: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }> {
+  async exportRows(req: { table: string; after: Value[] | null; limit: number; skip?: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }> {
     if (this.incoming.length > 0 || this.fenced.some((f) => !f.done)) throw new Migrating();
     const def = this.defs.get(req.table);
     if (!def) throw new SqlError(`no such table: ${req.table}`);
     const cols = def.pk.map(q).join(", ");
+    // 生成列は書き出さない。取り込み先では SQLite が計算する。
+    const list = def.generated?.length
+      ? [...(def.implicitRowid ? ["rowid"] : []), ...writable(def, def.columns).map(q)].join(", ")
+      : selectList(def);
     const keyset = req.after !== null && req.after.every((v) => v !== null);
     const where = keyset ? `WHERE (${cols}) > (${def.pk.map(() => "?").join(", ")})` : "";
     const limit = Math.max(1, Math.min(req.limit, 5000));
+    // 主キーに NULL を含む行は、行の比較では「その次」を表せない。その場合は、読んだ行数で続きを表す。
+    const offset = keyset ? "" : ` OFFSET ${Math.max(0, Math.floor(req.skip ?? 0))}`;
     const { columns, rows } = this.b.iterate(
-      `SELECT ${selectList(def)} FROM ${q(def.name)} ${where} ORDER BY ${cols} LIMIT ${limit}`, ...(keyset ? req.after! : []),
+      `SELECT ${list} FROM ${q(def.name)} ${where} ORDER BY ${cols} LIMIT ${limit}${offset}`, ...(keyset ? req.after! : []),
     );
     const out: Value[][] = [];
     let bytes = 0;
@@ -918,8 +1026,9 @@ export class ShardCore implements ShardApi {
     }
   }
 
-  async syncSchema(req: { version: number }): Promise<void> {
+  async syncSchema(req: { version: number }): Promise<{ moving: boolean }> {
     if (req.version > this.schema) await this.ensureSchema(req.version);
+    return { moving: this.moving() };
   }
 
   async now(_req: Record<string, never>): Promise<Ts> {
@@ -1294,6 +1403,8 @@ export class ShardCore implements ShardApi {
       : span.kind === "sk" ? `s\0${span.table}\0${span.sk}`
       : span.kind === "pred" && span.sk ? `s\0${span.table}\0${span.sk}`
       : `t\0${span.table}`;
+    // 索引を捨てた時点より前からは、書き込みがなかったとは言えない。検証も読み直しの確認も、ここで失敗させる。
+    if (from < this.recentLowWater) return true;
     if ((this.recent.get(key) ?? 0) <= from) return false;
     return span.kind === "pred" ? this.predicateChanged(span, from) : true;
   }
@@ -1333,18 +1444,26 @@ export class ShardCore implements ShardApi {
    * UNIQUE 違反で適用できなくなり、再駆動が永久に失敗する。書き込みの経路はすべてこれを通す。
    */
   private uniquePending(txn: string, writes: Change[]): string | null {
-    const constrained = writes.filter((w) => w.after && this.def(w.table).uniques.length > 0);
-    if (constrained.length === 0) return null;
-    const others = (this.b.exec(`SELECT * FROM __intents WHERE txn <> ?`, txn) as unknown as Intent[]).map(
-      (i) => decode<Change>(i.change),
-    );
-    for (const w of constrained) {
-      for (const cols of this.def(w.table).uniques) {
-        const same = others.find((o) => o.table === w.table && o.after && cols.every((c) => o.after![c] === w.after![c]));
-        if (same) return `unique pending: ${w.table} ${cols.join(",")}`;
-      }
+    const constrained = writes.filter((w) => this.hasUniqueBeyondKey(w.table));
+    if (!constrained.some((w) => w.after)) return null;
+    const tables = new Set(constrained.map((w) => w.table));
+    const others = (this.b.exec(`SELECT * FROM __intents WHERE txn <> ?`, txn) as unknown as Intent[])
+      .map((i) => decode<Change>(i.change))
+      .filter((o) => tables.has(o.table));
+    if (others.length === 0) return null;
+    // 値を自前で比べない。照合順序、BLOB、部分 index の条件まで SQLite と同じに判定するのは難しく、外すと適用できない取引が残る。
+    // ほかの取引の intent をすべて適用した状態を作り、そこへこの取引の変更を入れて、SQLite に判定させる。
+    // intent のない状態との衝突は、呼び出し側が本体への試適用か実際の実行で確かめている。行ごとに見れば、相手は本体の版か intent の版の
+    // どちらかなので、この 2 つの状態で通れば、どの intent が確定しても衝突しない。
+    try {
+      this.rollback(() => {
+        setBasedRestore(this.b, (t) => this.def(t), others.map((o) => ({ table: o.table, pk: o.pk, image: o.after })));
+        setBasedRestore(this.b, (t) => this.def(t), constrained.map((w) => ({ table: w.table, pk: w.pk, image: w.after })));
+      });
+      return null;
+    } catch (e) {
+      return `unique pending: ${e instanceof Error ? e.message : String(e)}`;
     }
-    return null;
   }
 
   /** 取引がこのシャードに書く変更が、変更ログの 1 行に収まるか。収まらなければ確定の前に拒否する。 */
@@ -1352,15 +1471,20 @@ export class ShardCore implements ShardApi {
     if (this.faults.noWriteSetLimit || writes.length === 0) return;
     let bytes = 0;
     for (const w of writes) {
-      bytes += encode(w).length;
+      bytes += utf8Length(encode(w));
       if (bytes > MAX_WRITE_SET_BYTES) {
         throw new SqlError(`transaction too large: it changes more than ${MAX_WRITE_SET_BYTES} bytes of rows on one shard; split it into smaller transactions`);
       }
     }
   }
 
+  /** 主キーが違っても衝突し得る表か。UNIQUE index のある表である。 */
+  private hasUniqueBeyondKey(table: string): boolean {
+    return this.def(table).uniques.length > 0;
+  }
+
   private checkUnique(txn: string, writes: Change[]): string | null {
-    const constrained = writes.filter((w) => this.def(w.table).uniques.length > 0);
+    const constrained = writes.filter((w) => this.hasUniqueBeyondKey(w.table));
     if (constrained.length === 0) return null;
     const pending = this.uniquePending(txn, constrained);
     if (pending) return pending;
@@ -1393,7 +1517,7 @@ export class ShardCore implements ShardApi {
 
   /** 索引が膨らんだら捨てて low-water を上げる。それより古い T の取引は保守的に abort する。 */
   private pruneRecent(): void {
-    if (this.recent.size < 200_000) return;
+    if (this.recent.size < (this.deps.recentMax ?? 200_000)) return;
     this.recentLowWater = this.hlc.value;
     this.recent.clear();
   }

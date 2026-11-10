@@ -148,7 +148,9 @@ export class Connection {
   }
   /** D1 の Sessions API。bookmark は HLC の時刻である。 */
   withSession(bookmark?: string): Connection & { getBookmark(): string } {
-    const known = bookmark && bookmark !== "first-primary" && bookmark !== "first-unconstrained" ? Number(bookmark) : 0;
+    // D1 の bookmark など、この DB のものでない値は時刻として読めない。その場合は制約なしで始める。
+    const parsed = bookmark && /^\d+$/.test(bookmark) ? Number(bookmark) : 0;
+    const known = Number.isSafeInteger(parsed) ? parsed : 0;
     const session = new Connection(this.binding, Math.max(this.token, known)) as Connection & { getBookmark(): string };
     session.getBookmark = () => String(session.token);
     return session;

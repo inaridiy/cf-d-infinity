@@ -207,7 +207,7 @@ The numbers above are for a workload that partitions cleanly by a shard key. Che
 - **Under 10 GB and no need for interactive transactions: use D1.** It bills 1 row per write instead of 2, and it is faster.
 - **A `UNIQUE` column or index that does not contain the shard key makes every write to that table a cross-shard commit.** `email TEXT UNIQUE` on a table sharded by `id` is the common case. Such an `INSERT` bills about 15 rows instead of 3, and takes a two-phase commit.
 - **Cross-shard transactions are slow.** Measured: 483 per second on 8 shards and 1,406 on 32 (about 44–60 per shard), p50 265–315 ms and p99 in seconds, automatic retries included.
-- **A statement that reads every shard does not get faster with more shards**, and at most 200,000 rows can be gathered for one statement. That limit is checked in the Worker after the rows arrive, so a careless `SELECT *` on a large table can exhaust the Worker's memory.
+- **A statement that reads every shard does not get faster with more shards**, and at most 200,000 rows or 32 MB can be gathered for one statement. Each shard stops reading at its share of that limit and the statement fails, so a careless `SELECT *` on a large table gets an error instead of exhausting the Worker's memory.
 - **A snapshot older than a fraction of a second can fail under write load.** A read "as of T" undoes at most 50 changed rows per shard, counted over the whole shard. A long optimistic `BEGIN` on a busy shard gets `ReadTooOld` and has to retry; the 10-minute change log is an upper bound, not what you can rely on.
 - **Reads are not free of billed rows while a shard is active**: each active shard writes one clock row per second.
 
@@ -256,6 +256,10 @@ None of the following is a proof of the implementation:
 - **Thin observability.** There is a slow-statement log (see [Command line](#command-line)), but no abort-rate or scatter-rate metrics and no tracing.
 - **Unverified platform behavior.** Whether an old Durable Object instance can serve reads during failover is not documented by Cloudflare and was not tested. Clock skew between Durable Objects has no published bound.
 - **SQLite differences.** Foreign keys are not enforced; `TEMP` tables, `ATTACH` and FTS5 are unavailable; integers beyond 2^53 lose precision; implicit rowids are unique but not contiguous. Durable Object SQLite limits also apply (for example 100 bound parameters). See [docs/sql-language.md](docs/sql-language.md).
+- **Transaction size.** What one transaction changes on one shard, old and new row images together, must fit in 1 MB of UTF-8 (a BLOB counts twice its size). A larger transaction is refused before it commits; split it.
+- **Schema changes.** A statement that SQLite rejects is refused before it is recorded. One that fails only on rows a shard already holds (a `UNIQUE` index over duplicates, `ADD COLUMN` with a `CHECK` the rows violate) is withdrawn on every shard and reported with SQLite's message. A schema change waits up to 60 seconds for a shard split in progress and then asks to be retried. `CREATE INDEX` on a column that is not the shard key fills the index from the existing rows inside one request; on a large table it can stop with "run the same statement again", and the same statement then continues where it stopped. Table, index, view and trigger names that start with `__` or `sqlite_` are reserved.
+- **Failures the caller must handle.** A transient platform error on a write is returned, not retried, because the write may already have been applied. Conflicts, stale routing and too-old snapshots are retried automatically.
+- **Open items from the November 2026 design review.** There is no operator command to discard a committed transaction that can never be applied (the review's known causes are fixed, and `status` reports the state). A shard keeps one bookkeeping row per shard-key group it ever handed to another shard. The HTTP and admin entry points have not had an independent security review.
 - **Scale limits.** At most 200,000 rows gathered into the Worker per statement; no hierarchical fan-out beyond 8 shards; a single hot row tops out around 650 writes/s; shards are never merged; the autoscaler notices new load within about a minute, then follows it every 5 seconds.
 - **No region control.** A shard is created near the Worker that first reaches it and never moves, so latency grows with distance from there.
 - **No stability promise.** Storage format, wire protocol and admin API may change between commits. The stored data carries a format version: a release that does not understand the format refuses to open it and says so, instead of rewriting it. No release has changed the format yet, so this has only been exercised in tests.
@@ -267,7 +271,7 @@ None of the following is a proof of the implementation:
 ```sh
 git clone https://github.com/inaridiy/cf-d-infinity.git && cd cf-d-infinity/packages/cf-d-infinity
 npm install
-npm test              # unit, simulator and workerd tests, about 90 s, no Cloudflare account
+npm test              # unit, simulator and workerd tests, a few minutes, no Cloudflare account
 npx wrangler dev --var DINF_API_TOKEN:dev-only-token --var DINF_ADMIN_TOKEN:dev-only-admin
 ```
 
