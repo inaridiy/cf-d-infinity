@@ -14,7 +14,7 @@ Read the name as "D-infinity": the D1 API your Worker already speaks, without th
 
 - **Interactive transactions, across shards.** `BEGIN`, read, decide, write, `COMMIT`, serializable by default, with no central timestamp oracle. D1 offers `batch()` only.
 - **Works with the SQLite clients you have.** `@libsql/client` over HTTP or WebSocket, Drizzle, and a D1-compatible API. You change the URL.
-- **Scales past one database.** Tables are spread over up to 4,096 hash slots; an autoscaler splits hot or large shards online. One shard takes ~950 writes/s; 64 shards reached 18,784 writes/s.
+- **Scales past one database.** Tables are spread over up to 4,096 hash slots; an autoscaler splits hot or large shards online. One shard takes ~950 single-shard writes/s; 64 shards reached 18,784 writes/s. Transactions that span shards are far slower: about 44–60 per second per shard (see [When not to use it](#when-not-to-use-it)).
 - **SQLite semantics, not a reimplementation.** Each shard is SQLite, and cross-shard statements re-run the original SQL in a WebAssembly SQLite inside the Worker. All 8,884 queries of sqllogictest `select1`–`select5` match.
 - **Pay per row, no instance to size.** Durable Object pricing: 2 billed rows per single-row `UPDATE`, $0.20 per GB-month. When nothing is happening, the only activity is the autoscaler waking each shard once a minute.
 - **Checked, not only claimed.** Eleven formal models, a fault-injecting simulator, and Elle-style black-box checks against production Cloudflare while Durable Objects crash and shards split.
@@ -194,6 +194,17 @@ Read it this way: against D1 you gain interactive transactions and room beyond 1
 
 Sources: [D1 limits](https://developers.cloudflare.com/d1/platform/limits/), [D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/), [Turso pricing](https://turso.tech/pricing), [Neon plans](https://neon.com/docs/introduction/plans), [Supabase compute and disk](https://supabase.com/docs/guides/platform/compute-and-disk), [PlanetScale plans](https://planetscale.com/docs/planetscale-plans). D∞: [docs/benchmarks.md](docs/benchmarks.md).
 
+## When not to use it
+
+The numbers above are for a workload that partitions cleanly by a shard key. Check these before choosing D∞ over D1:
+
+- **Under 10 GB and no need for interactive transactions: use D1.** It bills 1 row per write instead of 2, and it is faster.
+- **A `UNIQUE` column or index that does not contain the shard key makes every write to that table a cross-shard commit.** `email TEXT UNIQUE` on a table sharded by `id` is the common case. Such an `INSERT` bills about 15 rows instead of 3, and takes a two-phase commit.
+- **Cross-shard transactions are slow.** Measured: 483 per second on 8 shards and 1,406 on 32 (about 44–60 per shard), p50 265–315 ms and p99 in seconds, automatic retries included.
+- **A statement that reads every shard does not get faster with more shards**, and at most 200,000 rows can be gathered for one statement. That limit is checked in the Worker after the rows arrive, so a careless `SELECT *` on a large table can exhaust the Worker's memory.
+- **A snapshot older than a fraction of a second can fail under write load.** A read "as of T" undoes at most 50 changed rows per shard, counted over the whole shard. A long optimistic `BEGIN` on a busy shard gets `ReadTooOld` and has to retry; the 10-minute change log is an upper bound, not what you can rely on.
+- **Reads are not free of billed rows while a shard is active**: each active shard writes one clock row per second.
+
 ## Architecture
 
 ```mermaid
@@ -221,7 +232,7 @@ Rows are placed by `hash(shard key)`; the shard key defaults to the first primar
 |---|---|
 | Single-shard transaction | Strict serializable (not verified during a Durable Object failover) |
 | Multi-shard transaction | Serializable |
-| Real-time order across sessions | Autocommit reads and the first read of a transaction see every write committed before they start. Later statements of a transaction may miss a newer commit on another shard |
+| Real-time order across sessions | Autocommit reads and the first read of a transaction see every write committed before they start. Later statements of a transaction may miss a newer commit on another shard. (Until 0.1.0-alpha.0 this did not hold for an autocommit read of several shards that excluded the transaction's anchor; fixed, with a regression test) |
 
 `BEGIN IMMEDIATE` (`transaction("write")`) takes row locks and rarely fails at `COMMIT`. Plain `BEGIN` is optimistic and can fail at `COMMIT` with `SQLITE_BUSY`; retrying it is the application's job.
 
@@ -241,7 +252,9 @@ None of the following is a proof of the implementation:
 - **SQLite differences.** Foreign keys are not enforced; `TEMP` tables, `ATTACH` and FTS5 are unavailable; integers beyond 2^53 lose precision; implicit rowids are unique but not contiguous. Durable Object SQLite limits also apply (for example 100 bound parameters). See [docs/sql-language.md](docs/sql-language.md).
 - **Scale limits.** At most 200,000 rows gathered into the Worker per statement; no hierarchical fan-out beyond 8 shards; a single hot row tops out around 650 writes/s; shards are never merged; the autoscaler notices new load within about a minute, then follows it every 5 seconds.
 - **No region control.** A shard is created near the Worker that first reaches it and never moves, so latency grows with distance from there.
-- **No stability promise.** Storage format, wire protocol and admin API may change between commits.
+- **No stability promise.** Storage format, wire protocol and admin API may change between commits. The stored data carries no format version yet, so rolling your application back to an older release of this package is not checked and not safe.
+- **Autoscaling is on by default and cannot be undone or cancelled.** It has been measured with 128 shard-key groups per shard. A table whose shard key is its primary key (`id INTEGER PRIMARY KEY`, the default) has one group per row; splitting such a shard at millions of rows has not been run and is expected to be slow. A statement that reads a whole table is retried for under a second and then fails while a split is still moving data. Remove the Cron Trigger to turn autoscaling off.
+- **The schema is fetched from one Durable Object.** Each Worker isolate caches it for 2 seconds and refetches on the request path, so that object is a dependency of every request.
 
 ## Develop
 
