@@ -74,6 +74,55 @@ export { connect } from "cf-d-infinity/client";
 `;
 
 /**
+ * 設定ファイルの形式に関わらず共通の変更。クラスを再 export するモジュール、main への 1 行、package.json の依存。
+ * config には main (Worker の入口のパス) だけを渡す。
+ */
+function planCode(cwd, config, opts, { writes, done, kept, next }) {
+  // 再 export するモジュール
+  const { main, file } = moduleFile(config);
+  const filePath = join(cwd, file);
+  const existing = readText(filePath);
+  if (existing === null) {
+    writes.push({ path: filePath, content: moduleSource });
+    done.push(`${file} (re-exports the classes, connect and autoscale)`);
+  } else if (existing === moduleSource) kept.push(file);
+  else kept.push(`${file} (exists with other content; left as it is)`);
+
+  // main モジュールに DO のクラスを export させる
+  const mainPath = join(cwd, main);
+  const mainText = readText(mainPath);
+  let from = `./${posix.relative(posix.dirname(main.replaceAll("\\", "/")), file).replace(/\.(ts|js)$/, "")}`;
+  if (!from.startsWith("./.")) from = from.replace(/^\.\/\.\//, "./");
+  const exportLine = `export { DinfAutoscaler, DinfDatabase, DinfMeta, DinfShard } from "${from}";`;
+  if (mainText === null) next.push(`Create ${main} and add this line to it:\n    ${exportLine}`);
+  else if (/\bDinfShard\b/.test(mainText)) kept.push(`${main} already exports the classes`);
+  else {
+    writes.push({ path: mainPath, content: `${mainText}${mainText.endsWith("\n") ? "" : "\n"}\n// Added by create-cf-d-infinity: wrangler.jsonc refers to these classes by name.\n${exportLine}\n` });
+    done.push(`${main}: appended one line that re-exports the Durable Object classes`);
+  }
+  if (opts.autoscale && !(mainText && /\bautoscale\s*\(/.test(mainText))) {
+    next.push(`Call the autoscaler from your default export in ${main} (the Cron Trigger invokes it):\n    import { autoscale } from "${from}";\n    export default { /* fetch, ... */ scheduled: (_controller, env) => autoscale(env) };`);
+  }
+
+  // package.json
+  const pkgPath = join(cwd, "package.json");
+  const pkgText = readText(pkgPath);
+  if (pkgText === null) next.push(`Install the library: npm install ${opts.packageSpec === opts.defaultSpec ? `cf-d-infinity@${opts.distTag}` : opts.packageSpec}`);
+  else {
+    const pkg = new Doc("package.json", pkgText);
+    const have = pkg.value.dependencies?.["cf-d-infinity"] ?? pkg.value.devDependencies?.["cf-d-infinity"];
+    if (have) kept.push(`cf-d-infinity ${have} in package.json`);
+    else {
+      pkg.set(["dependencies", "cf-d-infinity"], opts.packageSpec);
+      writes.push({ path: pkgPath, content: pkg.text });
+      done.push(`package.json: dependency cf-d-infinity ${opts.packageSpec}`);
+    }
+  }
+  next.push(`Use it:  import { connect } from "${from}";  const db = connect(env.${opts.binding});`);
+  next.push("Then: npm install && npx wrangler dev");
+}
+
+/**
  * 既存の Workers プロジェクトへ足す変更を計画する。
  * @returns {{ writes: {path: string, content: string}[], done: string[], kept: string[], next: string[] }}
  */
@@ -161,50 +210,42 @@ function planExisting(cwd, configName, opts) {
     writes.push({ path: configPath, content: doc.text });
   }
 
-  // 再 export するモジュール
-  const { main, file } = moduleFile(config);
-  const filePath = join(cwd, file);
-  const existing = readText(filePath);
-  if (existing === null) {
-    writes.push({ path: filePath, content: moduleSource });
-    done.push(`${file} (re-exports the classes, connect and autoscale)`);
-  } else if (existing === moduleSource) kept.push(file);
-  else kept.push(`${file} (exists with other content; left as it is)`);
-
-  // main モジュールに DO のクラスを export させる
-  const mainPath = join(cwd, main);
-  const mainText = readText(mainPath);
-  let from = `./${posix.relative(posix.dirname(main.replaceAll("\\", "/")), file).replace(/\.(ts|js)$/, "")}`;
-  if (!from.startsWith("./.")) from = from.replace(/^\.\/\.\//, "./");
-  const exportLine = `export { DinfAutoscaler, DinfDatabase, DinfMeta, DinfShard } from "${from}";`;
   const next = [];
-  if (mainText === null) next.push(`Create ${main} and add this line to it:\n    ${exportLine}`);
-  else if (/\bDinfShard\b/.test(mainText)) kept.push(`${main} already exports the classes`);
-  else {
-    writes.push({ path: mainPath, content: `${mainText}${mainText.endsWith("\n") ? "" : "\n"}\n// Added by create-cf-d-infinity: wrangler.jsonc refers to these classes by name.\n${exportLine}\n` });
-    done.push(`${main}: appended one line that re-exports the Durable Object classes`);
-  }
-  if (opts.autoscale && !(mainText && /\bautoscale\s*\(/.test(mainText))) {
-    next.push(`Call the autoscaler from your default export in ${main} (the Cron Trigger invokes it):\n    import { autoscale } from "${from}";\n    export default { /* fetch, ... */ scheduled: (_controller, env) => autoscale(env) };`);
-  }
-
-  // package.json
-  const pkgPath = join(cwd, "package.json");
-  const pkgText = readText(pkgPath);
-  if (pkgText === null) next.push(`Install the library: npm install ${opts.packageSpec === opts.defaultSpec ? `cf-d-infinity@${opts.distTag}` : opts.packageSpec}`);
-  else {
-    const pkg = new Doc("package.json", pkgText);
-    const have = pkg.value.dependencies?.["cf-d-infinity"] ?? pkg.value.devDependencies?.["cf-d-infinity"];
-    if (have) kept.push(`cf-d-infinity ${have} in package.json`);
-    else {
-      pkg.set(["dependencies", "cf-d-infinity"], opts.packageSpec);
-      writes.push({ path: pkgPath, content: pkg.text });
-      done.push(`package.json: dependency cf-d-infinity ${opts.packageSpec}`);
-    }
-  }
-  next.push(`Use it:  import { connect } from "${from}";  const db = connect(env.${opts.binding});`);
-  next.push("Then: npm install && npx wrangler dev");
+  planCode(cwd, config, opts, { writes, done, kept, next });
   return { mode: "existing", writes, done, kept, next };
+}
+
+/**
+ * cf (cloudflare.config.ts) のプロジェクトへ足す変更を計画する。
+ * 設定は TypeScript のプログラムなので書き換えない。コードの側だけを整え、設定に足す内容は表示する。
+ */
+function planCf(cwd, opts) {
+  const configName = "cloudflare.config.ts";
+  const text = readFileSync(join(cwd, configName), "utf8");
+  const name = (/\bname\s*:\s*(["'`])([A-Za-z0-9_-]+)\1/.exec(text) ?? /\bconst\s+name\s*=\s*(["'`])([A-Za-z0-9_-]+)\1/.exec(text))?.[2];
+  const main = /from\s+["'](\.[^"']+)["']\s+with\s*\{\s*type\s*:\s*["']cf-worker["']/.exec(text)?.[1]?.replace(/^\.\//, "")
+    ?? /\bentrypoint\s*:\s*["'](\.[^"']+)["']/.exec(text)?.[1]?.replace(/^\.\//, "");
+  const writes = [];
+  const done = [];
+  const kept = [];
+  const next = [];
+  const worker = name ?? "<your Worker's name>";
+  if (/\bDinfShard\b/.test(text)) kept.push(`${configName} already declares the Durable Object classes`);
+  else {
+    const cron = opts.autoscale ? `\n      triggers: [triggers.scheduled({ schedule: "${CRON}" })],   // the autoscaler; leave it out to turn autoscaling off` : "";
+    next.push(`Add this to the worker in ${configName} (import bindings, exports and triggers from "cf/config"; merge with what is there):
+      exports: {
+${CLASSES.map((c) => `        ${c}: exports.durableObject({ storage: "sqlite" }),`).join("\n")}
+        DinfDatabase: exports.worker(),
+      },
+      env: {
+${DO_BINDINGS.map((b) => `        ${b.name}: bindings.durableObject({ worker: "${worker}", exportName: "${b.class_name}" }),`).join("\n")}
+        ${opts.binding}: bindings.worker({ worker: "${worker}", exportName: "DinfDatabase" }),
+        DINF_SHARD_COUNT: bindings.text("${opts.shards}"),
+      },${cron}`);
+  }
+  planCode(cwd, { main: main ?? "src/index.ts" }, opts, { writes, done, kept, next });
+  return { mode: "cf", writes, done, kept, next: next.map((n) => n.replace("npx wrangler dev", "npx cf dev")) };
 }
 
 /** 空のディレクトリに、DB だけの Worker を作る計画を立てる。 */
@@ -270,6 +311,8 @@ export function plan(cwd, options = {}) {
   };
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(opts.binding)) throw new Conflict(`--binding ${opts.binding} is not a valid binding name`);
   if (!Number.isInteger(opts.shards) || opts.shards < 1 || opts.shards > 4096) throw new Conflict("--shards must be an integer from 1 to 4096");
+  // cf は cloudflare.config.ts があるプロジェクトだけを設定済みとみなし、Wrangler の設定を読まない。両方あれば cf を優先する。
+  if (existsSync(join(cwd, "cloudflare.config.ts"))) return planCf(cwd, opts);
   const configName = ["wrangler.jsonc", "wrangler.json"].find((f) => existsSync(join(cwd, f)));
   if (configName) return planExisting(cwd, configName, opts);
   if (existsSync(join(cwd, "wrangler.toml"))) {
@@ -289,8 +332,8 @@ export function apply(result) {
 export function report(result, cwd) {
   const lines = [];
   const rel = (p) => relative(cwd, p) || p;
-  if (result.writes.length === 0) lines.push("Nothing to change: cf-d-infinity is already set up here.");
-  else lines.push(result.mode === "new" ? "Created a database Worker:" : "Added cf-d-infinity to this Worker:");
+  if (result.writes.length === 0) lines.push(result.next.some((n) => n.startsWith("Add this to the worker")) ? "No file to change." : "Nothing to change: cf-d-infinity is already set up here.");
+  else lines.push(result.mode === "new" ? "Created a database Worker:" : result.mode === "cf" ? "Prepared this cf project for cf-d-infinity (cloudflare.config.ts is yours to edit):" : "Added cf-d-infinity to this Worker:");
   for (const d of result.done) lines.push(`  + ${d}`);
   for (const k of result.kept) lines.push(`  = ${k} (kept)`);
   if (result.writes.length > 0) lines.push("", `Files written: ${result.writes.map((w) => rel(w.path)).join(", ")}`);

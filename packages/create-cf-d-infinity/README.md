@@ -24,6 +24,12 @@ The one thing it cannot do for you is call the autoscaler from your default expo
 scheduled: (_controller, env) => autoscale(env),
 ```
 
+## In a cf project
+
+When the directory has a `cloudflare.config.ts` (a project for the `cf` CLI), `init` does not edit it: the file is a
+TypeScript program. It writes `src/dinf.ts`, appends the re-export line to the entrypoint, adds the dependency, and
+prints the `exports`, `env` and `triggers` entries to add to the `worker` in `cloudflare.config.ts`.
+
 ## In an empty directory
 
 Without a wrangler config, `init` creates a database-only Worker (`package.json`, `wrangler.jsonc`, `src/index.ts`,

@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { build } from "esbuild";
 import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+// @ts-expect-error -- JavaScript のモジュール
+import { workerBundle } from "../scripts/esbuild-options.mjs";
 
 let mf: Miniflare;
 let consumerBundle = "";
@@ -15,9 +17,8 @@ const call = async (name: string) => {
 beforeAll(async () => {
   await build({
     entryPoints: { "fixture-app": "test/fixtures/app.ts", "fixture-consumer": "test/fixtures/consumer.ts" },
-    bundle: true, format: "esm", platform: "browser", outdir: "dist", logLevel: "error",
+    ...workerBundle, outdir: "dist", logLevel: "error",
     external: ["cloudflare:workers", "*.wasm"],
-    alias: { fs: "./src/empty.js", path: "./src/empty.js", crypto: "./src/empty.js" },
   });
   consumerBundle = readFileSync("dist/fixture-consumer.js", "utf8");
   const database = { name: "app", entrypoint: "DinfDatabase" };
@@ -29,7 +30,10 @@ beforeAll(async () => {
           { type: "ESModule", path: "dist/fixture-app.js", contents: readFileSync("dist/fixture-app.js", "utf8") },
           { type: "CompiledWasm", path: "dist/sql-wasm.wasm", contents: readFileSync("src/sql-wasm.wasm") },
         ],
+        // 利用者のプロジェクトの多くは nodejs_compat を有効にしている。そこでは process があり、
+        // sql.js が Node で動いていると誤認すると `__dirname is not defined` で落ちる。
         compatibilityDate: "2026-07-01",
+        compatibilityFlags: ["nodejs_compat"],
         bindings: { DINF_SHARD_COUNT: "4", DINF_API_TOKEN: "data-token" },
         durableObjects: {
           DINF_SHARD: { className: "DinfShard", useSQLite: true },

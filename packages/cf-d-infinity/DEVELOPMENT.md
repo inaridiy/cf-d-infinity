@@ -48,6 +48,7 @@ npx wrangler deploy
 | `POST /batch` | API | `{ statements, token }` | 全文を 1 取引で実行する |
 | `POST /admin/split` | ADMIN | `{ cluster, parent, child }` | 手動で増設する |
 | `POST /admin/status` | ADMIN | `{ cluster }` | 範囲表と Autoscaler の履歴を返す |
+| `POST /admin/slow` | ADMIN | `{ cluster, limit }` | 遅い文の記録を新しい順に返す |
 | `POST /admin/rowstats` | ADMIN | `{ cluster }` | 文の種類ごとの課金行数を返し、0 に戻す |
 
 ### 自動増設
@@ -70,6 +71,7 @@ Cron が毎分 Autoscaler DO を起こし、Autoscaler は全シャードの met
 | `DINF_SHARD_COUNT` | 8 | 最初のシャード数 |
 | `DINF_AUTOSCALE_TICK_MS` | 5000 | 負荷が続いている間の判断の周期 (ms) |
 | `DINF_AUTOSCALE_THRESHOLDS` | なし | 閾値の上書き (JSON)。項目は `src/autoscaler.ts` の `Thresholds` |
+| `DINF_SLOW_QUERY_MS` | 500 | これより遅い文を DinfMeta に記録する。`0` は全部、`off` は記録しない |
 
 `triggers` の行を消してデプロイすると止まる。
 ローカルの `wrangler dev` は Cron を自動では発火しない。
@@ -77,6 +79,26 @@ Cron が毎分 Autoscaler DO を起こし、Autoscaler は全シャードの met
 
 全シャードへの問い合わせは DO を起こすので、Duration の課金がかかる。
 常に 5 秒周期で回すと待機中のシャードも起きたままになるため、平常時は毎分 1 回に抑えている。
+
+### コマンドと遅い文の記録
+
+`bin/cli.js` (`npx cf-d-infinity`) は `sql`、`slow`、`status` を持つ。
+HTTP の入口とトークンは使わない。
+使い捨ての Worker を miniflare で立て、動いている dev サーバの `DinfDatabase` へ Service Binding を張って呼ぶ。
+
+dev サーバの探し方は、Wrangler と cf で違う。
+Wrangler は `~/.config/.wrangler/registry` に、cf (Cloudflare Vite plugin 2.0) は `~/.config/cloudflare/dev-registry/v5` に、Worker の名前のファイルを置く。
+コマンドは両方を探し、見つかった側のツールが使っている miniflare を利用者のプロジェクトから読み込む。
+cf の miniflare は 5 系で設定の形が違うので、`convertV4MiniflareOptions` があればそれを通す。
+この仕組みは `unsafeDevRegistryPath` という非公開の設定と registry の配置に依存しており、ツールの更新で壊れ得る。
+
+遅い文は `Db` の `onStatement` で測り、`DINF_SLOW_QUERY_MS` を超えたものを DinfMeta の `__slow` に書く。
+記録は応答を待たせない (`waitUntil`)。bound parameter は記録しない。
+直近 1,000 件だけ残し、isolate ごとに 10 秒あたり 20 件で打ち切る。
+
+sql.js は `process.versions.node` があると Node で動いているとみなし、`__dirname` と `fs` を使おうとする。
+`nodejs_compat` を有効にした Worker には `process` があるので、束ねる時点でこの判定を偽にしている (`scripts/esbuild-options.mjs` の `define`)。
+これがないと、`nodejs_compat` を使う利用者と cf のプロジェクトで `__dirname is not defined` になる。
 
 ### 公開する形
 
@@ -151,6 +173,7 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `src/entrypoint.ts` | Service Binding の入口 `DinfDatabase`。文、batch、対話的な取引を RPC で受ける |
 | `src/binding.ts` | アプリ側のクライアント `connect()`。D1 互換 API と取引 |
 | `src/cloudflare.ts` | 公開する入口。Worker に組み込むものをまとめて export する |
+| `bin/cli.js` | `cf-d-infinity` コマンド (`sql`、`slow`、`status`) |
 | `src/bench.ts` | 計測用の入口。ベンチマーク、DO のプローブ、障害注入 |
 | `src/listappend.ts` | 黒箱検査の負荷 (リストへの追記) |
 | `bench/elle.mjs` | 黒箱の直列化可能性の検査器 (Elle の list-append 方式) |
@@ -169,6 +192,7 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `test/rollback-read.test.ts` | どの過去時点も正確に再構成できること |
 | `test/migration.test.ts` | ライブ移動、`m5b` の反例、Autoscaler の判断 |
 | `test/workerd.test.ts` | 本物の workerd と DO の SQLite での結合テスト |
+| `test/ops.test.ts` | 遅い文の記録と、`cf-d-infinity` コマンド。miniflare を dev サーバに見立て、dev registry 経由で呼ぶ |
 | `test/binding.test.ts` | `DinfDatabase` と `connect()` を workerd の RPC で通す。同じ Worker の中の binding と、別の Worker からの binding の両方 |
 | `test/autoscale-cron.test.ts` | Cron から起こした Autoscaler が、負荷のある間だけ alarm で追い、増設し、負荷が止まると静まること |
 | `test/d1.test.ts` | D1 互換 API と Drizzle |

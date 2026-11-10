@@ -32,8 +32,12 @@
     },
     "./package.json": "./package.json"
   },
+  "bin": {
+    "cf-d-infinity": "bin/cli.js"
+  },
   "files": [
     "lib",
+    "bin",
     "NOTICE"
   ],
   "publishConfig": {
@@ -45,8 +49,8 @@
     "prepack": "npm run build",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "bundle": "esbuild src/worker.ts --bundle --format=esm --platform=browser --external:cloudflare:workers --external:*.wasm --alias:fs=./src/empty.js --alias:path=./src/empty.js --alias:crypto=./src/empty.js --outfile=dist/worker.js",
-    "bundle:bench": "esbuild src/bench.ts --bundle --format=esm --platform=browser --external:cloudflare:workers --external:*.wasm --alias:fs=./src/empty.js --alias:path=./src/empty.js --alias:crypto=./src/empty.js --outfile=dist/bench.js",
+    "bundle": "esbuild src/worker.ts --bundle --format=esm --platform=browser --external:cloudflare:workers --external:*.wasm --alias:fs=./src/empty.js --alias:path=./src/empty.js --alias:crypto=./src/empty.js --define:process.versions.node=undefined --outfile=dist/worker.js",
+    "bundle:bench": "esbuild src/bench.ts --bundle --format=esm --platform=browser --external:cloudflare:workers --external:*.wasm --alias:fs=./src/empty.js --alias:path=./src/empty.js --alias:crypto=./src/empty.js --define:process.versions.node=undefined --outfile=dist/bench.js",
     "deploy": "wrangler deploy",
     "deploy:bench": "wrangler deploy -c wrangler.bench.jsonc",
     "check": "tsc --noEmit && vitest run"

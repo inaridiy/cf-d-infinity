@@ -8,6 +8,7 @@
 import { execFileSync } from "node:child_process";
 import { cpSync, readFileSync, rmSync, statSync } from "node:fs";
 import { build } from "esbuild";
+import { workerBundle } from "./esbuild-options.mjs";
 
 rmSync("lib", { recursive: true, force: true });
 
@@ -18,9 +19,8 @@ if (!readFileSync("src/sql-wasm.wasm").equals(readFileSync("node_modules/sql.js/
 
 await build({
   entryPoints: { cloudflare: "src/cloudflare.ts", client: "src/binding.ts" },
-  bundle: true, format: "esm", platform: "browser", target: "es2023", outdir: "lib", logLevel: "warning",
+  ...workerBundle, target: "es2023", outdir: "lib", logLevel: "warning",
   external: ["cloudflare:workers", "sql-parser-cst", "*.wasm"],
-  alias: { fs: "./src/empty.js", path: "./src/empty.js", crypto: "./src/empty.js" },
 });
 cpSync("src/sql-wasm.wasm", "lib/sql-wasm.wasm");
 execFileSync("npx", ["tsc", "-p", "tsconfig.build.json"], { stdio: "inherit" });
@@ -29,5 +29,6 @@ const server = readFileSync("lib/cloudflare.js", "utf8");
 const client = readFileSync("lib/client.js", "utf8");
 if (!/from\s*"sql-parser-cst"/.test(server)) throw new Error("sql-parser-cst must stay an external import");
 if (/from\s*"(fs|path|crypto|sql\.js)"/.test(server)) throw new Error("lib/cloudflare.js still imports a module the consumer would have to alias");
+if (/typeof process\.versions\.node/.test(server)) throw new Error("lib/cloudflare.js still lets sql.js detect Node; it would fail under nodejs_compat");
 if (/cloudflare:workers|sql-parser-cst|sql-wasm/.test(client)) throw new Error("lib/client.js must not pull in the server");
 console.log(`lib/cloudflare.js ${statSync("lib/cloudflare.js").size} bytes, lib/client.js ${statSync("lib/client.js").size} bytes`);

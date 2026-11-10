@@ -21,7 +21,7 @@ Read the name as "D-infinity": the D1 API your Worker already speaks, without th
 
 ## Quick start
 
-Run `init` in a Workers project, the directory that holds your `wrangler.jsonc`. The database becomes part of that Worker: its configuration lives in `wrangler.jsonc`, its version in `package.json`, and one `wrangler dev` runs both. You need Node 20 or later; local development needs no Cloudflare account.
+Run `init` in a Workers project, the directory that holds your `wrangler.jsonc`. (For a project that uses the [`cf` CLI](https://developers.cloudflare.com/cf/) and `cloudflare.config.ts`, see [Wrangler and cf](#wrangler-and-cf).) The database becomes part of that Worker: its configuration lives in `wrangler.jsonc`, its version in `package.json`, and one `wrangler dev` runs both. You need Node 20 or later; local development needs no Cloudflare account.
 
 ```sh
 npx create-cf-d-infinity@alpha init    # edits wrangler.jsonc and package.json, writes src/dinf.ts
@@ -80,6 +80,53 @@ export { DinfAutoscaler, DinfDatabase, DinfMeta, DinfShard } from "./dinf";
 ```
 
 Open <http://localhost:8787>: it returns `[{"id":1,"balance":70},{"id":2,"balance":130}]`. `npx wrangler types` gives `Env` its types. Drizzle's D1 driver takes the same object: `drizzle(connect(env.DINF_DB))`. `npx wrangler deploy` ships the app and the database together; this needs the Workers Paid plan.
+
+## Command line
+
+With the dev server running (`wrangler dev` or `cf dev`), the package's command talks to the database in it:
+
+```sh
+npx cf-d-infinity sql "SELECT id, balance FROM accounts ORDER BY id"
+npx cf-d-infinity sql --file schema.sql          # several statements; also reads standard input
+npx cf-d-infinity sql "SELECT * FROM accounts WHERE id = ?" --param 1 --json
+npx cf-d-infinity slow                           # recorded slow statements, newest first
+npx cf-d-infinity status                         # shards, slot ranges, autoscaler events
+```
+
+It needs no HTTP endpoint and no token. The command starts a throwaway local Worker with a Service Binding to your Worker's `DinfDatabase` entrypoint, calls it, and exits (under a second). It finds the Worker by the `name` in `wrangler.jsonc` or `cloudflare.config.ts`; pass `--worker <NAME>` otherwise. It reaches dev servers on this machine only; a deployed database is not reachable from the command yet.
+
+**Slow statements.** A statement that takes longer than `DINF_SLOW_QUERY_MS` (a var; default 500 ms, `0` records everything, `off` disables) is recorded with its SQL text, duration, where it ran (`shard` for one shard, `gather` or `partial` for a scan gathered into the Worker, `transaction` for a batch), the number of shards it touched and its retries. Bound parameters are never recorded. The last 1,000 entries are kept, and a burst is capped at 20 entries per 10 seconds per isolate. The same list is available to your code as `env.DINF_DB.slowQueries()`.
+
+## Wrangler and cf
+
+D∞ works with both Wrangler and the `cf` CLI (in beta; it runs projects through Vite and reads `cloudflare.config.ts`).
+
+| | Wrangler | cf |
+|---|---|---|
+| Configuration | `wrangler.jsonc`, edited by `init` | `cloudflare.config.ts`; `init` prints the block to add, because the file is a program |
+| Develop and deploy | `wrangler dev`, `wrangler deploy` | `cf dev`, `cf deploy` |
+| `npx cf-d-infinity ...` | works against `wrangler dev` | works against `cf dev` |
+
+In a cf project, `init` writes `src/dinf.ts`, re-exports the classes from your entrypoint, adds the dependency, and prints this for the `worker` in `cloudflare.config.ts`:
+
+```ts
+exports: {
+  DinfShard: exports.durableObject({ storage: "sqlite" }),
+  DinfMeta: exports.durableObject({ storage: "sqlite" }),
+  DinfAutoscaler: exports.durableObject({ storage: "sqlite" }),
+  DinfDatabase: exports.worker(),
+},
+env: {
+  DINF_SHARD: bindings.durableObject({ worker: "my-app", exportName: "DinfShard" }),
+  DINF_META: bindings.durableObject({ worker: "my-app", exportName: "DinfMeta" }),
+  DINF_AUTOSCALER: bindings.durableObject({ worker: "my-app", exportName: "DinfAutoscaler" }),
+  DINF_DB: bindings.worker({ worker: "my-app", exportName: "DinfDatabase" }),
+  DINF_SHARD_COUNT: bindings.text("8"),
+},
+triggers: [triggers.scheduled({ schedule: "* * * * *" })],
+```
+
+`cf` is in beta and its configuration can change; this was checked with `cf` 1.0.0-beta.28 (`cf dev`, `cf build` and the generated types).
 
 ## Layouts and local development
 
@@ -186,7 +233,7 @@ None of the following is a proof of the implementation:
 
 - **No backup or point-in-time restore across shards.** Each Durable Object has its own 30-day PITR, but nothing restores all shards to one consistent point yet.
 - **One database, two static tokens.** No multi-tenancy, no per-user permissions.
-- **No observability.** No slow-query log, no abort-rate or scatter-rate metrics.
+- **Thin observability.** There is a slow-statement log (see [Command line](#command-line)), but no abort-rate or scatter-rate metrics and no tracing.
 - **Unverified platform behavior.** Whether an old Durable Object instance can serve reads during failover is not documented by Cloudflare and was not tested. Clock skew between Durable Objects has no published bound.
 - **SQLite differences.** Foreign keys are not enforced; `TEMP` tables, `ATTACH` and FTS5 are unavailable; integers beyond 2^53 lose precision; implicit rowids are unique but not contiguous. Durable Object SQLite limits also apply (for example 100 bound parameters). See [docs/sql-language.md](docs/sql-language.md).
 - **Scale limits.** At most 200,000 rows gathered into the Worker per statement; no hierarchical fan-out beyond 8 shards; a single hot row tops out around 650 writes/s; shards are never merged; the autoscaler notices new load within about a minute, then follows it every 5 seconds.
@@ -212,6 +259,7 @@ With `wrangler dev` running, the script under [From outside a Worker](#from-outs
 | `FUZZ_SEEDS=200 FUZZ_LENGTH=150 npx vitest run test/fuzz.test.ts` | Differential fuzzing against real SQLite |
 | `ROWCOST=1 npx vitest run test/rowcost.test.ts` | Check billed rows per operation |
 | `npm run deploy:bench` | Deploy the separate benchmark and fault-injection build |
+| `node bin/cli.js sql "SELECT 1" --worker <NAME>` | The `cf-d-infinity` command, against a dev server on this machine |
 | `npm test` (in `packages/create-cf-d-infinity/`) | Tests of the setup CLI |
 | `./check.sh` (in `specs/`, needs Java 17 or later) | Check all Quint models with TLC |
 

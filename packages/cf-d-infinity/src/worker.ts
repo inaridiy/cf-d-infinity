@@ -1,5 +1,5 @@
 import { DurableObject, RpcTarget } from "cloudflare:workers";
-import { Db, type Cluster } from "./client/db";
+import { Db, type Cluster, type StatementStat } from "./client/db";
 import { collectMetrics, decide, DEFAULTS, needsFollowUp, nextShardNumber, split, type AutoscalerState, type Thresholds } from "./autoscaler";
 import { MetaCore, type Catalog } from "./meta";
 import { planSplit, shardsOf } from "./routing";
@@ -25,6 +25,11 @@ export interface Env {
   DINF_AUTOSCALE_TICK_MS?: string;
   /** 増設の閾値の上書き (JSON)。省略した項目は既定値になる。 */
   DINF_AUTOSCALE_THRESHOLDS?: string;
+  /**
+   * 遅い文として記録する下限 (ms)。既定は 500。"off" で記録をやめ、0 なら全部の文を記録する。
+   * 記録は DinfMeta に直近 1,000 件だけ残る。
+   */
+  DINF_SLOW_QUERY_MS?: string;
   /** Hrana の baton に署名する鍵。未設定なら DINF_API_TOKEN から導く。 */
   DINF_BATON_SECRET?: string;
   /**
@@ -127,6 +132,39 @@ export class DinfShard extends DurableObject<Env> {
   }
 }
 
+/** 遅い文の 1 件。 */
+export interface SlowQuery extends StatementStat {
+  /** 記録した時刻 (ms)。 */
+  at: number;
+}
+const SLOW_KEEP = 1000;
+const SLOW_DEFAULT_MS = 500;
+const SLOW_SQL_MAX = 2000;
+/** 全部の文が遅い状況で記録が負荷にならないよう、isolate ごとに 10 秒あたり 20 件までにする。 */
+const SLOW_WINDOW_MS = 10_000;
+const SLOW_PER_WINDOW = 20;
+let slowWindow = { start: 0, count: 0 };
+
+/**
+ * 遅い文の記録先を作る。記録は応答を待たせず、background (waitUntil) があればそれに預ける。
+ * 記録するのは文面と時間と実行場所だけで、bound parameter は残さない。
+ */
+function slowSink(env: Env, background?: (p: Promise<unknown>) => void): ((s: StatementStat) => void) | undefined {
+  const raw = env.DINF_SLOW_QUERY_MS;
+  if (raw === "off") return undefined;
+  const min = raw === undefined || raw === "" ? SLOW_DEFAULT_MS : Number(raw);
+  if (!Number.isFinite(min) || min < 0) return undefined;
+  return (s) => {
+    if (s.ms < min) return;
+    const now = Date.now();
+    if (now - slowWindow.start > SLOW_WINDOW_MS) slowWindow = { start: now, count: 0 };
+    if (++slowWindow.count > SLOW_PER_WINDOW) return;
+    const p = Promise.resolve(env.DINF_META.getByName("shard").recordSlow({ ...s, at: now, sql: s.sql.slice(0, SLOW_SQL_MAX) }))
+      .catch(() => undefined);
+    if (background) background(p);
+  };
+}
+
 export class DinfMeta extends DurableObject<Env> {
   private core: MetaCore;
   constructor(ctx: DurableObjectState, env: Env) {
@@ -139,6 +177,23 @@ export class DinfMeta extends DurableObject<Env> {
   }
   ddlSince(v: number) {
     return this.core.ddlSince(v);
+  }
+  /** 遅い文を記録する。直近の SLOW_KEEP 件だけ残す。 */
+  recordSlow(e: SlowQuery): void {
+    const sql = this.ctx.storage.sql;
+    sql.exec(`CREATE TABLE IF NOT EXISTS __slow(seq INTEGER PRIMARY KEY, at INTEGER, ms INTEGER, plan TEXT, shards INTEGER, rows INTEGER, changes INTEGER, attempts INTEGER, error TEXT, sql TEXT)`);
+    sql.exec(
+      `INSERT INTO __slow(at, ms, plan, shards, rows, changes, attempts, error, sql) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      e.at, e.ms, e.plan, e.shards, e.rows, e.changes, e.attempts, e.error ?? null, e.sql,
+    );
+    sql.exec(`DELETE FROM __slow WHERE seq <= (SELECT max(seq) FROM __slow) - ?`, SLOW_KEEP);
+  }
+  /** 遅い文を新しい順に返す。 */
+  slowQueries(limit: number): SlowQuery[] {
+    const sql = this.ctx.storage.sql;
+    sql.exec(`CREATE TABLE IF NOT EXISTS __slow(seq INTEGER PRIMARY KEY, at INTEGER, ms INTEGER, plan TEXT, shards INTEGER, rows INTEGER, changes INTEGER, attempts INTEGER, error TEXT, sql TEXT)`);
+    return sql.exec(`SELECT at, ms, plan, shards, rows, changes, attempts, error, sql FROM __slow ORDER BY seq DESC LIMIT ?`, Math.max(1, Math.min(limit, SLOW_KEEP)))
+      .toArray().map((r) => ({ ...(r as unknown as SlowQuery), error: (r.error as string | null) ?? undefined }));
   }
   applyDdl(sql: string, initial: string[]) {
     this.core.setInitial(initial);
@@ -382,7 +437,7 @@ function hranaSocket(request: Request, env: Env): Response {
   const timer = setInterval(() => cluster.sweep(), SESSION_IDLE_MS);
   serveHranaSocket(server, {
     authorize: (jwt) => authorized(env, "data", jwt),
-    open: () => dbOn(cluster, 0),
+    open: () => dbOn(cluster, 0, slowSink(env)),
     onClose: () => {
       clearInterval(timer);
       cluster.close();
@@ -396,18 +451,29 @@ let cached: { at: number; catalog: Catalog } | null = null;
 
 const sharedIds = new Map<string, { next: number; end: number }>();
 
-export async function dbFor(env: Env, token: number): Promise<Db> {
-  return dbOn(clusterOf(env), token);
+export async function dbFor(env: Env, token: number, background?: (p: Promise<unknown>) => void): Promise<Db> {
+  return dbOn(clusterOf(env), token, slowSink(env, background));
 }
 
-async function dbOn(cluster: Cluster, token: number): Promise<Db> {
+async function dbOn(cluster: Cluster, token: number, onStatement?: (s: StatementStat) => void): Promise<Db> {
   if (!cached || Date.now() - cached.at > 2000) cached = { at: Date.now(), catalog: await cluster.catalog() };
   return new Db(cluster, {
-    token, catalog: cached.catalog, ids: sharedIds,
+    token, catalog: cached.catalog, ids: sharedIds, onStatement,
     onCatalog: (catalog) => {
       cached = { at: Date.now(), catalog };
     },
   });
+}
+
+/** シャード、範囲表、Autoscaler の履歴。 */
+export async function clusterStatus(env: Env, name = "shard", shards?: number) {
+  const cat = await clusterOf(env, shards, name).catalog();
+  return { routing: cat.routing, shards: shardsOf(cat.routing), scaler: await env.DINF_AUTOSCALER.getByName(name).status() };
+}
+
+/** 遅い文の記録を新しい順に返す。 */
+export async function slowQueries(env: Env, limit = 50, name = "shard"): Promise<SlowQuery[]> {
+  return env.DINF_META.getByName(name).slowQueries(limit);
 }
 
 interface AdminReq {
@@ -416,6 +482,7 @@ interface AdminReq {
   sql?: string;
   parent?: string;
   child?: string;
+  limit?: number;
 }
 
 async function admin(env: Env, path: string, b: AdminReq): Promise<unknown> {
@@ -437,10 +504,8 @@ async function admin(env: Env, path: string, b: AdminReq): Promise<unknown> {
       }
       return total;
     }
-    case "/admin/status": {
-      const cat = await cluster.catalog();
-      return { routing: cat.routing, shards: shardsOf(cat.routing), scaler: await scaler.status() };
-    }
+    case "/admin/slow": return slowQueries(env, b.limit ?? 50, name);
+    case "/admin/status": return clusterStatus(env, name, b.shards);
     default: throw new Error(`unknown admin path ${path}`);
   }
 }
@@ -462,8 +527,9 @@ export function authorized(env: Env, kind: "data" | "admin", token: string | nul
 }
 
 /** 本番の入口。計測用の入口は src/bench.ts が足す。 */
-export async function handle(request: Request, env: Env): Promise<Response> {
+export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Promise<unknown>): void }): Promise<Response> {
   const path = new URL(request.url).pathname;
+  const background = ctx ? (p: Promise<unknown>) => ctx.waitUntil(p) : undefined;
   // WebSocket は hello の jwt で認証する。ブラウザの WebSocket はヘッダを付けられないからである。
   if (request.headers.get("upgrade")?.toLowerCase() === "websocket") return hranaSocket(request, env);
   if (path.startsWith("/admin/")) {
@@ -477,7 +543,7 @@ export async function handle(request: Request, env: Env): Promise<Response> {
   if (!authorized(env, "data", bearer(request))) return new Response("unauthorized", { status: 401 });
   if (path === "/v3" || path === "/v2") return new Response(null, { status: 200 });
   if (path === "/v3/pipeline" || path === "/v2/pipeline") {
-    return Response.json(await handlePipeline((await request.json()) as PipelineReq, (token) => dbFor(env, token), batonSeal(env)));
+    return Response.json(await handlePipeline((await request.json()) as PipelineReq, (token) => dbFor(env, token, background), batonSeal(env)));
   }
   try {
     const body = (await request.json()) as Statement & { token?: number; statements?: Statement[] };
@@ -487,7 +553,7 @@ export async function handle(request: Request, env: Env): Promise<Response> {
       cached = null;
       return Response.json({ ok: true });
     }
-    const db = await dbFor(env, token);
+    const db = await dbFor(env, token, background);
     if (path === "/sql") {
       const r = await db.query(body.sql, body.params ?? []);
       return Response.json({ columns: r.columns, rows: r.rows, changes: r.changes, lastInsertRowid: r.lastInsertRowid, token: db.token });
