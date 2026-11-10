@@ -15,6 +15,8 @@ export interface Cluster {
   /** basedOn は呼び出し側が全シャードへ適用し終えた版。現在の版と違えば `schema moved` で断られる。 */
   applyDdl(sql: string, basedOn?: number): Promise<Catalog>;
   publishIndex(table: string, name: string, basedOn?: number): Promise<Catalog>;
+  /** index を埋める作業の途中経過を保存する (value あり) か、読む。無ければ、毎回先頭から埋める。 */
+  backfillProgress?(index: string, value?: string): Promise<string | null>;
   allocate(table: string, n: number, min?: number): Promise<number>;
   switchRange(move: { start: number; end: number; to: string; from?: string }): Promise<Routing>;
 }
@@ -925,12 +927,26 @@ export class Db {
         this.cached = cat;
         this.opts.onCatalog?.(cat);
         let moved = false;
-        for (const shard of shardsOf(cat.routing)) moved = (await this.backfillShard(def, ix, shard, cat)) || moved;
+        // 前回の要求が途中で終わっていれば、続きから埋める。範囲表が変わっていたら、行の置き場所が違うので先頭からやり直す。
+        const shards = shardsOf(cat.routing);
+        const saved = JSON.parse((await this.cluster.backfillProgress?.(ix.name)) ?? "null") as { routing: number; shard: string; after: Value[] | null } | null;
+        const from = saved && saved.routing === cat.routing.version ? Math.max(0, shards.indexOf(saved.shard)) : 0;
+        for (const [i, shard] of shards.entries()) {
+          if (i < from) continue;
+          const start = saved && i === from && shards[from] === saved.shard && saved.routing === cat.routing.version ? saved.after : null;
+          const save = (after: Value[] | null) =>
+            this.cluster.backfillProgress?.(ix.name, JSON.stringify({ routing: cat.routing.version, shard, after })).then(() => undefined);
+          moved = (await this.backfillShard(def, ix, shard, cat, start, save)) || moved;
+        }
         const after = await this.cluster.catalog();
         if (!moved && after.routing.version === cat.routing.version) break;
         if (round >= 20) throw new SqlError(`CREATE INDEX ${ix.name}: shards kept splitting during the backfill`);
       }
     } catch (e) {
+      // Worker の 1 回の呼び出しで使える要求の数を使い切った。index は消さず、途中経過を残す。同じ文を出し直せば続きから埋める。
+      if (/too many subrequests|subrequest/i.test((e as Error)?.message ?? "")) {
+        throw new SqlError(`CREATE INDEX ${ix.name} is not finished: this request ran out of subrequests. Run the same statement again to continue where it stopped.`);
+      }
       // 作りかけの index を消した表定義を、呼び出し側のキャッシュにも戻す。
       // 戻さないと、同じ isolate の次の要求が、消えた index を保守する計画を立てて失敗する。
       const { cat: without } = await this.record((basedOn) => this.cluster.applyDdl(`DROP INDEX IF EXISTS ${q(ix.name)}`, basedOn));
@@ -943,9 +959,12 @@ export class Db {
   }
 
   /** 1 シャードの行を主キーの順に少しずつ読み、index の項目を書く。途中で範囲が移ったら true を返す。 */
-  private async backfillShard(def: TableDef, ix: GlobalIndexDef, shard: string, cat: Catalog): Promise<boolean> {
+  private async backfillShard(
+    def: TableDef, ix: GlobalIndexDef, shard: string, cat: Catalog,
+    start: Value[] | null = null, save?: (after: Value[] | null) => Promise<void> | undefined,
+  ): Promise<boolean> {
     const pkCols = def.pk.map(q).join(", ");
-    let after: Value[] | null = null;
+    let after: Value[] | null = start;
     for (let attempt = 0; ; ) {
       let res: ExecRes;
       try {
@@ -971,6 +990,7 @@ export class Db {
         const keys = rows.map((row) => encodeKey(def, row));
         tx.assume(shard, keys.map((key) => ({ kind: "pk" as const, table: def.name, pk: key.pk, sk: key.sk })), res.T);
         const inBatch = new Map<string, string>();
+        const entries: { k: string; pk: string; sk: string }[] = [];
         for (const [i, row] of rows.entries()) {
           const vals = ix.columns.map((col) => fold(row[col] ?? null, def.collation[col]));
           if (vals.some((v) => v === null)) continue;
@@ -981,10 +1001,33 @@ export class Db {
             const prior = inBatch.get(k);
             if (prior !== undefined && prior !== key.pk) throw new SqlError(`UNIQUE constraint failed: ${def.name}.${ix.columns.join(", ")}`);
             inBatch.set(k, key.pk);
-            await tx.assertUnique(def, ix, k, key.pk);
           }
-          const seen = await tx.query(`SELECT "pk" FROM ${q(ix.table)} WHERE "k" = ? AND "pk" = ?`, [k, key.pk]);
-          if (seen.values.length === 0) tx.indexWrite(ix, { k, pk: key.pk, sk: key.sk }, false);
+          entries.push({ k, pk: key.pk, sk: key.sk });
+        }
+        // すでにある項目は、index のシャードごとに 1 回で読む。1 行ずつ読むと、行数だけ往復が要り、
+        // Worker の 1 回の呼び出しで使える要求の数を、数百行の表で使い切る。
+        const byShard = new Map<string, Set<string>>();
+        for (const e of entries) {
+          const owner = ownerOf(cat.routing, encode([e.k]));
+          byShard.set(owner, (byShard.get(owner) ?? new Set()).add(e.k));
+        }
+        const existing = new Map<string, Set<string>>();
+        for (const [owner, ks] of byShard) {
+          const list = [...ks];
+          const found = await tx.call(owner, {
+            sql: `SELECT "k", "pk" FROM ${q(ix.table)} WHERE "k" IN (${list.map(() => "?").join(", ")})`,
+            params: list,
+            // 読んだ k の項目が commit までに変われば競合になる。UNIQUE では、同じ値の項目が後から入るのを防ぐ。
+            spans: list.map((k) => ({ kind: "sk" as const, table: ix.table, sk: encode([k]) })),
+          });
+          for (const [k, pk] of found.values as [string, string][]) existing.set(k, (existing.get(k) ?? new Set()).add(pk));
+        }
+        for (const e of entries) {
+          const have = existing.get(e.k);
+          if (ix.unique && have && [...have].some((pk) => pk !== e.pk)) {
+            throw new SqlError(`UNIQUE constraint failed: ${def.name}.${ix.columns.join(", ")}`);
+          }
+          if (!have?.has(e.pk)) tx.indexWrite(ix, e, false);
         }
         await tx.commit();
       } catch (e) {
@@ -1001,6 +1044,7 @@ export class Db {
       attempt = 0;
       const last = rows[rows.length - 1]!;
       after = def.pk.map((col) => last[col] ?? null);
+      await save?.(after);
     }
   }
 
@@ -1236,8 +1280,21 @@ export class Db {
     }
     const src = await new ReadScope(this, cat).read(p.select);
     await this.ddl(`CREATE TABLE ${q(p.name)} (${src.columns.map(q).join(", ")})`);
-    for (const row of src.values) {
-      await this.query(`INSERT INTO ${q(p.name)} VALUES (${row.map(() => "?").join(", ")})`, row);
+    // 行はまとめて入れる。1 行ずつ入れると、行数だけ往復が要り、Worker の 1 回の呼び出しで使える要求の数を超える。
+    // 途中で失敗したら表ごと消す。SQLite でも、失敗した CREATE TABLE AS は表を残さない。
+    try {
+      const tuple = `(${src.columns.map(() => "?").join(", ")})`;
+      for (let at = 0; at < src.values.length; ) {
+        const batch: Value[][] = [];
+        for (let bytes = 0; at < src.values.length && batch.length < 200 && (batch.length === 0 || bytes < 100_000); at++) {
+          batch.push(src.values[at]!);
+          bytes += utf8Length(encode(src.values[at]!));
+        }
+        await this.query(`INSERT INTO ${q(p.name)} VALUES ${batch.map(() => tuple).join(", ")}`, batch.flat());
+      }
+    } catch (e) {
+      await this.ddl(`DROP TABLE IF EXISTS ${q(p.name)}`).catch(() => undefined);
+      throw e;
     }
     return new QueryResult([], []);
   }

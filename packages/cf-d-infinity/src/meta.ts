@@ -151,8 +151,24 @@ export class MetaCore {
     const cat = await this.catalog();
     if (basedOn !== undefined && basedOn !== cat.version) throw new SchemaMoved(cat.version);
     const parsed = parseDdl(sql, cat);
-    if (!parsed.noop) this.append(parsed, cat.version + 1);
+    if (!parsed.noop) {
+      this.append(parsed, cat.version + 1);
+      // 同じ名前の index を作り直したときに、前の index の途中経過から始めないようにする。
+      for (const n of [...Object.keys(parsed.indexes ?? {}), ...(parsed.dropIndexes ?? [])]) this.b.exec(`DELETE FROM __meta WHERE k = ?`, `bf:${n}`);
+    }
     return this.catalog();
+  }
+
+  /**
+   * index を既存の行で埋める作業が、どこまで進んだか。value を渡すと保存し、渡さなければ読む。
+   * 1 回の要求で埋めきれない大きさの表では、同じ CREATE INDEX を出し直して続きから埋める。
+   */
+  async backfillProgress(index: string, value?: string): Promise<string | null> {
+    if (value !== undefined) {
+      this.b.exec(`INSERT INTO __meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, `bf:${index}`, value);
+      return value;
+    }
+    return (this.b.exec(`SELECT v FROM __meta WHERE k = ?`, `bf:${index}`)[0]?.v as string | undefined) ?? null;
   }
 
   /**
@@ -192,6 +208,7 @@ export class MetaCore {
     const def = structuredClone(cat.tables[table]!);
     for (const g of def.globalIndexes) if (g.name === name) g.state = "public";
     this.append({ sql: [], defs: [def], drops: [], user: null }, cat.version + 1);
+    this.b.exec(`DELETE FROM __meta WHERE k = ?`, `bf:${name}`);
     return this.catalog();
   }
 

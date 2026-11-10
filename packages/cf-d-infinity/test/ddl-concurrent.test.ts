@@ -321,7 +321,7 @@ describe("known bugs, as deterministic interleavings", () => {
   /**
    * BUG-2。古い catalog の Worker も、遅延も要らない。backfill の読みと書きの間に 1 つ書き込みが入ればよい。
    * 台本: 同じシャードに行 A/1 (v = 7) と A2/1 (v = 8) がある。CREATE INDEX ix ON t(v) の backfill がそのシャードの表を読み終え、
-   *   index への最初の確認の読み (`SELECT "pk" FROM "__gidx_ix" WHERE "k" = ? AND "pk" = ?`) を送ったところで止める。
+   *   index への確認の読み (`SELECT "k", "pk" FROM "__gidx_ix" WHERE "k" IN (...)`) を送ったところで止める。
    *   別の Worker (最新の catalog、index は write-only) が A/1 を v = 9 に更新し、A2/1 を削除する。backfill を再開する。
    * 観測: __gidx_ix に (7 -> A/1) と (8 -> A2/1) が残る。表には v = 7 も v = 8 もない。
    * 原因: Db.backfill (db.ts:754-770) は表を exec で読み、その結果を後続の別の取引で index へ書く。
@@ -335,7 +335,7 @@ describe("known bugs, as deterministic interleavings", () => {
     const A2 = await tenantOn(c, "s0", 1);
     await db.query("INSERT INTO t VALUES (?, 1, 7, 0)", [A]);
     await db.query("INSERT INTO t VALUES (?, 1, 8, 0)", [A2]);
-    const h = hold(c, "gate", (m) => m.from === "client" && m.method === "exec" && /FROM "__gidx_ix" WHERE "k" = \? AND "pk" = \?/.test((m.req as { sql: string }).sql));
+    const h = hold(c, "gate", (m) => m.from === "client" && m.method === "exec" && /FROM "__gidx_ix" WHERE "k" IN \(/.test((m.req as { sql: string }).sql));
     const ddl = outcome(db.ddl(`CREATE ${unique ? "UNIQUE " : ""}INDEX ix ON t(v)`));
     await h.reached;
     const w = new Db(c);

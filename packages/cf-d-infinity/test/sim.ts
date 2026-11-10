@@ -220,6 +220,9 @@ export class SimCluster implements Cluster {
   publishIndex(table: string, name: string, basedOn?: number) {
     return this.meta.publishIndex(table, name, basedOn);
   }
+  backfillProgress(index: string, value?: string) {
+    return this.meta.backfillProgress(index, value);
+  }
   allocate(table: string, n: number, min?: number) {
     return this.meta.allocate(table, n, min);
   }

@@ -233,6 +233,9 @@ export class DinfMeta extends DurableObject<Env> {
   revokeDdl(version: number, reason: string) {
     return this.core.revokeDdl(version, reason);
   }
+  backfillProgress(index: string, value?: string) {
+    return this.core.backfillProgress(index, value);
+  }
   switchRange(move: { start: number; end: number; to: string; from?: string }) {
     return this.core.switchRange(move);
   }
@@ -421,6 +424,7 @@ export function clusterOf(env: Env, count?: number, prefix = "shard"): Cluster {
     applyDdl: (sql, basedOn) => meta.applyDdl(sql, initial, basedOn) as unknown as Promise<Catalog>,
     switchRange: (move) => meta.switchRange(move) as never,
     publishIndex: (table, name, basedOn) => meta.publishIndex(table, name, basedOn) as never,
+    backfillProgress: (index, value) => meta.backfillProgress(index, value),
     allocate: (table, n, min) => meta.allocate(table, n, min),
   };
 }
