@@ -157,6 +157,12 @@ export interface ExecRes {
   T: Ts;
   hlc: Ts;
   epoch: number;
+  /**
+   * 文が SQLite のエラーで失敗した (制約の違反など)。例外にせず、読んだ時刻と一緒に結果として返す。
+   * 失敗した文も、状態を読んでいる (「同じ主キーの行がある」など)。取引は、その読みも commit で検証しなければならない。
+   * 例外にすると、呼び出し側は読んだ時刻を知れず、読んだ範囲を記録できない。
+   */
+  error?: string;
 }
 
 export interface PrepareReq {

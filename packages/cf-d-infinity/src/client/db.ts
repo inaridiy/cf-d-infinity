@@ -73,6 +73,15 @@ const BACKFILL_RETRIES = 200;
 /** 表定義が古いと出る誤り。取り直すと解けることがある。 */
 const UNKNOWN_SCHEMA = /^(no such (table|column|index)|table \S+ has no column)/;
 
+/**
+ * 文が、制約の衝突を自分で解決する形か (OR IGNORE、OR REPLACE、REPLACE、ON CONFLICT)。
+ * シャードの中の衝突は SQLite が解決する。行が別のシャードにある衝突 (シャードをまたぐ UNIQUE、集めなかった行の主キー) は、
+ * ここでは解決できない。SQLite なら行を無視するか置き換える場面なので、UNIQUE 違反ではなく、対応していない文として断る。
+ */
+const resolvesConflicts = (sql: string): boolean => /^\s*(INSERT|UPDATE)\s+OR\s+|^\s*REPLACE\b|\bON\s+CONFLICT\b/i.test(sql);
+const UNRESOLVED = (what: string): string =>
+  `unsupported: this statement resolves conflicts itself (OR IGNORE, OR REPLACE or ON CONFLICT), but the conflicting row of ${what} is on another shard`;
+
 /** 文が読む表を SQLite に尋ねた結果。キーは DDL の履歴と文の文面。null はコンパイルできなかった文。 */
 const tablesSeen = new Map<string, string[]>();
 /** DDL の履歴を表す短いキー。版番号だけだと、同じ isolate の別のクラスタと混ざる。 */
@@ -147,6 +156,8 @@ class ReadScope {
     this.T ??= res.T;
     this.db.observe(res.hlc);
     this.record(shard, spans);
+    // 失敗した文も、読んだ範囲は記録してから失敗させる。
+    if (res.error !== undefined) throw new SqlError(res.error);
     return res;
   }
 
@@ -329,14 +340,51 @@ export class Txn extends ReadScope {
    */
   override async call(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "overlay">): Promise<ExecRes> {
     for (let attempt = 0; ; attempt++) {
+      // この要求が運ぶ T。応答を待っている間に、別の読みが T を進めることがある。
+      const sent = this.T;
+      let res: ExecRes | undefined;
+      let failure: unknown;
       try {
-        return await super.call(shard, req);
+        res = await super.call(shard, req);
       } catch (e) {
-        const moved = /moved at (\d+)/.exec((e as Error)?.message ?? "");
-        if (!moved || attempt >= 4 || this.T === undefined || !this.wantsFresh) throw e;
-        // T を進められなければ、スナップショットのまま読み続ける。書き込みがあれば commit の検証で競合になる。
-        if (!(await this.refreshTo(Number(moved[1])))) this.wantsFresh = false;
+        failure = e;
       }
+      // T を進める確認の最中に届いた応答は、その確認に入っていない。終わるのを待ってから、古い時点の読みかどうかを見る。
+      while (this.advancing) await this.advancing;
+      // 送った後で T が進んでいた。この応答は古い時点の状態で、進んだ T までの間に変わっていないことを誰も確かめていない。
+      // そのまま使うと、1 つの文の中で別々の時点の行が混ざる。いまの T で読み直す。失敗した文の「読み」も同じである。
+      const stale = sent !== undefined && this.T !== undefined && sent < this.T;
+      if (failure === undefined) {
+        if (!stale) return res!;
+        if (attempt >= 20) throw new ConflictError("the read timestamp kept moving while this statement was reading");
+        continue;
+      }
+      const moved = /moved at (\d+)/.exec((failure as Error)?.message ?? "");
+      if (moved && attempt < 4 && this.T !== undefined && this.wantsFresh) {
+        await this.advance(Number(moved[1]));
+        continue;
+      }
+      if (stale && attempt < 20 && !isRetryable(failure)) continue;
+      throw failure;
+    }
+  }
+
+  /** T を進める確認の最中なら、その完了。同時に 1 つだけ進める。 */
+  private advancing: Promise<void> | null = null;
+
+  /**
+   * T を to まで進める。進められなければ、スナップショットのまま読み続ける。書き込みがあれば commit の検証で競合になる。
+   * 確かめるのは、この時点までに記録した読みである。確認の最中に届く応答は、call が古い時点の読みとして読み直す。
+   */
+  private async advance(to: Ts): Promise<void> {
+    if (this.advancing) return this.advancing;
+    let done!: () => void;
+    this.advancing = new Promise<void>((r) => (done = r));
+    try {
+      if (this.T !== undefined && this.T < to && !(await this.refreshTo(to))) this.wantsFresh = false;
+    } finally {
+      this.advancing = null;
+      done();
     }
   }
 
@@ -441,6 +489,7 @@ export class Txn extends ReadScope {
     this.T ??= res.T;
     this.db.observe(res.hlc);
     this.record(shard, spans.map((s) => ({ ...s, since: res.F })));
+    if (res.error !== undefined) throw new SqlError(res.error);
     return res;
   }
 
@@ -489,7 +538,7 @@ export class Txn extends ReadScope {
       out.values.push(...res.values);
       changes += res.changes.length;
       for (const c of res.changes) this.buffer(target.shard, c);
-      await this.indexChanges(res.changes);
+      await this.indexChanges(res.changes, resolvesConflicts(t.sql));
     };
     const jobs: { t: WriteTarget; target: Target }[] = [];
     for (const t of p.targets) for (const target of await this.resolve(t.route)) jobs.push({ t, target });
@@ -525,14 +574,15 @@ export class Txn extends ReadScope {
       const r = w.raw(p.sql, ...p.params);
       const last = w.raw(`SELECT last_insert_rowid()`).values[0]?.[0] as number;
       const changes = capturedChanges(w, catalog);
+      const soft = resolvesConflicts(p.sql);
       for (const c of changes) {
-        if (c.before === null) await this.assertAbsent(catalog(c.table), c);
+        if (c.before === null) await this.assertAbsent(catalog(c.table), c, soft);
         this.buffer(ownerOf(this.cat.routing, c.sk), c);
         const def = catalog(c.table);
         const id = def.rowidAlias ? c.after?.[def.rowidAlias] : def.implicitRowid ? c.after?.rowid : undefined;
         if (typeof id === "number") this.db.planContext(this.cat).sawId(def.name, id);
       }
-      await this.indexChanges(changes);
+      await this.indexChanges(changes, soft);
       const target = changes.filter((c) => c.table === p.tables[0]?.name).length;
       return new QueryResult(r.columns, r.values, target, last || null);
     } finally {
@@ -570,7 +620,7 @@ export class Txn extends ReadScope {
   }
 
   /** グローバル index を同じ取引の参加者として更新する。 */
-  private async indexChanges(changes: Change[]): Promise<void> {
+  private async indexChanges(changes: Change[], soft = false): Promise<void> {
     for (const c of changes) {
       const def = this.cat.tables[c.table];
       for (const ix of def?.globalIndexes ?? []) {
@@ -584,7 +634,7 @@ export class Txn extends ReadScope {
         if (oldK === newK) continue;
         if (oldK !== null) this.indexWrite(ix, { k: oldK, pk: c.pk, sk: c.sk }, true);
         if (newK !== null) {
-          if (ix.unique) await this.assertUnique(def!, ix, newK, c.pk);
+          if (ix.unique) await this.assertUnique(def!, ix, newK, c.pk, soft);
           this.indexWrite(ix, { k: newK, pk: c.pk, sk: c.sk }, false);
         }
       }
@@ -592,24 +642,24 @@ export class Txn extends ReadScope {
   }
 
   /** 新しい主キーが既存の行と衝突しないかを確かめる。押し下げで集めなかった行とは Worker の SQLite では比べられない。 */
-  private async assertAbsent(def: TableDef, c: Change): Promise<void> {
+  private async assertAbsent(def: TableDef, c: Change, soft = false): Promise<void> {
     const where = def.pk.map((k) => `${q(k)} IS ?`).join(" AND ");
     const res = await this.call(ownerOf(this.cat.routing, c.sk), {
       sql: `SELECT 1 FROM ${q(def.name)} WHERE ${where}`, params: decode<Value[]>(c.pk),
       spans: [rowSpan(def.name, c.pk, c.sk)],
     });
-    if (res.values.length) throw new SqlError(`UNIQUE constraint failed: ${def.name}.${def.pk.join(", ")}`);
+    if (res.values.length) throw new SqlError(soft ? UNRESOLVED(`the primary key of ${def.name}`) : `UNIQUE constraint failed: ${def.name}.${def.pk.join(", ")}`);
   }
 
   /** SQLite と同じく文の時点で検査する。commit の検証だけだと、文が成功した後で COMMIT が失敗する。 */
-  async assertUnique(def: TableDef, ix: GlobalIndexDef, k: string, pk: string): Promise<void> {
+  async assertUnique(def: TableDef, ix: GlobalIndexDef, k: string, pk: string, soft = false): Promise<void> {
     const sk = encode([k]);
     const res = await this.call(ownerOf(this.cat.routing, sk), {
       sql: `SELECT "pk" FROM ${q(ix.table)} WHERE "k" = ?`, params: [k],
       spans: [rowSpan(ix.table, encode([k]), sk)],
     });
     if (res.values.some((r) => r[0] !== pk)) {
-      throw new SqlError(`UNIQUE constraint failed: ${def.name}.${ix.columns.join(", ")}`);
+      throw new SqlError(soft ? UNRESOLVED(`UNIQUE (${ix.columns.join(", ")}) of ${def.name}`) : `UNIQUE constraint failed: ${def.name}.${ix.columns.join(", ")}`);
     }
   }
 
@@ -927,6 +977,7 @@ export class Db {
         sql: `SELECT 1 x FROM ${q(def.name)} GROUP BY ${list} HAVING count(*) > 1 LIMIT 1`,
         params: [], spans: withSlots(cat.routing, shard, [tableSpan(def.name)]), schema: cat.version,
       });
+      if (res.error !== undefined) throw new SqlError(res.error);
       if (res.values.length) throw new SqlError(`UNIQUE constraint failed: ${def.name} has duplicate values`);
     }
   }
@@ -995,6 +1046,7 @@ export class Db {
         }
         throw e;
       }
+      if (res.error !== undefined) throw new SqlError(res.error);
       const rows = new QueryResult(res.columns, res.values).rows;
       if (rows.length === 0) return false;
       const tx = new Txn(this, cat, this.nextTxnId());
@@ -1189,7 +1241,14 @@ export class Db {
         const p = await planStatement(fresh, params, cat, this.current ? this.current.planContext() : this.planContext(cat));
         info.plan = p.kind;
         // 計画の途中で表を読む文は、読みと書き込みを 1 つの取引にする。
-        if (p.kind === "inTxn") return await this.transaction((tx) => tx.statement(parseStatements(source)[0], params));
+        if (p.kind === "inTxn") {
+          let at: (() => Ts | undefined) | undefined;
+          const r = await this.transaction(async (tx) => {
+            at = () => tx.commitTs ?? tx.T;
+            return tx.statement(parseStatements(source)[0], params);
+          });
+          return new QueryResult(r.columns, r.values, r.changes, r.lastInsertRowid, r.ts ?? at?.());
+        }
         return await this.dispatch(p, cat);
       } catch (e) {
         for (const [k, v] of saved) if (this.ids.get(k)?.end === v.end) this.ids.get(k)!.next = v.next;
@@ -1237,7 +1296,14 @@ export class Db {
     const fast = p.kind === "write" && p.targets.length === 1 && p.def.globalIndexes.length === 0
       && t!.route.by === "sk" && t!.route.sks.length === 1;
     if (fast) return this.autoWrite(p, t!, cat);
-    return this.transaction((tx) => tx.execute(p));
+    // 取引として実行した autocommit の文にも、確定の時刻を付けて返す。読みだけなら、読んだ時刻である。
+    let at: (() => Ts | undefined) | undefined;
+    const r = await this.transaction(async (tx) => {
+      const out = await tx.execute(p);
+      at = () => tx.commitTs ?? tx.T;
+      return out;
+    });
+    return new QueryResult(r.columns, r.values, r.changes, r.lastInsertRowid, r.ts ?? at?.());
   }
 
   private async control(p: Extract<Plan, { kind: "tcl" }>): Promise<QueryResult> {

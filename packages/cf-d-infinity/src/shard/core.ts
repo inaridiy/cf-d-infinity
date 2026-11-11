@@ -1023,10 +1023,17 @@ export class ShardCore implements ShardApi {
         this.count("writes", req.spans);
         this.renew(me.txn);
         const overlay = (req.overlay ?? []).map((c) => ({ table: c.table, pk: c.pk, image: c.after }));
-        const out = this.rollback(() => {
-          if (overlay.length) setBasedRestore(this.b, (t) => this.def(t), overlay);
-          return this.run(req);
-        });
+        let out: { columns: string[]; values: Value[][]; changes: Change[] };
+        try {
+          out = this.rollback(() => {
+            if (overlay.length) setBasedRestore(this.b, (t) => this.def(t), overlay);
+            return this.run(req);
+          });
+        } catch (e) {
+          if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner) throw e;
+          // 文は F の状態を読んだうえで失敗した。読んだ時刻を付けて返し、呼び出し側に範囲を記録させる (ExecRes.error)。
+          return { columns: [], values: [], changes: [], error: asSqlError(e).message, F, T: req.T ?? F, hlc: this.hlc.value, epoch: this.epoch };
+        }
         const rows = [...out.changes, ...(req.lockRows ?? [])] as Pick<Change, "table" | "pk">[];
         const blocked = this.blockedBy(rows, me);
         if (!blocked) {
@@ -1327,7 +1334,8 @@ export class ShardCore implements ShardApi {
       return { ...out, T, hlc: this.hlc.value, epoch: this.epoch };
     } catch (e) {
       if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner) throw e;
-      throw asSqlError(e);
+      // 文は T の状態を読んだうえで失敗した。読んだ時刻を付けて返し、呼び出し側に範囲を記録させる。
+      return { columns: [], values: [], changes: [], error: asSqlError(e).message, T, hlc: this.hlc.value, epoch: this.epoch };
     }
   }
 
