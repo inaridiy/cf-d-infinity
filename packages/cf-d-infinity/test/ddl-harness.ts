@@ -98,7 +98,7 @@ export async function indexAgreement(c: SimCluster, table = "acct", name = INDEX
   const cat = await c.catalog();
   const ix = cat.tables[table]?.globalIndexes.find((g) => g.name === name);
   const gidx = `__gidx_${name}`;
-  const out: IndexReport = { state: ix?.state ?? null, unique: ix?.unique === true, missing: [], dangling: [], wrongRead: [], leftover: [] };
+  const out: IndexReport = { state: ix?.state ?? null, unique: ix !== undefined, missing: [], dangling: [], wrongRead: [], leftover: [] };
   if (!ix) {
     for (const shard of shardsOf(cat.routing)) {
       const b = c.backends.get(shard)!;

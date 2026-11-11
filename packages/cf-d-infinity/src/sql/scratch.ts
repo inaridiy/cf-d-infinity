@@ -130,15 +130,13 @@ export class ScratchDb implements Backend {
   }
 
   /** 行をまとめて投入する。1 回の取引で流すと 10 万行で 100 ms 前後である。 */
-  load(table: string, columns: string[], rows: Value[][], generated: string[] = []): void {
+  load(table: string, columns: string[], rows: Value[][]): void {
     if (rows.length === 0) return;
-    // 生成列は入れない。ここの表も利用者の DDL で作ってあるので、SQLite が同じ式で計算する。
-    const keep = columns.map((c, i) => (generated.includes(c) ? -1 : i)).filter((i) => i >= 0);
-    const list = keep.map((i) => `"${columns[i]!.replaceAll('"', '""')}"`).join(", ");
-    const st = this.db.prepare(`INSERT INTO "${table}" (${list}) VALUES (${keep.map(() => "?").join(", ")})`);
+    const list = columns.map((c) => `"${c.replaceAll('"', '""')}"`).join(", ");
+    const st = this.db.prepare(`INSERT INTO "${table}" (${list}) VALUES (${columns.map(() => "?").join(", ")})`);
     this.db.run("BEGIN");
     try {
-      for (const r of rows) st.run((keep.length === columns.length ? r : keep.map((i) => r[i]!)) as never);
+      for (const r of rows) st.run(r as never);
       this.db.run("COMMIT");
     } catch (e) {
       // 集めた行が表の制約に反した (同じ UNIQUE の値の行が 2 つあるなど)。文のエラーと同じ型で返す。

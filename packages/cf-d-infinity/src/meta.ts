@@ -1,5 +1,5 @@
 import { SqlError, checkStorageFormat, type Backend, type TableDef } from "./types";
-import { parseDdl, type IndexInfo, type ParsedDdl, type SchemaView, type TriggerInfo } from "./sql/ddl";
+import { parseDdl, type IndexInfo, type ParsedDdl, type SchemaView } from "./sql/ddl";
 import { CAPTURE_TABLES } from "./shard/rows";
 import { applyMove, initialRouting, type Routing } from "./routing";
 
@@ -24,7 +24,6 @@ export interface Catalog {
   tables: Record<string, TableDef>;
   views: Record<string, string>;
   indexes: Record<string, IndexInfo>;
-  triggers: Record<string, TriggerInfo>;
   /** Worker の SQLite で再生する DDL の履歴。sqlite_master と PRAGMA はこれから答える。 */
   ddl: string[];
   routing: Routing;
@@ -103,7 +102,7 @@ export class MetaCore {
   }
 
   async catalog(): Promise<Catalog> {
-    const cat: Catalog = { version: 0, tables: {}, views: {}, indexes: {}, triggers: {}, ddl: [], routing: this.routing() };
+    const cat: Catalog = { version: 0, tables: {}, views: {}, indexes: {}, ddl: [], routing: this.routing() };
     const all = this.entries();
     const reverted = new Set(all.flatMap((e) => (e.reverts === undefined ? [] : [e.reverts, e.version])));
     for (const e of all) {
@@ -114,8 +113,6 @@ export class MetaCore {
       for (const n of e.dropViews ?? []) delete cat.views[n];
       Object.assign(cat.indexes, e.indexes);
       for (const n of e.dropIndexes ?? []) delete cat.indexes[n];
-      Object.assign(cat.triggers, e.triggers);
-      for (const n of e.dropTriggers ?? []) delete cat.triggers[n];
       // 取り消された文と取り消す文は、Worker の SQLite で再生しない。
       if (e.user && !reverted.has(e.version)) cat.ddl.push(e.user);
     }
@@ -167,7 +164,7 @@ export class MetaCore {
     if (done) return done.version;
     const e = all.at(-1);
     if (!e || e.version !== version || !e.undo || e.reverts !== undefined) return null;
-    const before: SchemaView = { tables: {}, views: {}, indexes: {}, triggers: {} };
+    const before: SchemaView = { tables: {}, views: {}, indexes: {} };
     for (const x of all.slice(0, -1)) {
       for (const d of x.defs) before.tables[d.name] = d;
       for (const n of x.drops) delete before.tables[n];

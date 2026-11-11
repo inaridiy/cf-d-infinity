@@ -2,7 +2,7 @@
 // 1 シャードに収まる文はそのシャードの SQLite へ、それ以外は行を集めて Worker の SQLite へ渡す。
 import type { Catalog } from "../meta";
 import { ownerOf } from "../routing";
-import { encode, fold, q, selectList } from "../shard/rows";
+import { encode, q, selectList } from "../shard/rows";
 import type { GlobalIndexDef, TableDef, Value, WritePlan } from "../types";
 import { SqlError } from "../types";
 import { bindParams, constant, ident, normalize, render, text, walk, type Node, type Params } from "./cst";
@@ -64,7 +64,6 @@ export type Plan =
   | { kind: "wasmWrite"; scans: Scan[]; sql: string; params: Value[]; tables: TableDef[]; lastRowid?: number | null }
   | { kind: "insertSelect"; def: TableDef; select: Plan; head: string; columns: string[] | null; tail: string; tailParams: Value[] }
   | { kind: "ddl"; sql: string }
-  | { kind: "ctas"; name: string; select: Plan; ifNotExists: boolean }
   | { kind: "noop" }
   /** 文を 1 つの取引の中で計画し直す。計画の途中で表を読む必要があるときに返す。 */
   | { kind: "inTxn" }
@@ -322,13 +321,13 @@ function equalities(conj: Node[], ref: Ref, col: string, s: Scope, values: Value
 
 function pinsOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string[] | null {
   const def = ref.def;
-  if (!def?.skPinnable) return null;
+  if (!def) return null;
   let keys: Value[][] = [[]];
   for (const [i, col] of def.shardKey.entries()) {
     const vs = equalities(conj, ref, col, s, values);
     if (!vs) return null;
     if (vs.some((v) => v === null)) return null; // NULL との等値は常に偽だが、経路にはしない
-    const norm = vs.map((v) => fold(normalize(v, def.skAffinity[i]!), def.collation[col]));
+    const norm = vs.map((v) => normalize(v, def.skAffinity[i]!));
     keys = keys.flatMap((k) => norm.map((v) => [...k, v]));
   }
   return keys.map((k) => encode(k));
@@ -341,7 +340,7 @@ function pkOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string | null 
     const vs = equalities(conj, ref, col, s, values);
     if (vs?.length !== 1) return null;
     // 行の同一性はシャードと同じ規則で作る (rows.ts の encodeKey)。照合順序のある列は値を揃える。
-    vals.push(fold(normalize(vs[0]!, def.affinity[col] ?? "INTEGER"), def.collation[col]));
+    vals.push(normalize(vs[0]!, def.affinity[col] ?? "INTEGER"));
   }
   return encode(vals);
 }
@@ -730,34 +729,11 @@ function planRead(stmt: Node, values: Value[], cat: Catalog, reference?: Referen
 
 const MAX_PARAMS = 100; // DO の SQL API の上限
 
-/**
- * trigger のある表への書き込みは Worker の SQLite で実行する。本体が他の表を読み書きするので、
- * 1 シャードでは発火できないからである。関係する表を全部集めるので、大きな表では行の上限に当たる。
- */
-function triggerWrite(stmt: Node, def: TableDef, values: Value[], cat: Catalog): Plan | null {
-  const seen = new Set<string>();
-  const visit = (name: string): void => {
-    const d = findTable(cat, name);
-    if (!d || seen.has(d.name)) return;
-    seen.add(d.name);
-    for (const t of Object.values(cat.triggers)) if (same(t.table, d.name)) t.tables.forEach(visit);
-  };
-  if (!Object.values(cat.triggers).some((t) => same(t.table, def.name))) return null;
-  visit(def.name);
-  const n: Names = { cat, ctes: new Set(), meta: { used: false }, views: new Set() };
-  for (const s of scopesOf(stmt, n)) for (const r of s.refs) if (r.def) visit(r.def.name);
-  const tables = [...seen].map((t) => findTable(cat, t)!);
-  const ordered = [def, ...tables.filter((t) => t !== def)];
-  return { kind: "wasmWrite", scans: ordered.map((d) => scanOf(null, null, d, values)), ...render(stmt, values), tables: ordered };
-}
-
 async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanContext): Promise<Plan> {
   const head = clause(stmt, "insert_clause");
   const name = ident(head.table.type === "alias" ? head.table.expr : head.table);
   const def = findTable(cat, name);
   if (!def) throw new SqlError(`no such table: ${name}`);
-  const fired = triggerWrite(stmt, def, values, cat);
-  if (fired) return fired;
   const keyword = head.insertKw.name === "REPLACE" ? "REPLACE" : head.orAction ? `INSERT OR ${head.orAction.actionKw.name}` : "INSERT";
   const prefix = `${keyword} INTO ${q(def.name)}`;
   const tailClauses = (stmt.clauses as Node[]).filter((c) => c.type === "upsert_clause" || c.type === "returning_clause");
@@ -851,12 +827,12 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
     const skVals: Value[] = [];
     for (const [k, at] of skAt.entries()) {
       const v = at < 0 ? null : await parts[at]!.value();
-      skVals.push(fold(normalize(v, def.skAffinity[k]!), def.collation[def.shardKey[k]!]));
+      skVals.push(normalize(v, def.skAffinity[k]!));
     }
     const pkVals: Value[] = [];
     for (const c of def.pk) {
       const at = outCols.findIndex((n2) => same(n2, c) || (c === "rowid" && ROWID_NAMES.has(lower(n2))));
-      pkVals.push(at < 0 ? null : fold(normalize(await parts[at]!.value(), def.affinity[c] ?? "INTEGER"), def.collation[c]));
+      pkVals.push(at < 0 ? null : normalize(await parts[at]!.value(), def.affinity[c] ?? "INTEGER"));
     }
     if (auto) {
       const v = id ?? given[i];
@@ -934,8 +910,6 @@ function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog, reference?:
   const ref = top.refs[0];
   const def = ref?.def;
   if (!ref || !def) throw new SqlError("cannot modify a view");
-  const fired = triggerWrite(stmt, def, values, cat);
-  if (fired) return fired;
   const { sql, params } = render(stmt, values);
   const set = clause(stmt, "set_clause");
   const assigned: string[] = (set?.assignments?.items ?? []).flatMap((a: Node) =>

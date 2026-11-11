@@ -19,23 +19,15 @@ export const pkValues = (pkJson: string) => decode<Value[]>(pkJson);
 /** PRIMARY KEY のない表は rowid も行イメージに含める。行の所在を決める値だからである。 */
 export const selectList = (def: TableDef) => (def.implicitRowid ? "rowid, *" : "*");
 
-/** 照合順序で等しい値を同じ値に揃える。'Abc' と 'ABC' が別のシャードへ行くと一意性が破れる。 */
-export function fold(v: Value, collation: string | undefined): Value {
-  if (typeof v !== "string" || !collation) return v;
-  if (collation === "NOCASE") return v.replace(/[A-Z]/g, (c) => c.toLowerCase());
-  if (collation === "RTRIM") return v.replace(/ +$/, "");
-  return v;
-}
-
 /**
- * 行の同一性を表す文字列を作る。主キーも shard key も、照合順序で等しい値は同じ文字列にする。
- * 揃えないと、'abc' と 'ABC' が SQLite では同じ行なのに、intent、ロック、検証では別の行として扱われる。
- * 揃えた値で行を引いても、列の照合順序で比べるので当たる。
+ * 行の同一性を表す文字列を作る。主キーと shard key の値を、そのまま並べたものである。
+ * 主キー、shard key、シャードをまたぐ UNIQUE の列には、BINARY 以外の照合順序を付けられない (sql/ddl.ts が断る)。
+ * だから、値が等しいことと、この文字列が等しいことは同じである。
  */
 export function encodeKey(def: TableDef, row: Row): { pk: string; sk: string } {
   return {
-    pk: encode(def.pk.map((c) => fold(row[c] ?? null, def.collation[c]))),
-    sk: encode(def.shardKey.map((c) => fold(row[c] ?? null, def.collation[c]))),
+    pk: encode(def.pk.map((c) => row[c] ?? null)),
+    sk: encode(def.shardKey.map((c) => row[c] ?? null)),
   };
 }
 
@@ -66,12 +58,8 @@ export function selectRow(b: Backend, def: TableDef, pk: string): Row | null {
   return b.exec(`SELECT ${selectList(def)} FROM ${q(def.name)} WHERE ${pkWhere(def)}`, ...pkValues(pk))[0] ?? null;
 }
 
-/** 行イメージのうち、書き込める列。生成列は SQLite が計算するので、値を指定すると拒否される。 */
-export const writable = (def: Pick<TableDef, "generated">, cols: string[]): string[] =>
-  def.generated?.length ? cols.filter((c) => !def.generated!.includes(c)) : cols;
-
 export function insertRow(b: Backend, def: TableDef, row: Row): void {
-  const cols = writable(def, Object.keys(row));
+  const cols = Object.keys(row);
   b.exec(
     `INSERT INTO ${q(def.name)} (${cols.map(q).join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`,
     ...cols.map((c) => row[c] ?? null),
@@ -83,7 +71,7 @@ export function deleteRow(b: Backend, def: TableDef, pk: string): void {
 }
 
 function updateRow(b: Backend, def: TableDef, pk: string, row: Row): void {
-  const cols = writable(def, Object.keys(row)).filter((c) => !def.pk.includes(c));
+  const cols = Object.keys(row).filter((c) => !def.pk.includes(c));
   if (cols.length === 0) return;
   b.exec(
     `UPDATE ${q(def.name)} SET ${cols.map((c) => `${q(c)} = ?`).join(", ")} WHERE ${pkWhere(def)}`,

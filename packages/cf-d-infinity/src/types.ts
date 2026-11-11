@@ -3,12 +3,12 @@ export type Ts = number;
 export type Value = string | number | null | Uint8Array;
 export type Row = Record<string, Value>;
 
+/** シャードをまたぐ UNIQUE を守る index。一意でない index は、各シャードのローカル index になるので、ここには入らない。 */
 export interface GlobalIndexDef {
   name: string;
   table: string; // 内部表 __gidx_<name>
   columns: string[];
-  unique: boolean;
-  /** writeOnly の間は書き込みだけが更新する。backfill が終わると public になり検索に使える。 */
+  /** writeOnly の間は、書き込みが項目を足すだけである。既存の行の項目を埋め終えると public になる。 */
   state: "writeOnly" | "public";
 }
 
@@ -24,8 +24,6 @@ export interface TableDef {
   rowidAlias: string | null;
   /** shard key の列の型親和性。同じ値が同じシャードへ行くように経路の計算で値を揃える。 */
   skAffinity: Affinity[];
-  /** shard key に照合順序があると、等値でも値が一致しないので経路を固定できない。 */
-  skPinnable: boolean;
   /** 列の型親和性。 */
   affinity: Record<string, Affinity>;
   /** 照合順序を宣言した列。 */
@@ -44,8 +42,6 @@ export interface TableDef {
    * この項目のない古い表定義では、省いた列の値は分からないものとして扱う。
    */
   defaults?: string[];
-  /** 生成列。値は SQLite が計算するので、行イメージを書き戻すときは除く。 */
-  generated?: string[];
   globalIndexes: GlobalIndexDef[];
 }
 

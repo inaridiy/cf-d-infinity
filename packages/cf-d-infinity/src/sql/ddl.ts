@@ -1,25 +1,17 @@
 import type { Affinity, GlobalIndexDef, TableDef } from "../types";
 import { SqlError } from "../types";
 import { captureDdl, dropCaptureDdl, q } from "../shard/rows";
-import { affinityOf, ident, parseStatements, text, walk, type Node } from "./cst";
+import { affinityOf, ident, parseStatements, text, type Node } from "./cst";
 
 export interface IndexInfo {
   table: string;
   global: boolean;
 }
 
-export interface TriggerInfo {
-  table: string;
-  sql: string;
-  /** 本体が読み書きする表。 */
-  tables: string[];
-}
-
 export interface SchemaView {
   tables: Record<string, TableDef>;
   views: Record<string, string>;
   indexes: Record<string, IndexInfo>;
-  triggers: Record<string, TriggerInfo>;
 }
 
 export interface ParsedDdl {
@@ -33,8 +25,6 @@ export interface ParsedDdl {
   dropViews?: string[];
   indexes?: Record<string, IndexInfo>;
   dropIndexes?: string[];
-  triggers?: Record<string, TriggerInfo>;
-  dropTriggers?: string[];
   /** IF NOT EXISTS などで何もしない。 */
   noop?: boolean;
   /**
@@ -86,13 +76,14 @@ function assertFree(schema: SchemaView, name: string): void {
 
 const NOOP: ParsedDdl = { sql: [], defs: [], drops: [], user: null, noop: true };
 
-export function globalIndexTable(ix: Pick<GlobalIndexDef, "name" | "unique">): { def: TableDef; sql: string } {
+export function globalIndexTable(ix: Pick<GlobalIndexDef, "name">): { def: TableDef; sql: string } {
   const table = `__gidx_${ix.name}`;
-  const pk = ix.unique ? ["k"] : ["k", "pk"];
+  // 1 つの値に 1 つの項目。主キーが、同じ値の 2 つ目の項目を断る。
+  const pk = ["k"];
   return {
     def: {
       name: table, columns: ["k", "pk", "sk"], pk, shardKey: ["k"], uniques: [], globalIndexes: [],
-      implicitRowid: false, rowidAlias: null, skAffinity: ["TEXT"], skPinnable: true,
+      implicitRowid: false, rowidAlias: null, skAffinity: ["TEXT"],
       affinity: { k: "TEXT", pk: "TEXT", sk: "TEXT" }, collated: [], collation: {},
     },
     sql: `CREATE TABLE ${q(table)} ("k" TEXT NOT NULL, "pk" TEXT NOT NULL, "sk" TEXT NOT NULL, PRIMARY KEY (${pk.map(q).join(", ")}))`,
@@ -127,7 +118,6 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
   const types = new Map<string, string | null>();
   const collated = new Set<string>();
   const collation: Record<string, string> = {};
-  const generated: string[] = [];
   const defaults: string[] = [];
   let pk: string[] = [];
   const uniqueSets: string[][] = [];
@@ -196,19 +186,17 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
   const def: TableDef = {
     name, columns, pk, shardKey: sk, uniques: [], globalIndexes: [], implicitRowid, rowidAlias,
     skAffinity: sk.map((c): Affinity => (c === "rowid" ? "INTEGER" : affinityOf(types.get(c) ?? null))),
-    skPinnable: sk.every((c) => !collated.has(c) || ["NOCASE", "RTRIM", "BINARY"].includes(collation[c]!)),
     affinity: Object.fromEntries(columns.map((c) => [c, affinityOf(types.get(c) ?? null)])),
     collated: [...collated],
     collation,
     defaults,
-    ...(generated.length ? { generated } : {}),
   };
   const sql = [text(stmt), ...captureDdl(def)];
   const defs: TableDef[] = [];
   const indexes: Record<string, IndexInfo> = {};
   uniqueSets.forEach((cols, i) => {
     if (isGlobal(cols)) {
-      const ix: GlobalIndexDef = { name: `${name}_${i}_key`, table: `__gidx_${name}_${i}_key`, columns: cols, unique: true, state: "public" };
+      const ix: GlobalIndexDef = { name: `${name}_${i}_key`, table: `__gidx_${name}_${i}_key`, columns: cols, state: "public" };
       const t = globalIndexTable(ix);
       def.globalIndexes.push(ix);
       sql.push(t.sql, rowIndexSql(ix, name));
@@ -225,7 +213,7 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
     // 既存の行で埋めている途中の index は、まだ作り終えていない。同じ文の出し直しは、続きを埋める指示として受ける。
     const half = schema.tables[schema.indexes[name]!.table]?.globalIndexes.find((g) => g.name === name && g.state === "writeOnly");
     // 出し直しとして受けるのは、列と UNIQUE の指定が同じ文だけである。違う文を「続き」にすると、頼んだのと違う index ができる。
-    const sameShape = half && half.unique === (stmt.indexTypeKw?.name === "UNIQUE")
+    const sameShape = half && stmt.indexTypeKw?.name === "UNIQUE"
       && stmt.columns.expr.items.every((s: Node) => s.expr.type === "identifier")
       && JSON.stringify(stmt.columns.expr.items.map((s: Node) => ident(s.expr))) === JSON.stringify(half.columns);
     if (stmt.ifNotExistsKw || (sameShape && schema.indexes[name]!.table === table)) return NOOP;
@@ -257,50 +245,14 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
   }
   const collatedCol = unique ? cols.find((c) => (def.collation[c] ?? "BINARY") !== "BINARY") : undefined;
   if (collatedCol) unsupported(`COLLATE ${def.collation[collatedCol]} on column ${collatedCol} of a UNIQUE index that does not include the shard key`);
-  const ix: GlobalIndexDef = { name, table: `__gidx_${name}`, columns: cols, unique, state: "writeOnly" };
+  const ix: GlobalIndexDef = { name, table: `__gidx_${name}`, columns: cols, state: "writeOnly" };
   const t = globalIndexTable(ix);
   def.globalIndexes.push(ix);
   return { sql: [t.sql, rowIndexSql(ix, table)], defs: [def, t.def], drops: [], user: source, indexes: { [name]: { table, global: true } } };
 }
 
-function triggerTables(stmt: Node): string[] {
-  const out = new Set<string>();
-  const add = (e: Node): void => {
-    if (!e) return;
-    if (e.type === "identifier") out.add(ident(e));
-    else if (e.type === "member_expr") out.add(ident(e.property));
-    else if (e.type === "alias") add(e.expr);
-    else if (e.type === "join_expr") {
-      add(e.left);
-      add(e.right);
-    } else if (e.type === "paren_expr" && e.expr?.type === "join_expr") add(e.expr);
-  };
-  walk(stmt.body, (x) => {
-    if (x.type === "insert_clause") add(x.table);
-    if (x.type === "update_clause" || x.type === "delete_clause") x.tables.items.forEach(add);
-    if (x.type === "from_clause") add(x.expr);
-  });
-  return [...out];
-}
-
-function createTrigger(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
-  // trigger のある表への書き込みは、行を Worker に集めて Worker の SQLite で発火させる、別の実行経路を通る。
-  // その経路の読みと検証を確かめきるまで、trigger は受け付けない。
-  unsupported("CREATE TRIGGER");
-  const name = userName(ident(stmt.name), "trigger");
-  if (schema.triggers[name]) {
-    if (stmt.ifNotExistsKw) return NOOP;
-    throw new SqlError(`trigger ${name} already exists`);
-  }
-  const t = stmt.target.table;
-  const table = ident(t.type === "member_expr" ? t.property : t);
-  if (!existingTable(schema, table) && !schema.views[table]) throw new SqlError(`no such table: main.${table}`);
-  // シャードには作らない。trigger のある表への書き込みは Worker の SQLite で実行し、そこで発火させる。
-  return { sql: [], defs: [], drops: [], user: null, triggers: { [name]: { table, sql: source, tables: triggerTables(stmt) } } };
-}
-
 function dropTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
-  const out: ParsedDdl = { sql: [], defs: [], drops: [], user: source, dropIndexes: [], dropTriggers: [] };
+  const out: ParsedDdl = { sql: [], defs: [], drops: [], user: source, dropIndexes: [] };
   for (const t of stmt.tables.items) {
     const name = ident(t.type === "member_expr" ? t.property : t);
     const def = existingTable(schema, name);
@@ -315,7 +267,6 @@ function dropTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
     }
     out.drops.push(name);
     for (const [i, info] of Object.entries(schema.indexes)) if (info.table === name) out.dropIndexes!.push(i);
-    for (const [i, info] of Object.entries(schema.triggers)) if (info.table === name) out.dropTriggers!.push(i);
   }
   return out.drops.length ? out : NOOP;
 }
@@ -393,7 +344,6 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       def.affinity = Object.fromEntries(Object.entries(def.affinity).map(([c, a]) => [ren(c), a]));
       def.collation = Object.fromEntries(Object.entries(def.collation).map(([c, a]) => [ren(c), a]));
       def.collated = def.collated.map(ren);
-      if (def.generated) def.generated = def.generated.map(ren);
       break;
     }
     case "alter_action_drop_column": {
@@ -404,7 +354,6 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       if (def.globalIndexes.some((g) => g.columns.includes(col))) throw new SqlError(`cannot drop indexed column: "${col}"`);
       sql.push(`ALTER TABLE ${q(name)} DROP COLUMN ${q(col)}`);
       def.columns = def.columns.filter((c) => c !== col);
-      if (def.generated) def.generated = def.generated.filter((c) => c !== col);
       delete def.affinity[col];
       delete def.collation[col];
       def.collated = def.collated.filter((c) => c !== col);
@@ -437,14 +386,12 @@ export function parseDdl(source: string, schema: SchemaView): ParsedDdl {
     case "drop_table_stmt": return dropTable(clean, stmt, schema);
     case "drop_index_stmt": return dropIndex(clean, stmt, schema);
     case "alter_table_stmt": return alterTable(clean, stmt, schema);
-    case "create_trigger_stmt": return createTrigger(clean, stmt, schema);
+    // trigger は受け付けない。本体が他の表を読み書きするので、1 シャードでは発火できない。
+    case "create_trigger_stmt": return unsupported("CREATE TRIGGER");
     case "drop_trigger_stmt": {
-      const name = ident(stmt.trigger);
-      if (!schema.triggers[name]) {
-        if (stmt.ifExistsKw) return NOOP;
-        throw new SqlError(`no such trigger: ${name}`);
-      }
-      return { sql: [], defs: [], drops: [], user: null, dropTriggers: [name] };
+      // trigger は作れないので、消すものもない。
+      if (stmt.ifExistsKw) return NOOP;
+      throw new SqlError(`no such trigger: ${ident(stmt.trigger)}`);
     }
     case "create_view_stmt": {
       const name = userName(ident(stmt.name), "view");
