@@ -24,6 +24,10 @@ export interface ShardDeps {
     ddlSince(v: number): Promise<{ version: number; ddl: DdlEntry[] }>;
     /** 適用できなかった版の取り消しを求める。取り消す版の番号か、取り消せなければ null が返る。 */
     revokeDdl(version: number, reason: string): Promise<number | null>;
+    /** 分割の枠を示して、子が受け取り始める。分割の版が返る (meta.ts の startSplit)。 */
+    startSplit(id: string, move: { parent: string; child: string; start: number; end: number }): Promise<{ version: number }>;
+    /** 分割の枠が生きていて、子が受け取り始めていることを確かめる (meta.ts の checkSplit)。 */
+    checkSplit(id: string, move: { parent: string; child: string; start: number; end: number }): Promise<void>;
   };
   /** 実時間、待ち、乱数の出どころ。指定しなければ実物を使う。シミュレータは seed から決まる実装を渡す。 */
   runtime?: Runtime;
@@ -569,11 +573,14 @@ export class ShardCore implements ShardApi {
     };
   }
 
-  async beginIncoming(req: { start: number; end: number; from: string; schema: number }): Promise<{ schema: number }> {
+  async beginIncoming(req: { start: number; end: number; from: string; slot: string }): Promise<{ schema: number }> {
     const same = () => this.incoming.some((x) => x.start === req.start && x.end === req.end && x.from_id === req.from);
     if (same()) return { schema: this.schema };
-    // 増設を始めた側の表定義が古いこともある。このシャードが先の版にいるなら、そのままでよい。親が fence の前に追いつく。
-    await this.reachSchema(req.schema);
+    // Meta が分割に渡した枠を示す。枠がある間、Meta は新しい版を記録しない (specs/m15_maintenance_slot.qnt)。
+    // 受け取り始める版は、枠を取ったときの Meta の版である。分割を進める側が先に読んだ版は使わない。間に記録された版を、
+    // 親だけが先に適用していると、子が親より古い版で受け取り始め、子へ移った行を読めなくなる。
+    const { version } = await this.deps.meta.startSplit(req.slot, { parent: req.from, child: this.id, start: req.start, end: req.end });
+    await this.reachSchema(version);
     if (same()) return { schema: this.schema };
     // 重なる範囲を別の親から受け取ると、どちらの行が正しいのか決められない。送り出し中のシャードも子にしない。
     const clash = this.incoming.find((x) => x.start < req.end && req.start < x.end);
@@ -585,12 +592,13 @@ export class ShardCore implements ShardApi {
     return { schema: this.schema };
   }
 
-  async fence(req: { start: number; end: number; to: string; schema?: number }): Promise<void> {
+  async fence(req: { start: number; end: number; to: string; schema?: number; slot: string }): Promise<void> {
     const same = () => this.fenced.some((x) => x.start === req.start && x.end === req.end && x.to === req.to);
     if (same()) return;
     // 子の表定義の版まで追いついてから fence する。子が先の版にいると、親の古い形の行と intent を子が受け取れない。
     // 移動の間は、親も子も DDL を適用しない (applySchema)。
     // 親が先の版にいるなら、そのままでよい。子は、行を受け取るときに親の版まで追いつく。
+    await this.deps.meta.checkSplit(req.slot, { parent: this.id, child: req.to, start: req.start, end: req.end });
     if (req.schema !== undefined) await this.reachSchema(req.schema);
     if (same()) return;
     // 同じ範囲を 2 つの子へ送り出すと、行が両方へ分かれ、範囲表はどちらか片方しか指さない。

@@ -37,7 +37,7 @@ import {
 
 type Kind =
   | "history" | "indexReadsMissing" | "indexReadsExtra" | "ackedNotApplied" | "errors" | "errorsDropped" | "stuck" | "schema" | "misplaced"
-  | "missing" | "dangling" | "wrongRead" | "leftover" | "uniqueWithDuplicates" | "resurrected" | "lost" | "badExtra";
+  | "missing" | "dangling" | "wrongRead" | "leftover" | "uniqueWithDuplicates" | "resurrected" | "lost" | "badExtra" | "splitRefusals";
 
 /** DROP した表を、確定済みの取引の後始末が参照して出る誤り。BUG-5 の症状である。 */
 const DROPPED = /no such table: (main\.)?(side|__gidx_)/;
@@ -51,6 +51,7 @@ function violations(r: Report): Record<Kind, string[]> {
     indexReadsExtra: r.indexReads.extra,
     ackedNotApplied: r.ackedNotApplied,
     errors: r.errors.filter((e) => !DROPPED.test(e)),
+    splitRefusals: r.splitRefusals,
     errorsDropped: r.errors.filter((e) => DROPPED.test(e)),
     stuck: r.stuck,
     schema: Object.entries(r.schema.shards).filter(([, v]) => v !== r.schema.meta).map(([id, v]) => `${id} at ${v}, meta at ${r.schema.meta}`),
@@ -189,6 +190,19 @@ const CASES = {
     },
     seeds: [1, 2, 3, 4, 5, 6], known: [],
   },
+  // シャードをまたぐ UNIQUE の index の作成 (書き込みを止めて作る) と、分割。値はほぼ一意で、ときどき重複する。
+  uniqueIndexAndSplits: {
+    s: {
+      splits: true, ops: 60, replyJitter: true, values: "dup",
+      ddl: async (e: Env) => {
+        await createUnique(e);
+        await e.at(0.7);
+        await e.ddl("ALTER TABLE acct ADD COLUMN extra INTEGER DEFAULT 5");
+        e.useExtra = true;
+      },
+    },
+    seeds: [1, 2, 3, 4, 5, 6], known: [],
+  },
 } satisfies Record<string, Case>;
 
 /** 同じ (scenario, seed) の実行は 1 回だけにする。seed ごとのテストと、seed をまたぐテストが共有する。 */
@@ -275,6 +289,12 @@ describe("4. DDL racing with shard splits", () => {
   each("splitAndDdl", "CREATE INDEX and ADD COLUMN while shards split", (r) => {
     expect(r.splits).toBeGreaterThan(0);
     expect(r.ddlLog.every((l) => l.endsWith("=> ok"))).toBe(true);
+  });
+  each("uniqueIndexAndSplits", "CREATE UNIQUE INDEX (global) and ADD COLUMN while shards split", (r) => {
+    expect(r.splits).toBeGreaterThan(0);
+    const ok = r.ddlLog.some((l) => /CREATE UNIQUE INDEX.*=> ok$/.test(l));
+    expect(r.index.state).toBe(ok ? "public" : null);
+    for (const l of r.ddlLog) expect(l).toMatch(/=> (ok|UNIQUE constraint failed.*)$/);
   });
 });
 
@@ -503,28 +523,24 @@ describe("known bugs, as deterministic interleavings", () => {
 
   /**
    * BUG-6。
-   * 台本: 30 個の tenant に 1 行ずつある。CREATE INDEX ix ON t(v) が全シャードへ適用され、backfill が最初の
-   *   表の読みを送ったところで止める。その間に s0 の半分を新しいシャード s2 へ分割し、完了させる。backfill を再開する。
-   * 観測: DDL は成功し、index は public になる。s2 へ移った行の項目が index にない。`WHERE v = ?` はそれらの行を返さない。
-   * 原因: Db.backfill (db.ts:752-753) は DDL の時点で取った catalog の範囲表でシャードを列挙する。分割で増えた
-   *   シャードは列挙に入らない。親は移動の完了後は全表の読みを拒否しない (core.ts:358 は移動中だけ Migrating を返す) ので、
-   *   移った行を誰も読まないまま public になる。移動の途中に当たれば Migrating で DDL は失敗し、安全側に倒れる。
+   * 台本: 30 個の tenant に 1 行ずつある。CREATE UNIQUE INDEX ix ON t(v) が既存の行を読み始めたところで止め、s0 を分割する。
+   * 以前の観測: 分割は通り、DDL も成功して index は public になった。s2 へ移った行の項目が index になかった。
+   * いま: index を作っている間は、分割が保守の操作の枠を取れない (specs/m15_maintenance_slot.qnt)。分割は、作り終えてから進む。
    */
-  it("BUG-6 (fixed): a global index built while a shard splits covers the rows that moved", async () => {
+  it("BUG-6 (fixed): a split waits while a global index is built, and the index covers the rows after it moves them", async () => {
     const { c, db } = await two();
     for (let t = 1; t <= 30; t++) await db.query("INSERT INTO t VALUES (?, 1, ?, 0)", [t, 100 + t]);
-    // backfill の最初の走査を止める。走査は主キーの順に少しずつ読む文である。
+    // 既存の行を読む最初の要求を止める。
     const scan = hold(c, "gate", (m) => m.from === "client" && m.method === "exec" && /FROM "t"\s+ORDER BY/.test((m.req as { sql: string }).sql));
     const ddl = outcome(db.ddl("CREATE UNIQUE INDEX ix ON t(v)"));
     await scan.reached;
-    await split(c, "s0", "s2");
+    expect(await outcome(split(c, "s0", "s2"))).toMatch(/^split busy: schema busy: CREATE INDEX ix is in progress/);
     scan.release();
-    const result = await ddl;
+    expect(await ddl).toBe("ok");
+    expect(await outcome(split(c, "s0", "s2"))).toBe("ok");
     await c.settle();
     const ix = await indexAgreement(c, "t", "ix");
-    // 失敗して index が残らないのも正しい。public になったのに欠けているのが誤りである。
-    expect({ result, state: ix.state, missing: result === "ok" ? ix.missing : [] })
-      .toEqual({ result, state: result === "ok" ? "public" : null, missing: [] });
+    expect({ state: ix.state, missing: ix.missing, dangling: ix.dangling }).toEqual({ state: "public", missing: [], dangling: [] });
   });
 });
 

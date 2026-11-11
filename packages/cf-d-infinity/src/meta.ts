@@ -57,6 +57,24 @@ export class SchemaBusy extends Error {
   }
 }
 
+/**
+ * 分割が持つ、保守の操作の枠 (specs/m15_maintenance_slot.qnt)。分割どうしは枠を共有でき、DDL とは排他である。
+ * 枠を取った直後は期限がある。分割を進める側が、子が受け取り始める前に止まっても、枠が残らないようにするためである。
+ * 子が受け取り始めると (startSplit)、期限を外す。分割は取り消せないので、進める側 (Autoscaler) が再開して終える。
+ */
+export interface SplitSlot {
+  id: string;
+  parent: string;
+  child: string;
+  start: number;
+  end: number;
+  /** 分割の版。子はこの版で受け取り始め、親はこの版まで追いついてから fence する。 */
+  version: number;
+  started: boolean;
+  until: number;
+}
+export type SplitMove = Pick<SplitSlot, "parent" | "child" | "start" | "end">;
+
 /** 表への書き込みを止めている作業の名前。誤りの文に使う。 */
 function describe(e: DdlEntry): string {
   return e.build ? `CREATE INDEX ${e.build.index}` : `the lock on ${e.guard!.tables.join(", ")} before DROP TABLE`;
@@ -151,11 +169,88 @@ export class MetaCore {
     return last?.build || last?.guard ? last : null;
   }
 
+  private splitSlots(): SplitSlot[] {
+    const r = this.b.exec(`SELECT v FROM __meta WHERE k = 'splits'`)[0];
+    return r ? (JSON.parse(r.v as string) as SplitSlot[]) : [];
+  }
+  private setSplitSlots(list: SplitSlot[]): void {
+    this.b.exec(`INSERT INTO __meta(k, v) VALUES ('splits', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, JSON.stringify(list));
+  }
+
+  /**
+   * 保守の操作の枠を、誰が持っているか。DDL を記録する場所と、分割が枠を取る場所が、この 1 つで確かめる。
+   * exclusive は表への書き込みを止めている作業 (index の作成、DROP の前の禁止)。splits は進行中の分割である。
+   */
+  private holders(): { exclusive: DdlEntry | null; splits: SplitSlot[] } {
+    return { exclusive: this.building(), splits: this.splitSlots() };
+  }
+
+  /** DDL を記録してよいか。だめなら、待ってやり直せる誤りを投げる。 */
+  private assertFreeForDdl(): void {
+    const h = this.holders();
+    if (h.exclusive) throw new SchemaBusy(describe(h.exclusive));
+    if (h.splits.length > 0) throw new SchemaBusy(`a shard split of ${h.splits.map((x) => x.parent).join(", ")}`);
+  }
+
+  /**
+   * 分割のために、保守の操作の枠を取る。basedOn は、呼び出し側が全シャードへ適用させた版で、最新の版と違えば断る。
+   * こうすると、分割の途中に、最新の版の取り消し (シャードが適用に失敗した版) が入ることもない。
+   * 同じ範囲の分割の枠がもうあれば、それを返す (分割の再開)。
+   */
+  async beginSplit(move: SplitMove, basedOn: number): Promise<SplitSlot> {
+    this.expire();
+    const list = this.splitSlots();
+    const same = list.find((x) => x.parent === move.parent && x.child === move.child && x.start === move.start && x.end === move.end);
+    if (same) return same;
+    const cat = this.current();
+    if (basedOn !== cat.version) throw new SchemaMoved(cat.version);
+    const h = this.holders();
+    if (h.exclusive) throw new SchemaBusy(describe(h.exclusive));
+    const slot: SplitSlot = { id: `split:${move.parent}:${move.child}:${move.start}:${move.end}`, ...move, version: cat.version, started: false, until: this.rt.now() + this.leaseMs };
+    this.setSplitSlots([...list, slot]);
+    return slot;
+  }
+
+  /** 子が受け取り始める。枠が生きていれば、期限を外して分割の版を返す。枠がなければ (期限切れ) 断る。 */
+  async startSplit(id: string, move: SplitMove): Promise<{ version: number }> {
+    this.expire();
+    const list = this.splitSlots();
+    const slot = list.find((x) => x.id === id);
+    if (!slot || slot.parent !== move.parent || slot.child !== move.child || slot.start !== move.start || slot.end !== move.end) {
+      throw new SqlError(`split ${id}: no such split slot (it expired before the child started, or it is for another range)`);
+    }
+    if (!slot.started) this.setSplitSlots(list.map((x) => (x.id === id ? { ...x, started: true } : x)));
+    return { version: slot.version };
+  }
+
+  /** 親が fence する前に、枠が生きていて、子が受け取り始めていることを確かめる。 */
+  async checkSplit(id: string, move: SplitMove): Promise<void> {
+    const slot = this.splitSlots().find((x) => x.id === id);
+    if (!slot?.started || slot.parent !== move.parent || slot.child !== move.child || slot.start !== move.start || slot.end !== move.end) {
+      throw new SqlError(`split ${id}: the split slot is not held, or the child has not started receiving`);
+    }
+  }
+
+  /** 分割が終わった。枠を返す。 */
+  async endSplit(id: string): Promise<void> {
+    this.setSplitSlots(this.splitSlots().filter((x) => x.id !== id));
+  }
+
+  /** 進行中の分割の枠。Autoscaler が、止まった分割を再開するのに使う。 */
+  async splits(): Promise<SplitSlot[]> {
+    this.expire();
+    return this.splitSlots();
+  }
+
   /**
    * 期限を過ぎた index の作成を取り消す。外から呼ばれるたびに、最初に確かめる。
    * 書き込みを断られた Worker も、版を進めたいシャードも、Meta に尋ねる。だから、タイマーがなくても、待っている者がいれば取り消される。
    */
   private expire(): void {
+    // 子が受け取り始める前に、期限を過ぎた分割の枠を捨てる。
+    const slots = this.splitSlots();
+    const live = slots.filter((x) => x.started || this.rt.now() <= x.until);
+    if (live.length !== slots.length) this.setSplitSlots(live);
     const b = this.building();
     if (!b) return;
     const lease = this.lease();
@@ -244,8 +339,7 @@ export class MetaCore {
     this.expire();
     const cat = this.current();
     if (basedOn !== undefined && basedOn !== cat.version) throw new SchemaMoved(cat.version);
-    const busy = this.building();
-    if (busy) throw new SchemaBusy(describe(busy));
+    this.assertFreeForDdl();
     const parsed = parseDdl(sql, cat);
     if (!parsed.noop) {
       this.append(parsed, cat.version + 1);
@@ -312,8 +406,7 @@ export class MetaCore {
     this.expire();
     const cat = this.current();
     if (basedOn !== undefined && basedOn !== cat.version) throw new SchemaMoved(cat.version);
-    const busy = this.building();
-    if (busy) throw new SchemaBusy(describe(busy));
+    this.assertFreeForDdl();
     const defs = tables.map((t) => {
       const def = cat.tables[t];
       if (!def) throw new SqlError(`no such table: ${t}`);

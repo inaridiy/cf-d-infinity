@@ -35,8 +35,12 @@ interface RunOpts {
   faults?: Faults;
 }
 
-/** 範囲の移動で時計を渡さない欠陥 (finishWithoutClock) を、行ロック、分割、再起動の掛け合わせが見つける seed。 */
-const PUT_BACK_SEEDS = [147, 219];
+/**
+ * 範囲の移動で時計を渡さない欠陥 (finishWithoutClock) を、行ロック、分割、再起動の掛け合わせが見つける seed。
+ * 見つける割合は低い。2026-11-11 に分割が保守の操作の枠を取るようにした後は、seed 1 から 1000 のうち 958 だけだった
+ * (その前は 400 のうち 2 つ)。欠陥そのものの決定的な再現は test/move-timestamp.test.ts にある。
+ */
+const PUT_BACK_SEEDS = [958];
 
 async function run(o: RunOpts) {
   const rnd = prng(o.seed);

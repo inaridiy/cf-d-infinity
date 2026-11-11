@@ -317,6 +317,11 @@ export interface Report {
   ackedNotApplied: string[];
   /** 想定していない誤り。表定義の変更に伴う誤りは scenario ごとに想定を決めている。 */
   errors: string[];
+  /**
+   * 分割の途中だという理由で、シャードが DDL 以外の要求を断った回数の記録。やり直せる誤りなので、取引の誤りとしては数えない。
+   * 分割の途中に新しい版が記録されたか、子が親より古い版で受け取り始めたときに起きる (不変条件 4、specs/m15_maintenance_slot.qnt)。
+   */
+  splitRefusals: string[];
   stuck: string[];
   schema: { meta: number; shards: Record<string, number> };
   index: IndexReport;
@@ -662,8 +667,15 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
           splits++;
           break;
         } catch (e) {
+          const m = e instanceof Error ? e.message : String(e);
+          // 表定義の変更 (index の作成など) が、保守の操作の枠を持っている。終わるまで待つ。待つ回数には数えない。
+          if (/^split busy:/.test(m) && !stop) {
+            attempt--;
+            await c.sleep(50);
+            continue;
+          }
           // 子が古い表定義のまま親の行を受け取ると drain が失敗する。要求が届けば子は追い付くので、やり直す。
-          if (attempt === 19) errors.push(`split: ${e instanceof Error ? e.message : String(e)}`);
+          if (attempt === 19) errors.push(`split: ${m}`);
           await c.sleep(5);
         }
       }
@@ -738,6 +750,9 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
     indexReads: checkIndexReads(history, new Map()),
     ackedNotApplied,
     errors: [...new Set(errors)],
+    splitRefusals: c.net.failed
+      .filter((f) => f.m.method !== "syncSchema" && /waiting for a shard split/.test(f.message))
+      .map((f) => `${f.m.from} -> ${f.m.to} ${f.m.method}: ${f.message}`),
     stuck,
     schema,
     index: await indexAgreementAll(c),

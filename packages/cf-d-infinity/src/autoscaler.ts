@@ -1,6 +1,7 @@
 import type { Cluster } from "./client/db";
+import { SchemaMoved, type SplitSlot } from "./meta";
 import { planSplit, shardsOf, type Routing } from "./routing";
-import { systemRuntime } from "./runtime";
+import { sleep, systemRuntime } from "./runtime";
 import type { ShardHealth, ShardMetrics } from "./types";
 
 export interface Thresholds {
@@ -159,15 +160,76 @@ export async function split(
   if (owned.length > 0 && !owned.some((r) => r.start < range.end && range.start < r.end)) {
     throw new Error(`split: ${child} already owns other ranges`);
   }
+  // 範囲表はもう子を指し、親にも子にも途中の移動がない。分割は終わっていて、枠だけが残っている (枠を返す前に止まった)。
+  // 段をやり直すと、子が受け取りの記録をもう一度作ってしまうので、枠を返すだけにする。
+  const switched = cat.routing.ranges.some((r) => r.shard === child && r.start <= range.start && r.end >= range.end);
+  if (!unfinished && switched) {
+    const left = (await cluster.splits()).find((x) => x.parent === parent && x.child === child && x.start === range.start && x.end === range.end);
+    if (left) await cluster.endSplit(left.id);
+    // 終わった分割の再開は成功として返す (null は「割るものがない」の意味である)。運んだものはない。
+    return { parent, child, ...range, groups: 0, rows: 0, bytes: 0, ms: 0 };
+  }
   const t0 = now();
-  const { schema } = await cluster.shard(child).beginIncoming({ ...range, from: parent, schema: cat.version });
-  await cluster.shard(parent).fence({ ...range, to: child, schema });
+  // 保守の操作の枠を取る (specs/m15_maintenance_slot.qnt)。枠がある間、Meta は新しい表定義の版を記録しない。
+  const slot = await reserveSplit(cluster, { parent, child, ...range });
+  const { schema } = await cluster.shard(child).beginIncoming({ ...range, from: parent, slot: slot.id });
+  await cluster.shard(parent).fence({ ...range, to: child, schema, slot: slot.id });
   await cluster.switchRange({ ...range, to: child, from: parent });
   const moved = await cluster.shard(child).drain(range);
   // 親の時計を子へ渡す。行のないグループは運ばれないので、子の時計は、ここで初めて親に追いつく。
   const { m } = await cluster.shard(parent).finishMove(range);
   await cluster.shard(child).finishIncoming({ ...range, m });
+  await cluster.endSplit(slot.id);
   return { parent, child, ...range, ...moved, ms: now() - t0 };
+}
+
+/**
+ * Meta に残っている分割の枠のうち、再開すべきもの。子が受け取り始めた分割は取り消せないので、進めていなければ再開する。
+ * 受け取り始める前の枠は、期限で消えるので、再開しない。
+ */
+export function splitsToResume(slots: SplitSlot[], running: (child: string) => boolean): SplitJobLike[] {
+  return slots.filter((s) => s.started && !running(s.child)).map((s) => ({ parent: s.parent, child: s.child, range: { start: s.start, end: s.end } }));
+}
+export interface SplitJobLike {
+  parent: string;
+  child: string;
+  range: { start: number; end: number };
+}
+
+/** 表定義の変更が、保守の操作の枠を持っている。分割は、それが終わってから始める。やり直してよい。 */
+export class SplitBusy extends Error {
+  readonly retryable = true;
+  constructor(detail: string) {
+    super(`split busy: ${detail}`);
+  }
+}
+
+/**
+ * 分割の枠を取る。先に、全シャードに最新の版を適用させる。適用に失敗したシャードは、その版の取り消しを記録するので、
+ * 版が進む。進んでいれば、もう一度適用させてから取る。こうして取った枠の間は、取り消しも入らない (m15_red_no_based_on)。
+ * 表定義の変更 (index の作成など) が枠を持っていれば、SplitBusy を投げる。同じ範囲の枠がもうあれば、それを返す (再開)。
+ */
+async function reserveSplit(cluster: Cluster, move: { parent: string; child: string; start: number; end: number }) {
+  const rt = cluster.runtime ?? systemRuntime;
+  const cat = await cluster.catalog();
+  // 最新の版は Meta が知っている。手元の表定義が古ければ、Meta が断るときに教える版まで、全シャードを進める。
+  let version = cat.version;
+  for (let attempt = 0; ; attempt++) {
+    await Promise.all(shardsOf(cat.routing).map((id) => cluster.shard(id).syncSchema({ version })));
+    try {
+      return await cluster.beginSplit(move, version);
+    } catch (e) {
+      const m = (e as Error)?.message ?? "";
+      if (e instanceof SchemaMoved || /schema moved to version/.test(m)) {
+        if (attempt >= 10) throw e;
+        version = e instanceof SchemaMoved ? e.version : Number(/schema moved to version (\d+)/.exec(m)![1]);
+        await sleep(rt, 10);
+        continue;
+      }
+      if (/schema busy:/.test(m)) throw new SplitBusy(m);
+      throw e;
+    }
+  }
 }
 
 /** 同時に問い合わせるシャードの数。多数へ一斉に投げると、往復時間が負荷と無関係に伸びる。 */

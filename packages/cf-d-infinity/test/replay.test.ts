@@ -204,7 +204,7 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
           return c.shard(shard);
         },
         runtime: c.runtime, reference: c.reference, catalog: () => c.catalog(), applyDdl: (q, b) => c.applyDdl(q, b),
-        publishIndex: (t, n, v, at) => c.publishIndex(t, n, v, at), revokeDdl: (v, r) => c.revokeDdl(v, r), renewLock: (v) => c.renewLock(v), lockTables: (t, b) => c.lockTables(t, b), finishLock: (v, q) => c.finishLock(v, q), allocate: (t, n, m) => c.allocate(t, n, m), switchRange: (m) => c.switchRange(m),
+        publishIndex: (t, n, v, at) => c.publishIndex(t, n, v, at), revokeDdl: (v, r) => c.revokeDdl(v, r), renewLock: (v) => c.renewLock(v), lockTables: (t, b) => c.lockTables(t, b), finishLock: (v, q) => c.finishLock(v, q), beginSplit: (m, b) => c.beginSplit(m, b), endSplit: (id) => c.endSplit(id), splits: () => c.splits(), allocate: (t, n, m) => c.allocate(t, n, m), switchRange: (m) => c.switchRange(m),
       };
       if (rnd() < 0.4) {
         // 取引の外の 1 文。
