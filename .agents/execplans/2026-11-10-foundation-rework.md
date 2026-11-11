@@ -53,20 +53,18 @@ npm への公開は、素地ができるまで行わない。
 
 ## いまの状態 (2026-11-11)
 
-- `main` は `f2224ce`。2 回目のレビューの修正まで入っている。
-- ブランチ `spans-and-replay` は、検査が繰り返し通った最後の状態 (`6b55ad3`) に、引き継ぎの文書と、コードと食い違っていた文書の修正を足したものである。これを PR にして `main` へ入れる (Plan of Work の 1)。
-- ブランチ `wip/gather-missing-rows` (`45e9b57`) は、前の作業者の未完成の変更である。集めていない行と衝突したら集め足して実行し直す仕組みで、`UPDATE OR IGNORE` と `UPDATE OR REPLACE`、DEFAULT のある UNIQUE の列を省いた INSERT、`x IN 表名` を通す。モデルも、それを狙う生成器もないまま入れてあるので、`main` へは入れていない。採否は Plan of Work の 4 で決める。
-- ブランチ `foundation-3` は、上の 2 つに分ける前の並びで、もう使わない。push していない。
-- `spans-and-replay` での検査の結果は、下の「検査の結果」に書く。
+- `main` は `8dc8376` (PR #8)。前の作業者の検査済みの変更 (`6b55ad3` まで) と、引き継ぎの文書が入っている。
+- ブランチ `deterministic-sim` は、シミュレータを決定的にする変更である (Plan of Work の 2 の前半)。PR にして `main` へ入れる。
+- ブランチ `wip/gather-missing-rows` (`45e9b57`) は、前の作業者の未完成の変更である。集めていない行と衝突したら集め足して実行し直す仕組みで、`UPDATE OR IGNORE` と `UPDATE OR REPLACE`、DEFAULT のある UNIQUE の列を省いた INSERT、`x IN 表名` を通す。モデルも、それを狙う生成器もないまま入れてあるので、`main` へは入れていない。採否は Plan of Work の 4 で決める。ローカルにだけある。
+- ブランチ `foundation-3` (ローカル) は、PR #8 と `wip/gather-missing-rows` に分ける前の並びで、もう使わない。
 - `packages/cf-d-infinity/DEVELOPMENT.md` は、この一連の変更を反映していない。`AGENTS.md` にそう書いてある。
 
-### 検査の結果 (`spans-and-replay`、2026-11-11)
+### 検査の結果 (`deterministic-sim`、2026-11-11)
 
 - `npm run typecheck` は通る。
-- `npx vitest run` は、436 件のうち 435 件が合格、1 件が失敗だった。失敗は未解決の問題 2 で、`main` にも元からある。
-- `npx vitest run test/replay.test.ts` は、20 回の繰り返しで全部通った。
+- `npx vitest run` は、441 件が全部通る。2 回続けて流して、2 回とも通った。
 - `ROWCOST=1 npx vitest run test/rowcost.test.ts` は通る。
-- `OPEN=1 npx vitest run test/open` は、未解決の再現テストが落ちる (落ちるのが正しい)。
+- `OPEN=1 npx vitest run test/open` は、未解決の再現テスト 7 件が落ちる (落ちるのが正しい)。
 
 ## 設計上の決定 (現在形)
 
@@ -140,7 +138,7 @@ SQLite と突き合わせる検査 (逐次の差分、sqllogictest、乱択、�
 
 最後の 2 つは、基準経路が完全になれば断る理由がなくなる (Plan of Work の 4)。
 
-`main` と `spans-and-replay` には、規則 4 に反する拒否が 1 つ残っている。
+`main` には、規則 4 に反する拒否が 1 つ残っている。
 `UPDATE OR IGNORE` と `UPDATE OR REPLACE` は、衝突する行が別のシャードにあるときだけ `unsupported:` で断る。
 再現は `test/open/update-conflict-other-shard.test.ts`。
 Early の前に必ず消す。
@@ -191,7 +189,7 @@ seed を大量に流して失敗を集める道具、基準経路だけの実行
 - [x] (2026-11-11) 文を再生する検査を入れた。見つけた欠陥 2 件 (失敗した文の読みが検証されない、読む時点を進めるとき応答待ちの読みが漏れる) を直した。`363b869`
 - [x] (2026-11-11) 衝突を自分で解決する INSERT を、シャードをまたいで解決するようにした。`6b55ad3`
 - [x] (2026-11-11) 作業者が交代した。方針を変え、この文書を書き直した。README、`docs/overview.md`、`docs/sql-language.md` の、コードと食い違っていた箇所を直した。
-- [ ] 1. ここまでを `main` へ入れる (PR、CI、squash merge)
+- [x] (2026-11-11) 1. ここまでを `main` へ入れた。PR #8、`8dc8376`
 - [x] (2026-11-11) 2 の前半。シミュレータを決定的にした。乱択の検査と、本物のタイマーで待っていた試験を、仮想の時計へ移した。
 - [ ] 2 の後半。seed を大量に流す道具を作り、未解決の問題 1、2、11 を探す
 - [ ] 3. 切った機能の残りのコードを消し、入口の受け入れの規則を入れる
@@ -212,8 +210,8 @@ seed を大量に流して失敗を集める道具、基準経路だけの実行
 2. **`test/ddl-concurrent.test.ts` の「CREATE UNIQUE INDEX (global) racing with writes that create duplicates (seed 1)」が、別の試験を同時に流すと落ちることがある (2026-11-11)。**
    `CREATE UNIQUE INDEX acct_v ON acct(v)` が成功した後、行 `[6,3]` (v = 1) の項目がグローバル index にない。
    項目のない行があると、同じ値の行をもう 1 つ入れられるので、UNIQUE が守られない。
-   `main` (`f2224ce`) でも、同じ seed、同じ行で出た。このブランチの変更が原因ではない。
-   単独で流すと 6 回とも通り、別の試験と同時に流すと `spans-and-replay` で 5 回に 1 回、`main` で 4 回に 1 回出た。
+   PR #8 の前の `main` (`f2224ce`) でも、同じ seed、同じ行で出た。PR #8 の変更が原因ではない。
+   単独で流すと 6 回とも通り、別の試験と同時に流すと、PR #8 のブランチで 5 回に 1 回、その前の `main` (`f2224ce`) で 4 回に 1 回出た。
    同時に流したときは、同じ場面の seed 4 が 120 秒の制限時間を超えたことも 1 回ある。遅いだけか、進まなくなったのかは分からない。
    出力は `.agents/execplans/evidence/2026-11-11-ddl-concurrent-missing-index-entry.txt`。
    不変条件 7。
@@ -278,9 +276,8 @@ seed を大量に流して失敗を集める道具、基準経路だけの実行
 
 ### 1. ここまでを `main` へ入れる
 
-`spans-and-replay` を push して PR を作り、CI が通ったら squash merge する。
-未解決の問題 2 と 11 の試験は、まれに落ちる。CI で落ちたら、やり直す前に、落ちた seed と出力を証拠に足す。
-同じ失敗でなければ、新しい問題として記録する。
+済んだ (PR #8)。
+最初の CI は、未解決の問題 11 で 1 回落ちた。出力を証拠に足してから、やり直した。
 
 ### 2. シミュレータを決定的にする
 
@@ -373,7 +370,7 @@ seed を大量に流して失敗を集める道具、基準経路だけの実行
 
 - `main` へは、PR を作り、CI が通ってから squash merge する。`specs/` を変えると、CI の models ジョブが 75 分ほど走る。
 - 前の作業者の未完成の変更は `wip/gather-missing-rows` (`45e9b57`) にある。ローカルにだけあり、push していない。
-- `foundation-3` (ローカル) は、`spans-and-replay` と `wip/gather-missing-rows` に分ける前の並びである。2 つが残っていれば消してよい。
+- `foundation-3` (ローカル) は、PR #8 と `wip/gather-missing-rows` に分ける前の並びである。`wip/gather-missing-rows` が残っていれば消してよい。
 - Cloudflare 上に、この作業のためのリソースは残していない。
 - 証拠 (Codex の報告、試験の出力) は `.agents/execplans/evidence/` に置く。
 
