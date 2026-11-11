@@ -3,7 +3,7 @@ import { Db, type Cluster, type StatementStat } from "./client/db";
 import { exportPage, importRows, type ExportCursor } from "./transfer";
 
 export { importRows, type ExportCursor };
-import { collectMetrics, decide, DEFAULTS, healthProblems, needsFollowUp, nextShardNumber, split, type AutoscalerState, type Thresholds } from "./autoscaler";
+import { collectMetrics, decide, DEFAULTS, healthProblems, needsFollowUp, nextShardNumber, split, splitsToResume, type AutoscalerState, type Thresholds } from "./autoscaler";
 import { MetaCore, type Catalog, type SplitMove } from "./meta";
 import { planSplit, shardsOf } from "./routing";
 import { ShardCore } from "./shard/core";
@@ -383,10 +383,7 @@ export class DinfAutoscaler extends DurableObject<Env> {
     for (const job of c.pending) this.runSplit(cluster, job);
     // Meta に残っている分割の枠も再開する。別の進め方 (手で始めた分割など) が途中で止まると、枠が残り、
     // 表定義の変更がいつまでも記録できなくなる。子が受け取り始めた分割は取り消せないので、終わらせる。
-    for (const s of await cluster.splits()) {
-      if (!s.started || c.pending.some((j) => j.child === s.child)) continue;
-      this.runSplit(cluster, { parent: s.parent, child: s.child, range: { start: s.start, end: s.end } });
-    }
+    for (const job of splitsToResume(await cluster.splits(), (child) => c.pending.some((j) => j.child === child))) this.runSplit(cluster, job);
     const { routing } = await cluster.catalog();
     // 持続回数と cooldown は永続化する。メモリだけだと、再起動のたびに cooldown が消えて続けて割る。
     const saved = this.ctx.storage.sql.exec(`SELECT v FROM conf WHERE k = 'state'`).toArray()[0];

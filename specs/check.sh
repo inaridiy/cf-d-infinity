@@ -241,7 +241,9 @@ red     $f m15_red_no_slot servable          # 2026-11 までの実装: 分割�
 red     $f m15_red_stale_begin servable      # 分割が、枠を取る前に読んだ版を使う (子が親より古い版で受け取る)
 red     $f m15_red_early_release servable    # 枠を、子が受け取り終える前に返す
 red     $f m15_red_no_based_on servable      # 全シャードが最新の版を適用する前に枠を取る (分割の途中に取り消しが入る)
+red     $f m15_red_late_start servable       # 期限切れの後に届いた、子の受け取りの始まりを断らない
 witness $f m15_green witnessRecordedBeforeAndServed
+witness $f m15_green witnessRecordedAfterDeath   # 分割を進める側が枠を取った後で止まっても、DDL は記録できる
 
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt

@@ -1,5 +1,5 @@
 import type { Cluster } from "./client/db";
-import { SchemaMoved } from "./meta";
+import { SchemaMoved, type SplitSlot } from "./meta";
 import { planSplit, shardsOf, type Routing } from "./routing";
 import { sleep, systemRuntime } from "./runtime";
 import type { ShardHealth, ShardMetrics } from "./types";
@@ -160,6 +160,14 @@ export async function split(
   if (owned.length > 0 && !owned.some((r) => r.start < range.end && range.start < r.end)) {
     throw new Error(`split: ${child} already owns other ranges`);
   }
+  // 範囲表はもう子を指し、親にも子にも途中の移動がない。分割は終わっていて、枠だけが残っている (枠を返す前に止まった)。
+  // 段をやり直すと、子が受け取りの記録をもう一度作ってしまうので、枠を返すだけにする。
+  const switched = cat.routing.ranges.some((r) => r.shard === child && r.start <= range.start && r.end >= range.end);
+  if (!unfinished && switched) {
+    const left = (await cluster.splits()).find((x) => x.parent === parent && x.child === child && x.start === range.start && x.end === range.end);
+    if (left) await cluster.endSplit(left.id);
+    return null;
+  }
   const t0 = now();
   // 保守の操作の枠を取る (specs/m15_maintenance_slot.qnt)。枠がある間、Meta は新しい表定義の版を記録しない。
   const slot = await reserveSplit(cluster, { parent, child, ...range });
@@ -172,6 +180,19 @@ export async function split(
   await cluster.shard(child).finishIncoming({ ...range, m });
   await cluster.endSplit(slot.id);
   return { parent, child, ...range, ...moved, ms: now() - t0 };
+}
+
+/**
+ * Meta に残っている分割の枠のうち、再開すべきもの。子が受け取り始めた分割は取り消せないので、進めていなければ再開する。
+ * 受け取り始める前の枠は、期限で消えるので、再開しない。
+ */
+export function splitsToResume(slots: SplitSlot[], running: (child: string) => boolean): SplitJobLike[] {
+  return slots.filter((s) => s.started && !running(s.child)).map((s) => ({ parent: s.parent, child: s.child, range: { start: s.start, end: s.end } }));
+}
+export interface SplitJobLike {
+  parent: string;
+  child: string;
+  range: { start: number; end: number };
 }
 
 /** 表定義の変更が、保守の操作の枠を持っている。分割は、それが終わってから始める。やり直してよい。 */

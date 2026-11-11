@@ -86,8 +86,8 @@ red と green は同じ core モジュールを `const` フラグで切り替え
 | M13 `m13_red_main` / `_pin_only` / `_repin` / `_retry_whole` / `_ddl_anyway` | `prefixOfScript` / `ownDdlVisible` / `pinned` / `prefixOfScript` / `prefixOfScript` | 決めた設計から条件を 1 つずつ外す (`_main` は 2026-11 までの実装) | 反例 | 反例は 4 / 5 / 11 / 10 / 10 手 | 反例 (5 本すべて) |
 | M14 `m14_green` | `guardSafe` (= noLostWrite ∧ oneExit) | 古い表の行を持つシャード 2、別の接続の書き込み 2 回 (prepare と確定)、時計 0〜5、禁止の期限切れあり | 92,634 | 20 | No violation |
 | M14 `m14_red_no_lock` / `_no_check` / `_check_early` / `_no_drain` / `_untied` / `_commit_ts` | `noLostWrite` | 決めた設計から条件を 1 つずつ外す | 反例 | 反例は 15 / 11 / 14 / 14 / 17 / 15 手 | 反例 (6 本すべて) |
-| M15 `m15_green` | `servable` | 親、子、分割に関わらないシャード 1 つ (最新の版の適用に失敗して取り消すことがある)、版 0〜3、要求は最新の版で計画 | 766 | 20 | No violation |
-| M15 `m15_red_no_slot` / `_stale_begin` / `_early_release` / `_no_based_on` | `servable` | 決めた設計から条件を 1 つずつ外す (`_no_slot` は 2026-11 までの実装) | 反例 | 反例は 13 / 18 / 13 / 13 手 | 反例 (4 本すべて) |
+| M15 `m15_green` | `servable` | 親、子、分割に関わらないシャード 1 つ (最新の版の適用に失敗して取り消すことがある)、版 0〜3、要求は最新の版で計画、枠の期限切れと、分割を進める側の停止あり | 2,524 | 21 | No violation |
+| M15 `m15_red_no_slot` / `_stale_begin` / `_early_release` / `_no_based_on` / `_late_start` | `servable` | 決めた設計から条件を 1 つずつ外す (`_no_slot` は 2026-11 までの実装) | 反例 | 反例は 12 / 16 / 12 / 13 / 14 手 | 反例 (5 本すべて) |
 
 witness (vacuous でないことの確認。`not(到達したい状態)` を invariant にして違反 = 到達可能):
 
@@ -117,7 +117,7 @@ witness (vacuous でないことの確認。`not(到達したい状態)` を inv
 | M12 | `witnessAwareOnSlowShard` (`m12_clock_green`) | 時計の遅いシャードが公開の版を適用し、そこで index を使う文が、別のシャードの古い書き込みを全部見る |
 | M13 | `witnessRetriedAndDone` / `witnessOtherDdlThenDone` | 確定を断られた区切りをやり直して最後まで進む / 別の接続の DDL の後で最後まで進む |
 | M14 | `witnessDroppedAfterWrites` / `witnessRefusedByCheck` | 別の接続の書き込みの後で DROP まで進む / copy の後の書き込みを見つけて禁止を取り消す |
-| M15 | `witnessRecordedBeforeAndServed` | 分割の前に記録された版で分割が始まり、子へ移った行がグループの到着で読める |
+| M15 | `witnessRecordedBeforeAndServed` / `witnessRecordedAfterDeath` | 分割の前に記録された版で分割が始まり、子へ移った行がグループの到着で読める / 分割を進める側が枠を取った後で止まっても、期限で枠が消え、DDL が記録される |
 
 ## 新しく見つかった設計バグ (M1、green が破れた)
 
@@ -479,8 +479,10 @@ invariant は 4 つである。
 | 分割は、枠を取ったときの Meta の版を使う | `m15_red_stale_begin` | 子が古い版で受け取り始め、親は新しい版を先に適用している。切り替えの後、子が要求を断る |
 | 枠は、子が受け取り終えた後で返す | `m15_red_early_release` | 切り替えの直後に記録された版の要求を、受け取り中の子が断る |
 | 枠は、全シャードが最新の版を適用した後でだけ取れる | `m15_red_no_based_on` | 分割の途中に、別のシャードが失敗した版を取り消し、版が進む |
+| 子は、枠が消えていれば受け取り始めない | `m15_red_late_start` | 期限切れの後に、止まっていた進め方の受け取りの始まりが届き、枠のないまま分割が進む。その間に DDL が記録される |
 
-モデルにないもの。枠を取った後、子が受け取り始める前に分割を進める側が止まった場合。実装は、その間だけ枠に期限を付け、子が受け取り始めた後は期限を外す (分割は取り消せないので、分割を進める側が再開する)。
+枠の終わり方。子が受け取り始める前の枠は、期限 (5 秒) で消える。分割を進める側が止まっても枠が残らないことは、`witnessRecordedAfterDeath` が示す。子が受け取り始めると期限を外す。分割は取り消せないので、子が受け取り終えたときにだけ枠を返し、止まった分割は Autoscaler が Meta の枠の一覧から再開する。
+モデルにないもの。受け取り始めた後に止まった分割の再開 (実装の試験 `test/split-slot.test.ts` が、止まる位置ごとに確かめる)。終わらない分割 (16 MB を超えるグループ) が枠を持ち続けると、DDL がいつまでも待つ。
 
 ### M5b `m5b_live_migration.qnt` — pull 型ライブ再構成 (S2 + S3)
 
