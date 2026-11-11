@@ -166,7 +166,8 @@ export async function split(
   if (!unfinished && switched) {
     const left = (await cluster.splits()).find((x) => x.parent === parent && x.child === child && x.start === range.start && x.end === range.end);
     if (left) await cluster.endSplit(left.id);
-    return null;
+    // 終わった分割の再開は成功として返す (null は「割るものがない」の意味である)。運んだものはない。
+    return { parent, child, ...range, groups: 0, rows: 0, bytes: 0, ms: 0 };
   }
   const t0 = now();
   // 保守の操作の枠を取る (specs/m15_maintenance_slot.qnt)。枠がある間、Meta は新しい表定義の版を記録しない。
