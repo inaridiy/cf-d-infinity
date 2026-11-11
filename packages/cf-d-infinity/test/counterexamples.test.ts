@@ -178,7 +178,7 @@ describe("phantom: a predicate read is not protected by intents", () => {
     c.net.gate = (m) => (m.method === "prepare" && m.to === "s2" ? held : undefined);
     const commit = w.commit().then(() => "committed", () => "aborted");
     while (!c.net.log.some((m) => m.method === "prepare" && m.to === "s0")) await new Promise((r) => setImmediate(r));
-    await new Promise((r) => setTimeout(r, 2));
+    await c.sleep(2);
     await c.client().query("INSERT INTO users(tenant_id,id,n) VALUES (?,99,1)", [A]);
     c.net.gate = () => {};
     release();
@@ -296,7 +296,7 @@ describe("RED_G from the Quint model: push inside the refresh window", () => {
     c.time += 1; // 読み手の T が c より後になる
     const r = await new Db(c).begin();
     const read = (async () => [await getN(r, A), await getN(r, B)])();
-    await new Promise((res) => setTimeout(res, 5));
+    await c.sleep(5);
     c.net.gate = () => {};
     release();
     const seen = await read;
@@ -459,9 +459,9 @@ describe("pessimistic transactions", () => {
     await a.query("UPDATE h SET n = 1 WHERE id = 1");
     await new Db(c).query("UPDATE h SET n = 5 WHERE id = 2"); // a の読みを壊す
     await expect(a.query("COMMIT")).rejects.toThrow(/conflict/);
-    const t0 = Date.now();
+    const t0 = c.time;
     await new Db(c).query("UPDATE h SET n = 9 WHERE id = 1");
-    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(c.time - t0).toBeLessThan(1000);
     expect((await db.query("SELECT n FROM h WHERE id = 1")).rows).toEqual([{ n: 9 }]);
   });
   it("releases locks on ROLLBACK", async () => {
@@ -470,9 +470,9 @@ describe("pessimistic transactions", () => {
     await a.query("BEGIN IMMEDIATE");
     await a.query("UPDATE h SET n = 1 WHERE id = 1");
     await a.query("ROLLBACK");
-    const t0 = Date.now();
+    const t0 = c.time;
     await new Db(c).query("UPDATE h SET n = 2 WHERE id = 1");
-    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(c.time - t0).toBeLessThan(1000);
   });
   const lost = async (faults: Faults) => {
     // ロックが再起動で消えても、検証が F 以降の変更を見るので更新は失われない。
@@ -496,19 +496,19 @@ describe("pessimistic transactions", () => {
     expect(await lost({})).toEqual({ out: "aborted", n: 100 });
   });
   it("m9_impl_wake: wakes a waiter when the holder's lock expires", async () => {
-    const c = new SimCluster({ shards: 1, now: () => Date.now(), lockTtlMs: 150 });
+    const c = new SimCluster({ shards: 1, lockTtlMs: 150 });
     const db = new Db(c);
     await db.query("CREATE TABLE h(id INTEGER PRIMARY KEY, n INTEGER)");
     await db.query("INSERT INTO h VALUES (1, 0)");
     const dead = new Db(c);
     await dead.query("BEGIN IMMEDIATE");
     await dead.query("UPDATE h SET n = 1 WHERE id = 1"); // Worker が死んだまま戻らない
-    const t0 = Date.now();
+    const t0 = c.time;
     await new Db(c).query("UPDATE h SET n = 2 WHERE id = 1");
-    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(c.time - t0).toBeLessThan(1500);
   });
   it("m9_red_leave_silent: a woken waiter that cannot take the lock wakes the next one", async () => {
-    const c = new SimCluster({ shards: 1, now: () => Date.now() });
+    const c = new SimCluster({ shards: 1 });
     const db = new Db(c);
     await db.ddl("CREATE TABLE g(t INTEGER, id INTEGER, n INTEGER, PRIMARY KEY (t, id)) SHARD KEY (t)");
     await db.query("INSERT INTO g VALUES (1, 1, 0), (1, 2, 0)");
@@ -521,15 +521,15 @@ describe("pessimistic transactions", () => {
     const w1 = new Db(c);
     await w1.query("BEGIN IMMEDIATE");
     const first = w1.query("UPDATE g SET n = 2 WHERE t = 1"); // 行 1 で待ち、次に行 2 で止まる
-    await new Promise((r) => setTimeout(r, 20));
+    await c.sleep(20);
     const w2 = new Db(c);
     await w2.query("BEGIN IMMEDIATE");
-    const t0 = Date.now();
+    const t0 = c.time;
     const second = w2.query("UPDATE g SET n = 3 WHERE t = 1 AND id = 1");
-    await new Promise((r) => setTimeout(r, 20));
+    await c.sleep(20);
     await holder.query("COMMIT"); // W1 が起きるが行 2 で止まるので、W2 を起こす必要がある
     await second;
-    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(c.time - t0).toBeLessThan(1500);
     await w2.query("COMMIT");
     await other.query("COMMIT");
     await first.catch(() => {});
@@ -543,9 +543,9 @@ describe("pessimistic transactions", () => {
     const old = new Db(c);
     (old as unknown as { startStamp(): number }).startStamp = () => 0; // より古い取引
     await old.query("BEGIN IMMEDIATE");
-    const t0 = Date.now();
+    const t0 = c.time;
     await old.query("UPDATE h SET n = 2 WHERE id = 1");
-    expect(Date.now() - t0).toBeGreaterThanOrEqual(150);
+    expect(c.time - t0).toBeGreaterThanOrEqual(150);
     await old.query("COMMIT");
     await expect(stuck.query("COMMIT")).rejects.toThrow(/conflict/);
   });
@@ -570,7 +570,7 @@ describe("anchor crash", () => {
       }
     };
     const out = await w.commit().then(() => "committed", (e) => String(e.message));
-    await new Promise((r) => setTimeout(r, 5));
+    await c.sleep(5);
     c.net.gate = () => {};
     expect(out).toMatch(/conflict/);
     // redrive は ORPHAN_AGE_MS を過ぎた intent だけを片付ける。

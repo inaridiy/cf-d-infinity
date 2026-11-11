@@ -4,6 +4,7 @@ import { decode, encode } from "../shard/rows";
 import type { Value } from "../types";
 import type { Params } from "../sql/cst";
 import type { Db, QueryResult } from "./db";
+import { sleep } from "../runtime";
 
 type HValue =
   | { type: "null" }
@@ -146,7 +147,7 @@ async function runRequest(db: Db, r: Request, stored: Map<number, string>): Prom
         const busy = stepErrors.some((e) => (e as { code?: string } | null)?.code === "SQLITE_BUSY");
         if (!replayable || !busy || attempt >= 12) break;
         db.abandon();
-        await new Promise((done) => setTimeout(done, Math.random() * Math.min(50, 2 ** attempt)));
+        await sleep(db.rt, db.rt.random() * Math.min(50, 2 ** attempt));
       }
       return { type: "batch", result: { step_results: stepResults, step_errors: stepErrors } };
     }

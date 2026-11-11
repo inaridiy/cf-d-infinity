@@ -5,6 +5,7 @@ import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isWideSpan, u
 import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, fold, q, selectList } from "../shard/rows";
 import type { Catalog } from "../meta";
 import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
+import { type Runtime, sleep, systemRuntime } from "../runtime";
 import { normalize, parseStatements, text, type Node, type Params } from "../sql/cst";
 import { findTable, fullScan, planStatement, type Plan, type PlanContext, type Route, type Scan, type WriteTarget } from "../sql/plan";
 import { parseDdl } from "../sql/ddl";
@@ -19,6 +20,8 @@ export interface Cluster {
   publishIndex(table: string, name: string, basedOn?: number): Promise<Catalog>;
   allocate(table: string, n: number, min?: number): Promise<number>;
   switchRange(move: { start: number; end: number; to: string; from?: string }): Promise<Routing>;
+  /** 実時間、待ち、乱数、識別子の出どころ。なければ実物を使う。シミュレータのクラスタは、seed から決まる実装を持つ。 */
+  runtime?: Runtime;
 }
 
 /** 接続をまたいで渡された token を時刻にする。時刻として読めない値は「何も見ていない」として扱う。 */
@@ -82,8 +85,14 @@ const resolvesConflicts = (sql: string): boolean => /^\s*(INSERT|UPDATE)\s+OR\s+
 const UNRESOLVED = (what: string): string =>
   `unsupported: this statement resolves conflicts itself (OR IGNORE, OR REPLACE or ON CONFLICT), but the conflicting row of ${what} is on another shard`;
 
-/** 文が読む表を SQLite に尋ねた結果。キーは DDL の履歴と文の文面。null はコンパイルできなかった文。 */
-const tablesSeen = new Map<string, string[]>();
+/**
+ * 文が読む表を SQLite に尋ねた結果。キーは DDL の履歴と文の文面。
+ *
+ * 実行環境ごとに持つ。本番の実行環境は 1 つなので、isolate に 1 つの覚え書きになる。
+ * シミュレータのクラスタは、それぞれ自分の実行環境を持つ。覚えているかどうかで await の回数が変わり、並行する処理の
+ * 前後が変わるので、覚え書きをクラスタの間で共有すると、同じ seed の実行が、同じプロセスで前に流したものに依ってしまう。
+ */
+const tablesSeenBy = new WeakMap<Runtime, Map<string, string[]>>();
 /** DDL の履歴を表す短いキー。版番号だけだと、同じ isolate の別のクラスタと混ざる。 */
 const historyKeys = new WeakMap<Catalog, string>();
 function historyKey(cat: Catalog): string {
@@ -99,8 +108,7 @@ function historyKey(cat: Catalog): string {
 /** DDL が、進行中のシャードの増設が終わるのを待つ時間。 */
 const SPLIT_WAIT_MS = 60_000;
 
-const backoff = (attempt: number) =>
-  new Promise((r) => setTimeout(r, Math.random() * Math.min(50, 2 ** attempt)));
+const backoff = (rt: Runtime, attempt: number) => sleep(rt, rt.random() * Math.min(50, 2 ** attempt));
 
 /** 文を送る先のシャード。sks が null なら全行が対象である。 */
 interface Target {
@@ -784,6 +792,7 @@ export class Db {
   private touched = new Set<string>();
   /** 文の中から呼んだ transaction は、文の記録に含める。 */
   private inStatement = false;
+  readonly rt: Runtime;
   constructor(
     readonly cluster: Cluster,
     private opts: {
@@ -798,8 +807,11 @@ export class Db {
       limits?: { rows?: number; bytes?: number; writeSetBytes?: number };
       /** 文が終わるたびに呼ぶ。失敗した文でも呼ぶ。 */
       onStatement?: (s: StatementStat) => void;
+      /** 実時間、待ち、乱数、識別子の出どころ。指定しなければ、クラスタのもの、なければ実物を使う。 */
+      runtime?: Runtime;
     } = {},
   ) {
+    this.rt = opts.runtime ?? cluster.runtime ?? systemRuntime;
     this.token = cleanToken(opts.token);
     this.cached = opts.catalog ?? null;
     this.ids = opts.ids ?? new Map();
@@ -811,7 +823,7 @@ export class Db {
 
   /** ロックの優先順位に使う開始時刻。古い取引が勝つ。 */
   startStamp(): Ts {
-    return Date.now();
+    return this.rt.now();
   }
 
   async catalog(): Promise<Catalog> {
@@ -838,6 +850,8 @@ export class Db {
    */
   async tablesOf(sql: string, cat: Catalog, known: TableDef[]): Promise<TableDef[]> {
     const key = `${historyKey(cat)}\0${sql}`;
+    let tablesSeen = tablesSeenBy.get(this.rt);
+    if (!tablesSeen) tablesSeenBy.set(this.rt, (tablesSeen = new Map()));
     let names = tablesSeen.get(key);
     if (names === undefined) {
       const w = await openScratch(cat);
@@ -939,16 +953,16 @@ export class Db {
    * 前の版を適用していないシャードが残ったまま次の版を積むと、前の版がそのシャードで失敗したときに取り消せなくなる。
    */
   private async record(write: (basedOn: number, before: Catalog) => Promise<Catalog>): Promise<{ before: Catalog; cat: Catalog }> {
-    const deadline = Date.now() + (this.opts.splitWaitMs ?? SPLIT_WAIT_MS);
+    const deadline = this.rt.now() + (this.opts.splitWaitMs ?? SPLIT_WAIT_MS);
     for (let attempt = 0; ; attempt++) {
       const before = await this.cluster.catalog();
       const { failed, moving } = await this.syncAll(before);
       // シャードの増設の途中は、新しい版を記録しない。増設の間、親と子は DDL を適用しないので、記録すると、
       // 新しい版で計画した要求がそのシャードで通らなくなる。終わるのを待つ。
       if (moving) {
-        if (Date.now() > deadline) throw new SqlError("a shard split is in progress; retry the schema change when it finishes");
+        if (this.rt.now() > deadline) throw new SqlError("a shard split is in progress; retry the schema change when it finishes");
         attempt = Math.min(attempt, 3);
-        await new Promise((r) => setTimeout(r, 20));
+        await sleep(this.rt, 20);
         continue;
       }
       if (failed) {
@@ -986,11 +1000,11 @@ export class Db {
     // 後から DROP が適用されて行が消える。適用後は古い要求を全シャードが拒否する。
     let { failed, moving } = await this.syncAll(cat);
     // 記録した直後に増設が始まると、そのシャードは増設が終わるまで適用しない。終われば適用するので、待つ。
-    for (const deadline = Date.now() + (this.opts.splitWaitMs ?? SPLIT_WAIT_MS); failed && moving; ) {
-      if (Date.now() > deadline) {
+    for (const deadline = this.rt.now() + (this.opts.splitWaitMs ?? SPLIT_WAIT_MS); failed && moving; ) {
+      if (this.rt.now() > deadline) {
         throw new SqlError("the schema change is recorded, but a shard split is in progress; shards being split apply it when the split finishes");
       }
-      await new Promise((r) => setTimeout(r, 20));
+      await sleep(this.rt, 20);
       ({ failed, moving } = await this.syncAll(cat));
     }
     if (failed) {
@@ -1092,7 +1106,7 @@ export class Db {
         if (/^not owner|stale schema/.test(m)) return true;
         // 移動の途中は表全体を読めない。終わるのを待つ。
         if (/^migrating|group not arrived|read too old/.test(m) && attempt++ < BACKFILL_RETRIES) {
-          await backoff(attempt);
+          await backoff(this.rt, attempt);
           continue;
         }
         throw e;
@@ -1153,7 +1167,7 @@ export class Db {
         // 走査の後で行が変わった、などの競合。同じ位置から読み直す。
         if (!isRetryable(e) || attempt++ >= BACKFILL_RETRIES) throw e;
         this.onRetry(e);
-        await backoff(attempt);
+        await backoff(this.rt, attempt);
         continue;
       }
       attempt = 0;
@@ -1165,7 +1179,7 @@ export class Db {
   private nextTxnId(): string {
     // UUID を丸ごと使う。anchor は同じ ID の記録があればその決着を返すので、ID が衝突すると、
     // 後の取引は何も書かずに「確定」と応答される。先頭 8 桁 (32 bit) では、負荷があれば 1 時間に何度か衝突する。
-    return `${this.opts.idPrefix ?? "t"}-${crypto.randomUUID()}-${this.seq++}`;
+    return `${this.opts.idPrefix ?? "t"}-${this.rt.uuid()}-${this.seq++}`;
   }
 
   get rowBudget(): number {
@@ -1186,7 +1200,7 @@ export class Db {
 
   private report(sql: string, t0: number, info: { plan: string; attempts: number }, r: QueryResult | null, e?: unknown): void {
     this.opts.onStatement?.({
-      sql, ms: Date.now() - t0, plan: info.plan, shards: this.touched.size,
+      sql, ms: this.rt.now() - t0, plan: info.plan, shards: this.touched.size,
       rows: r?.values.length ?? 0, changes: r?.changes ?? 0, attempts: info.attempts,
       ...(e === undefined ? {} : { error: (e as Error)?.message ?? String(e) }),
     });
@@ -1202,7 +1216,7 @@ export class Db {
     const retries = this.opts.retries ?? 12;
     let refreshed = false;
     const observed = this.opts.onStatement && !this.inStatement;
-    const t0 = Date.now();
+    const t0 = this.rt.now();
     if (observed) this.touched.clear();
     for (let attempt = 0; ; attempt++) {
       const tx = new Txn(this, await this.catalog(), this.nextTxnId());
@@ -1224,7 +1238,7 @@ export class Db {
         }
         if (!isRetryable(e) || attempt >= retries) throw e;
         this.onRetry(e);
-        await backoff(attempt);
+        await backoff(this.rt, attempt);
       }
     }
   }
@@ -1263,7 +1277,7 @@ export class Db {
   private async statement(stmt: Node, params: Params): Promise<QueryResult> {
     if (!this.opts.onStatement) return this.attemptStatement(stmt, params, { plan: "", attempts: 0 });
     const info = { plan: "", attempts: 0 };
-    const t0 = Date.now();
+    const t0 = this.rt.now();
     this.touched.clear();
     this.inStatement = true;
     try {
@@ -1324,7 +1338,7 @@ export class Db {
           throw e;
         }
         this.onRetry(e);
-        await backoff(attempt);
+        await backoff(this.rt, attempt);
       }
     }
   }

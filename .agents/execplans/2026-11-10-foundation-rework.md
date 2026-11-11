@@ -49,24 +49,22 @@ npm への公開は、素地ができるまで行わない。
 - **基準経路**：文が読む表の行を、走査で各シャードから Worker の中の SQLite (sql.js) に集め、元の文をそこで実行する経路。読みは計画 `gather`、書き込みは計画 `wasmWrite` (捕捉した行の変更を、行を持つシャードへ振り分ける) がこれにあたる。走査の文と範囲は、同じ物 (`Scan`) から作る。
 - **最適化の経路**：基準経路と同じ結果を、より少ない費用で返す経路。文を 1 シャードへそのまま送る (`shard`、`write`)、集約を分けて押し下げる (`partial`)、上位 N 件を押し下げる、取引を省く autocommit の書き込み (`execAuto`) がある。
 - **グローバル index**：シャードをまたぐ UNIQUE を守るための表 `__gidx_<名前>(k, pk, sk)`。行と同じ取引で保守する。
-- **決定的なシミュレータ**：同じ seed を与えると、RPC の配送の順序まで同じ実行になるシミュレータ。いまのシミュレータはそうなっていない。
+- **決定的なシミュレータ**：同じ seed を与えると、RPC の配送の順序まで同じ実行になるシミュレータ。実時間、待ち、乱数、取引の ID を `Runtime` (`src/runtime.ts`) から取り、シミュレータは seed から決まる `VirtualRuntime` (`test/sim.ts`) を渡す。
 
 ## いまの状態 (2026-11-11)
 
-- `main` は `f2224ce`。2 回目のレビューの修正まで入っている。
-- ブランチ `spans-and-replay` は、検査が繰り返し通った最後の状態 (`6b55ad3`) に、引き継ぎの文書と、コードと食い違っていた文書の修正を足したものである。これを PR にして `main` へ入れる (Plan of Work の 1)。
-- ブランチ `wip/gather-missing-rows` (`45e9b57`) は、前の作業者の未完成の変更である。集めていない行と衝突したら集め足して実行し直す仕組みで、`UPDATE OR IGNORE` と `UPDATE OR REPLACE`、DEFAULT のある UNIQUE の列を省いた INSERT、`x IN 表名` を通す。モデルも、それを狙う生成器もないまま入れてあるので、`main` へは入れていない。採否は Plan of Work の 4 で決める。
-- ブランチ `foundation-3` は、上の 2 つに分ける前の並びで、もう使わない。push していない。
-- `spans-and-replay` での検査の結果は、下の「検査の結果」に書く。
+- `main` は `8dc8376` (PR #8)。前の作業者の検査済みの変更 (`6b55ad3` まで) と、引き継ぎの文書が入っている。
+- ブランチ `deterministic-sim` は、シミュレータを決定的にする変更である (Plan of Work の 2 の前半)。PR にして `main` へ入れる。
+- ブランチ `wip/gather-missing-rows` (`45e9b57`) は、前の作業者の未完成の変更である。集めていない行と衝突したら集め足して実行し直す仕組みで、`UPDATE OR IGNORE` と `UPDATE OR REPLACE`、DEFAULT のある UNIQUE の列を省いた INSERT、`x IN 表名` を通す。モデルも、それを狙う生成器もないまま入れてあるので、`main` へは入れていない。採否は Plan of Work の 4 で決める。ローカルにだけある。
+- ブランチ `foundation-3` (ローカル) は、PR #8 と `wip/gather-missing-rows` に分ける前の並びで、もう使わない。
 - `packages/cf-d-infinity/DEVELOPMENT.md` は、この一連の変更を反映していない。`AGENTS.md` にそう書いてある。
 
-### 検査の結果 (`spans-and-replay`、2026-11-11)
+### 検査の結果 (`deterministic-sim`、2026-11-11)
 
 - `npm run typecheck` は通る。
-- `npx vitest run` は、436 件のうち 435 件が合格、1 件が失敗だった。失敗は未解決の問題 2 で、`main` にも元からある。
-- `npx vitest run test/replay.test.ts` は、20 回の繰り返しで全部通った。
+- `npx vitest run` は、441 件が全部通る。2 回続けて流して、2 回とも通った。
 - `ROWCOST=1 npx vitest run test/rowcost.test.ts` は通る。
-- `OPEN=1 npx vitest run test/open` は、未解決の再現テストが落ちる (落ちるのが正しい)。
+- `OPEN=1 npx vitest run test/open` は、未解決の再現テスト 7 件が落ちる (落ちるのが正しい)。
 
 ## 設計上の決定 (現在形)
 
@@ -140,7 +138,7 @@ SQLite と突き合わせる検査 (逐次の差分、sqllogictest、乱択、�
 
 最後の 2 つは、基準経路が完全になれば断る理由がなくなる (Plan of Work の 4)。
 
-`main` と `spans-and-replay` には、規則 4 に反する拒否が 1 つ残っている。
+`main` には、規則 4 に反する拒否が 1 つ残っている。
 `UPDATE OR IGNORE` と `UPDATE OR REPLACE` は、衝突する行が別のシャードにあるときだけ `unsupported:` で断る。
 再現は `test/open/update-conflict-other-shard.test.ts`。
 Early の前に必ず消す。
@@ -167,16 +165,17 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 | 道具 | 場所 | 確かめること | 弱いところ |
 |---|---|---|---|
 | 範囲の検査 | `src/shard/core.ts` の `checked`、`test/setup.ts` | シミュレータでシャードが実行した文のすべてについて、範囲の外の行を消して再実行し、結果が同じか。どの試験にも掛かる | 範囲の外の行を全部消すので、打ち消し合う依存を見逃す。3,000 行を超える状態では省く。時点は確かめない。読むべき行が別のシャードにある場合は見つけない |
-| 文を再生する検査 | `test/replay.ts`、`test/replay.test.ts` | 並行に流した文を、確定の時刻の順に 1 つの SQLite で再生し、1 文ずつ結果が同じか。文のひな形ごとに成功した実行の下限、断った文が 0 | 文のひな形は手書き、表定義は 1 組。分割、DDL、再起動、応答の喪失を掛けていない。シミュレータが決定的でないので、同じ seed で再現しない |
+| 文を再生する検査 | `test/replay.ts`、`test/replay.test.ts` | 並行に流した文を、確定の時刻の順に 1 つの SQLite で再生し、1 文ずつ結果が同じか。文のひな形ごとに成功した実行の下限、断った文が 0 | 文のひな形は手書き、表定義は 1 組。分割、DDL、再起動、応答の喪失を掛けていない |
 | SQLite との差分 (逐次) | `test/diff.ts`、`test/compat.test.ts`、`test/fuzz.test.ts` | 1 接続で流した文の結果とエラー | 並行がない。表定義が固定 |
-| DDL と並行する取引 | `test/ddl-harness.ts`、`test/ddl-concurrent.test.ts` | DDL、分割、取引を並行に流した後の、index と行の一致、読みの正しさ | 決定的でない。未解決の問題 2 と 11 は、ここでまれに出る。CI が、欠陥と関係のない変更で落ちることがある |
+| DDL と並行する取引 | `test/ddl-harness.ts`、`test/ddl-concurrent.test.ts` | DDL、分割、取引を並行に流した後の、index と行の一致、読みの正しさ | 流す seed は場面ごとに 5、6 個。未解決の問題 2 と 11 は、決定的にする前に、ここでまれに出た |
+| 決定性の検査 | `test/determinism.test.ts` と、乱択の検査のそれぞれ | ソースが、時計、タイマー、乱数を直に呼んでいないこと。同じ seed の実行が、単独でも、別のクラスタと同時でも、同じ RPC の記録になること | workerd を動かす試験は対象外 (本物の時間で動く) |
 | 終了時の不変条件 | `test/invariants.ts` | intent の残り、適用されない確定済みの取引、index と行の一致 | |
 | 未解決の再現テスト | `test/open/` | 見つかっているが直していない欠陥。正しい挙動を期待して書いてあるので落ちる。既定の実行から外してある | `OPEN=1 npx vitest run test/open` で実行する |
 
 過去の欠陥を戻す切り替えは、シャード側が `Faults` (`src/types.ts`、20 個あまり)、範囲が `spanFaults` (`src/client/spans.ts`)。
 
 まだない道具は 3 つで、Plan of Work の 2、4、5 で作る。
-決定的なシミュレータ、基準経路だけの実行、表定義から文を作る生成器である。
+seed を大量に流して失敗を集める道具、基準経路だけの実行、表定義から文を作る生成器である。
 
 ## Progress
 
@@ -190,8 +189,9 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 - [x] (2026-11-11) 文を再生する検査を入れた。見つけた欠陥 2 件 (失敗した文の読みが検証されない、読む時点を進めるとき応答待ちの読みが漏れる) を直した。`363b869`
 - [x] (2026-11-11) 衝突を自分で解決する INSERT を、シャードをまたいで解決するようにした。`6b55ad3`
 - [x] (2026-11-11) 作業者が交代した。方針を変え、この文書を書き直した。README、`docs/overview.md`、`docs/sql-language.md` の、コードと食い違っていた箇所を直した。
-- [ ] 1. ここまでを `main` へ入れる (PR、CI、squash merge)
-- [ ] 2. シミュレータを決定的にする
+- [x] (2026-11-11) 1. ここまでを `main` へ入れた。PR #8、`8dc8376`
+- [x] (2026-11-11) 2 の前半。シミュレータを決定的にした。乱択の検査と、本物のタイマーで待っていた試験を、仮想の時計へ移した。
+- [ ] 2 の後半。seed を大量に流す道具を作り、未解決の問題 1、2、11 を探す
 - [ ] 3. 切った機能の残りのコードを消し、入口の受け入れの規則を入れる
 - [ ] 4. 基準経路だけの実行を作り、基準経路への切り替えを 1 か所にする。`wip/gather-missing-rows` の採否を決める
 - [ ] 5. 表定義から文を作る生成器と、障害の掛け合わせ。欠陥を戻して見つかるかの表
@@ -210,8 +210,8 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 2. **`test/ddl-concurrent.test.ts` の「CREATE UNIQUE INDEX (global) racing with writes that create duplicates (seed 1)」が、別の試験を同時に流すと落ちることがある (2026-11-11)。**
    `CREATE UNIQUE INDEX acct_v ON acct(v)` が成功した後、行 `[6,3]` (v = 1) の項目がグローバル index にない。
    項目のない行があると、同じ値の行をもう 1 つ入れられるので、UNIQUE が守られない。
-   `main` (`f2224ce`) でも、同じ seed、同じ行で出た。このブランチの変更が原因ではない。
-   単独で流すと 6 回とも通り、別の試験と同時に流すと `spans-and-replay` で 5 回に 1 回、`main` で 4 回に 1 回出た。
+   PR #8 の前の `main` (`f2224ce`) でも、同じ seed、同じ行で出た。PR #8 の変更が原因ではない。
+   単独で流すと 6 回とも通り、別の試験と同時に流すと、PR #8 のブランチで 5 回に 1 回、その前の `main` (`f2224ce`) で 4 回に 1 回出た。
    同時に流したときは、同じ場面の seed 4 が 120 秒の制限時間を超えたことも 1 回ある。遅いだけか、進まなくなったのかは分からない。
    出力は `.agents/execplans/evidence/2026-11-11-ddl-concurrent-missing-index-entry.txt`。
    不変条件 7。
@@ -222,7 +222,9 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 6. `test/open/unique-pending-cost.test.ts`: 未決着の intent が多いとき、UNIQUE のある表への書き込みの費用が増える。いったん通るようになったが、いまは落ちる。理由は調べていない。
 7. `test/open/internal-names.test.ts` と `test/open/ddl-endpoint-multistatement.test.ts` は、いまは通る。`test/` の直下へ移していないだけである。
 8. UNIQUE のある表での競合の頻度を、負荷を掛けて測っていない。衝突を解決する INSERT の費用も測っていない。
-9. `test/autoscale-cron.test.ts` が、CI で 1 回落ちたことがある (`main` の PR #4 のマージ直後)。原因は調べていない。
+9. `test/autoscale-cron.test.ts` が、CI で 1 回落ちたことがある (`main` の PR #4 のマージ直後)。
+   この試験は、16 本の書き込みで負荷の閾値を実時間のうちに超える必要がある。ほかの試験と CPU を取り合うと、20 秒待っても増設が起きずに落ちる (手元の全件の実行で、3 回に 2 回)。
+   workerd を動かす試験を、シミュレータの試験の後に流すようにした。それでも CI の計算機が遅ければ落ち得る。閾値を実時間に依らない形にするのは、まだである。
 10. 内部の名前の予約を狭めた理由は「drizzle-kit が `__new_<表名>` を使う」という記憶で、確かめていない。Plan of Work の 8 で、実際の移行の道具が出す文で確かめる。
 11. **`test/ddl-concurrent.test.ts` の「ALTER TABLE ADD COLUMN (seed 2)」が、PR #8 の CI で 1 回落ちた (2026-11-11)。**
     `ALTER TABLE acct ADD COLUMN extra INTEGER DEFAULT 5` と並行する取引の文が、`column index out of range` で失敗した。
@@ -241,6 +243,8 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 - `ON CONFLICT (email)` は、シャードの表に UNIQUE (email) がないので、衝突がなくても SQLite のエラーになっていた。持ち主の指摘で分かった。
 - 主キーに NULL のある行の取り違えと、`pragma_table_info('__txn')` でシャードの内部の表が読めることは、Codex の指摘を手元で再現した。
 - (2026-11-11) シミュレータが決定的でない原因は、タイマーだけではなかった。取引の ID が `crypto.randomUUID()` で作られ、その ID のハッシュが anchor の選び方に使われる (`Txn.commit`)。待ちの長さにも `Math.random()` が使われている (`backoff`、`SqliteBackend.sync`)。
+- (2026-11-11) 決定的にするには、時計とタイマーを差し替えるだけでは足りなかった。文のコンパイル結果の覚え書きがプロセスで共有されていて、2 回目の実行は await の回数が減り、並行する処理の前後が変わった。同じ seed を 2 回流して RPC の記録を比べる検査が、これを見つけた。
+- (2026-11-11) 本物のタイマーで待っていた試験のうち、仮想の時計に替えて意味が変わるものがあった。「待たされないこと」を実時間が 1 秒未満であることで確かめていた試験は、仮想の時計では何もしなくても通る。経過は `c.time` で測るように直した。
 - (2026-11-11) DDL と並行する取引の試験 (`test/ddl-concurrent.test.ts`) は、1 日のうちに 3 種類の失敗を 1 回ずつ出した。index の項目の欠け、制限時間の超過、`column index out of range` である (未解決の問題 2 と 11)。どれも同じ seed の次の実行では出ない。
 - (2026-11-11) 全件の実行で 1 回、UNIQUE の index の項目の欠けが出た (未解決の問題 2)。`main` にも元からあった。別の試験を同時に流すと実行のタイミングが変わり、普段は出ない並びが出る。3 回のレビューと、これまでの繰り返しの実行では見つかっていなかった。
 - (2026-11-11) `6b55ad3` には、規則 4 に反する拒否が残っていた (未解決の問題 5)。`docs/sql-language.md` には書いてあったが、この計画の「対応する範囲」には載っていなかった。
@@ -261,6 +265,7 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
   - 実行経路を基準経路と最適化の経路に分け、基準経路だけの実行を検査にする (上の「基準経路と最適化の経路」)。
   - 小さい PR で `main` へ入れる。前の並び (`foundation-3`) は 10 コミットが未マージで、CI を 1 度も通っていなかった。
   - UNIQUE の列を引く読みの経路は、Early の前に入れる決定を変えずに、順序を最後にする。できた素地に機能を足す最初の試験として使う (完了の条件 4)。
+- (2026-11-11) 決定性は、時計などを外から渡す形 (`Runtime`) で作った。vitest の偽のタイマーで全体を差し替える案は採らなかった。夜間に seed を大量に流す道具を vitest の外でも動かせるようにしたいことと、ソースが何に依存しているかを型で見えるようにしたいことが理由である。直に呼ぶコードが紛れ込むのは、`test/determinism.test.ts` が止める。
 - (2026-11-11) `45e9b57` は `main` へ入れず、`wip/gather-missing-rows` に残した。集め足しを 16 回で打ち切って `unsupported:` を返す箇所があり、これはデータ次第の拒否にあたる。
 - 採らなかったもの: 実行を自前で持つ (TiDB の形)。snapshot isolation を逃げ道にする。行のある表への DDL に書き込みの締め出しを使う (保留)。シャードへ送る文を走査だけに絞り、利用者の文をシャードで実行するのをやめる (範囲の検査が要らなくなるが、1 シャードで済む文の往復と課金の行数が増え、設計の利点を捨てる)。
 
@@ -271,25 +276,28 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 
 ### 1. ここまでを `main` へ入れる
 
-`spans-and-replay` を push して PR を作り、CI が通ったら squash merge する。
-未解決の問題 2 と 11 の試験は、まれに落ちる。CI で落ちたら、やり直す前に、落ちた seed と出力を証拠に足す。
-同じ失敗でなければ、新しい問題として記録する。
+済んだ (PR #8)。
+最初の CI は、未解決の問題 11 で 1 回落ちた。出力を証拠に足してから、やり直した。
 
 ### 2. シミュレータを決定的にする
 
-同じ seed で同じ実行になるようにする。
-これがないと、検査が見つけたものを再現できず、未解決の問題 1、2、11 に手を付けられない。
+前半は済んだ。
+同じ seed は同じ実行になる。
+仕組みは次のとおりである。
 
-- 時計、待ち、乱数、取引の ID を、`Db` と `ShardCore` へ外から渡す。いま直に呼んでいる場所は、`src/client/db.ts` の `backoff`、分割の待ち、`nextTxnId`、`startStamp`、`src/shard/core.ts` の表定義の待ちと行ロックの待ちである。本番の既定は、いまと同じ実物にする。
-- シミュレータ (`test/sim.ts`) に、仮想の時計と、seed で次の出来事 (RPC の配送、応答の配送、タイマー) を選ぶスケジューラを持たせる。`setTimeout`、`setImmediate`、`Math.random()` を使わない。
-- Worker の SQLite (sql.js) の初期化は本物の非同期の入出力なので、実行の前に済ませておく。
-- 同じ seed を 2 回流し、RPC の記録が一致することを確かめる試験を足す。決定的でなくなったら、この試験が落ちる。
-- `test/replay.test.ts`、`test/ddl-concurrent.test.ts`、`test/history.test.ts`、`test/elle-sim.test.ts` を、このスケジューラの上へ移す。
-- workerd を使う結合テストは、本物を動かすので対象にしない。
+- 実時間、待ち、乱数、取引の ID は、`Runtime` (`src/runtime.ts`) から取る。`Db` と `ShardCore` は依存として受け取り、本番は実物 (`systemRuntime`) を使う。
+- シミュレータは、seed から決まる `VirtualRuntime` (`test/sim.ts`) を渡す。時刻は、予約された出来事 (待ちの終わり、RPC の配送) が起きるときにだけ進む。出来事は、時刻の順 (同じ時刻なら予約した順) に 1 つずつ起こし、あいだに本物の `setImmediate` を挟んで、起こした処理が次の待ちに入るまで進ませる。
+- 文のコンパイル結果の覚え書きは、実行環境ごとに持つ。プロセスで共有すると、覚えているかどうかで await の回数が変わり、同じ seed の実行が、前に流したものに依ってしまう。
+- Worker の SQLite (sql.js) の初期化は本物の非同期の入出力なので、試験の前に済ませる (`test/setup.ts`)。
+- 試験の中の待ちは `c.sleep(ms)` で書く。本物のタイマーを混ぜると、その試験は再現できなくなる。条件を待つ繰り返しは `c.sleep(1)` で書く。`c.sleep(0)` だと、同じ時刻の出来事が尽きず、時刻が進まない。
+- workerd を動かす試験は、本物の時間で動くので対象にしない。シミュレータの試験が終わってから流す (`vitest.config.ts` の 2 つの組)。
+- `test/contention.test.ts` (競合率の計測、`CONTENTION=1` のときだけ動く) は、実時間のままにしてある。`docs/benchmarks.md` の数字が実時間の計測だからである。
 
-できたら、未解決の問題 1、2、11 を、seed を数千個流して探す。
-見つかった seed は、再現テストとして `test/open/` に置く。
-直すのは、不変条件と持ち主に割り当ててからである。
+後半が残っている。
+
+- 乱択の検査の作業負荷 (`test/replay.test.ts`、`test/history.test.ts` の `run`、`test/ddl-concurrent.test.ts` の場面) を、試験ファイルの外へ出し、seed の範囲を指定して流せるようにする。
+- 未解決の問題 1、2、11 を、seed を数千個流して探す。
+- 見つかった seed は、再現テストとして `test/open/` に置く。直すのは、不変条件と持ち主に割り当ててからである。
 
 確定前の書き込みの消失と、再起動の時点の制御 (Codex の指摘 6) は、5 で足す。
 
@@ -338,8 +346,9 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 作業ディレクトリは `packages/cf-d-infinity`。
 
     npm run typecheck
-    npx vitest run                          # 全部。2 分ほど。範囲の検査が全試験に掛かる
-    npx vitest run test/replay.test.ts      # 文を再生する検査。まだ決定的でない
+    npx vitest run                          # 全部。3 分ほど。シミュレータの試験 (sim) の後に、workerd を動かす試験 (workerd) が走る
+    npx vitest run --project sim            # シミュレータの試験だけ。範囲の検査が全試験に掛かる
+    npx vitest run test/replay.test.ts      # 文を再生する検査。seed ごとに 1 つの実行
     ROWCOST=1 npx vitest run test/rowcost.test.ts
     OPEN=1 npx vitest run test/open         # 未解決の再現テスト。落ちるのが正しい
 
@@ -361,7 +370,7 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 
 - `main` へは、PR を作り、CI が通ってから squash merge する。`specs/` を変えると、CI の models ジョブが 75 分ほど走る。
 - 前の作業者の未完成の変更は `wip/gather-missing-rows` (`45e9b57`) にある。ローカルにだけあり、push していない。
-- `foundation-3` (ローカル) は、`spans-and-replay` と `wip/gather-missing-rows` に分ける前の並びである。2 つが残っていれば消してよい。
+- `foundation-3` (ローカル) は、PR #8 と `wip/gather-missing-rows` に分ける前の並びである。`wip/gather-missing-rows` が残っていれば消してよい。
 - Cloudflare 上に、この作業のためのリソースは残していない。
 - 証拠 (Codex の報告、試験の出力) は `.agents/execplans/evidence/` に置く。
 

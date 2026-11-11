@@ -31,8 +31,8 @@ describe("a schema change recorded just after a split fenced a shard", () => {
       if (started || m.method !== "syncSchema") return;
       started = true;
       splitting = outcome(split(c, "s0", "s1"));
-      for (let i = 0; i < 500 && (await c.cores.get("s0")!.moves({})).outgoing.length === 0; i++) await new Promise((r) => setTimeout(r, 2));
-      for (let i = 0; i < 500 && (await c.catalog()).routing.ranges.length < 2; i++) await new Promise((r) => setTimeout(r, 2));
+      for (let i = 0; i < 500 && (await c.cores.get("s0")!.moves({})).outgoing.length === 0; i++) await c.sleep(2);
+      for (let i = 0; i < 500 && (await c.catalog()).routing.ranges.length < 2; i++) await c.sleep(2);
     };
     const before = (await c.catalog()).version;
     const ddl = await outcome(new Db(c, { splitWaitMs: 300 }).ddl("ALTER TABLE other ADD COLUMN x INTEGER"));

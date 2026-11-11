@@ -1,8 +1,15 @@
 // どの試験にも掛かる検査。シミュレータのシャードが実行した文のうち、宣言した範囲 (span) の外の行に依存したものがあれば、
 // その試験を失敗にする。範囲の外の行は、intent の決着も commit の検証も受けないので、取引の検証が成り立たない。
 // 文の形ごとに範囲の作り方を確かめる代わりに、実行された文のすべてをこれで確かめる。
-import { afterEach, expect } from "vitest";
+import { afterEach, beforeAll, expect } from "vitest";
+import { openScratch } from "../src/sql/scratch";
 import { allSpanEscapes } from "./sim";
+
+// Worker の SQLite (sql.js) の初期化は、本物の非同期の入出力である。試験の途中で初めて起きると、仮想の実行環境の
+// 出来事との前後が実行ごとに変わる。先に済ませておく。
+beforeAll(async () => {
+  (await openScratch({ ddl: [] })).close();
+});
 
 afterEach(() => {
   const found = allSpanEscapes.splice(0);

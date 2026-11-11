@@ -1,5 +1,6 @@
 import type { Cluster } from "./client/db";
 import { planSplit, shardsOf, type Routing } from "./routing";
+import { systemRuntime } from "./runtime";
 import type { ShardHealth, ShardMetrics } from "./types";
 
 export interface Thresholds {
@@ -137,7 +138,8 @@ export async function split(
   cluster: Cluster, parent: string, child: string,
   opts: { now?: () => number; range?: { start: number; end: number } } = {},
 ): Promise<SplitResult | null> {
-  const now = opts.now ?? (() => Date.now());
+  const rt = cluster.runtime ?? systemRuntime;
+  const now = opts.now ?? (() => rt.now());
   const cat = await cluster.catalog();
   // 途中で終わった増設があれば、同じ範囲を続ける。範囲表を切り替えた後で範囲を計算し直すと、別の範囲になり、
   // 元の範囲は親も子も「移動の途中」のまま残る。
@@ -171,15 +173,16 @@ export async function split(
 const PROBE_PARALLEL = 6;
 
 export async function collectMetrics(cluster: Cluster): Promise<ShardMetrics[]> {
+  const rt = cluster.runtime ?? systemRuntime;
   const cat = await cluster.catalog();
   const ids = shardsOf(cat.routing);
   const out: ShardMetrics[] = new Array(ids.length);
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(PROBE_PARALLEL, ids.length) }, async () => {
     for (let i = next++; i < ids.length; i = next++) {
-      const t0 = Date.now();
+      const t0 = rt.now();
       const m = await cluster.shard(ids[i]!).metrics({});
-      out[i] = { ...m, probeMs: Date.now() - t0 };
+      out[i] = { ...m, probeMs: rt.now() - t0 };
     }
   }));
   return out;

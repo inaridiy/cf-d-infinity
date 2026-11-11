@@ -379,7 +379,7 @@ describe("known bugs, as deterministic interleavings", () => {
     const update = outcome(stale.query("UPDATE t SET v = 99 WHERE tenant_id = ? AND id = 1", [A]));
     const ddl = outcome(db.ddl("CREATE UNIQUE INDEX ix ON t(v)"));
     await waited.reached;
-    await new Promise((r) => setTimeout(r, 20));
+    await c.sleep(20);
     waited.release();
     expect(await ddl).toBe("ok");
     await holder.query("ROLLBACK");
@@ -425,7 +425,7 @@ describe("known bugs, as deterministic interleavings", () => {
     await ack.reached;
     // 修正後は、intent を持つ参加者が DDL の適用を待たせる。応答が届いて取引が決着してから、DDL が進む。
     const ddl = outcome(db.ddl("CREATE UNIQUE INDEX ix ON t(v)"));
-    await new Promise((r) => setTimeout(r, 30));
+    await c.sleep(30);
     ack.release();
     expect(await ddl).toBe("ok");
     const committed = await commit;
@@ -637,6 +637,19 @@ describe("a bug in whole-table reads that the same workload found (not specific 
 /** シャードの private な実装を差し替える。欠陥の注入にだけ使う。 */
 type Inner = { schema: number; ensureSchema(version: number): Promise<void>; syncSchema(req: { version: number }): Promise<void> };
 const inner = (core: ShardCore) => core as unknown as Inner;
+
+describe("the simulator is deterministic for this workload", () => {
+  // 失敗した seed を再現できるのは、同じ seed が同じ実行になるからである。分割も、DDL も、応答の遅れも、seed から決まる。
+  it("the same scenario and seed give the same run, alone or next to another run", async () => {
+    const unique = CASES.uniqueIndex.s;
+    const a = await runScenario(1, unique);
+    const [b, other] = await Promise.all([runScenario(1, unique), runScenario(2, unique)]);
+    expect(b.fingerprint).toBe(a.fingerprint);
+    expect(other.fingerprint).not.toBe(a.fingerprint);
+    const splits = CASES.splitAndDdl.s;
+    expect((await runScenario(1, splits)).fingerprint).toBe((await runScenario(1, splits)).fingerprint);
+  }, 120_000);
+});
 
 describe("the checks are not vacuous", () => {
   const detects = async (s: Scenario, hit: (r: Report) => boolean, seeds = [201, 202, 203, 204, 205, 206]) => {

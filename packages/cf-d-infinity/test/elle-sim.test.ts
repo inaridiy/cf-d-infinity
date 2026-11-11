@@ -25,7 +25,7 @@ async function run(seed: number, o: { faults?: Faults; restarts?: boolean; split
   const rnd = prng(seed);
   const skew = new Map<string, number>();
   const c = new SimCluster({
-    shards: 4, faults: o.faults, now: () => Date.now(),
+    shards: 4, faults: o.faults, seed,
     skewMs: (id) => {
       if (!skew.has(id)) skew.set(id, Math.floor(rnd() * (o.skewMs ?? 0)));
       return skew.get(id)!;
@@ -36,7 +36,7 @@ async function run(seed: number, o: { faults?: Faults; restarts?: boolean; split
   let stop = false;
   const chaos = (async () => {
     while (!stop && o.restarts) {
-      await new Promise((r) => setTimeout(r, 15));
+      await c.sleep(15);
       c.restart(c.shardIds[Math.floor(rnd() * c.shardIds.length)]!);
       await Promise.all([...c.cores.values()].map((core) => core.redrive().catch(() => {})));
     }
@@ -44,7 +44,7 @@ async function run(seed: number, o: { faults?: Faults; restarts?: boolean; split
   const grower = (async () => {
     let next = c.shardIds.length;
     while (!stop && o.splits) {
-      await new Promise((r) => setTimeout(r, 30));
+      await c.sleep(30);
       const { routing } = await c.catalog();
       const list = shardsOf(routing);
       const parent = list[Math.floor(rnd() * list.length)]!;
@@ -57,13 +57,13 @@ async function run(seed: number, o: { faults?: Faults; restarts?: boolean; split
           break;
         } catch (e) {
           if (!/fenced|dropped/.test(String(e))) throw e;
-          await new Promise((r) => setTimeout(r, 2));
+          await c.sleep(2);
         }
       }
     }
   })();
   const out = await runListAppend(() => c.client(), {
-    lanes: 6, ops: o.ops ?? 25, rnd, epochMs: 3_600_000, keysPerEpoch: 6, tag: `s${seed}`,
+    lanes: 6, ops: o.ops ?? 25, rnd, now: () => c.time, epochMs: 3_600_000, keysPerEpoch: 6, tag: `s${seed}`,
   });
   stop = true;
   await chaos;

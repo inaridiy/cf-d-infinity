@@ -40,7 +40,7 @@ async function run(o: RunOpts) {
   const c = new SimCluster({
     shards: 4,
     faults: o.faults,
-    now: () => Date.now(),
+    seed: o.seed,
     skewMs: (id) => {
       if (!skew.has(id)) skew.set(id, Math.floor(rnd() * (o.skewMs ?? 0)));
       return skew.get(id)!;
@@ -135,7 +135,7 @@ async function run(o: RunOpts) {
   let stop = false;
   const chaos = (async () => {
     while (!stop && o.restarts) {
-      await new Promise((r) => setTimeout(r, 15));
+      await c.sleep(15);
       c.restart(c.shardIds[Math.floor(rnd() * c.shardIds.length)]!);
       await Promise.all([...c.cores.values()].map((core) => core.redrive().catch(() => {})));
     }
@@ -144,7 +144,7 @@ async function run(o: RunOpts) {
   const grower = (async () => {
     let next = c.shardIds.length;
     while (!stop && o.splits) {
-      await new Promise((r) => setTimeout(r, 25));
+      await c.sleep(25);
       const { routing } = await c.catalog();
       const list = shardsOf(routing);
       const parent = list[Math.floor(rnd() * list.length)]!;
@@ -159,7 +159,7 @@ async function run(o: RunOpts) {
           break;
         } catch (e) {
           if (!/fenced|dropped/.test(String(e))) throw e;
-          await new Promise((r) => setTimeout(r, 2));
+          await c.sleep(2);
         }
       }
     }
@@ -228,6 +228,16 @@ describe("history checker with pessimistic transactions", () => {
       expect(violations.slice(0, 3)).toEqual([]);
     }, 60000);
   }
+});
+
+describe("the simulator is deterministic for this workload", () => {
+  it("the same seed gives the same run, with clock skew, restarts and splits", async () => {
+    const o = { seed: 31, skewMs: 20, splits: true, restarts: true, ops: 60 };
+    const a = await run(o);
+    const b = await run(o);
+    expect(b.c.fingerprint()).toBe(a.c.fingerprint());
+    expect(b.history.length).toBe(a.history.length);
+  });
 });
 
 describe("the checker is not vacuous", () => {
