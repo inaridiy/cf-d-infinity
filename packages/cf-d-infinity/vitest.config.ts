@@ -9,7 +9,8 @@ const open = process.env.OPEN ? [] : ["test/open/**"];
 // 試験は 2 組に分ける。
 // sim: シミュレータの上の試験。仮想の時計で動き、実時間に依らない。計算機の全部のコアを使う。
 // workerd: 本物の workerd (Miniflare) を動かす試験。実時間で待ち、負荷の閾値を実時間の書き込みの速さで超える試験もある。
-//          sim と同時に流すと、CPU を取り合って遅くなり、制限時間や閾値に届かずに落ちる。sim が終わってから流す。
+//          ほかの試験と同時に流すと、CPU を取り合って遅くなり、制限時間や閾値に届かずに落ちる。sim が終わってから、
+//          ファイルを 1 つずつ流す (CI の計算機は 4 コアで、workerd の試験どうしでも取り合う)。
 const dir = join(import.meta.dirname, "test");
 const tests = [
   ...readdirSync(dir).map((f) => `test/${f}`),
@@ -29,7 +30,7 @@ export default defineConfig({
       },
       {
         extends: true,
-        test: { name: "workerd", include: workerd, exclude: ["node_modules/**", ...open], sequence: { groupOrder: 1 } },
+        test: { name: "workerd", include: workerd, exclude: ["node_modules/**", ...open], sequence: { groupOrder: 1 }, poolOptions: { forks: { singleFork: true } } },
       },
     ],
   },

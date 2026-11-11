@@ -1,5 +1,5 @@
 // Review of f2224ce: access control of the data path (POST /ddl with the data token), on real workerd.
-// Asserts the correct behaviour; fails today.
+// This was a reproduction of an open defect; it passes now.
 //
 // Db.ddl(sql) -> parseDdl(sql) looks only at the first statement of `sql`, but for a local CREATE INDEX (and a local
 // DROP INDEX) it records the WHOLE text as the shard statement (`sql: [source]`, src/sql/ddl.ts). Meta and every shard

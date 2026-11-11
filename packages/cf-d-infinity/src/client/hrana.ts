@@ -1,7 +1,7 @@
 // libSQL の Hrana over HTTP (v3 の JSON)。@libsql/client が接続先を変えるだけで動く。
 // Worker は状態を持たないので、取引の状態は baton に載せて持ち回る。
 import { decode, encode } from "../shard/rows";
-import type { Value } from "../types";
+import { SqlError, type Value } from "../types";
 import type { Params } from "../sql/cst";
 import type { Db, QueryResult } from "./db";
 import { sleep } from "../runtime";
@@ -54,7 +54,15 @@ const fromBase64 = (s: string) => Uint8Array.from(atob(s.padEnd(Math.ceil(s.leng
 function fromH(v: HValue): Value {
   switch (v.type) {
     case "null": return null;
-    case "integer": return Number(v.value);
+    case "integer": {
+      // 整数は 10 進の文字列で届く。JavaScript の数値は 2^53 を超える整数を正確に表せないので、そのまま数値にすると、
+      // 黙って別の値になる。主キーなら別の行を指す。この先の検査は、変わった後の値しか見ない。ここで断る。
+      const n = Number(v.value);
+      if (!Number.isSafeInteger(n)) {
+        throw new SqlError(`unsupported: the integer ${v.value} cannot be stored exactly; integers are limited to the range from -(2^53 - 1) to 2^53 - 1`);
+      }
+      return n;
+    }
     case "float": return v.value;
     case "text": return v.value;
     case "blob": return fromBase64(v.base64);

@@ -11,7 +11,7 @@ import type { DdlEntry } from "../meta";
 import { slotOf } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import {
-  CAPTURE_TABLES, applyChanges, asSqlError, capturedChanges, decode, deleteRow, encode, encodeKey, fold, insertRow, q,
+  CAPTURE_TABLES, applyChanges, asSqlError, assertKeyed, capturedChanges, decode, deleteRow, encode, encodeKey, fold, insertRow, q,
   rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore, writable,
 } from "./rows";
 
@@ -1417,6 +1417,7 @@ export class ShardCore implements ShardApi {
         if (capture === "update" && (rows.length > 1 || (rows.length === 1 && was !== encodeKey(def, rows[0]!).pk))) {
           throw FALLBACK;
         }
+        if (capture !== "delete") for (const row of rows) assertKeyed(def, row);
         const changes: Change[] = rows.map((row) => ({
           table: def.name, ...encodeKey(def, row),
           before: capture === "insert" ? null : capture === "delete" ? row : before,

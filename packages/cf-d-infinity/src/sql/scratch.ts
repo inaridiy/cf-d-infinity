@@ -74,18 +74,35 @@ export class ScratchDb implements Backend {
    * 手書きの解析が表の参照を見落とすと、空の表として黙って誤った結果を返すので、実行の前に必ず照合する。
    */
   tablesUsed(sql: string): string[] {
+    return this.reads(sql).tables;
+  }
+
+  /**
+   * 文が開く表と、文が表定義そのものを読むかどうか (metadata)。
+   *
+   * 表定義を読む文は、`sqlite_master` (どの名前で呼んでも、開くのはルートページ 1 である) を読む文と、`pragma_table_info(...)` の
+   * ような PRAGMA の関数を FROM に置く文である。ここには利用者の表しかないので、ここで実行すれば利用者の表定義について答える。
+   * 同じ文をシャードで実行すると、シャードの内部の表について答えてしまう。呼び出し側は、metadata の文をシャードへ送らない。
+   * PRAGMA の関数は仮想表として開かれる。`json_each` なども仮想表なので、仮想表を開き、かつ文面に `pragma_` で始まる
+   * 名前があるときに、表定義を読む文として扱う。
+   */
+  reads(sql: string): { tables: string[]; metadata: boolean } {
     const roots = new Map<number, string>();
     for (const r of this.exec(`SELECT rootpage, tbl_name FROM sqlite_master WHERE rootpage > 0`)) {
       roots.set(r.rootpage as number, r.tbl_name as string);
     }
     const out = new Set<string>();
+    let schema = false;
+    let virtual = false;
     for (const op of this.exec(`EXPLAIN ${sql}`)) {
       if (op.opcode === "OpenRead" || op.opcode === "OpenWrite") {
+        if (op.p2 === 1) schema = true;
         const t = roots.get(op.p2 as number);
         if (t && !t.startsWith("sqlite_")) out.add(t);
-      }
+      } else if (op.opcode === "VOpen") virtual = true;
     }
-    return [...out];
+    const text = sql.replace(/'(?:[^']|'')*'/g, "''").replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, " ");
+    return { tables: [...out], metadata: schema || (virtual && /\bpragma_/i.test(text)) };
   }
 
   /** 行をまとめて投入する。1 回の取引で流すと 10 万行で 100 ms 前後である。 */
