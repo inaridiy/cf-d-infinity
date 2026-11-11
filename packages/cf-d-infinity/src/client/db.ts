@@ -2,7 +2,7 @@ import type {
   Change, CommitRes, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
 } from "../types";
 import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isWideSpan, utf8Length } from "../types";
-import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, fold, q, selectList } from "../shard/rows";
+import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, q, selectList } from "../shard/rows";
 import type { Catalog } from "../meta";
 import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
@@ -118,7 +118,7 @@ async function runPlanned(
 function keysOf(l: Loaded): string[] {
   const at = l.table.pk.map((c) => l.columns.indexOf(c));
   if (at.some((i) => i < 0)) return [];
-  return l.rows.map((row) => `${l.table.name}\0${encode(at.map((i, n) => fold(row[i] ?? null, l.table.collation[l.table.pk[n]!])))}`);
+  return l.rows.map((row) => `${l.table.name}\0${encode(at.map((i) => row[i] ?? null))}`);
 }
 
 /** 基準経路で集めた行。Worker の SQLite を作り直すときに読み直さずに済むように、表ごとに持っておく。 */
@@ -283,7 +283,7 @@ class ReadScope {
   protected async scratch(loaded: Loaded[]): Promise<ScratchDb> {
     const w = await openScratch(this.cat);
     try {
-      for (const l of loaded) w.load(l.table.name, l.columns, l.rows, l.table.generated);
+      for (const l of loaded) w.load(l.table.name, l.columns, l.rows);
       return w;
     } catch (e) {
       w.close();
@@ -301,7 +301,6 @@ class ReadScope {
       case "meta": {
         const w = await this.gather([], p.sql);
         try {
-          for (const t of Object.values(this.cat.triggers)) w.exec(t.sql);
           const r = w.raw(p.sql, ...p.params);
           return new QueryResult(r.columns, r.values, 0, null, this.T);
         } finally {
@@ -583,7 +582,6 @@ export class Txn extends ReadScope {
       case "noop":
         return new QueryResult([], []);
       case "ddl":
-      case "ctas":
       case "tcl":
         throw new SqlError(p.kind === "tcl"
           ? "unsupported: BEGIN, COMMIT, ROLLBACK and SAVEPOINT inside a transaction object; use the object's own methods"
@@ -657,8 +655,6 @@ export class Txn extends ReadScope {
         if (w.reads(p.sql).metadata) throw new SqlError(METADATA_IN_WRITE);
         for (const ddl of CAPTURE_TABLES) w.exec(ddl);
         for (const d of p.tables) for (const ddl of captureDdl(d)) w.exec(ddl);
-        // 利用者の trigger は行を読み込んだ後に作る。先に作ると読み込みで発火する。
-        for (const t of Object.values(this.cat.triggers)) w.exec(t.sql);
         w.exec(`PRAGMA recursive_triggers = ON`);
         w.exec(`INSERT INTO __cap_on VALUES (1)`);
         const r = w.raw(p.sql, ...p.params);
@@ -718,10 +714,9 @@ export class Txn extends ReadScope {
       }
       // シャードをまたぐ UNIQUE。index の表を引き、同じ値を持つ行の主キーと場所を知ってから、その行を読む。
       for (const ix of def.globalIndexes) {
-        if (!ix.unique) continue;
         const keyOf = (r: Row | null): string | null => {
           if (!r) return null;
-          const vals = ix.columns.map((col) => fold(r[col] ?? null, def.collation[col]));
+          const vals = ix.columns.map((col) => r[col] ?? null);
           return vals.some((v) => v === null) ? null : encode(vals);
         };
         const k = keyOf(c.after);
@@ -799,7 +794,7 @@ export class Txn extends ReadScope {
       for (const ix of def?.globalIndexes ?? []) {
         const keyOf = (r: Row | null): string | null => {
           if (!r) return null;
-          const vals = ix.columns.map((col) => fold(r[col] ?? null, def!.collation[col]));
+          const vals = ix.columns.map((col) => r[col] ?? null);
           return vals.some((v) => v === null) ? null : encode(vals);
         };
         const oldK = keyOf(c.before);
@@ -812,7 +807,7 @@ export class Txn extends ReadScope {
     // 項目を消すほうを全部済ませてから、足す。1 つの文が、ある行を消して同じ値の行を入れる (REPLACE) とき、
     // 先に足そうとすると、消える行の項目と衝突する。
     for (const a of adds) {
-      if (a.ix.unique && check !== "trusted") await this.assertUnique(a.def, a.ix, a.k, a.c.pk, check === "resolve");
+      if (check !== "trusted") await this.assertUnique(a.def, a.ix, a.k, a.c.pk, check === "resolve");
       this.indexWrite(a.ix, { k: a.k, pk: a.c.pk, sk: a.c.sk }, false);
     }
   }
@@ -1042,16 +1037,14 @@ export class Db {
   /**
    * DDL の履歴は、Worker の SQLite でも再生する (行を集めて実行する文のため)。記録する前に、ここで再生できることを確かめる。
    * Meta が確かめるのはシャードで実行する文だけで、利用者が書いた形の文は確かめない。再生できない文が履歴に入ると、
-   * 履歴は書き換えられないので、以後、行を集める文がすべて失敗する。trigger も同じ SQLite に作るので、ここで確かめる。
+   * 履歴は書き換えられないので、以後、行を集める文がすべて失敗する。
    */
   private async assertReplays(sql: string, cat: Catalog): Promise<void> {
     const parsed = parseDdl(sql, cat);
-    const statements = [...(parsed.user ? [parsed.user] : []), ...Object.values(parsed.triggers ?? {}).map((t) => t.sql)];
-    if (parsed.noop || statements.length === 0) return;
+    if (parsed.noop || !parsed.user) return;
     const w = await openScratch(cat);
     try {
-      for (const t of Object.values(cat.triggers)) w.exec(t.sql);
-      for (const s of statements) w.exec(s);
+      w.exec(parsed.user);
     } catch (e) {
       throw new SqlError((e as Error)?.message ?? String(e));
     } finally {
@@ -1246,16 +1239,14 @@ export class Db {
         const inBatch = new Map<string, string>();
         const entries: { k: string; pk: string; sk: string }[] = [];
         for (const [i, row] of rows.entries()) {
-          const vals = ix.columns.map((col) => fold(row[col] ?? null, def.collation[col]));
+          const vals = ix.columns.map((col) => row[col] ?? null);
           if (vals.some((v) => v === null)) continue;
           const k = encode(vals);
           const key = keys[i]!;
-          if (ix.unique) {
-            // 同じ取引の中の 2 件目は、バッファの上で 1 件目を上書きするだけで、シャードには届かない。ここで照合する。
-            const prior = inBatch.get(k);
-            if (prior !== undefined && prior !== key.pk) throw new SqlError(`UNIQUE constraint failed: ${def.name}.${ix.columns.join(", ")}`);
-            inBatch.set(k, key.pk);
-          }
+          // 同じ取引の中の 2 件目は、バッファの上で 1 件目を上書きするだけで、シャードには届かない。ここで照合する。
+          const prior = inBatch.get(k);
+          if (prior !== undefined && prior !== key.pk) throw new SqlError(`UNIQUE constraint failed: ${def.name}.${ix.columns.join(", ")}`);
+          inBatch.set(k, key.pk);
           entries.push({ k, pk: key.pk, sk: key.sk });
         }
         // すでにある項目は、index のシャードごとに 1 回で読む。1 行ずつ読むと、行数だけ往復が要り、
@@ -1278,7 +1269,7 @@ export class Db {
         }
         for (const e of entries) {
           const have = existing.get(e.k);
-          if (ix.unique && have && [...have].some((pk) => pk !== e.pk)) {
+          if (have && [...have].some((pk) => pk !== e.pk)) {
             throw new SqlError(`UNIQUE constraint failed: ${def.name}.${ix.columns.join(", ")}`);
           }
           if (!have?.has(e.pk)) tx.indexWrite(ix, e, false);
@@ -1476,7 +1467,6 @@ export class Db {
       await this.ddl(p.sql);
       return new QueryResult([], []);
     }
-    if (p.kind === "ctas") return this.createAs(p, cat);
     if (this.current) return this.current.execute(p);
     if (p.kind === "shard" || p.kind === "gather" || p.kind === "partial" || p.kind === "meta") {
       const scope = new ReadScope(this, cat);
@@ -1538,33 +1528,6 @@ export class Db {
         this.current.rollbackTo(p.name!);
         return empty;
     }
-  }
-
-  /** CREATE TABLE ... AS SELECT。結果の列で表を作り、行を入れる。 */
-  private async createAs(p: Extract<Plan, { kind: "ctas" }>, cat: Catalog): Promise<QueryResult> {
-    if (findTable(cat, p.name)) {
-      if (p.ifNotExists) return new QueryResult([], []);
-      throw new SqlError(`table ${p.name} already exists`);
-    }
-    const src = await new ReadScope(this, cat).read(p.select);
-    await this.ddl(`CREATE TABLE ${q(p.name)} (${src.columns.map(q).join(", ")})`);
-    // 行はまとめて入れる。1 行ずつ入れると、行数だけ往復が要り、Worker の 1 回の呼び出しで使える要求の数を超える。
-    // 途中で失敗したら表ごと消す。SQLite でも、失敗した CREATE TABLE AS は表を残さない。
-    try {
-      const tuple = `(${src.columns.map(() => "?").join(", ")})`;
-      for (let at = 0; at < src.values.length; ) {
-        const batch: Value[][] = [];
-        for (let bytes = 0; at < src.values.length && batch.length < 200 && (batch.length === 0 || bytes < 100_000); at++) {
-          batch.push(src.values[at]!);
-          bytes += utf8Length(encode(src.values[at]!));
-        }
-        await this.query(`INSERT INTO ${q(p.name)} VALUES ${batch.map(() => tuple).join(", ")}`, batch.flat());
-      }
-    } catch (e) {
-      await this.ddl(`DROP TABLE IF EXISTS ${q(p.name)}`).catch(() => undefined);
-      throw e;
-    }
-    return new QueryResult([], []);
   }
 
   private async autoWrite(p: Extract<Plan, { kind: "write" }>, t: WriteTarget, cat: Catalog): Promise<QueryResult> {

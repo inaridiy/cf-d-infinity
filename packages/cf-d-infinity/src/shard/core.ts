@@ -11,8 +11,8 @@ import type { DdlEntry } from "../meta";
 import { slotOf } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import {
-  CAPTURE_TABLES, applyChanges, asSqlError, assertKeyed, capturedChanges, decode, deleteRow, encode, encodeKey, fold, insertRow, q,
-  rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore, writable,
+  CAPTURE_TABLES, applyChanges, asSqlError, assertKeyed, capturedChanges, decode, deleteRow, encode, encodeKey, insertRow, q,
+  rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore,
 } from "./rows";
 
 export interface ShardDeps {
@@ -633,9 +633,7 @@ export class ShardCore implements ShardApi {
         let read = 0;
         for (const r of rows) {
           read++;
-          // 経路と同じ規則で値を揃える。照合順序のある列 (NOCASE など) を保存された値のまま数えると、
-          // 'User1' と 'user1' が別のスロットになり、行が、範囲表の指すのとは違うシャードに残る。
-          add(encode(r.map((v, i) => fold(v, def.collation[def.shardKey[i]!]))));
+          add(encode(r));
           if (out.length >= req.limit) {
             // NULL を含む shard key は行の比較で絞れないので、読んだ数で続きを表す。
             const next: GroupCursor = r.every((v) => v !== null)
@@ -848,10 +846,7 @@ export class ShardCore implements ShardApi {
     const def = this.defs.get(req.table);
     if (!def) throw new SqlError(`no such table: ${req.table}`);
     const cols = def.pk.map(q).join(", ");
-    // 生成列は書き出さない。取り込み先では SQLite が計算する。
-    const list = def.generated?.length
-      ? [...(def.implicitRowid ? ["rowid"] : []), ...writable(def, def.columns).map(q)].join(", ")
-      : selectList(def);
+    const list = selectList(def);
     const keyset = req.after !== null && req.after.every((v) => v !== null);
     const where = keyset ? `WHERE (${cols}) > (${def.pk.map(() => "?").join(", ")})` : "";
     const limit = Math.max(1, Math.min(req.limit, 5000));

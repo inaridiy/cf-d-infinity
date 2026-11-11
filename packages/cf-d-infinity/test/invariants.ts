@@ -3,7 +3,7 @@
 // 「本体とずれた index」を見逃す。全部の要求が終わった後の静止した状態で、後始末が済んでいることを確かめる。
 import { expect } from "vitest";
 import { ORPHAN_AGE_MS } from "../src/shard/core";
-import { encode, fold } from "../src/shard/rows";
+import { encode } from "../src/shard/rows";
 import type { Row } from "../src/types";
 import type { SimCluster } from "./sim";
 
@@ -55,7 +55,7 @@ export async function quiescentProblems(c: SimCluster): Promise<string[]> {
       const actual = new Set<string>();
       for (const b of c.backends.values()) {
         for (const row of tryExec(b, `SELECT * FROM "${def.name}"`)) {
-          const vals = ix.columns.map((col) => fold(row[col] ?? null, def.collation[col]));
+          const vals = ix.columns.map((col) => row[col] ?? null);
           if (vals.some((v) => v === null)) continue;
           expected.add(`${encode(vals)} -> ${encode(def.pk.map((col) => row[col] ?? null))}`);
         }
@@ -67,11 +67,11 @@ export async function quiescentProblems(c: SimCluster): Promise<string[]> {
       if (ix.state === "public" && missing.length) problems.push(`index ${ix.name}: ${missing.length} rows are not indexed, e.g. ${missing[0]}`);
     }
     // シャード内の UNIQUE は SQLite が守る。ここではシャードを跨いだ UNIQUE (public な UNIQUE のグローバル index) の重複を見る。
-    for (const ix of def.globalIndexes.filter((i) => i.unique && i.state === "public")) {
+    for (const ix of def.globalIndexes.filter((i) => i.state === "public")) {
       const seen = new Map<string, number>();
       for (const b of c.backends.values()) {
         for (const row of tryExec(b, `SELECT * FROM "${def.name}"`)) {
-          const vals = ix.columns.map((col) => fold(row[col] ?? null, def.collation[col]));
+          const vals = ix.columns.map((col) => row[col] ?? null);
           if (vals.some((v) => v === null)) continue;
           seen.set(encode(vals), (seen.get(encode(vals)) ?? 0) + 1);
         }

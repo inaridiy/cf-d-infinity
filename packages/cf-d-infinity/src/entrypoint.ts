@@ -69,9 +69,7 @@ export class DinfDatabase extends WorkerEntrypoint<Env> {
   }
   /** 利用者が実行した DDL を、実行した順に返す。 */
   async schemaSql(): Promise<string[]> {
-    // trigger は DDL の履歴に文面が残らないので、現在の表定義から足す。
-    const cat = await (await dbFor(this.env, 0)).catalog();
-    return [...(await schemaSql(this.env)), ...Object.values(cat.triggers).map((t) => t.sql)];
+    return schemaSql(this.env);
   }
   /** 利用者の表の名前。内部の表 (グローバル index の実体) は含まない。 */
   async tables(): Promise<string[]> {
