@@ -644,14 +644,8 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
       return Response.json({ columns: r.columns, rows: r.rows, changes: r.changes, lastInsertRowid: r.lastInsertRowid, token: db.token });
     }
     if (path === "/batch") {
-      const results = await db.transaction(async (tx) => {
-        const out: { rows: Row[]; changes: number }[] = [];
-        for (const s of body.statements ?? []) {
-          const r = await tx.query(s.sql, s.params ?? []);
-          out.push({ rows: r.rows, changes: r.changes });
-        }
-        return out;
-      });
+      const out = await db.batch((body.statements ?? []).map((s) => ({ sql: s.sql, params: s.params ?? [] })));
+      const results = out.map((r) => ({ rows: r.rows, changes: r.changes }));
       return Response.json({ results, token: db.token });
     }
     return new Response("not found", { status: 404 });

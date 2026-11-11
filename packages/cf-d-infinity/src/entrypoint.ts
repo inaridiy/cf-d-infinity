@@ -44,14 +44,10 @@ export class DinfDatabase extends WorkerEntrypoint<Env> {
     const db = await dbFor(this.env, token, this.background);
     return pack(await db.query(sql, values(params)), db);
   }
-  /** 全文を 1 取引で実行する。競合は内部でやり直す。 */
+  /** 全文を 1 取引で実行する。競合は内部でやり直す。表定義を変える文を含むと、その位置で区切る (Db.batch)。 */
   async batch(statements: RemoteStatement[], token = 0): Promise<RemoteResult[]> {
     const db = await dbFor(this.env, token, this.background);
-    const out = await db.transaction(async (tx) => {
-      const results: QueryResult[] = [];
-      for (const s of statements) results.push(await tx.query(s.sql, values(s.params)));
-      return results;
-    });
+    const out = await db.batch(statements.map((s) => ({ sql: s.sql, params: values(s.params) })));
     return out.map((r) => pack(r, db));
   }
   async begin(mode: TransactionMode = "write", token = 0): Promise<RemoteTx> {

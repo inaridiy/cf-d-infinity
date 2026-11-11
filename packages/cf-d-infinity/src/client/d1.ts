@@ -59,16 +59,13 @@ export class D1Compatible {
   prepare(sql: string): Statement {
     return new Statement(this.db, sql);
   }
-  /** D1 と同じく全文を 1 取引で実行する。ここではシャードを跨いでも原子的である。 */
+  /**
+   * D1 と同じく全文を 1 取引で実行する。ここではシャードを跨いでも原子的である。
+   * 表定義を変える文を含む batch だけは、その位置で区切り、区切りごとに 1 取引で実行する (Db.batch)。
+   */
   async batch<T = Row>(statements: Statement[]): Promise<D1LikeResult<T>[]> {
-    return this.db.transaction(async (tx) => {
-      const out: D1LikeResult<T>[] = [];
-      for (const s of statements) {
-        const r = await s.inTxn(tx);
-        out.push({ success: true, results: r.rows as T[], meta: meta(r) });
-      }
-      return out;
-    });
+    const out = await this.db.batch(statements.map((s) => ({ sql: s.sql, params: s.params })));
+    return out.map((r) => ({ success: true, results: r.rows as T[], meta: meta(r) }));
   }
   /** Sessions API。bookmark は HLC トークンである。 */
   withSession(bookmark?: string): D1Compatible & { getBookmark(): string } {

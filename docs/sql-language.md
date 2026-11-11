@@ -65,7 +65,6 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 | 主キー、shard key、shard key を含まない UNIQUE の列の、BINARY 以外の照合順序 | 同上。行と行き先のシャードを値で決めるので、照合順序で等しい値を同じ行として扱えない |
 | 主キーの列に NULL のある行 | 断る。SQLite は INTEGER でない主キーに NULL をいくつでも入れられるが、行を主キーの値で名指しするので区別できない。`INTEGER PRIMARY KEY` に NULL を渡すと rowid が入るのは SQLite と同じである |
 | 書き込みの文の中の `sqlite_master` と PRAGMA の関数 (`pragma_table_info(...)` など) | 断る。読みの文の中なら、利用者の表定義について答える (シャードの内部の表は見えない) |
-| 取引の中の DDL | DDL は全シャードへの適用を伴うので、取引に含められない |
 
 ### DO の SQLite の制限
 
@@ -111,7 +110,7 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 読んでから書く取引は `BEGIN IMMEDIATE` を使うのがよい。
 
 ロックは行ごとで、待ちは SQLite の busy_timeout に相当する 5 秒が上限である。
-autocommit の文は内部でリトライし、`batch` も文が全部分かっているので内部でやり直す。
+autocommit の文は内部でリトライし、`batch` も文が全部分かっているので内部でやり直す (DDL を含む `batch` は、次の「取引の中の DDL」を参照)。
 `BEGIN` で始めた対話的な取引のリトライはアプリの責任である。
 
 条件で読んだ範囲は、条件に関わる行の変更だけを競合にする。
@@ -123,6 +122,25 @@ autocommit の読み取りと取引の最初の読み取りでは、開始前に
 例外は取引の 2 文目以降である。
 読み取り時刻を進められなかった取引は最初のスナップショットのまま読み続けるので、別のシャードに後から確定した書き込みが見えないことがある。
 Serializable は保たれ、書き込みがあれば `COMMIT` の検証で競合になる。
+
+### 取引の中の DDL
+
+取引の中で DDL を実行すると、先にその取引を確定し、DDL の後の文は新しい取引になる。
+MySQL と同じ扱いで、SQLite とは違う。
+DDL は全シャードへの適用を伴い、取り消せないからである。
+先に確定しないと、手元に溜めた書き込みより先に DDL が効く。表を作り直す移行 (新しい表を作る、行を写す、古い表を消す、名前を変える) では、行が失われる。
+
+このため、次の点が SQLite と違う。
+
+- `ROLLBACK` と `ROLLBACK TO` が戻すのは、最後の DDL より後の文だけである。SAVEPOINT も DDL で消える。
+- 先に確定できなければ (競合など)、DDL は実行せず、取引は終わる。エラーは DDL の文に返る。
+- `batch` (D1 互換 API と Service Binding) は、DDL の位置で区切り、区切りごとに 1 つの取引で実行する。DDL を含む `batch` は「全部か無か」にならない。途中で失敗するとそこで止まり、それより前の区切りと DDL は効いたまま残る。
+- 表を作り直す移行の途中で別の接続が古い表へ書いた行は、写されないまま、古い表とともに消える。行を写した区切りの確定から古い表を消すまでの間、その表を守る仕組みがないからである。移行の間は、その表への書き込みを止める。
+
+取引が最初に読むか書くかした後で、別の接続が表定義を変えた場合、その取引は古い表定義のまま続く。
+後から作られた表は見えない (`no such table`)。
+SQLite で、読み始めた取引から、後で作られた表が見えないのと同じである。
+その取引の以後の文と `COMMIT` は、新しい表定義を適用したシャードで断られる (`SQLITE_BUSY`)。取引をやり直す。
 
 ### DDL
 
@@ -172,9 +190,19 @@ shard key を含まない UNIQUE は 1 つのシャードでは確かめられ�
 | 種類 | 使い方 |
 |---|---|
 | `@libsql/client` | `createClient({ url, authToken })`。`https://` なら Hrana over HTTP、`wss://` なら Hrana over WebSocket (hrana2) で話す |
-| Drizzle | libSQL または D1 のドライバ |
+| Drizzle | libSQL または D1 のドライバ。移行 (`migrate`) の前に、記録の表を `drizzleMigrationsTable()` (`cf-d-infinity/client`) の文で作る |
 | D1 互換 API | `prepare`、`bind`、`batch`、`withSession` |
 | Worker の中から直接 | `Db` クラスの `query`、`transaction` |
+
+Drizzle は、移行の記録の表を `id SERIAL PRIMARY KEY` で作り、記録の INSERT で id を省く。
+SERIAL は INTEGER ではないので、SQLite では id に NULL が入る。
+この DB は主キーに NULL のある行を断るので、Drizzle が作る前に、id を `INTEGER PRIMARY KEY` にした同じ表を作っておく。
+
+```ts
+import { drizzleMigrationsTable } from "cf-d-infinity/client";
+await client.execute(drizzleMigrationsTable());          // libSQL。D1 互換なら db.prepare(...).run()
+await migrate(drizzle(client), { migrationsFolder: "./drizzle" });
+```
 
 better-sqlite3 のような同期 API は提供できない。
 ネットワークを跨ぐ DB なので、呼び出しは必ず非同期になる。

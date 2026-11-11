@@ -75,6 +75,8 @@ red と green は同じ core モジュールを `const` フラグで切り替え
 | M11 `m11_impl` | `schemaSafe` | 実装どおり (修正案を 5 つとも外す)、取引 2 件 | 約 15 万で反例 | 反例は 12 状態 | 反例 (実装の欠陥) |
 | M11 `m11_impl_wait` / `_inflight` / `_backfill` / `_chunk` / `_drop` | `schemaSafe` | 修正案を 1 つずつ外す、取引 1 件 | 各 約 700〜3,900 で反例 | 反例は 12 / 13 / 11 / 12 / 8 状態 | 反例 (5 本すべて、実装の欠陥) |
 | M11 `m11_red_no_reject` / `_early_public` / `_no_write_only` / `_no_sync` | `schemaSafe` | 実装にある防御を 1 つずつ外す、取引 1 件 | 各 約 80〜3,000 で反例 | 反例は 12 / 3 / 11 / 7 状態 | 反例 (4 本すべて) |
+| M13 `m13_green` | `boundarySafe` (= prefixOfScript ∧ pinned ∧ ownDdlVisible ∧ completeWhenOk) | 1 つの接続の文 (書き込み、DDL、書き込み、DDL、書き込み、COMMIT)、別の接続の DDL 1 回、確定の競合、1 度のやり直し | 52 | 10 | No violation |
+| M13 `m13_red_main` / `_pin_only` / `_repin` / `_retry_whole` / `_ddl_anyway` | `prefixOfScript` / `ownDdlVisible` / `pinned` / `prefixOfScript` / `prefixOfScript` | 決めた設計から条件を 1 つずつ外す (`_main` は 2026-11 までの実装) | 反例 | 反例は 4 / 5 / 11 / 10 / 10 手 | 反例 (5 本すべて) |
 
 witness (vacuous でないことの確認。`not(到達したい状態)` を invariant にして違反 = 到達可能):
 
@@ -98,6 +100,7 @@ witness (vacuous でないことの確認。`not(到達したい状態)` を inv
 | M11 | `witnessCrossDuringDdl` | 2PC の取引が DDL の途中で確定し、両方のシャードに適用された後で public になる |
 | M11 | `witnessUniqueFailed` / `witnessUniquePublic` | 重複があって UNIQUE index の作成が失敗する。重複がなければ 2 行を持って public になる |
 | M11 | `witnessRecreateWritten` | 表を作り直した後に書いた行が残る |
+| M13 | `witnessRetriedAndDone` / `witnessOtherDdlThenDone` | 確定を断られた区切りをやり直して最後まで進む / 別の接続の DDL の後で最後まで進む |
 
 ## 新しく見つかった設計バグ (M1、green が破れた)
 
@@ -318,6 +321,35 @@ backfill の読みが新しい版の要求なので、読まれたシャード�
 モデルが示し、実装にないものは修正案の 5 つである。
 このほか、分割と DDL の並行 (BUG-6) と、index で引いた読み取りの span の不足 (BUG-7) はテストで見つけたが、このモデルにはない。
 シャードの数と範囲表が固定で、読み取りの取引がないからである。
+
+### M13 `m13_txn_schema_boundary.qnt` — 取引の中の DDL と、取引が名乗る表定義の版
+
+2026-11-11 に書いた。
+取引の書き込みは COMMIT まで Worker の手元に溜まり、DDL は取引の中でもその場で全シャードに効く。
+何もしなければ、効く順序が書いた順序と入れ替わる。表を作り直す移行では、行を写す前に古い表が消え、行が全部消える (`test/open/migration-tools.test.ts`)。
+
+決めた設計は 2 つの規則である。
+
+- DDL は、開いている取引を先に確定してから実行する。その後の文は新しい取引になる (MySQL と同じ)。取引は開いたままにする。libSQL のクライアントは、`COMMIT` を「autocommit でない」ことを条件に送るからである。
+- 取引は、最初に読むか書くかしたときの表定義の版を、確定まで名乗り続ける。版が変わるのは、確定の境目だけである。
+
+invariant は 4 つである。
+
+- `prefixOfScript`: 効いた文 (確定した書き込みと実行した DDL) は、文の並びの頭から順に、抜けも重なりもなく並ぶ。
+- `pinned`: 確定した書き込みは、どれも、確定のときに名乗った版で計画されている。
+- `ownDdlVisible`: 文は、同じ接続が先に実行した DDL を見て計画される。
+- `completeWhenOk`: COMMIT が成功を返したなら、全部の文が効いている。
+
+| 外した条件 | インスタンス | 反例 |
+|---|---|---|
+| DDL の前に確定する、と版を名乗り続ける (2026-11 までの実装) | `m13_red_main` | DDL が、前に溜めた書き込みより先に効く |
+| DDL の前に確定する | `m13_red_pin_only` | 自分が作った表へ書く文が、古い版で計画されて失敗する |
+| 版を名乗り続ける | `m13_red_repin` | 別の接続の DDL の後で、古い計画の書き込みが新しい版を名乗って確定する |
+| 断られた区切りだけをやり直す | `m13_red_retry_whole` | 文の並びの頭からやり直し、確定した区切りと DDL を 2 度実行する |
+| 先に確定できなければ DDL を実行しない | `m13_red_ddl_anyway` | 前の区切りの書き込みが失われたまま、DDL だけが効く |
+
+モデルにないもの。シャードが古い版の計画を断ることは前提にした (M11、M12)。区切りの中の取引の直列可能性は M1 と M9 に任せた。
+取引の中で表を作り直すとき、行を写した区切りの確定から古い表を消すまでの間に、別の接続が古い表へ書いた行は消える。MySQL と同じで、この設計の範囲の外である。
 
 ### M5b `m5b_live_migration.qnt` — pull 型ライブ再構成 (S2 + S3)
 

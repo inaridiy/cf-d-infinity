@@ -49,6 +49,18 @@ export { DinfAutoscaler, DinfDatabase, DinfMeta, DinfShard } from "./dinf";
 
 Drizzle's D1 driver takes the same object: `drizzle(connect(env.DINF_DB))`.
 
+Before Drizzle's `migrate()`, create its journal table once. Drizzle would create it with a `SERIAL` key that it leaves
+`NULL`, and the database refuses `NULL` in a primary key:
+
+```ts
+import { connect, drizzleMigrationsTable } from "cf-d-infinity/client";
+const db = connect(env.DINF_DB);
+await db.prepare(drizzleMigrationsTable()).run();
+await migrate(drizzle(db), { migrationsFolder: "./drizzle" });
+```
+
+A schema change inside a transaction or a `batch` first commits what came before it, as in MySQL.
+
 ## Command line
 
 With `wrangler dev` or `cf dev` running:

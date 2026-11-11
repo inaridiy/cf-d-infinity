@@ -7,7 +7,7 @@ import type { Catalog } from "../meta";
 import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import { normalize, parseStatements, text, type Node, type Params } from "../sql/cst";
-import { findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
+import { SCHEMA_STATEMENTS, findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
 import { parseDdl } from "../sql/ddl";
 import { openScratch, ScratchDb, type Compiled } from "../sql/scratch";
 import { groupSpan, rowSpan, scanSpans, statementSpans, tableSpan } from "./spans";
@@ -24,6 +24,27 @@ export interface Cluster {
   runtime?: Runtime;
   /** このクラスタへつなぐ Db の、基準経路だけで実行する指定の既定。試験が使う。 */
   reference?: Reference;
+}
+
+/** Worker の側の欠陥を再導入するスイッチ (シャードの側は types.ts の Faults)。検査が欠陥を見つけることを確かめる試験だけが使う。 */
+export interface ClientFaults {
+  /** 書き出した取引を組み立て直すとき、表定義が変わっていても、新しい版を名乗らせる (モデル m13_red_repin)。 */
+  repinOnRestore?: boolean;
+  /** DDL を実行した batch も、競合したら頭からやり直す (モデル m13_red_retry_whole)。 */
+  replayAcrossSchemaChange?: boolean;
+}
+
+/** SHARD KEY はこの DB の拡張で、パーサは読めない。そういう CREATE TABLE は、DDL の解釈に直接渡す。 */
+const SHARD_KEY_TABLE = /^\s*CREATE\s+TABLE\b[\s\S]*\bSHARD\s+KEY\s*\(/i;
+
+/** 表定義を変える文を含むか。読めない文は、含まないものとして扱う (実行すれば、その誤りが返る)。 */
+export function changesSchema(sql: string): boolean {
+  if (SHARD_KEY_TABLE.test(sql)) return true;
+  try {
+    return parseStatements(sql).some((s) => SCHEMA_STATEMENTS.has(s.type));
+  } catch {
+    return false;
+  }
 }
 
 /** 接続をまたいで渡された token を時刻にする。時刻として読めない値は「何も見ていない」として扱う。 */
@@ -349,6 +370,8 @@ class ReadScope {
 
 export interface TxnDump {
   id: string;
+  /** 取引が文を計画した表定義の版 (Txn.catalog)。 */
+  schema: number;
   T: Ts | undefined;
   pessimistic: boolean;
   lockReads: boolean;
@@ -463,9 +486,26 @@ export class Txn extends ReadScope {
     return true;
   }
 
-  useCatalog(cat: Catalog): void {
+  /**
+   * 取引が文を計画し、実行する表定義。取引は、最初に読むか書くかしてから確定まで、同じ表定義を使う (specs/m13_txn_schema_boundary.qnt)。
+   * シャードは、要求が名乗る版を、その計画に使った版として信じる (自分より古い版の計画を断る)。溜めた書き込みを計画し直さずに
+   * 新しい版を名乗ると、新しい index を保守しない書き込みが通る。表定義が変わるのは、確定の境目だけである。
+   */
+  get catalog(): Catalog {
+    return this.cat;
+  }
+
+  /** まだ何も読み書きしていない取引を、新しい表定義へ移す。 */
+  rebase(cat: Catalog): void {
+    if (!this.untouched) throw new Error("a transaction that has read or written keeps its schema version until it commits");
     this.cat = cat;
   }
+
+  /** 以後、この取引の文と COMMIT を、この誤りで失敗させる。ROLLBACK は通る。 */
+  doom(e: Error): void {
+    this.doomed = e;
+  }
+  private doomed: Error | null = null;
 
   /** まだ何も読み書きしていない。 */
   get untouched(): boolean {
@@ -476,13 +516,26 @@ export class Txn extends ReadScope {
   dump(): TxnDump {
     const m = (x: Map<string, Map<string, Change>>) => [...x].map(([k, v]) => [k, [...v]] as const);
     return {
-      id: this.id, T: this.T, writes: m(this.writes), spans: [...this.spans],
+      id: this.id, schema: this.cat.version, T: this.T, writes: m(this.writes), spans: [...this.spans],
       pessimistic: this.pessimistic, lockReads: this.lockReads, lockOwner: this.lockOwner,
       saves: [...this.saves].map(([k, v]) => [k, { writes: m(v.writes), spans: [...v.spans] }] as const),
     };
   }
 
+  /**
+   * 書き出した取引を組み立て直す。cat は、いまの表定義である。
+   * 書き出した後で表定義が変わっていたら、溜めた読みと書き込みは古い版のものである。新しい版を名乗らせるわけにはいかないので、
+   * 取引を失敗させる (Txn.catalog)。何もしていない取引は、新しい版で続ける。
+   */
   static load(db: Db, cat: Catalog, d: TxnDump): Txn {
+    const tx = Txn.restore(db, cat, d);
+    if (cat.version !== d.schema && !tx.untouched && !db.faults.repinOnRestore) {
+      tx.doom(new ConflictError(`the schema changed while the transaction was open (version ${d.schema} to ${cat.version}); roll back and run the transaction again`));
+    }
+    return tx;
+  }
+
+  private static restore(db: Db, cat: Catalog, d: TxnDump): Txn {
     const tx = new Txn(db, cat, d.id);
     const m = (x: TxnDump["writes"]) => new Map(x.map(([k, v]) => [k, new Map(v)] as const));
     tx.T = d.T;
@@ -518,6 +571,7 @@ export class Txn extends ReadScope {
   }
 
   async statement(stmt: Node, params: Params): Promise<QueryResult> {
+    if (this.doomed) throw this.doomed;
     return runPlanned(stmt, text(stmt), params, this.cat, this.planContext(), (p) => this.execute(p));
   }
 
@@ -575,6 +629,7 @@ export class Txn extends ReadScope {
   }
 
   async execute(p: Plan): Promise<QueryResult> {
+    if (this.doomed) throw this.doomed;
     switch (p.kind) {
       case "write": return this.atomically(() => this.write(p));
       case "wasmWrite": return this.atomically(() => this.wasmWrite(p));
@@ -834,6 +889,7 @@ export class Txn extends ReadScope {
   }
 
   async commit(): Promise<void> {
+    if (this.doomed) throw this.doomed;
     // 大きすぎる取引は、シャードへ送る前にここで断る。シャードも同じ検査をするが、そちらの拒否は競合と同じ扱いで再試行される。
     for (const changes of this.writes.values()) {
       let bytes = 0;
@@ -897,6 +953,12 @@ export class Db {
   private inStatement = false;
   readonly rt: Runtime;
   readonly reference: Reference | undefined;
+  readonly faults: ClientFaults;
+  /**
+   * この接続が、開いている取引の途中で確定したか、表定義を変えた回数。batch をやり直してよいかを決めるのに使う。
+   * 増えていれば、batch の前のほうの文は、もう効いている。頭からやり直すと、2 度実行することになる。
+   */
+  boundaries = 0;
   constructor(
     readonly cluster: Cluster,
     private opts: {
@@ -915,10 +977,13 @@ export class Db {
       runtime?: Runtime;
       /** 最適化の経路を使わず、基準経路だけで実行する (sql/plan.ts の Reference)。指定しなければ、クラスタのものを使う。試験が使う。 */
       reference?: Reference;
+      /** 検証済みの欠陥を再導入するスイッチ。試験だけが使う。 */
+      faults?: ClientFaults;
     } = {},
   ) {
     this.rt = opts.runtime ?? cluster.runtime ?? systemRuntime;
     this.reference = opts.reference ?? cluster.reference;
+    this.faults = opts.faults ?? {};
     this.token = cleanToken(opts.token);
     this.cached = opts.catalog ?? null;
     this.ids = opts.ids ?? new Map();
@@ -1097,7 +1162,40 @@ export class Db {
     }
   }
 
+  /**
+   * 表定義を変える。取引の中なら、先に取引を確定し、DDL の後は新しい取引を開いておく (MySQL と同じ。specs/m13_txn_schema_boundary.qnt)。
+   *
+   * DDL は、取引の中でも、その場で全シャードに効き、取り消せない。書き込みは COMMIT まで手元に溜まる。先に確定しないと、
+   * 効く順序が書いた順序と入れ替わる (行を写してから古い表を消す移行で、行が全部消える)。
+   * 確定できなければ、DDL は実行せず、取引は終わる (SQLite が誤りで取引を巻き戻したときと同じ)。
+   * 新しい取引を開いておくのは、利用者が最後に送る COMMIT のためである。libSQL のクライアントは、COMMIT を
+   * 「autocommit でない」ことを条件に送る。ROLLBACK と SAVEPOINT が戻せるのは、最後の DDL より後だけになる。
+   */
   async ddl(sql: string): Promise<void> {
+    const open = this.current;
+    if (!open) return this.changeSchema(sql);
+    this.current = null;
+    try {
+      await open.commit();
+    } catch (e) {
+      await open.unlockAll().catch(() => undefined);
+      throw e;
+    }
+    this.boundaries++;
+    const next = new Txn(this, await this.catalog(), this.nextTxnId());
+    next.pessimistic = open.pessimistic;
+    next.lockReads = open.lockReads;
+    this.current = next;
+    try {
+      await this.changeSchema(sql);
+      this.boundaries++;
+    } finally {
+      // 新しい取引は、まだ何もしていない。DDL の後の表定義で計画する。
+      next.rebase(await this.catalog());
+    }
+  }
+
+  private async changeSchema(sql: string): Promise<void> {
     await this.checkUnique(sql);
     const { before, cat } = await this.record(async (basedOn, at) => {
       await this.assertReplays(sql, at);
@@ -1359,6 +1457,37 @@ export class Db {
     }
   }
 
+  /**
+   * 文の並びを実行する (D1 の batch)。表定義を変える文を含まなければ、全部を 1 つの取引で実行する。競合したら丸ごとやり直す。
+   * 含むと、その位置で区切る。区切りごとに 1 つの取引で実行し、表定義を変える文は区切りの間で実行する。取引の中の DDL と同じ規則である
+   * (Db.ddl、specs/m13_txn_schema_boundary.qnt)。競合でやり直すのは、断られた区切りだけである。
+   * 途中で失敗したら、そこで止めて誤りを返す。それより前の区切りと DDL は、もう効いている。
+   */
+  async batch(statements: { sql: string; params?: Params }[]): Promise<QueryResult[]> {
+    const out: QueryResult[] = [];
+    let part: { sql: string; params: Params }[] = [];
+    const flush = async () => {
+      if (part.length === 0) return;
+      const run = part;
+      part = [];
+      out.push(...(await this.transaction(async (tx) => {
+        const results: QueryResult[] = [];
+        for (const s of run) results.push(await tx.query(s.sql, s.params));
+        return results;
+      })));
+    };
+    for (const s of statements) {
+      if (!changesSchema(s.sql)) {
+        part.push({ sql: s.sql, params: s.params ?? [] });
+        continue;
+      }
+      await flush();
+      out.push(await this.query(s.sql, s.params ?? []));
+    }
+    await flush();
+    return out;
+  }
+
   get inTransaction(): boolean {
     return this.current !== null;
   }
@@ -1375,13 +1504,23 @@ export class Db {
 
   async restore(d: { token: Ts; tx: TxnDump | null }): Promise<void> {
     this.token = cleanToken(d.token);
-    this.current = d.tx ? Txn.load(this, await this.catalog(), d.tx) : null;
+    if (!d.tx) {
+      this.current = null;
+      return;
+    }
+    let cat = await this.catalog();
+    // この接続の持つ表定義が、取引のものより古い。取り直す。
+    if (cat.version < d.tx.schema) {
+      this.cached = null;
+      cat = await this.catalog();
+    }
+    this.current = Txn.load(this, cat, d.tx);
   }
 
   /** 文を実行する。`;` で区切った複数の文を渡すと順に実行し、最後の結果を返す。 */
   async query(sql: string, params: Params = []): Promise<QueryResult> {
     // SHARD KEY はこの DB の拡張で、パーサは読めない。DDL の解釈に直接渡す。
-    if (/^\s*CREATE\s+TABLE\b[\s\S]*\bSHARD\s+KEY\s*\(/i.test(sql)) {
+    if (SHARD_KEY_TABLE.test(sql)) {
       await this.ddl(sql);
       return new QueryResult([], []);
     }
@@ -1414,7 +1553,9 @@ export class Db {
     let refreshed = false;
     for (let attempt = 0; ; attempt++) {
       info.attempts = attempt + 1;
-      const cat = await this.catalog();
+      // 取引の中の文は、取引の表定義で計画する (Txn.catalog)。
+      const txn = this.current;
+      const cat = txn?.catalog ?? (await this.catalog());
       // 失敗した文の採番を戻す。SQLite でも失敗した INSERT は rowid を消費しない。
       const saved = new Map([...this.ids].map(([k, v]) => [k, { ...v }]));
       try {
@@ -1434,17 +1575,25 @@ export class Db {
         }, (p) => (info.plan = p.kind));
       } catch (e) {
         for (const [k, v] of saved) if (this.ids.get(k)?.end === v.end) this.ids.get(k)!.next = v.next;
+        // 文が取引を終えたか、別の取引に替えた (取引の中の DDL)。前の取引の分は、もう確定したか、失われた。やり直さない。
+        // やり直すと、取引の外の文として、DDL だけが効く (specs/m13_txn_schema_boundary.qnt の m13_red_ddl_anyway)。
+        if (txn && this.current !== txn) {
+          if (isRetryable(e)) this.onRetry(e);
+          throw e;
+        }
         // 別の接続の DDL を知らないだけかもしれないので、表定義を取り直して 1 度だけやり直す。
-        if (!refreshed && UNKNOWN_SCHEMA.test((e as Error)?.message ?? "")) {
+        // 取引の中では、まだ何も読み書きしていないときだけである。読み書きした取引の表定義は変えない (Txn.catalog)。
+        // その取引から新しい表が見えないのは、SQLite で、読み始めた取引から、後で作られた表が見えないのと同じである。
+        if (!refreshed && UNKNOWN_SCHEMA.test((e as Error)?.message ?? "") && (!this.current || this.current.untouched)) {
           refreshed = true;
           this.cached = null;
-          this.current?.useCatalog(await this.catalog());
+          this.current?.rebase(await this.catalog());
           continue;
         }
         // 取引の最初の文なら何も読んでいないので、表定義を取り直してやり直せる。
         if (this.current?.untouched && /stale schema/.test((e as Error)?.message ?? "") && attempt < retries) {
           this.cached = null;
-          this.current.useCatalog(await this.catalog());
+          this.current.rebase(await this.catalog());
           continue;
         }
         // COMMIT は取引を閉じた後で失敗するので再実行できない。競合は呼び出し側に見せる。

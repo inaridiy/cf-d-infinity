@@ -186,6 +186,19 @@ witness $f m11_green_unique witnessUniquePublic
 witness $f m11_green_recreate witnessRecreateWritten
 for m in m11_green m11_impl_wait m11_impl_inflight m11_impl_backfill m11_impl_chunk m11_impl_drop m11_red_no_reject m11_red_early_public m11_red_no_write_only m11_red_no_sync; do tests $f $m; done
 
+echo "== M13 取引の中の DDL と、取引が名乗る表定義の版"
+f=m13_txn_schema_boundary.qnt
+green   $f m13_green boundarySafe
+red     $f m13_red_main prefixOfScript           # 2026-11 までの実装: DDL が、前に溜めた書き込みより先に効く
+red     $f m13_red_pin_only ownDdlVisible        # 版を名乗り続けるが、DDL の前に確定しない: 自分が作った表へ書けない
+red     $f m13_red_repin pinned                  # 計画し直さずに新しい版を名乗る
+red     $f m13_red_retry_whole prefixOfScript    # 文の並びの頭からやり直し、確定した分を 2 度実行する
+red     $f m13_red_ddl_anyway prefixOfScript     # 先に確定するのに失敗しても DDL を実行する
+witness $f m13_green witnessRetriedAndDone
+witness $f m13_green witnessOtherDdlThenDone
+tests   $f m13_green
+tests   $f m13_red_main
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect
