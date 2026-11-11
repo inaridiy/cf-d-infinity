@@ -488,6 +488,8 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 
 - 文のひな形を、表定義から作る。表定義は、shard key と主キーの関係、シャード内の UNIQUE、シャードをまたぐ UNIQUE、index、DEFAULT の有無を変えた数組にする。
 - 文を再生する検査に、分割、DDL、再起動、応答の喪失、確定前の書き込みの消失を掛ける。
+- 文を再生する検査は、`db.begin()` の取引オブジェクトで文を流すので、取引の中の DDL (不変条件 9) を乱択で試していない (そこでは DDL を断る)。SQL の `BEGIN` と Hrana の batch で流す接続を混ぜ、DDL の位置を区切りとして再生する。いま不変条件 9 を確かめているのは、モデル M13 と、1 つの接続の決定的な試験 (`test/migration-tools.test.ts`、`test/txn-across-schema-change.test.ts`) だけである。
+- Drizzle の D1 のドライバの移行は、`D1Compatible` を同じプロセスで通して確かめた。利用者が使う `connect(env.DINF_DB)` (Service Binding) を通しては流していない。workerd の試験 (`test/binding.test.ts`) に足す。
 - `Faults` と `spanFaults` を 1 つずつ入れ、個別の回帰テストを使わずに、生成器と検査が見つけるかを表にする。見つからない欠陥は、生成器が薄い場所を示す。
 - 夜間の実行を CI に足し、実行した数、seed、掛け合わせ、省いた数を記録する。
 

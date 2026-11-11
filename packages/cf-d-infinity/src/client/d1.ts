@@ -1,5 +1,5 @@
 import type { Row, Value } from "../types";
-import type { Db, QueryResult, Txn } from "./db";
+import type { Db, QueryResult } from "./db";
 
 interface Meta {
   changes: number;
@@ -45,10 +45,6 @@ export class Statement {
   async raw<T = Value[]>(opts?: { columnNames?: boolean }): Promise<T[]> {
     const r = await this.db.query(this.sql, this.params);
     return opts?.columnNames ? [r.columns as T, ...(r.values as T[])] : (r.values as T[]);
-  }
-  /** batch の中で同じ文を取引の一部として実行する。 */
-  async inTxn(tx: Txn): Promise<QueryResult> {
-    return tx.query(this.sql, this.params);
   }
 }
 

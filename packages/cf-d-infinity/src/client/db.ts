@@ -396,8 +396,14 @@ export class Txn extends ReadScope {
   private lockOwner: LockOwner | null = null;
   /** この取引で実行した文。遅い取引の記録に使う。 */
   readonly sqls: string[] = [];
+  /**
+   * 取引の文を計画した表定義の版。書き出すときはこの値を運び、組み立て直しても変えない。
+   * いまの表定義の版と違えば、取引は古い版で計画した読み書きを持っているので、失敗させる (Txn.load)。
+   */
+  private planned: number;
   constructor(db: Db, cat: Catalog, private id: string) {
     super(db, cat);
+    this.planned = cat.version;
   }
 
   private get txnId(): string {
@@ -499,6 +505,7 @@ export class Txn extends ReadScope {
   rebase(cat: Catalog): void {
     if (!this.untouched) throw new Error("a transaction that has read or written keeps its schema version until it commits");
     this.cat = cat;
+    this.planned = cat.version;
   }
 
   /** 以後、この取引の文と COMMIT を、この誤りで失敗させる。ROLLBACK は通る。 */
@@ -516,7 +523,7 @@ export class Txn extends ReadScope {
   dump(): TxnDump {
     const m = (x: Map<string, Map<string, Change>>) => [...x].map(([k, v]) => [k, [...v]] as const);
     return {
-      id: this.id, schema: this.cat.version, T: this.T, writes: m(this.writes), spans: [...this.spans],
+      id: this.id, schema: this.planned, T: this.T, writes: m(this.writes), spans: [...this.spans],
       pessimistic: this.pessimistic, lockReads: this.lockReads, lockOwner: this.lockOwner,
       saves: [...this.saves].map(([k, v]) => [k, { writes: m(v.writes), spans: [...v.spans] }] as const),
     };
@@ -529,8 +536,11 @@ export class Txn extends ReadScope {
    */
   static load(db: Db, cat: Catalog, d: TxnDump): Txn {
     const tx = Txn.restore(db, cat, d);
-    if (cat.version !== d.schema && !tx.untouched && !db.faults.repinOnRestore) {
-      tx.doom(new ConflictError(`the schema changed while the transaction was open (version ${d.schema} to ${cat.version}); roll back and run the transaction again`));
+    // 何もしていない取引は、いまの版で続けてよい。
+    if (tx.untouched || db.faults.repinOnRestore) tx.planned = cat.version;
+    // 版は書き出し直しても変わらないので、次の要求でも、その次でも失敗する。
+    if (tx.planned !== cat.version) {
+      tx.doom(new ConflictError(`the schema changed while the transaction was open (version ${tx.planned} to ${cat.version}); roll back and run the transaction again`));
     }
     return tx;
   }
@@ -538,6 +548,7 @@ export class Txn extends ReadScope {
   private static restore(db: Db, cat: Catalog, d: TxnDump): Txn {
     const tx = new Txn(db, cat, d.id);
     const m = (x: TxnDump["writes"]) => new Map(x.map(([k, v]) => [k, new Map(v)] as const));
+    tx.planned = d.schema;
     tx.T = d.T;
     tx.pessimistic = d.pessimistic;
     tx.lockReads = d.lockReads;

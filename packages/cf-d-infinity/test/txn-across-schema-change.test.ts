@@ -16,6 +16,7 @@
 import { describe, expect, it } from "vitest";
 import { Db, type ClientFaults } from "../src/client/db";
 import { rawRows, tenantOn } from "./ddl-harness";
+import { clientOf } from "./libsql";
 import { SimCluster } from "./sim";
 
 describe("a transaction that planned a write before a UNIQUE index existed", () => {
@@ -63,6 +64,23 @@ describe("a transaction that planned a write before a UNIQUE index existed", () 
     await other.ddl("CREATE UNIQUE INDEX u ON t(v)");
     await db.query("SELECT count(*) FROM extra").catch(() => undefined);
     await db.query("COMMIT").catch(() => undefined);
+    expect(await holders(c)).toBe(1);
+  });
+
+  // 接続をまたぐ取引は、要求ごとに組み立て直し、書き出し直す。失敗させた取引を書き出し直すとき、版を新しくしてはならない。
+  // 新しくすると、次の要求では版が合い、古い計画の書き込みが確定する。SQLite では、文の誤りを受け取った後に COMMIT してよい。
+  it("keeps failing after a statement failed, on the requests that follow", async () => {
+    const { c, A } = await setup();
+    const client = clientOf(c);
+    const tx = await client.transaction("write");
+    await tx.execute({ sql: "INSERT INTO t VALUES (?, 1, 7)", args: [A] });
+    await new Db(c).ddl("CREATE UNIQUE INDEX u ON t(v)");
+    const failed = await tx.execute("SELECT 1").then(() => "ok", (e: Error) => e.message);
+    const commit = await tx.commit().then(() => "committed", (e: Error) => e.message);
+    expect({ failed, commit }).toEqual({
+      failed: expect.stringMatching(/the schema changed while the transaction was open/),
+      commit: expect.stringMatching(/the schema changed while the transaction was open/),
+    });
     expect(await holders(c)).toBe(1);
   });
 });

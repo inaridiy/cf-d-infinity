@@ -12,7 +12,6 @@
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createClient, type Client } from "@libsql/client";
 import { drizzle as drizzleD1 } from "drizzle-orm/d1";
 import { migrate as migrateD1 } from "drizzle-orm/d1/migrator";
 import { drizzle } from "drizzle-orm/libsql";
@@ -22,22 +21,8 @@ import { drizzleMigrationsTable } from "../src/binding";
 import { D1Compatible } from "../src/client/d1";
 import { Db, type ClientFaults } from "../src/client/db";
 import { handlePipeline, type PipelineReq } from "../src/client/hrana";
+import { clientOf } from "./libsql";
 import { SimCluster } from "./sim";
-
-/** @libsql/client の HTTP を、シミュレータの Hrana の入口へつなぐ。 */
-function clientOf(c: SimCluster): Client {
-  const fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const req = input instanceof Request ? input : new Request(input, init);
-    const path = new URL(req.url).pathname;
-    if (req.method === "GET" && (path === "/v2" || path === "/v3")) return new Response(null, { status: 200 });
-    if (req.method === "POST" && (path === "/v2/pipeline" || path === "/v3/pipeline")) {
-      const body = (await req.json()) as PipelineReq;
-      return Response.json(await handlePipeline(body, async (token) => new Db(c, { token })));
-    }
-    return new Response("not found", { status: 404 });
-  };
-  return createClient({ url: "http://sim", fetch: fetch as never });
-}
 
 /** drizzle-kit が書き出す形の移行の置き場を作る。 */
 function migrations(list: { tag: string; sql: string[] }[]): string {

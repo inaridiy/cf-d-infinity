@@ -244,7 +244,7 @@ Rows are placed by `hash(shard key)`; the shard key defaults to the first primar
 
 None of the following is a proof of the implementation:
 
-- **Formal models** ([specs/](specs/README.md)): twelve Quint models of the risky protocol parts (the newest covers schema changes under concurrent transactions), exhaustively checked with TLC on small instances. Each has variants with a known bug re-introduced, and TLC finds every one.
+- **Formal models** ([specs/](specs/README.md)): thirteen Quint models of the risky protocol parts (the newest covers schema changes inside transactions), exhaustively checked with TLC on small instances. Each has variants with a known bug re-introduced, and TLC finds every one.
 - **Simulator**: the real shard code runs on `node:sqlite` under simulated delays, clock skew, restarts and splits, with a serializability checker over the history.
 - **Black-box checks** (Elle-style list-append): run in the simulator and against production Cloudflare while Durable Objects are crashed, shards split and code redeployed. The latest production run (10 minutes, 38 crashes, 22,798 commits) found no anomaly; earlier runs found three real bugs, including an undocumented Durable Object limit of 5 terms per compound `SELECT`.
 - **Compatibility**: sqllogictest (`select1`–`select5` in full, ~174,000 further queries) and differential fuzzing against real SQLite (200 seeds).
