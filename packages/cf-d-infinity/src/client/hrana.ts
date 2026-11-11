@@ -135,11 +135,14 @@ async function runRequest(db: Db, r: Request, stored: Map<number, string>): Prom
     }
     case "batch": {
       // BEGIN から始まる batch は文が全部分かっているので、競合したら丸ごとやり直せる。
+      // ただし、途中の DDL が取引を確定した後は、前のほうの文がもう効いている。やり直すと 2 度実行するので、やり直さない
+      // (Db.ddl、specs/m13_txn_schema_boundary.qnt の m13_red_retry_whole)。
       const first = sqlOf(r.batch.steps[0]?.stmt ?? {});
       const replayable = !db.inTransaction && /^\s*BEGIN\b/i.test(first);
       let stepResults: (unknown | null)[] = [];
       let stepErrors: (unknown | null)[] = [];
       for (let attempt = 0; ; attempt++) {
+        const boundaries = db.boundaries;
         stepResults = [];
         stepErrors = [];
         for (const [i, step] of r.batch.steps.entries()) {
@@ -153,7 +156,8 @@ async function runRequest(db: Db, r: Request, stored: Map<number, string>): Prom
           }
         }
         const busy = stepErrors.some((e) => (e as { code?: string } | null)?.code === "SQLITE_BUSY");
-        if (!replayable || !busy || attempt >= 12) break;
+        const settled = db.boundaries !== boundaries && !db.faults.replayAcrossSchemaChange;
+        if (!replayable || !busy || settled || attempt >= 12) break;
         db.abandon();
         await sleep(db.rt, db.rt.random() * Math.min(50, 2 ** attempt));
       }

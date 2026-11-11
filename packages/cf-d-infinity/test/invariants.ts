@@ -64,10 +64,10 @@ export async function quiescentProblems(c: SimCluster): Promise<string[]> {
       const dangling = [...actual].filter((e) => !expected.has(e));
       const missing = [...expected].filter((e) => !actual.has(e));
       if (dangling.length) problems.push(`index ${ix.name}: ${dangling.length} entries point at no row, e.g. ${dangling[0]}`);
-      if (ix.state === "public" && missing.length) problems.push(`index ${ix.name}: ${missing.length} rows are not indexed, e.g. ${missing[0]}`);
+      if (missing.length) problems.push(`index ${ix.name}: ${missing.length} rows are not indexed, e.g. ${missing[0]}`);
     }
     // シャード内の UNIQUE は SQLite が守る。ここではシャードを跨いだ UNIQUE (public な UNIQUE のグローバル index) の重複を見る。
-    for (const ix of def.globalIndexes.filter((i) => i.state === "public")) {
+    for (const ix of def.globalIndexes) {
       const seen = new Map<string, number>();
       for (const b of c.backends.values()) {
         for (const row of tryExec(b, `SELECT * FROM "${def.name}"`)) {

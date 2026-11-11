@@ -31,7 +31,12 @@ export interface ParsedDdl {
    * この文を取り消す文。シャードの持つ行によって適用に失敗し得る文にだけ付ける。
    * 空の表では通るので、Meta での事前の検証では見つからない。失敗したシャードが取り消しを求める。
    */
-  undo?: { sql: string[]; user: string };
+  undo?: { sql: string[]; user: string | null };
+  /**
+   * この文は、既存の行からシャードをまたぐ UNIQUE の index を作り始める。記録した版は表を書き込み禁止にするだけで、
+   * index は出来上がるまで見えない。user は、公開の版が Worker の SQLite で再生する文である。
+   */
+  build?: { table: string; index: string; user: string };
 }
 
 /** 内部の表は `__` で始まる。利用者の表と名前が衝突すると、内部の状態を利用者の SQL で書き換えられる。 */
@@ -196,7 +201,7 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
   const indexes: Record<string, IndexInfo> = {};
   uniqueSets.forEach((cols, i) => {
     if (isGlobal(cols)) {
-      const ix: GlobalIndexDef = { name: `${name}_${i}_key`, table: `__gidx_${name}_${i}_key`, columns: cols, state: "public" };
+      const ix: GlobalIndexDef = { name: `${name}_${i}_key`, table: `__gidx_${name}_${i}_key`, columns: cols };
       const t = globalIndexTable(ix);
       def.globalIndexes.push(ix);
       sql.push(t.sql, rowIndexSql(ix, name));
@@ -210,13 +215,7 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
   const name = userName(ident(stmt.name), "index");
   const table = ident(stmt.table);
   if (schema.indexes[name]) {
-    // 既存の行で埋めている途中の index は、まだ作り終えていない。同じ文の出し直しは、続きを埋める指示として受ける。
-    const half = schema.tables[schema.indexes[name]!.table]?.globalIndexes.find((g) => g.name === name && g.state === "writeOnly");
-    // 出し直しとして受けるのは、列と UNIQUE の指定が同じ文だけである。違う文を「続き」にすると、頼んだのと違う index ができる。
-    const sameShape = half && stmt.indexTypeKw?.name === "UNIQUE"
-      && stmt.columns.expr.items.every((s: Node) => s.expr.type === "identifier")
-      && JSON.stringify(stmt.columns.expr.items.map((s: Node) => ident(s.expr))) === JSON.stringify(half.columns);
-    if (stmt.ifNotExistsKw || (sameShape && schema.indexes[name]!.table === table)) return NOOP;
+    if (stmt.ifNotExistsKw) return NOOP;
     throw new SqlError(`index ${name} already exists`);
   }
   assertFree(schema, name);
@@ -245,10 +244,25 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
   }
   const collatedCol = unique ? cols.find((c) => (def.collation[c] ?? "BINARY") !== "BINARY") : undefined;
   if (collatedCol) unsupported(`COLLATE ${def.collation[collatedCol]} on column ${collatedCol} of a UNIQUE index that does not include the shard key`);
-  const ix: GlobalIndexDef = { name, table: `__gidx_${name}`, columns: cols, state: "writeOnly" };
+  // 既存の行から作る。この版は、index の表を用意して、元の表を書き込み禁止にするだけである。index は、既存の行の項目を
+  // 埋め終えて公開の版が記録されるまで、表定義にも、Worker の SQLite にも現れない。作れなければ、この版ごと取り消す。
+  const ix: GlobalIndexDef = { name, table: `__gidx_${name}`, columns: cols };
   const t = globalIndexTable(ix);
-  def.globalIndexes.push(ix);
-  return { sql: [t.sql, rowIndexSql(ix, table)], defs: [def, t.def], drops: [], user: source, indexes: { [name]: { table, global: true } } };
+  def.building = ix;
+  return {
+    sql: [t.sql, rowIndexSql(ix, table)], defs: [def, t.def], drops: [], user: null,
+    build: { table, index: name, user: source },
+    undo: { sql: [`DROP TABLE IF EXISTS ${q(ix.table)}`, `DROP INDEX IF EXISTS ${q(rowIndexName(ix))}`], user: null },
+  };
+}
+
+/** 作っている最中の index を公開する。表定義に index を入れ、書き込み禁止を解く。 */
+export function publishBuild(def: TableDef, build: NonNullable<ParsedDdl["build"]>): ParsedDdl {
+  const next = structuredClone(def);
+  const ix = next.building!;
+  delete next.building;
+  next.globalIndexes.push(ix);
+  return { sql: [], defs: [next], drops: [], user: build.user, indexes: { [build.index]: { table: build.table, global: true } } };
 }
 
 function dropTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {

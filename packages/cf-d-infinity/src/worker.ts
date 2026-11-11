@@ -236,8 +236,17 @@ export class DinfMeta extends DurableObject<Env> {
   switchRange(move: { start: number; end: number; to: string; from?: string }) {
     return this.core.switchRange(move);
   }
-  publishIndex(table: string, name: string, basedOn?: number) {
-    return this.core.publishIndex(table, name, basedOn);
+  publishIndex(table: string, name: string, version: number, at: number) {
+    return this.core.publishIndex(table, name, version, at);
+  }
+  renewLock(version: number) {
+    return this.core.renewLock(version);
+  }
+  lockTables(tables: string[], basedOn?: number) {
+    return this.core.lockTables(tables, basedOn);
+  }
+  finishLock(version: number, sql: string) {
+    return this.core.finishLock(version, sql);
   }
   allocate(table: string, n: number, min?: number) {
     return this.core.allocate(table, n, min);
@@ -420,7 +429,11 @@ export function clusterOf(env: Env, count?: number, prefix = "shard"): Cluster {
     catalog: () => meta.catalog(initial) as unknown as Promise<Catalog>,
     applyDdl: (sql, basedOn) => meta.applyDdl(sql, initial, basedOn) as unknown as Promise<Catalog>,
     switchRange: (move) => meta.switchRange(move) as never,
-    publishIndex: (table, name, basedOn) => meta.publishIndex(table, name, basedOn) as never,
+    publishIndex: (table, name, version, at) => meta.publishIndex(table, name, version, at) as never,
+    revokeDdl: (version, reason) => meta.revokeDdl(version, reason),
+    renewLock: (version) => meta.renewLock(version),
+    lockTables: (tables, basedOn) => meta.lockTables(tables, basedOn) as never,
+    finishLock: (version, sql) => meta.finishLock(version, sql) as never,
     allocate: (table, n, min) => meta.allocate(table, n, min),
   };
 }
@@ -644,14 +657,8 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
       return Response.json({ columns: r.columns, rows: r.rows, changes: r.changes, lastInsertRowid: r.lastInsertRowid, token: db.token });
     }
     if (path === "/batch") {
-      const results = await db.transaction(async (tx) => {
-        const out: { rows: Row[]; changes: number }[] = [];
-        for (const s of body.statements ?? []) {
-          const r = await tx.query(s.sql, s.params ?? []);
-          out.push({ rows: r.rows, changes: r.changes });
-        }
-        return out;
-      });
+      const out = await db.batch((body.statements ?? []).map((s) => ({ sql: s.sql, params: s.params ?? [] })));
+      const results = out.map((r) => ({ rows: r.rows, changes: r.changes }));
       return Response.json({ results, token: db.token });
     }
     return new Response("not found", { status: 404 });

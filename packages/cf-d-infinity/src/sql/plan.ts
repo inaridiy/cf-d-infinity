@@ -932,8 +932,21 @@ function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog, reference?:
 
 // ---- 入口 ----
 
+/** 表定義を変える文の種類。取引の中では、取引の区切りになる (Db.ddl)。 */
+export const SCHEMA_STATEMENTS: ReadonlySet<string> = new Set([
+  "create_table_stmt", "create_index_stmt", "create_view_stmt", "create_trigger_stmt", "drop_trigger_stmt",
+  "drop_table_stmt", "drop_index_stmt", "drop_view_stmt", "alter_table_stmt",
+]);
+
 export async function planStatement(stmt: Node, input: Params, cat: Catalog, ctx: PlanContext): Promise<Plan> {
   const values = bindParams(stmt, input);
+  if (SCHEMA_STATEMENTS.has(stmt.type)) {
+    // 表の作成と行の挿入を 1 文で行うと、途中で失敗したときの後始末が要る。CREATE TABLE と INSERT ... SELECT に分けて書ける。
+    if (stmt.type === "create_table_stmt" && clause(stmt, "as_clause")) {
+      throw new SqlError("unsupported: CREATE TABLE ... AS SELECT; create the table, then INSERT ... SELECT");
+    }
+    return { kind: "ddl", sql: text(stmt) };
+  }
   switch (stmt.type) {
     case "select_stmt":
     case "compound_select_stmt":
@@ -942,21 +955,6 @@ export async function planStatement(stmt: Node, input: Params, cat: Catalog, ctx
     case "update_stmt":
     case "delete_stmt":
       return planUpdateDelete(stmt, values, cat, ctx.reference);
-    case "create_table_stmt": {
-      const as = clause(stmt, "as_clause");
-      // 表の作成と行の挿入を 1 文で行うと、途中で失敗したときの後始末が要る。CREATE TABLE と INSERT ... SELECT に分けて書ける。
-      if (as) throw new SqlError("unsupported: CREATE TABLE ... AS SELECT; create the table, then INSERT ... SELECT");
-      return { kind: "ddl", sql: text(stmt) };
-    }
-    case "create_index_stmt":
-    case "create_view_stmt":
-    case "create_trigger_stmt":
-    case "drop_trigger_stmt":
-    case "drop_table_stmt":
-    case "drop_index_stmt":
-    case "drop_view_stmt":
-    case "alter_table_stmt":
-      return { kind: "ddl", sql: text(stmt) };
     case "pragma_stmt":
     case "explain_stmt":
       return { kind: "meta", ...render(stmt, values) };

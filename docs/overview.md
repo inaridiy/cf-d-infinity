@@ -162,8 +162,18 @@ Five rules keep a schema change from tearing a transaction that is under way:
   and a committed one could never be applied after its table or column is gone.
 - A write rechecks the schema version after any wait (a row lock, a group still arriving, the prepare round at the
   anchor), because DDL may have been applied meanwhile.
-- A new global index is written by every transaction first and backfilled afterwards. The backfill treats the rows
-  it scanned as read at the scan's timestamp, so commit-time validation rejects an entry for a row that changed since.
+- A new global (cross-shard `UNIQUE`) index on a table that has rows is built while writes to that table wait. The
+  version that records the index write-locks the table, shards refuse writes to it, and the index stays invisible to
+  planning until it is published. The rows are indexed while they cannot change, then Meta publishes or withdraws the
+  index exactly once. The builder renews a 5-second lease; if it stops, the lock lifts within the lease, and a build
+  ends after 5 minutes in any case. The publishing version carries a timestamp that every shard's clock moves past,
+  so statements that use the index come after every write made without it. Model M12.
+- A schema change inside a transaction first commits what the transaction did, and the statements after it form a
+  new transaction (as in MySQL). A transaction keeps the schema version it first planned with until it commits, also
+  when it continues on another connection. Model M13.
+- A `DROP TABLE` of a table the transaction read (the last step of a table rebuild) write-locks the table, has every
+  shard check that nothing changed in what the transaction read since it read it, and only then drops it. If
+  something changed, the drop fails as a conflict and no row is lost. Model M14.
 - A shard born from a split catches up to its parent's schema before it accepts the parent's rows.
 - A shard that is handing over or receiving a range applies no schema change until the move is finished, and the
   parent catches up to the child's version before it fences the range. Rows and intents in transit then always have

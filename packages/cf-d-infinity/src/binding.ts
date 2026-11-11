@@ -157,6 +157,18 @@ export class Connection {
   }
 }
 
+/**
+ * Drizzle の移行が記録に使う表を作る文。Drizzle の migrate() より前に 1 度実行する。
+ *
+ * Drizzle は、この表がなければ `id SERIAL PRIMARY KEY` で作り、記録の INSERT で id を省く。SERIAL は INTEGER ではないので、
+ * SQLite では id に NULL が入る。この DB は主キーに NULL のある行を断る (行を主キーの値で名指しするため)。
+ * ここで作る表は id が INTEGER PRIMARY KEY なので、番号が自動で振られる。Drizzle は id の値を使わない。
+ * 表がもうあれば何もしない。
+ */
+export function drizzleMigrationsTable(name = "__drizzle_migrations"): string {
+  return `CREATE TABLE IF NOT EXISTS "${name.replaceAll('"', '""')}" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)`;
+}
+
 /** `env.DINF_DB` (DinfDatabase への Service Binding) から接続を作る。 */
 export function connect(binding: unknown): Connection {
   return new Connection(binding as DatabaseBinding);

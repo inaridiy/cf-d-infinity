@@ -5,7 +5,7 @@ import { MetaCore } from "../src/meta";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
 import { ShardCore, type SpanEscape } from "../src/shard/core";
-import type { Backend, Faults, Row, ShardApi, Value } from "../src/types";
+import type { Backend, Faults, Row, ShardApi, Ts, Value } from "../src/types";
 
 /**
  * DO の SQLite の実測の制限 (公式の表にないもの)。node:sqlite は上限を変えられないので、文を見て模す。
@@ -236,6 +236,9 @@ export interface SimOptions {
   noSpanCheck?: boolean;
   /** 仮想の実行環境の seed。同じ seed なら同じ実行になる。 */
   seed?: number;
+  /** index を既存の行から作る間の、書き込み禁止の期限と、その上限 (ms)。既定は meta.ts の INDEX_LEASE_MS と INDEX_BUILD_MAX_MS。 */
+  leaseMs?: number;
+  buildMaxMs?: number;
   /**
    * 本物の時計とタイマーで動かす。実行は再現できない。本物のタイマーで待つ、まだ移していない試験のためにある。
    * now を渡したときも、こちらになる。
@@ -277,7 +280,7 @@ export class SimCluster implements Cluster {
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
     this.runtime = this.virtual ?? systemRuntime;
     this.shardIds = Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
-    this.meta = new MetaCore(new SqliteBackend(), this.shardIds);
+    this.meta = new MetaCore(new SqliteBackend(), this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs });
     for (const id of this.shardIds) this.core(id);
   }
 
@@ -426,8 +429,20 @@ export class SimCluster implements Cluster {
   switchRange(move: { start: number; end: number; to: string; from?: string }) {
     return this.meta.switchRange(move);
   }
-  publishIndex(table: string, name: string, basedOn?: number) {
-    return this.meta.publishIndex(table, name, basedOn);
+  publishIndex(table: string, name: string, version: number, at: Ts) {
+    return this.meta.publishIndex(table, name, version, at);
+  }
+  revokeDdl(version: number, reason: string) {
+    return this.meta.revokeDdl(version, reason);
+  }
+  renewLock(version: number) {
+    return this.meta.renewLock(version);
+  }
+  lockTables(tables: string[], basedOn?: number) {
+    return this.meta.lockTables(tables, basedOn);
+  }
+  finishLock(version: number, sql: string) {
+    return this.meta.finishLock(version, sql);
   }
   allocate(table: string, n: number, min?: number) {
     return this.meta.allocate(table, n, min);

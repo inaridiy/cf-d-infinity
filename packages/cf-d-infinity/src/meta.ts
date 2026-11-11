@@ -1,5 +1,6 @@
-import { SqlError, checkStorageFormat, type Backend, type TableDef } from "./types";
-import { parseDdl, type IndexInfo, type ParsedDdl, type SchemaView } from "./sql/ddl";
+import { SqlError, checkStorageFormat, type Backend, type TableDef, type Ts } from "./types";
+import { parseDdl, publishBuild, type IndexInfo, type ParsedDdl, type SchemaView } from "./sql/ddl";
+import { systemRuntime, type Runtime } from "./runtime";
 import { CAPTURE_TABLES } from "./shard/rows";
 import { applyMove, initialRouting, type Routing } from "./routing";
 
@@ -9,7 +10,24 @@ export interface DdlEntry extends ParsedDdl {
   reverts?: number;
   /** 取り消しの理由。シャードが適用に失敗したときの SQLite のメッセージ。 */
   reason?: string;
+  /** 取引が読んだ表を DROP する前に、その表を書き込み禁止にする版。次の版が、その DROP か、取り消しである (finishLock)。 */
+  guard?: { tables: string[] };
+  /**
+   * index を公開する版が運ぶ時刻。シャードは、この版を適用するときに、時計をここまで進める。
+   * index を使わずに確定した書き込みは、どれもこの時刻以下である。index を使う文は、この版を適用したシャードで読むので、
+   * この時刻より後になる。公開が、時刻の順の中の 1 点になる (specs/m12_unique_index_build.qnt の m12_clock)。
+   */
+  at?: Ts;
 }
+
+/**
+ * 既存の行から index を作る間は、表への書き込みが止まる。その止め方の期限。
+ * 作る側は、作業の合間に期限を延ばし続ける (MetaCore.renewLock)。作る側 (Worker の 1 回の呼び出し) が止まると延長も止まり、
+ * INDEX_LEASE_MS のうちに Meta が取り消す。延ばし続けても、作り始めてから INDEX_BUILD_MAX_MS を過ぎれば取り消す。
+ * 書き込みが止まる時間の上限である。
+ */
+export const INDEX_LEASE_MS = 5_000;
+export const INDEX_BUILD_MAX_MS = 300_000;
 
 /** DDL の版が、呼び出し側の見た版から進んでいた。表定義を取り直してやり直す。 */
 export class SchemaMoved extends Error {
@@ -31,9 +49,31 @@ export interface Catalog {
   revoked?: { version: number; reason: string };
 }
 
+/** index を作っている最中で、別の表定義の変更を記録できない。終わるのを待ってやり直す。 */
+export class SchemaBusy extends Error {
+  readonly retryable = true;
+  constructor(readonly what: string) {
+    super(`schema busy: ${what} is in progress`);
+  }
+}
+
+/** 表への書き込みを止めている作業の名前。誤りの文に使う。 */
+function describe(e: DdlEntry): string {
+  return e.build ? `CREATE INDEX ${e.build.index}` : `the lock on ${e.guard!.tables.join(", ")} before DROP TABLE`;
+}
+
 /** 表定義、DDL 履歴、範囲表、rowid の採番を持つ。hot path には載せない。 */
 export class MetaCore {
-  constructor(private b: Backend, private initialShards: string[] = []) {
+  private rt: Runtime;
+  private leaseMs: number;
+  private buildMaxMs: number;
+  constructor(
+    private b: Backend, private initialShards: string[] = [],
+    opts: { runtime?: Runtime; leaseMs?: number; buildMaxMs?: number } = {},
+  ) {
+    this.rt = opts.runtime ?? systemRuntime;
+    this.leaseMs = opts.leaseMs ?? INDEX_LEASE_MS;
+    this.buildMaxMs = opts.buildMaxMs ?? INDEX_BUILD_MAX_MS;
     b.exec(`CREATE TABLE IF NOT EXISTS __ddl(version INTEGER PRIMARY KEY, entry TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __routing(version INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __seq(name TEXT PRIMARY KEY, next INTEGER NOT NULL)`);
@@ -101,7 +141,62 @@ export class MetaCore {
       .map((r) => JSON.parse(r.entry as string) as DdlEntry);
   }
 
+  /**
+   * 表への書き込みを止めている作業 (index の作成か、DROP の前の書き込み禁止) を記録した版。最新の版がそれであるときだけ、作業の最中である。
+   * 作業の間は、ほかの表定義の変更を記録しない。だから、終わり方 (公開、DROP、取り消し) は「最新の版がこの版のまま」のときだけ
+   * 次の版を積み、どれか 1 つしか起きない。
+   */
+  private building(all = this.entries()): DdlEntry | null {
+    const last = all.at(-1);
+    return last?.build || last?.guard ? last : null;
+  }
+
+  /**
+   * 期限を過ぎた index の作成を取り消す。外から呼ばれるたびに、最初に確かめる。
+   * 書き込みを断られた Worker も、版を進めたいシャードも、Meta に尋ねる。だから、タイマーがなくても、待っている者がいれば取り消される。
+   */
+  private expire(): void {
+    const b = this.building();
+    if (!b) return;
+    const lease = this.lease();
+    const now = this.rt.now();
+    if (lease?.version === b.version && now <= lease.until) return;
+    const reason = lease?.version === b.version && now > lease.started + this.buildMaxMs
+      ? `${describe(b)} did not finish within ${Math.round(this.buildMaxMs / 1000)} seconds and was withdrawn; the table is unchanged`
+      : `${describe(b)} stopped before it finished and was withdrawn; the table is unchanged`;
+    this.revoke(b.version, reason);
+  }
+
+  /** 作っている最中の index の期限。版、作り始めた時刻、いまの期限。 */
+  private lease(): { version: number; started: number; until: number } | null {
+    const r = this.b.exec(`SELECT v FROM __meta WHERE k = 'build_lease'`)[0];
+    return r ? (JSON.parse(r.v as string) as { version: number; started: number; until: number }) : null;
+  }
+  private setLease(l: { version: number; started: number; until: number }): void {
+    this.b.exec(`INSERT INTO __meta(k, v) VALUES ('build_lease', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, JSON.stringify(l));
+  }
+
+  /**
+   * 表への書き込みを止めている作業の期限を延ばす。version は作業を始めた版で、まだ作業の最中でなければ断る。
+   * 取り消された後の延長が、作業を生き返らせることはない (公開と同じ確認。specs/m12_unique_index_build.qnt の ONE_EXIT)。
+   */
+  async renewLock(version: number): Promise<{ leaseMs: number }> {
+    this.expire();
+    const b = this.building();
+    const lease = this.lease();
+    if (!b || b.version !== version || lease?.version !== version) {
+      throw new SqlError(`the schema change that locked the table is no longer in progress`);
+    }
+    this.setLease({ ...lease, until: Math.min(this.rt.now() + this.leaseMs, lease.started + this.buildMaxMs) });
+    return { leaseMs: this.leaseMs };
+  }
+
   async catalog(): Promise<Catalog> {
+    this.expire();
+    return this.current();
+  }
+
+  private current(): Catalog {
     const cat: Catalog = { version: 0, tables: {}, views: {}, indexes: {}, ddl: [], routing: this.routing() };
     const all = this.entries();
     const reverted = new Set(all.flatMap((e) => (e.reverts === undefined ? [] : [e.reverts, e.version])));
@@ -122,6 +217,7 @@ export class MetaCore {
   }
 
   async ddlSince(version: number): Promise<{ version: number; ddl: DdlEntry[] }> {
+    this.expire();
     const ddl = this.entries(version);
     return { version: ddl.at(-1)?.version ?? version, ddl };
   }
@@ -145,13 +241,18 @@ export class MetaCore {
    * シャードが適用に失敗した版を取り消せるのは、その後に別の版が積まれていないからである。
    */
   async applyDdl(sql: string, basedOn?: number): Promise<Catalog> {
-    const cat = await this.catalog();
+    this.expire();
+    const cat = this.current();
     if (basedOn !== undefined && basedOn !== cat.version) throw new SchemaMoved(cat.version);
+    const busy = this.building();
+    if (busy) throw new SchemaBusy(describe(busy));
     const parsed = parseDdl(sql, cat);
     if (!parsed.noop) {
       this.append(parsed, cat.version + 1);
+      const now = this.rt.now();
+      if (parsed.build) this.setLease({ version: cat.version + 1, started: now, until: now + this.leaseMs });
     }
-    return this.catalog();
+    return this.current();
   }
 
   /**
@@ -159,6 +260,11 @@ export class MetaCore {
    * 取り消せるのは、最新の版で、取り消す文を持つものだけである。
    */
   async revokeDdl(version: number, reason: string): Promise<number | null> {
+    this.expire();
+    return this.revoke(version, reason);
+  }
+
+  private revoke(version: number, reason: string): number | null {
     const all = this.entries();
     const done = all.find((e) => e.reverts === version);
     if (done) return done.version;
@@ -184,14 +290,51 @@ export class MetaCore {
     return version + 1;
   }
 
-  /** backfill が終わった index を検索に使えるようにする。 */
-  async publishIndex(table: string, name: string, basedOn?: number): Promise<Catalog> {
-    const cat = await this.catalog();
+  /**
+   * 既存の行の項目を埋め終えた index を公開する。version は index を作り始めた版で、それが最新の版のままでなければ断る。
+   * 期限切れで取り消された後に、遅れてきた公開が通ることはない。at は公開の時刻 (DdlEntry.at)。
+   */
+  async publishIndex(table: string, name: string, version: number, at: Ts): Promise<Catalog> {
+    this.expire();
+    const b = this.building();
+    if (!b || b.version !== version || b.build!.table !== table || b.build!.index !== name) {
+      throw new SqlError(`CREATE INDEX ${name}: the index is no longer being built`);
+    }
+    this.append({ ...publishBuild(this.current().tables[table]!, b.build!), at }, b.version + 1);
+    return this.current();
+  }
+
+  /**
+   * 取引が読んだ表を DROP する前に、その表を書き込み禁止にする (specs/m14_rebuild_guard.qnt)。表定義の形は変えない。
+   * 次の版は、finishLock が記録する DROP か、取り消しである。期限は index の作成と同じく、延ばし続ける。
+   */
+  async lockTables(tables: string[], basedOn?: number): Promise<Catalog> {
+    this.expire();
+    const cat = this.current();
     if (basedOn !== undefined && basedOn !== cat.version) throw new SchemaMoved(cat.version);
-    const def = structuredClone(cat.tables[table]!);
-    for (const g of def.globalIndexes) if (g.name === name) g.state = "public";
-    this.append({ sql: [], defs: [def], drops: [], user: null }, cat.version + 1);
-    return this.catalog();
+    const busy = this.building();
+    if (busy) throw new SchemaBusy(describe(busy));
+    const defs = tables.map((t) => {
+      const def = cat.tables[t];
+      if (!def) throw new SqlError(`no such table: ${t}`);
+      return { ...structuredClone(def), locked: `DROP TABLE ${t} by a transaction that read it` };
+    });
+    const version = cat.version + 1;
+    this.append({ sql: [], defs, drops: [], user: null, guard: { tables }, undo: { sql: [], user: null } }, version);
+    const now = this.rt.now();
+    this.setLease({ version, started: now, until: now + this.leaseMs });
+    return this.current();
+  }
+
+  /** 書き込み禁止の版 (lockTables) を、その DROP で終える。version は禁止の版で、それが最新の版のままでなければ断る。 */
+  async finishLock(version: number, sql: string): Promise<Catalog> {
+    this.expire();
+    const b = this.building();
+    if (!b?.guard || b.version !== version) throw new SqlError(`DROP TABLE: the lock on the table was withdrawn before the table was dropped`);
+    const parsed = parseDdl(sql, this.current());
+    if (!b.guard.tables.every((t) => parsed.drops.includes(t))) throw new SqlError(`DROP TABLE: the statement does not drop ${b.guard.tables.join(", ")}`);
+    this.append(parsed, version + 1);
+    return this.current();
   }
 
   /** rowid を n 個採番する。min は利用者が明示した値で、これより大きい値から続ける。 */

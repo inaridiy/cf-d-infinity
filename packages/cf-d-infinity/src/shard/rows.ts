@@ -42,7 +42,11 @@ export function assertKeyed(def: TableDef, row: Row): void {
   if (def.implicitRowid) return;
   const col = def.pk.find((c) => (row[c] ?? null) === null);
   if (col !== undefined) {
-    throw new SqlError(`unsupported: NULL in the primary key column ${col} of ${def.name}; rows are identified by their primary key, so every primary key column needs a value`);
+    // Drizzle の移行の記録の表は、Drizzle が作ると、こうなる。直し方を添える。
+    const drizzle = def.name === "__drizzle_migrations"
+      ? `. Drizzle creates this table with a SERIAL key that it leaves NULL; create the table first with drizzleMigrationsTable() from cf-d-infinity/client`
+      : "";
+    throw new SqlError(`unsupported: NULL in the primary key column ${col} of ${def.name}; rows are identified by their primary key, so every primary key column needs a value (declare it INTEGER PRIMARY KEY to have one assigned)${drizzle}`);
   }
 }
 

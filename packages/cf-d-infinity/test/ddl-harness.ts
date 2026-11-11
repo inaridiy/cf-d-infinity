@@ -79,7 +79,7 @@ export async function rawRows(c: SimCluster, table: string): Promise<{ shard: st
 }
 
 export interface IndexReport {
-  /** catalog 上の状態。index がなければ null。 */
+  /** catalog 上の状態。出来上がっていれば public、作っている最中なら building、index がなければ null。 */
   state: string | null;
   /** UNIQUE の index である。 */
   unique: boolean;
@@ -98,7 +98,10 @@ export async function indexAgreement(c: SimCluster, table = "acct", name = INDEX
   const cat = await c.catalog();
   const ix = cat.tables[table]?.globalIndexes.find((g) => g.name === name);
   const gidx = `__gidx_${name}`;
-  const out: IndexReport = { state: ix?.state ?? null, unique: ix !== undefined, missing: [], dangling: [], wrongRead: [], leftover: [] };
+  const building = cat.tables[table]?.building?.name === name;
+  const out: IndexReport = { state: ix ? "public" : building ? "building" : null, unique: ix !== undefined, missing: [], dangling: [], wrongRead: [], leftover: [] };
+  // 作っている最中の index の表は、まだ埋まっていなくてよい。
+  if (building) return out;
   if (!ix) {
     for (const shard of shardsOf(cat.routing)) {
       const b = c.backends.get(shard)!;
@@ -117,7 +120,7 @@ export async function indexAgreement(c: SimCluster, table = "acct", name = INDEX
   const actual = new Set((await rawRows(c, gidx)).map(({ row }) => `${row.k} -> ${row.pk}`));
   out.missing = [...expected].filter((e) => !actual.has(e)).sort();
   out.dangling = [...actual].filter((e) => !expected.has(e)).sort();
-  if (ix.state === "public" && ix.columns.length === 1) {
+  if (ix.columns.length === 1) {
     const col = ix.columns[0]!;
     const db = new Db(c);
     const values = [...new Set(base.map(({ row }) => row[col] ?? null))].filter((x) => x !== null);
@@ -158,7 +161,7 @@ export async function duplicates(c: SimCluster, table = "acct", col = "v"): Prom
 
 /**
  * 各シャードが適用した表定義の版。最新の版を持つ読み取りを全シャードへ送った後で呼ぶ。
- * publishIndex と backfill 失敗時の DROP INDEX はシャードへ押し出されないので、送る前は遅れていてよい。
+ * 期限切れで取り消された index の版などは、シャードへ押し出されないので、送る前は遅れていてよい。
  */
 export async function schemaVersions(c: SimCluster): Promise<{ meta: number; shards: Record<string, number> }> {
   const cat = await c.catalog();
@@ -503,6 +506,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   /** 乱数はここで全部引く。取引の本体はリトライで再実行されるので、乱数を引かない。 */
   const plan = (): {
     mode: "txn" | "pess" | "slow" | "autoUpdate" | "autoInsert" | "vread"; p: Plan; x: { t: number; i: number }; n: number; v: number | null; extra: boolean;
+    readOnly: boolean;
   } => {
     const name = `w${++seq}`;
     const n = seq * 10;
@@ -551,11 +555,15 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
     };
     const body = kind < 0.12 ? "read" : kind < 0.32 ? "one" : kind < 0.55 ? "two" : kind < 0.65 ? "del" : "one";
     const usesSide = side && (body === "one" || body === "two") && (mode === "txn" || mode === "pess" || mode === "slow");
-    return { mode, p: { name, body: bodies[body]!, side: usesSide ? side : undefined }, x: a, n, v: va, extra };
+    return { mode, p: { name, body: bodies[body]!, side: usesSide ? side : undefined }, x: a, n, v: va, extra, readOnly: mode === "vread" || body === "read" };
   };
 
-  const one = async (db: Db) => {
-    const { mode, p, x, n, v, extra } = plan();
+  /** シャードをまたぐ UNIQUE の index が、一度でも公開されたか。 */
+  let everUnique = false;
+  /** note には、この操作が読むだけかを渡す。UNIQUE の誤りを分類するのに使う。 */
+  const one = async (db: Db, note: (readOnly: boolean) => void) => {
+    const { mode, p, x, n, v, extra, readOnly: ro } = plan();
+    note(ro);
     const begun = env.tick();
     const w1 = (): Writes => Object.assign([{ key: k(x), value: n }], { v: [v] });
     if (mode === "vread") {
@@ -612,14 +620,23 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
       if (rnd() < 0.1) db = client();
       while (paused) await c.sleep(1);
       active++;
+      let readOnly = false;
       try {
-        await one(db);
+        await one(db, (ro) => (readOnly = ro));
       } catch (e) {
         const m = e instanceof Error ? e.message : String(e);
         if (SCHEMA_ERR.test(m)) db = client(); // 古い表定義を捨てる。利用者のリトライに当たる。
         const sideGone = /no such table: (main\.)?(side|__gidx_)/.test(m);
         const extraUnknown = /extra/.test(m) && SCHEMA_ERR.test(m);
-        if (!(EXPECTED.test(m) || /UNIQUE constraint failed/.test(m) || sideGone || extraUnknown)) errors.push(m);
+        // UNIQUE の誤りは、書き込みだけが受け取ってよい。主キーの衝突はいつでも起きる。v の衝突は、v の UNIQUE の index が
+        // 公開された後だけである。作っている最中の index と、取り消された index は、どの文の結果も変えてはならない。
+        // 読みが UNIQUE で失敗するのは、どの場合も誤りである。
+        let uniqueOk = false;
+        if (/UNIQUE constraint failed/.test(m) && !readOnly) {
+          everUnique ||= ((await c.catalog()).tables.acct?.globalIndexes.length ?? 0) > 0;
+          uniqueOk = /acct\.tenant_id, acct\.id/.test(m) || everUnique;
+        }
+        if (!(EXPECTED.test(m) || uniqueOk || sideGone || extraUnknown)) errors.push(readOnly && /UNIQUE/.test(m) ? `a read failed: ${m}` : m);
       } finally {
         active--;
         done++;

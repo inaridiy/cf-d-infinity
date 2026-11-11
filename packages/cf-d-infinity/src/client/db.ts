@@ -1,13 +1,13 @@
 import type {
   Change, CommitRes, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
 } from "../types";
-import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isWideSpan, utf8Length } from "../types";
+import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, utf8Length } from "../types";
 import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, q, selectList } from "../shard/rows";
 import type { Catalog } from "../meta";
 import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
-import { normalize, parseStatements, text, type Node, type Params } from "../sql/cst";
-import { findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
+import { ident, normalize, parseStatements, text, type Node, type Params } from "../sql/cst";
+import { SCHEMA_STATEMENTS, findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
 import { parseDdl } from "../sql/ddl";
 import { openScratch, ScratchDb, type Compiled } from "../sql/scratch";
 import { groupSpan, rowSpan, scanSpans, statementSpans, tableSpan } from "./spans";
@@ -17,13 +17,56 @@ export interface Cluster {
   catalog(): Promise<Catalog>;
   /** basedOn は呼び出し側が全シャードへ適用し終えた版。現在の版と違えば `schema moved` で断られる。 */
   applyDdl(sql: string, basedOn?: number): Promise<Catalog>;
-  publishIndex(table: string, name: string, basedOn?: number): Promise<Catalog>;
+  /** 作り終えた index を公開する。version は index を作り始めた版、at は公開の時刻 (meta.ts の DdlEntry.at)。 */
+  publishIndex(table: string, name: string, version: number, at: Ts): Promise<Catalog>;
+  /** 表への書き込みを止めている作業 (index の作成、DROP の前の禁止) の期限を延ばす。version は作業を始めた版。期限の長さを返す。 */
+  renewLock(version: number): Promise<{ leaseMs: number }>;
+  /** 取引が読んだ表を DROP する前に、その表を書き込み禁止にする版を記録する (meta.ts の lockTables)。 */
+  lockTables(tables: string[], basedOn?: number): Promise<Catalog>;
+  /** 書き込み禁止の版を、その DROP で終える。 */
+  finishLock(version: number, sql: string): Promise<Catalog>;
+  /** 版を取り消す。取り消す版を返す。取り消せなければ null。 */
+  revokeDdl(version: number, reason: string): Promise<number | null>;
   allocate(table: string, n: number, min?: number): Promise<number>;
   switchRange(move: { start: number; end: number; to: string; from?: string }): Promise<Routing>;
   /** 実時間、待ち、乱数、識別子の出どころ。なければ実物を使う。シミュレータのクラスタは、seed から決まる実装を持つ。 */
   runtime?: Runtime;
   /** このクラスタへつなぐ Db の、基準経路だけで実行する指定の既定。試験が使う。 */
   reference?: Reference;
+}
+
+/** Worker の側の欠陥を再導入するスイッチ (シャードの側は types.ts の Faults)。検査が欠陥を見つけることを確かめる試験だけが使う。 */
+export interface ClientFaults {
+  /** 書き出した取引を組み立て直すとき、表定義が変わっていても、新しい版を名乗らせる (モデル m13_red_repin)。 */
+  repinOnRestore?: boolean;
+  /** DDL を実行した batch も、競合したら頭からやり直す (モデル m13_red_retry_whole)。 */
+  replayAcrossSchemaChange?: boolean;
+  /** 取引が読んだ表を、書き込みを止めず、確かめずに DROP する (2026-11 までの挙動。モデル m14_red_no_lock と m14_red_no_check)。 */
+  dropWithoutGuard?: boolean;
+}
+
+/**
+ * 取引が、あるシャードで読んだ範囲と、その時刻。表を消す前の確認に使う (Db.guardedDrop)。
+ * from は、そのシャードがこの範囲の変更を確かめてよい最初の時刻である。読んだ時刻、ただし同じ取引がそこへ書いたなら確定の時刻。
+ * どちらも、そのシャードが見た時刻である (読みの要求が運ぶ時刻、確定の phase 2 が運ぶ時刻)。
+ */
+export interface ReadRecord {
+  shard: string;
+  spans: Span[];
+  from: Ts;
+}
+
+/** SHARD KEY はこの DB の拡張で、パーサは読めない。そういう CREATE TABLE は、DDL の解釈に直接渡す。 */
+const SHARD_KEY_TABLE = /^\s*CREATE\s+TABLE\b[\s\S]*\bSHARD\s+KEY\s*\(/i;
+
+/** 表定義を変える文を含むか。読めない文は、含まないものとして扱う (実行すれば、その誤りが返る)。 */
+export function changesSchema(sql: string): boolean {
+  if (SHARD_KEY_TABLE.test(sql)) return true;
+  try {
+    return parseStatements(sql).some((s) => SCHEMA_STATEMENTS.has(s.type));
+  } catch {
+    return false;
+  }
 }
 
 /** 接続をまたいで渡された token を時刻にする。時刻として読めない値は「何も見ていない」として扱う。 */
@@ -71,9 +114,16 @@ export interface StatementStat {
   error?: string;
 }
 
-/** index の backfill が 1 回に読む行数と、競合や移動でやり直す回数の上限。 */
-const BACKFILL_PAGE = 50;
-const BACKFILL_RETRIES = 200;
+/** index を作るときに、1 回に読む行数、1 つの取引で書く項目の数、移動や競合でやり直す回数の上限。 */
+const BUILD_PAGE = 500;
+const BUILD_BATCH = 200;
+const BUILD_RETRIES = 200;
+/**
+ * 表定義の変更が終わるのを待つ時間。index を作っている間は、その表への書き込みと、ほかの表定義の変更が待つ。
+ * 作る側が止まれば、期限 (meta.ts の INDEX_LEASE_MS、既定 5 秒) のうちに取り消されて書ける。作る側が動き続けている間は、
+ * これだけ待って、やり直してよい誤り (`conflict: locked: ...`) を返す。
+ */
+const SCHEMA_WAIT_MS = 30_000;
 
 /** 表定義が古いと出る誤り。取り直すと解けることがある。 */
 const UNKNOWN_SCHEMA = /^(no such (table|column|index)|table \S+ has no column)/;
@@ -349,6 +399,10 @@ class ReadScope {
 
 export interface TxnDump {
   id: string;
+  /** 同じ取引の、前の区切り (DDL の前に確定した分) で読んだ範囲。 */
+  earlier?: ReadRecord[];
+  /** 取引が文を計画した表定義の版 (Txn.catalog)。 */
+  schema: number;
   T: Ts | undefined;
   pessimistic: boolean;
   lockReads: boolean;
@@ -373,8 +427,14 @@ export class Txn extends ReadScope {
   private lockOwner: LockOwner | null = null;
   /** この取引で実行した文。遅い取引の記録に使う。 */
   readonly sqls: string[] = [];
+  /**
+   * 取引の文を計画した表定義の版。書き出すときはこの値を運び、組み立て直しても変えない。
+   * いまの表定義の版と違えば、取引は古い版で計画した読み書きを持っているので、失敗させる (Txn.load)。
+   */
+  private planned: number;
   constructor(db: Db, cat: Catalog, private id: string) {
     super(db, cat);
+    this.planned = cat.version;
   }
 
   private get txnId(): string {
@@ -386,16 +446,6 @@ export class Txn extends ReadScope {
   }
   protected override record(shard: string, spans: Span[]): void {
     this.spans.set(shard, [...(this.spans.get(shard) ?? []), ...spans]);
-  }
-
-  /**
-   * 取引の外で時刻 T に読んだ範囲を、この取引が読んだものとして扱う。
-   * commit の検証が T より後の変更を見つけるので、読んだ後に変わった行をもとに書くことがない。
-   */
-  assume(shard: string, spans: Span[], T: Ts): void {
-    if (this.T !== undefined && this.T !== T) throw new SqlError("assume: the transaction already has a read timestamp");
-    this.T = T;
-    this.record(shard, spans);
   }
 
   /**
@@ -463,9 +513,42 @@ export class Txn extends ReadScope {
     return true;
   }
 
-  useCatalog(cat: Catalog): void {
-    this.cat = cat;
+  /**
+   * 取引が文を計画し、実行する表定義。取引は、最初に読むか書くかしてから確定まで、同じ表定義を使う (specs/m13_txn_schema_boundary.qnt)。
+   * シャードは、要求が名乗る版を、その計画に使った版として信じる (自分より古い版の計画を断る)。溜めた書き込みを計画し直さずに
+   * 新しい版を名乗ると、新しい index を保守しない書き込みが通る。表定義が変わるのは、確定の境目だけである。
+   */
+  get catalog(): Catalog {
+    return this.cat;
   }
+
+  /** まだ何も読み書きしていない取引を、新しい表定義へ移す。 */
+  rebase(cat: Catalog): void {
+    if (!this.untouched) throw new Error("a transaction that has read or written keeps its schema version until it commits");
+    this.cat = cat;
+    this.planned = cat.version;
+  }
+
+  /**
+   * 同じ取引 (BEGIN から) の、前の区切りで読んだ範囲。DDL が区切りを作るたびに、次の取引へ引き継ぐ。
+   * 取引が読んだ表を DROP するときに、読んだ後に別の接続が書いていないかを確かめる (Db.guardedDrop)。
+   */
+  earlier: ReadRecord[] = [];
+
+  /** この取引が読んだ範囲。確定した後に呼ぶ。 */
+  readRecord(): ReadRecord[] {
+    const T = this.T ?? 0;
+    return [...this.spans].map(([shard, spans]) => ({
+      shard, spans,
+      from: this.commitTs !== undefined && (this.writes.get(shard)?.size ?? 0) > 0 ? Math.max(T, this.commitTs) : T,
+    }));
+  }
+
+  /** 以後、この取引の文と COMMIT を、この誤りで失敗させる。ROLLBACK は通る。 */
+  doom(e: Error): void {
+    this.doomed = e;
+  }
+  private doomed: Error | null = null;
 
   /** まだ何も読み書きしていない。 */
   get untouched(): boolean {
@@ -476,15 +559,33 @@ export class Txn extends ReadScope {
   dump(): TxnDump {
     const m = (x: Map<string, Map<string, Change>>) => [...x].map(([k, v]) => [k, [...v]] as const);
     return {
-      id: this.id, T: this.T, writes: m(this.writes), spans: [...this.spans],
+      id: this.id, schema: this.planned, earlier: this.earlier, T: this.T, writes: m(this.writes), spans: [...this.spans],
       pessimistic: this.pessimistic, lockReads: this.lockReads, lockOwner: this.lockOwner,
       saves: [...this.saves].map(([k, v]) => [k, { writes: m(v.writes), spans: [...v.spans] }] as const),
     };
   }
 
+  /**
+   * 書き出した取引を組み立て直す。cat は、いまの表定義である。
+   * 書き出した後で表定義が変わっていたら、溜めた読みと書き込みは古い版のものである。新しい版を名乗らせるわけにはいかないので、
+   * 取引を失敗させる (Txn.catalog)。何もしていない取引は、新しい版で続ける。
+   */
   static load(db: Db, cat: Catalog, d: TxnDump): Txn {
+    const tx = Txn.restore(db, cat, d);
+    // 何もしていない取引は、いまの版で続けてよい。
+    if (tx.untouched || db.faults.repinOnRestore) tx.planned = cat.version;
+    // 版は書き出し直しても変わらないので、次の要求でも、その次でも失敗する。
+    if (tx.planned !== cat.version) {
+      tx.doom(new ConflictError(`the schema changed while the transaction was open (version ${tx.planned} to ${cat.version}); roll back and run the transaction again`));
+    }
+    return tx;
+  }
+
+  private static restore(db: Db, cat: Catalog, d: TxnDump): Txn {
     const tx = new Txn(db, cat, d.id);
     const m = (x: TxnDump["writes"]) => new Map(x.map(([k, v]) => [k, new Map(v)] as const));
+    tx.planned = d.schema;
+    tx.earlier = d.earlier ?? [];
     tx.T = d.T;
     tx.pessimistic = d.pessimistic;
     tx.lockReads = d.lockReads;
@@ -518,6 +619,7 @@ export class Txn extends ReadScope {
   }
 
   async statement(stmt: Node, params: Params): Promise<QueryResult> {
+    if (this.doomed) throw this.doomed;
     return runPlanned(stmt, text(stmt), params, this.cat, this.planContext(), (p) => this.execute(p));
   }
 
@@ -575,6 +677,7 @@ export class Txn extends ReadScope {
   }
 
   async execute(p: Plan): Promise<QueryResult> {
+    if (this.doomed) throw this.doomed;
     switch (p.kind) {
       case "write": return this.atomically(() => this.write(p));
       case "wasmWrite": return this.atomically(() => this.wasmWrite(p));
@@ -834,6 +937,7 @@ export class Txn extends ReadScope {
   }
 
   async commit(): Promise<void> {
+    if (this.doomed) throw this.doomed;
     // 大きすぎる取引は、シャードへ送る前にここで断る。シャードも同じ検査をするが、そちらの拒否は競合と同じ扱いで再試行される。
     for (const changes of this.writes.values()) {
       let bytes = 0;
@@ -897,12 +1001,20 @@ export class Db {
   private inStatement = false;
   readonly rt: Runtime;
   readonly reference: Reference | undefined;
+  readonly faults: ClientFaults;
+  /**
+   * この接続が、開いている取引の途中で確定したか、表定義を変えた回数。batch をやり直してよいかを決めるのに使う。
+   * 増えていれば、batch の前のほうの文は、もう効いている。頭からやり直すと、2 度実行することになる。
+   */
+  boundaries = 0;
   constructor(
     readonly cluster: Cluster,
     private opts: {
       retries?: number; idPrefix?: string; token?: Ts; catalog?: Catalog; idBlock?: number;
       /** DDL が、進行中のシャードの増設が終わるのを待つ時間 (ms)。既定は 60 秒。 */
       splitWaitMs?: number;
+      /** 書き込みが、表を書き込み禁止にしている表定義の変更が終わるのを待つ時間 (ms)。既定は 35 秒。 */
+      schemaWaitMs?: number;
       /** 取り直した表定義を呼び出し側のキャッシュへ戻す。 */
       onCatalog?: (c: Catalog) => void;
       /** 採番のブロック。要求ごとに Db を作る環境では共有しないと番号が大きく飛ぶ。 */
@@ -915,10 +1027,13 @@ export class Db {
       runtime?: Runtime;
       /** 最適化の経路を使わず、基準経路だけで実行する (sql/plan.ts の Reference)。指定しなければ、クラスタのものを使う。試験が使う。 */
       reference?: Reference;
+      /** 検証済みの欠陥を再導入するスイッチ。試験だけが使う。 */
+      faults?: ClientFaults;
     } = {},
   ) {
     this.rt = opts.runtime ?? cluster.runtime ?? systemRuntime;
     this.reference = opts.reference ?? cluster.reference;
+    this.faults = opts.faults ?? {};
     this.token = cleanToken(opts.token);
     this.cached = opts.catalog ?? null;
     this.ids = opts.ids ?? new Map();
@@ -1041,10 +1156,12 @@ export class Db {
    */
   private async assertReplays(sql: string, cat: Catalog): Promise<void> {
     const parsed = parseDdl(sql, cat);
-    if (parsed.noop || !parsed.user) return;
+    // 既存の行から作る index の文は、公開のときに再生する。ここで確かめておく。
+    const user = parsed.user ?? parsed.build?.user;
+    if (parsed.noop || !user) return;
     const w = await openScratch(cat);
     try {
-      w.exec(parsed.user);
+      w.exec(user);
     } catch (e) {
       throw new SqlError((e as Error)?.message ?? String(e));
     } finally {
@@ -1072,6 +1189,7 @@ export class Db {
    */
   private async record(write: (basedOn: number, before: Catalog) => Promise<Catalog>): Promise<{ before: Catalog; cat: Catalog }> {
     const deadline = this.rt.now() + (this.opts.splitWaitMs ?? SPLIT_WAIT_MS);
+    const busyUntil = this.rt.now() + SCHEMA_WAIT_MS;
     for (let attempt = 0; ; attempt++) {
       const before = await this.cluster.catalog();
       const { failed, moving } = await this.syncAll(before);
@@ -1091,13 +1209,57 @@ export class Db {
       try {
         return { before, cat: await write(before.version, before) };
       } catch (e) {
-        if (attempt < 5 && /schema moved to version/.test((e as Error)?.message ?? "")) continue;
+        const m = (e as Error)?.message ?? "";
+        if (attempt < 5 && /schema moved to version/.test(m)) continue;
+        // 別の接続が index を作っている最中である。終わるか、期限で取り消されるまで待つ。
+        if (/schema busy:/.test(m) && this.rt.now() <= busyUntil) {
+          attempt = Math.min(attempt, 3);
+          await sleep(this.rt, 50);
+          continue;
+        }
         throw e;
       }
     }
   }
 
-  async ddl(sql: string): Promise<void> {
+  /**
+   * 表定義を変える。取引の中なら、先に取引を確定し、DDL の後は新しい取引を開いておく (MySQL と同じ。specs/m13_txn_schema_boundary.qnt)。
+   *
+   * DDL は、取引の中でも、その場で全シャードに効き、取り消せない。書き込みは COMMIT まで手元に溜まる。先に確定しないと、
+   * 効く順序が書いた順序と入れ替わる (行を写してから古い表を消す移行で、行が全部消える)。
+   * 確定できなければ、DDL は実行せず、取引は終わる (SQLite が誤りで取引を巻き戻したときと同じ)。
+   * 新しい取引を開いておくのは、利用者が最後に送る COMMIT のためである。libSQL のクライアントは、COMMIT を
+   * 「autocommit でない」ことを条件に送る。ROLLBACK と SAVEPOINT が戻せるのは、最後の DDL より後だけになる。
+   */
+  async ddl(sql: string, reads: ReadRecord[] = []): Promise<void> {
+    const open = this.current;
+    if (!open) return this.changeSchema(sql, reads);
+    this.current = null;
+    try {
+      await open.commit();
+    } catch (e) {
+      await open.unlockAll().catch(() => undefined);
+      throw e;
+    }
+    this.boundaries++;
+    const next = new Txn(this, await this.catalog(), this.nextTxnId());
+    next.pessimistic = open.pessimistic;
+    next.lockReads = open.lockReads;
+    next.earlier = [...open.earlier, ...open.readRecord()];
+    this.current = next;
+    try {
+      await this.changeSchema(sql, next.earlier);
+      this.boundaries++;
+    } finally {
+      // 新しい取引は、まだ何もしていない。DDL の後の表定義で計画する。
+      next.rebase(await this.catalog());
+    }
+  }
+
+  /** reads は、この DDL を含む取引が、それまでに読んだ範囲である。読んだ表を DROP するなら、guardedDrop を通す。 */
+  private async changeSchema(sql: string, reads: ReadRecord[] = []): Promise<void> {
+    const guarded = this.faults.dropWithoutGuard ? [] : await this.droppedAfterRead(sql, reads);
+    if (guarded.length > 0) return this.guardedDrop(sql, guarded, reads);
     await this.checkUnique(sql);
     const { before, cat } = await this.record(async (basedOn, at) => {
       await this.assertReplays(sql, at);
@@ -1105,26 +1267,13 @@ export class Db {
     });
     this.publish(cat);
     this.ids.clear();
-    if (cat.version === before.version) {
-      // 何も記録されなかった。同じ index を作る文の出し直しなら、前回の要求が途中で終わっているので、埋める作業を再開する。
-      const name = /^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"((?:[^"]|"")+)"|([^\s(]+))/i.exec(sql);
-      const wanted = name?.[1]?.replaceAll('""', '"') ?? name?.[2];
-      for (const def of Object.values(cat.tables)) {
-        for (const ix of def.globalIndexes) if (ix.state === "writeOnly" && ix.name === wanted) await this.backfill(def, ix);
-      }
-      return;
-    }
+    if (cat.version === before.version) return; // 何も記録されなかった
+    // 既存の行から index を作り始めた。記録した版は、表を書き込み禁止にしている。
+    const table = Object.values(cat.tables).find((def) => def.building && !before.tables[def.name]?.building);
+    if (table) return this.buildIndex(table, table.building!, cat);
     // 全シャードへ適用してから完了を返す。適用が遅れると、古い表定義の Worker がそのシャードへ書き、
     // 後から DROP が適用されて行が消える。適用後は古い要求を全シャードが拒否する。
-    let { failed, moving } = await this.syncAll(cat);
-    // 記録した直後に増設が始まると、そのシャードは増設が終わるまで適用しない。終われば適用するので、待つ。
-    for (const deadline = this.rt.now() + (this.opts.splitWaitMs ?? SPLIT_WAIT_MS); failed && moving; ) {
-      if (this.rt.now() > deadline) {
-        throw new SqlError("the schema change is recorded, but a shard split is in progress; shards being split apply it when the split finishes");
-      }
-      await sleep(this.rt, 20);
-      ({ failed, moving } = await this.syncAll(cat));
-    }
+    const failed = await this.syncRecorded(cat);
     if (failed) {
       // シャードの行によっては適用できない文がある (重複のある列への UNIQUE index など)。
       // そのシャードが取り消しを求めているので、取り消しを全シャードへ行き渡らせてから、理由を返す。
@@ -1134,12 +1283,84 @@ export class Db {
       await this.syncAll(now);
       throw new SqlError(now.revoked.reason);
     }
-    for (const def of Object.values(cat.tables)) {
-      for (const ix of def.globalIndexes) {
-        const known = before.tables[def.name]?.globalIndexes.some((g) => g.name === ix.name);
-        if (ix.state === "writeOnly" && !known) await this.backfill(def, ix);
-      }
+  }
+
+  /** DROP TABLE が消す表のうち、reads が読んだもの。 */
+  private async droppedAfterRead(sql: string, reads: ReadRecord[]): Promise<string[]> {
+    if (reads.length === 0) return [];
+    let stmt: Node | undefined;
+    try {
+      [stmt] = parseStatements(sql);
+    } catch {
+      return [];
     }
+    if (stmt?.type !== "drop_table_stmt") return [];
+    const cat = await this.catalog();
+    const read = new Set(reads.flatMap((r) => r.spans.map((s) => s.table)));
+    return (stmt.tables.items as Node[])
+      .map((t) => findTable(cat, ident(t.type === "member_expr" ? t.property : t))?.name)
+      .filter((n): n is string => n !== undefined && read.has(n));
+  }
+
+  /**
+   * 取引が読んだ表を DROP する (specs/m14_rebuild_guard.qnt)。表を作り直す移行は、行を写した区切りを確定してから、古い表を消す。
+   * その間に別の接続が古い表へ書いた行は、写されないまま消える。そこで、
+   *   1. 古い表を書き込み禁止にする版を記録し、全シャードへ適用させる (intent を決着させ、以後の書き込みを断る)。
+   *   2. 取引が読んだ範囲を持つシャードごとに、読んだ後に変更がないかを確かめる (ShardApi.unchanged)。
+   *   3. 変更がなければ、DROP を、禁止の唯一の終わり方として記録する。変更があれば、禁止を取り消し、競合として失敗する。
+   * 行は失われない。代わりに、移行が失敗する。禁止は、index の作成と同じく期限つきで、延ばし続ける。
+   */
+  private async guardedDrop(sql: string, tables: string[], reads: ReadRecord[]): Promise<void> {
+    const { cat: locked } = await this.record((basedOn) => this.cluster.lockTables(tables, basedOn));
+    this.publish(locked);
+    const version = locked.version;
+    const names = new Set(tables);
+    const lease = this.keepLease(version);
+    let dropped: Catalog;
+    try {
+      const failed = await this.syncRecorded(locked);
+      if (failed) throw failed;
+      for (const r of reads) {
+        const spans = r.spans.filter((s) => names.has(s.table));
+        if (spans.length === 0) continue;
+        const res = await this.shardOf(r.shard).unchanged({ spans, from: r.from, schema: version });
+        if (!res.ok) {
+          throw new ConflictError(`another connection wrote to ${tables.join(", ")} after this transaction read it (${res.reason}); nothing was dropped, run the change again`);
+        }
+      }
+      dropped = await this.cluster.finishLock(version, sql);
+    } catch (e) {
+      const reason = (e as Error)?.message ?? String(e);
+      await this.cluster.revokeDdl(version, reason).catch(() => null);
+      const now = await this.cluster.catalog().catch(() => null);
+      if (now) {
+        this.publish(now);
+        await this.syncAll(now).catch(() => undefined);
+      }
+      // 期限で先に取り消されていれば、その理由を返す。
+      if (now?.revoked?.version === version && now.revoked.reason !== reason) throw new SqlError(now.revoked.reason);
+      throw e;
+    } finally {
+      lease.stop();
+    }
+    this.publish(dropped);
+    this.ids.clear();
+    const failed = await this.syncRecorded(dropped);
+    if (failed) throw failed;
+  }
+
+  /** 記録した版を全シャードへ適用させる。増設の途中のシャードは、増設が終われば適用するので、待つ。失敗を返す。 */
+  private async syncRecorded(cat: Catalog): Promise<unknown> {
+    let { failed, moving } = await this.syncAll(cat);
+    // 記録した直後に増設が始まると、そのシャードは増設が終わるまで適用しない。
+    for (const deadline = this.rt.now() + (this.opts.splitWaitMs ?? SPLIT_WAIT_MS); failed && moving; ) {
+      if (this.rt.now() > deadline) {
+        throw new SqlError("the schema change is recorded, but a shard split is in progress; shards being split apply it when the split finishes");
+      }
+      await sleep(this.rt, 20);
+      ({ failed, moving } = await this.syncAll(cat));
+    }
+    return failed;
   }
 
   /**
@@ -1166,130 +1387,201 @@ export class Db {
   }
 
   /**
-   * F1 の write-only 状態の index を既存の行で埋めて public にする。
-   * 書き込みは DDL の時点から index を更新しているので、埋め終われば全行が揃う。
-   */
-  /**
-   * 既存の行から、新しいグローバル index の項目を作る。index は書き込み専用の状態で、並行する書き込みは自分で index を保守する。
+   * 既存の行から、シャードをまたぐ UNIQUE の index を作る。started は index を作り始めた版の表定義で、その版が表を書き込み禁止に
+   * している (specs/m12_unique_index_build.qnt)。
    *
-   * 走査と書き込みは別々に行うので、その間に行が変わり得る。変わった行の古い値を index に書くと、行のない項目が残る。
-   * そこで、走査した行を「取引が時刻 T に読んだ」ものとして扱い、commit の検証に掛ける。変わっていれば競合になり、読み直す。
-   * UNIQUE は、すでにある項目と、同じ取引で書く項目の両方と照合する。
-   * 増設が挟まると行が別のシャードへ移るので、範囲表が変わらなくなるまで全体を繰り返す。
+   *   1. 全シャードの行を読み、値ごとに、その値を持つ行を 1 つ覚える。同じ値の行が 2 つあれば、UNIQUE 違反である。
+   *   2. index の項目を書く。
+   *   3. index を公開する。公開の版が、書き込み禁止を解く。
+   *
+   * 行は止まっているので、読んだ後で変わる行はなく、並行する書き込みと項目を取り合うこともない。index は公開まで
+   * 計画からも Worker の SQLite からも見えないので、作りかけの index をもとに結果を変える文はない。
+   * 途中で失敗したら、作り始めた版ごと取り消す。この呼び出しが途中で止まっても、期限が来れば Meta が取り消す。
+   * どちらの場合も、表は元のままである。
    */
-  private async backfill(def: TableDef, ix: GlobalIndexDef): Promise<void> {
+  private async buildIndex(def: TableDef, ix: GlobalIndexDef, started: Catalog): Promise<void> {
+    const version = started.version;
+    let published: Catalog;
+    const lease = this.keepLease(version);
     try {
-      for (let round = 0; ; round++) {
-        const cat = await this.cluster.catalog();
-        this.cached = cat;
-        this.opts.onCatalog?.(cat);
-        let moved = false;
-        // 毎回、先頭から埋める。途中経過を保存して続きから埋める作りは、別の DDL や増設と重なったときに、
-        // 終わっていないシャードを飛ばして index を公開した。再開できる埋め込みは、状態を持つ駆動役を用意してから入れる。
-        for (const shard of shardsOf(cat.routing)) moved = (await this.backfillShard(def, ix, shard, cat)) || moved;
-        const after = await this.cluster.catalog();
-        if (!moved && after.routing.version === cat.routing.version) break;
-        if (round >= 20) throw new SqlError(`CREATE INDEX ${ix.name}: shards kept splitting during the backfill`);
-      }
+      // 行を読む要求は、作り始めた版を名乗る。シャードはその版を適用してから答えるので、読んだ時点で、そのシャードの行は止まっている。
+      const failed = await this.syncRecorded(started);
+      if (failed) throw failed;
+      const { entries, at } = await this.scanForIndex(def, ix, version);
+      const written = await this.writeIndex(ix, entries, version);
+      published = await this.cluster.publishIndex(def.name, ix.name, version, Math.max(at, written));
     } catch (e) {
-      // Worker の 1 回の呼び出しで使える要求の数を使い切った。後始末の DROP も通らないので、index は書き込み専用のまま残る。
-      if (/too many subrequests|subrequest/i.test((e as Error)?.message ?? "")) {
-        throw new SqlError(`CREATE INDEX ${ix.name} did not finish: the table has too many rows to index within one request. Drop the index; a UNIQUE constraint declared in CREATE TABLE needs no backfill.`);
+      // 取り消す。期限切れで先に取り消されていれば、その理由を返す。Worker の 1 回の呼び出しで使える要求の数を使い切ったときは、
+      // 取り消しの要求も通らない。その場合は、期限が来れば Meta が取り消す。
+      const exhausted = /too many subrequests|subrequest/i.test((e as Error)?.message ?? "");
+      const reason = exhausted
+        ? `CREATE INDEX ${ix.name} did not finish: the table has too many rows to index within one request. The index was not created and the table is unchanged. A UNIQUE constraint declared in CREATE TABLE needs no build.`
+        : ((e as Error)?.message ?? String(e));
+      await this.cluster.revokeDdl(version, reason).catch(() => null);
+      const now = await this.cluster.catalog().catch(() => null);
+      if (now) {
+        this.publish(now);
+        await this.syncAll(now).catch(() => undefined);
       }
-      // 作りかけの index を消した表定義を、呼び出し側のキャッシュにも戻す。
-      // 戻さないと、同じ isolate の次の要求が、消えた index を保守する計画を立てて失敗する。
-      const { cat: without } = await this.record((basedOn) => this.cluster.applyDdl(`DROP INDEX IF EXISTS ${q(ix.name)}`, basedOn));
-      this.publish(without);
-      await this.syncAll(without);
+      if (exhausted) throw new SqlError(reason);
+      if (now?.revoked?.version === version && now.revoked.reason !== reason) throw new SqlError(now.revoked.reason);
       throw e;
+    } finally {
+      lease.stop();
     }
-    const { cat } = await this.record((basedOn) => this.cluster.publishIndex(def.name, ix.name, basedOn));
-    this.publish(cat);
+    this.publish(published);
+    // 公開の版を全シャードへ適用させて、書き込み禁止を早く解く。届かなくても、次の要求が適用させる。
+    await this.syncAll(published);
   }
 
-  /** 1 シャードの行を主キーの順に少しずつ読み、index の項目を書く。途中で範囲が移ったら true を返す。 */
-  private async backfillShard(def: TableDef, ix: GlobalIndexDef, shard: string, cat: Catalog): Promise<boolean> {
+  /**
+   * 作っている最中の index の期限を、期限の半分ごとに延ばし続ける (meta.ts の INDEX_LEASE_MS)。期限の長さは Meta が返す。
+   * 最初の延長は、すぐに行う。それまでは期限の長さを知らないからである。
+   * 作業の段ごとではなく時計で延ばすのは、1 つの要求が長くかかる間 (シャードが取引の決着を待つ、など) も、延ばし続けるためである。
+   * この呼び出しが止まれば、延長も止まり、Meta が取り消す。延長が断られたら (もう取り消された)、そこでやめる。
+   */
+  private keepLease(version: number): { stop(): void } {
+    let stopped = false;
+    let handle: unknown;
+    const tick = () => {
+      if (stopped) return;
+      this.cluster.renewLock(version).then(
+        ({ leaseMs }) => {
+          if (!stopped) handle = this.rt.after(leaseMs / 2, tick);
+        },
+        () => undefined,
+      );
+    };
+    tick();
+    return {
+      stop: () => {
+        stopped = true;
+        this.rt.cancel(handle);
+      },
+    };
+  }
+
+  /** index を作り始めた版が、まだ最新か。取り消されていれば、その理由で失敗させる。 */
+  private async stillBuilding(version: number): Promise<Catalog> {
+    const cat = await this.cluster.catalog();
+    if (cat.version === version) return cat;
+    throw new SqlError(cat.revoked?.version === version ? cat.revoked.reason : `CREATE INDEX: the schema moved to version ${cat.version} while the index was being built`);
+  }
+
+  /**
+   * 全シャードの行を読んで、index の項目を集める。値ごとに 1 行。同じ値を持つ行が 2 つあれば失敗する。
+   * 返す at は、読んだシャードの時計の最大である。index を使わずに確定した書き込みは、どれもこの時刻以下である。
+   * 行のないシャードも読む。そのシャードで行を消した書き込みの時刻も、at に入れなければならないからである。
+   * 増設が挟まると、行が別のシャードへ移る。行そのものは変わらないので、範囲表が変わらなくなるまで、全体を読み直せば足りる。
+   */
+  private async scanForIndex(def: TableDef, ix: GlobalIndexDef, version: number): Promise<{ entries: Map<string, { pk: string; sk: string }>; at: Ts }> {
+    let at: Ts = 0;
+    for (let round = 0; ; round++) {
+      const cat = await this.stillBuilding(version);
+      const entries = new Map<string, { pk: string; sk: string }>();
+      let moved = false;
+      for (const shard of shardsOf(cat.routing)) {
+        const seen = await this.scanShard(def, ix, shard, cat, entries);
+        if (seen === null) {
+          moved = true;
+          break;
+        }
+        at = Math.max(at, seen);
+      }
+      if (!moved && (await this.stillBuilding(version)).routing.version === cat.routing.version) return { entries, at };
+      if (round >= 20) throw new SqlError(`CREATE INDEX ${ix.name}: shards kept splitting while the index was being built`);
+    }
+  }
+
+  /** 1 シャードの行を主キーの順に少しずつ読む。読んだ時点のシャードの時計を返す。途中で範囲が移ったら null を返す。 */
+  private async scanShard(
+    def: TableDef, ix: GlobalIndexDef, shard: string, cat: Catalog, entries: Map<string, { pk: string; sk: string }>,
+  ): Promise<Ts | null> {
+    // 要るのは、行の同一性 (主キーと shard key) と、index の列だけである。
+    const cols = [...new Set([...def.pk, ...def.shardKey, ...ix.columns])].map(q).join(", ");
     const pkCols = def.pk.map(q).join(", ");
     let after: Value[] | null = null;
+    let at: Ts = 0;
     for (let attempt = 0; ; ) {
       let res: ExecRes;
       try {
         res = await this.shardOf(shard).exec({
-          sql: `SELECT ${selectList(def)} FROM ${q(def.name)} ${after ? `WHERE (${pkCols}) > (${def.pk.map(() => "?").join(", ")})` : ""} ORDER BY ${pkCols} LIMIT ${BACKFILL_PAGE}`,
+          sql: `SELECT ${cols} FROM ${q(def.name)} ${after ? `WHERE (${pkCols}) > (${def.pk.map(() => "?").join(", ")})` : ""} ORDER BY ${pkCols} LIMIT ${BUILD_PAGE}`,
           params: after ?? [], spans: withSlots(cat.routing, shard, [tableSpan(def.name)]), schema: cat.version,
         });
       } catch (e) {
         const m = (e as Error)?.message ?? "";
-        // 範囲の持ち主が変わった。呼び出し側が範囲表を取り直して、全体をやり直す。
-        if (/^not owner|stale schema/.test(m)) return true;
+        // 範囲の持ち主が変わったか、表定義の版が進んだ。呼び出し側が取り直して、全体をやり直す (取り消されていれば、そこで失敗する)。
+        if (/^not owner|stale schema/.test(m)) return null;
         // 移動の途中は表全体を読めない。終わるのを待つ。
-        if (/^migrating|group not arrived|read too old/.test(m) && attempt++ < BACKFILL_RETRIES) {
+        if (/^migrating|group not arrived|read too old/.test(m) && attempt++ < BUILD_RETRIES) {
           await backoff(this.rt, attempt);
           continue;
         }
         throw e;
       }
       if (res.error !== undefined) throw new SqlError(res.error);
-      const rows = new QueryResult(res.columns, res.values).rows;
-      if (rows.length === 0) return false;
-      const tx = new Txn(this, cat, this.nextTxnId());
-      try {
-        const keys = rows.map((row) => encodeKey(def, row));
-        tx.assume(shard, keys.map((key) => rowSpan(def.name, key.pk, key.sk)), res.T);
-        const inBatch = new Map<string, string>();
-        const entries: { k: string; pk: string; sk: string }[] = [];
-        for (const [i, row] of rows.entries()) {
-          const vals = ix.columns.map((col) => row[col] ?? null);
-          if (vals.some((v) => v === null)) continue;
-          const k = encode(vals);
-          const key = keys[i]!;
-          // 同じ取引の中の 2 件目は、バッファの上で 1 件目を上書きするだけで、シャードには届かない。ここで照合する。
-          const prior = inBatch.get(k);
-          if (prior !== undefined && prior !== key.pk) throw new SqlError(`UNIQUE constraint failed: ${def.name}.${ix.columns.join(", ")}`);
-          inBatch.set(k, key.pk);
-          entries.push({ k, pk: key.pk, sk: key.sk });
-        }
-        // すでにある項目は、index のシャードごとに 1 回で読む。1 行ずつ読むと、行数だけ往復が要り、
-        // Worker の 1 回の呼び出しで使える要求の数を、数百行の表で使い切る。
-        const byShard = new Map<string, Set<string>>();
-        for (const e of entries) {
-          const owner = ownerOf(cat.routing, encode([e.k]));
-          byShard.set(owner, (byShard.get(owner) ?? new Set()).add(e.k));
-        }
-        const existing = new Map<string, Set<string>>();
-        for (const [owner, ks] of byShard) {
-          const list = [...ks];
-          const found = await tx.call(owner, {
-            sql: `SELECT "k", "pk" FROM ${q(ix.table)} WHERE "k" IN (${list.map(() => "?").join(", ")})`,
-            params: list,
-            // 読んだ k の項目が commit までに変われば競合になる。UNIQUE では、同じ値の項目が後から入るのを防ぐ。
-            spans: list.map((k) => groupSpan(ix.table, encode([k]))),
-          });
-          for (const [k, pk] of found.values as [string, string][]) existing.set(k, (existing.get(k) ?? new Set()).add(pk));
-        }
-        for (const e of entries) {
-          const have = existing.get(e.k);
-          if (have && [...have].some((pk) => pk !== e.pk)) {
-            throw new SqlError(`UNIQUE constraint failed: ${def.name}.${ix.columns.join(", ")}`);
-          }
-          if (!have?.has(e.pk)) tx.indexWrite(ix, e, false);
-        }
-        await tx.commit();
-      } catch (e) {
-        await tx.unlockAll().catch(() => undefined);
-        // index の項目を書く先のシャードが、範囲を手放していた。この取引は古い範囲表で組んであるので、
-        // 同じ範囲表でやり直しても同じ誤りになる。呼び出し側に範囲表を取り直させ、全体をやり直す。
-        if (/not owner/.test((e as Error)?.message ?? "")) return true;
-        // 走査の後で行が変わった、などの競合。同じ位置から読み直す。
-        if (!isRetryable(e) || attempt++ >= BACKFILL_RETRIES) throw e;
-        this.onRetry(e);
-        await backoff(this.rt, attempt);
-        continue;
-      }
       attempt = 0;
+      at = Math.max(at, res.T, res.hlc);
+      const rows = new QueryResult(res.columns, res.values).rows;
+      for (const row of rows) {
+        const vals = ix.columns.map((col) => row[col] ?? null);
+        if (vals.some((v) => v === null)) continue; // NULL のある値は、どの行とも衝突しない
+        const k = encode(vals);
+        const key = encodeKey(def, row);
+        const prior = entries.get(k);
+        if (prior !== undefined && prior.pk !== key.pk) throw new SqlError(`UNIQUE constraint failed: ${def.name}.${ix.columns.join(", ")}`);
+        entries.set(k, key);
+      }
+      if (rows.length < BUILD_PAGE) return at;
       const last = rows[rows.length - 1]!;
       after = def.pk.map((col) => last[col] ?? null);
     }
+  }
+
+  /**
+   * 集めた項目を index の表へ書く。確定の時刻の最大を返す。
+   * 項目は、持ち主のシャードごとに、少しずつ取引で書く。先に、同じ値の項目がもうあるかを読む。あれば書かない。
+   * こうすると、範囲が移ってやり直しても、書き終えた分を 2 度書くことがない。
+   */
+  private async writeIndex(ix: GlobalIndexDef, entries: Map<string, { pk: string; sk: string }>, version: number): Promise<Ts> {
+    let at: Ts = 0;
+    let left = [...entries].map(([k, row]) => ({ k, ...row }));
+    let cat = await this.stillBuilding(version);
+    for (let attempt = 0; left.length > 0; ) {
+      const owner = ownerOf(cat.routing, encode([left[0]!.k]));
+      const batch = left.filter((e) => ownerOf(cat.routing, encode([e.k])) === owner).slice(0, BUILD_BATCH);
+      const tx = new Txn(this, cat, this.nextTxnId());
+      try {
+        const ks = batch.map((e) => e.k);
+        // 値の一覧は 1 つの引数で渡す。1 つずつ渡すと、文に付けられる引数の数の上限 (100) に当たる。
+        const found = await tx.call(owner, {
+          sql: `SELECT "k", "pk" FROM ${q(ix.table)} WHERE "k" IN (SELECT value FROM json_each(?))`,
+          params: [JSON.stringify(ks)],
+          spans: ks.map((k) => rowSpan(ix.table, encode([k]), encode([k]))),
+        });
+        const existing = new Map(found.values as [string, string][]);
+        for (const e of batch) {
+          const have = existing.get(e.k);
+          if (have !== undefined && have !== e.pk) throw new SqlError(`UNIQUE constraint failed: index ${ix.name} already has an entry for another row`);
+          if (have === undefined) tx.indexWrite(ix, e, false);
+        }
+        await tx.commit();
+        at = Math.max(at, tx.commitTs ?? tx.T ?? 0);
+      } catch (e) {
+        await tx.unlockAll().catch(() => undefined);
+        // 範囲が移った、などの一時的な失敗。範囲表を取り直して、同じ項目からやり直す。取り消されていれば、ここで失敗する。
+        if (!isRetryable(e) || attempt++ >= BUILD_RETRIES) throw e;
+        this.onRetry(e);
+        await backoff(this.rt, attempt);
+        cat = await this.stillBuilding(version);
+        continue;
+      }
+      attempt = 0;
+      const done = new Set(batch.map((e) => e.k));
+      left = left.filter((e) => !done.has(e.k));
+    }
+    return at;
   }
 
   private nextTxnId(): string {
@@ -1327,7 +1619,10 @@ export class Db {
     return new Txn(this, await this.catalog(), this.nextTxnId());
   }
 
-  /** fn を 1 取引として実行する。競合は jitter 付きでリトライするので fn は再実行に耐える必要がある。 */
+  /**
+   * fn を 1 取引として実行する。競合は jitter 付きでリトライするので fn は再実行に耐える必要がある。
+   * 表が書き込み禁止なら (index を作っている最中)、表定義が変わるのを待ってやり直す。
+   */
   async transaction<T>(fn: (tx: Txn) => Promise<T>): Promise<T> {
     const retries = this.opts.retries ?? 12;
     let refreshed = false;
@@ -1335,7 +1630,8 @@ export class Db {
     const t0 = this.rt.now();
     if (observed) this.touched.clear();
     for (let attempt = 0; ; attempt++) {
-      const tx = new Txn(this, await this.catalog(), this.nextTxnId());
+      const cat = await this.catalog();
+      const tx = new Txn(this, cat, this.nextTxnId());
       const done = (e?: unknown) => {
         if (observed) this.report(`BEGIN; ${tx.sqls.join("; ")}; COMMIT`, t0, { plan: "transaction", attempts: attempt + 1 }, null, e);
       };
@@ -1345,17 +1641,77 @@ export class Db {
         done();
         return out;
       } catch (e) {
-        if (!(!refreshed && UNKNOWN_SCHEMA.test((e as Error)?.message ?? "")) && (!isRetryable(e) || attempt >= retries)) done(e);
+        const fail = (): never => {
+          done(e);
+          throw e;
+        };
         // 別の isolate の DDL を知らないだけかもしれないので、表定義を取り直して 1 度だけやり直す。
         if (!refreshed && UNKNOWN_SCHEMA.test((e as Error)?.message ?? "")) {
           refreshed = true;
           this.cached = null;
           continue;
         }
-        if (!isRetryable(e) || attempt >= retries) throw e;
+        if (!isRetryable(e) || attempt >= retries) fail();
         this.onRetry(e);
+        // 表定義の変更が、表への書き込みを止めている。終わるのを待つ。
+        if (isTableLocked(e) && !(await this.schemaMovedPast(cat.version))) fail();
         await backoff(this.rt, attempt);
       }
+    }
+  }
+
+  /**
+   * 文の並びを実行する (D1 の batch)。表定義を変える文を含まなければ、全部を 1 つの取引で実行する。競合したら丸ごとやり直す。
+   * 含むと、その位置で区切る。区切りごとに 1 つの取引で実行し、表定義を変える文は区切りの間で実行する。取引の中の DDL と同じ規則である
+   * (Db.ddl、specs/m13_txn_schema_boundary.qnt)。競合でやり直すのは、断られた区切りだけである。
+   * 途中で失敗したら、そこで止めて誤りを返す。それより前の区切りと DDL は、もう効いている。
+   */
+  async batch(statements: { sql: string; params?: Params }[]): Promise<QueryResult[]> {
+    const out: QueryResult[] = [];
+    let part: { sql: string; params: Params }[] = [];
+    // 前の区切りで読んだ範囲。読んだ表を DROP するときに確かめる (Db.guardedDrop)。
+    const reads: ReadRecord[] = [];
+    const flush = async () => {
+      if (part.length === 0) return;
+      const run = part;
+      part = [];
+      let done: Txn | undefined;
+      out.push(...(await this.transaction(async (tx) => {
+        done = tx;
+        const results: QueryResult[] = [];
+        for (const s of run) results.push(await tx.query(s.sql, s.params));
+        return results;
+      })));
+      reads.push(...done!.readRecord());
+    };
+    for (const s of statements) {
+      if (!changesSchema(s.sql)) {
+        part.push({ sql: s.sql, params: s.params ?? [] });
+        continue;
+      }
+      await flush();
+      // 1 文の DDL は、読んだ範囲を渡して実行する。複数の文を含むものは、1 文ずつ取引の外で実行する。
+      const one = SHARD_KEY_TABLE.test(s.sql) || parseStatements(s.sql).length === 1;
+      if (one && !this.current) {
+        await this.ddl(s.sql, reads);
+        out.push(new QueryResult([], []));
+      } else out.push(await this.query(s.sql, s.params ?? []));
+    }
+    await flush();
+    return out;
+  }
+
+  /**
+   * 表定義の変更が終わる (版が進む) のを待つ。待ち切れなければ false を返す。
+   * index を作っている間、シャードはその表への書き込みを断る。作る作業には期限があるので、待てば必ず版が進む。
+   */
+  private async schemaMovedPast(version: number): Promise<boolean> {
+    const deadline = this.rt.now() + (this.opts.schemaWaitMs ?? SCHEMA_WAIT_MS);
+    for (let i = 0; ; i++) {
+      this.cached = null;
+      if ((await this.catalog()).version !== version) return true;
+      if (this.rt.now() >= deadline) return false;
+      await sleep(this.rt, Math.min(1000, 10 * 2 ** i));
     }
   }
 
@@ -1375,13 +1731,23 @@ export class Db {
 
   async restore(d: { token: Ts; tx: TxnDump | null }): Promise<void> {
     this.token = cleanToken(d.token);
-    this.current = d.tx ? Txn.load(this, await this.catalog(), d.tx) : null;
+    if (!d.tx) {
+      this.current = null;
+      return;
+    }
+    let cat = await this.catalog();
+    // この接続の持つ表定義が、取引のものより古い。取り直す。
+    if (cat.version < d.tx.schema) {
+      this.cached = null;
+      cat = await this.catalog();
+    }
+    this.current = Txn.load(this, cat, d.tx);
   }
 
   /** 文を実行する。`;` で区切った複数の文を渡すと順に実行し、最後の結果を返す。 */
   async query(sql: string, params: Params = []): Promise<QueryResult> {
     // SHARD KEY はこの DB の拡張で、パーサは読めない。DDL の解釈に直接渡す。
-    if (/^\s*CREATE\s+TABLE\b[\s\S]*\bSHARD\s+KEY\s*\(/i.test(sql)) {
+    if (SHARD_KEY_TABLE.test(sql)) {
       await this.ddl(sql);
       return new QueryResult([], []);
     }
@@ -1414,7 +1780,9 @@ export class Db {
     let refreshed = false;
     for (let attempt = 0; ; attempt++) {
       info.attempts = attempt + 1;
-      const cat = await this.catalog();
+      // 取引の中の文は、取引の表定義で計画する (Txn.catalog)。
+      const txn = this.current;
+      const cat = txn?.catalog ?? (await this.catalog());
       // 失敗した文の採番を戻す。SQLite でも失敗した INSERT は rowid を消費しない。
       const saved = new Map([...this.ids].map(([k, v]) => [k, { ...v }]));
       try {
@@ -1434,18 +1802,37 @@ export class Db {
         }, (p) => (info.plan = p.kind));
       } catch (e) {
         for (const [k, v] of saved) if (this.ids.get(k)?.end === v.end) this.ids.get(k)!.next = v.next;
+        // 文が取引を終えたか、別の取引に替えた (取引の中の DDL)。前の取引の分は、もう確定したか、失われた。やり直さない。
+        // やり直すと、取引の外の文として、DDL だけが効く (specs/m13_txn_schema_boundary.qnt の m13_red_ddl_anyway)。
+        if (txn && this.current !== txn) {
+          if (isRetryable(e)) this.onRetry(e);
+          throw e;
+        }
         // 別の接続の DDL を知らないだけかもしれないので、表定義を取り直して 1 度だけやり直す。
-        if (!refreshed && UNKNOWN_SCHEMA.test((e as Error)?.message ?? "")) {
+        // 取引の中では、まだ何も読み書きしていないときだけである。読み書きした取引の表定義は変えない (Txn.catalog)。
+        // その取引から新しい表が見えないのは、SQLite で、読み始めた取引から、後で作られた表が見えないのと同じである。
+        if (!refreshed && UNKNOWN_SCHEMA.test((e as Error)?.message ?? "") && (!this.current || this.current.untouched)) {
           refreshed = true;
           this.cached = null;
-          this.current?.useCatalog(await this.catalog());
+          this.current?.rebase(await this.catalog());
           continue;
         }
         // 取引の最初の文なら何も読んでいないので、表定義を取り直してやり直せる。
         if (this.current?.untouched && /stale schema/.test((e as Error)?.message ?? "") && attempt < retries) {
           this.cached = null;
-          this.current.useCatalog(await this.catalog());
+          this.current.rebase(await this.catalog());
           continue;
+        }
+        // 表定義の変更が、表への書き込みを止めている (index を作っている最中、DROP の前)。終わるのを待って、新しい表定義で計画し直す。
+        // 待つのは 1 度だけである (SCHEMA_WAIT_MS)。待ち切れなければ、やり直さずに誤りを返す。やり直すと、そのたびに待つ。
+        // 読むか書くかした取引は表定義を取り替えられないので、待たずに誤りを返す。
+        if (isTableLocked(e)) {
+          if ((!this.current || this.current.untouched) && stmt.type !== "commit_transaction_stmt" && (await this.schemaMovedPast(cat.version))) {
+            this.current?.rebase(await this.catalog());
+            continue;
+          }
+          this.onRetry(e);
+          throw e;
         }
         // COMMIT は取引を閉じた後で失敗するので再実行できない。競合は呼び出し側に見せる。
         if (this.current || stmt.type === "commit_transaction_stmt" || !isRetryable(e) || attempt >= retries) {
