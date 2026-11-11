@@ -3,7 +3,7 @@ import type {
 } from "../types";
 import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, utf8Length } from "../types";
 import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, q, selectList } from "../shard/rows";
-import { INDEX_BUILD_MS, type Catalog } from "../meta";
+import type { Catalog } from "../meta";
 import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import { normalize, parseStatements, text, type Node, type Params } from "../sql/cst";
@@ -19,6 +19,8 @@ export interface Cluster {
   applyDdl(sql: string, basedOn?: number): Promise<Catalog>;
   /** 作り終えた index を公開する。version は index を作り始めた版、at は公開の時刻 (meta.ts の DdlEntry.at)。 */
   publishIndex(table: string, name: string, version: number, at: Ts): Promise<Catalog>;
+  /** 作っている最中の index の期限を延ばす。version は作り始めた版。もう作っている最中でなければ断る。期限の長さを返す。 */
+  renewBuild(version: number): Promise<{ leaseMs: number }>;
   /** 版を取り消す。取り消す版を返す。取り消せなければ null。 */
   revokeDdl(version: number, reason: string): Promise<number | null>;
   allocate(table: string, n: number, min?: number): Promise<number>;
@@ -101,9 +103,10 @@ const BUILD_BATCH = 200;
 const BUILD_RETRIES = 200;
 /**
  * 表定義の変更が終わるのを待つ時間。index を作っている間は、その表への書き込みと、ほかの表定義の変更が待つ。
- * 作る作業には期限があり (meta.ts の INDEX_BUILD_MS)、過ぎれば取り消される。それより少し長く待てば、必ず先へ進める。
+ * 作る側が止まれば、期限 (meta.ts の INDEX_LEASE_MS、既定 5 秒) のうちに取り消されて書ける。作る側が動き続けている間は、
+ * これだけ待って、やり直してよい誤り (`conflict: locked: ...`) を返す。
  */
-const SCHEMA_WAIT_MS = INDEX_BUILD_MS + 5_000;
+const SCHEMA_WAIT_MS = 30_000;
 
 /** 表定義が古いと出る誤り。取り直すと解けることがある。 */
 const UNKNOWN_SCHEMA = /^(no such (table|column|index)|table \S+ has no column)/;
@@ -1296,6 +1299,7 @@ export class Db {
   private async buildIndex(def: TableDef, ix: GlobalIndexDef, started: Catalog): Promise<void> {
     const version = started.version;
     let published: Catalog;
+    const lease = this.keepLease(version);
     try {
       // 行を読む要求は、作り始めた版を名乗る。シャードはその版を適用してから答えるので、読んだ時点で、そのシャードの行は止まっている。
       const failed = await this.syncRecorded(started);
@@ -1319,10 +1323,39 @@ export class Db {
       if (exhausted) throw new SqlError(reason);
       if (now?.revoked?.version === version && now.revoked.reason !== reason) throw new SqlError(now.revoked.reason);
       throw e;
+    } finally {
+      lease.stop();
     }
     this.publish(published);
     // 公開の版を全シャードへ適用させて、書き込み禁止を早く解く。届かなくても、次の要求が適用させる。
     await this.syncAll(published);
+  }
+
+  /**
+   * 作っている最中の index の期限を、期限の半分ごとに延ばし続ける (meta.ts の INDEX_LEASE_MS)。期限の長さは Meta が返す。
+   * 最初の延長は、すぐに行う。それまでは期限の長さを知らないからである。
+   * 作業の段ごとではなく時計で延ばすのは、1 つの要求が長くかかる間 (シャードが取引の決着を待つ、など) も、延ばし続けるためである。
+   * この呼び出しが止まれば、延長も止まり、Meta が取り消す。延長が断られたら (もう取り消された)、そこでやめる。
+   */
+  private keepLease(version: number): { stop(): void } {
+    let stopped = false;
+    let handle: unknown;
+    const tick = () => {
+      if (stopped) return;
+      this.cluster.renewBuild(version).then(
+        ({ leaseMs }) => {
+          if (!stopped) handle = this.rt.after(leaseMs / 2, tick);
+        },
+        () => undefined,
+      );
+    };
+    tick();
+    return {
+      stop: () => {
+        stopped = true;
+        this.rt.cancel(handle);
+      },
+    };
   }
 
   /** index を作り始めた版が、まだ最新か。取り消されていれば、その理由で失敗させる。 */

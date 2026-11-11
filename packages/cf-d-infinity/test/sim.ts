@@ -236,8 +236,9 @@ export interface SimOptions {
   noSpanCheck?: boolean;
   /** 仮想の実行環境の seed。同じ seed なら同じ実行になる。 */
   seed?: number;
-  /** index を既存の行から作る作業の期限 (ms)。既定は meta.ts の INDEX_BUILD_MS。 */
-  buildMs?: number;
+  /** index を既存の行から作る間の、書き込み禁止の期限と、その上限 (ms)。既定は meta.ts の INDEX_LEASE_MS と INDEX_BUILD_MAX_MS。 */
+  leaseMs?: number;
+  buildMaxMs?: number;
   /**
    * 本物の時計とタイマーで動かす。実行は再現できない。本物のタイマーで待つ、まだ移していない試験のためにある。
    * now を渡したときも、こちらになる。
@@ -279,7 +280,7 @@ export class SimCluster implements Cluster {
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
     this.runtime = this.virtual ?? systemRuntime;
     this.shardIds = Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
-    this.meta = new MetaCore(new SqliteBackend(), this.shardIds, { runtime: this.runtime, buildMs: o.buildMs });
+    this.meta = new MetaCore(new SqliteBackend(), this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs });
     for (const id of this.shardIds) this.core(id);
   }
 
@@ -433,6 +434,9 @@ export class SimCluster implements Cluster {
   }
   revokeDdl(version: number, reason: string) {
     return this.meta.revokeDdl(version, reason);
+  }
+  renewBuild(version: number) {
+    return this.meta.renewBuild(version);
   }
   allocate(table: string, n: number, min?: number) {
     return this.meta.allocate(table, n, min);

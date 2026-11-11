@@ -59,7 +59,7 @@ describe("a split that is interrupted or repeated", () => {
     const range = planSplit((await c.catalog()).routing, "s0")!;
     // 1 つ目の増設は、子の受け入れと親の fence の後、範囲表の切り替えで失敗した。
     const metaDown: Cluster = {
-      shard: (id) => c.shard(id), catalog: () => c.catalog(), applyDdl: (q) => c.applyDdl(q), publishIndex: (t, n, v, at) => c.publishIndex(t, n, v, at), revokeDdl: (v, r) => c.revokeDdl(v, r),
+      shard: (id) => c.shard(id), catalog: () => c.catalog(), applyDdl: (q) => c.applyDdl(q), publishIndex: (t, n, v, at) => c.publishIndex(t, n, v, at), revokeDdl: (v, r) => c.revokeDdl(v, r), renewBuild: (v) => c.renewBuild(v),
       allocate: (t, n, m) => c.allocate(t, n, m), switchRange: async () => { throw new Error("meta unreachable"); },
     };
     expect(await outcome(split(metaDown, "s0", "s1", { range }))).toMatch(/meta unreachable/);
@@ -81,7 +81,7 @@ describe("a split that is interrupted or repeated", () => {
     await c.client().ddl("ALTER TABLE items ADD COLUMN extra INTEGER DEFAULT 5");
     // 増設を始めた側は、DDL の前の表定義を持っている。親はすでに新しい版にいる。
     const stale: Cluster = {
-      shard: (id) => c.shard(id), catalog: async () => before, applyDdl: (q) => c.applyDdl(q), publishIndex: (t, n, v, at) => c.publishIndex(t, n, v, at), revokeDdl: (v, r) => c.revokeDdl(v, r),
+      shard: (id) => c.shard(id), catalog: async () => before, applyDdl: (q) => c.applyDdl(q), publishIndex: (t, n, v, at) => c.publishIndex(t, n, v, at), revokeDdl: (v, r) => c.revokeDdl(v, r), renewBuild: (v) => c.renewBuild(v),
       allocate: (t, n, m) => c.allocate(t, n, m), switchRange: (m) => c.switchRange(m),
     };
     expect(await outcome(split(stale, "s0", "s1"))).toBe("ok");

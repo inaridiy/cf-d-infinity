@@ -10,8 +10,6 @@ export interface DdlEntry extends ParsedDdl {
   reverts?: number;
   /** 取り消しの理由。シャードが適用に失敗したときの SQLite のメッセージ。 */
   reason?: string;
-  /** index を作り始める版 (build のある版) の期限。過ぎると Meta が取り消す。 */
-  deadline?: number;
   /**
    * index を公開する版が運ぶ時刻。シャードは、この版を適用するときに、時計をここまで進める。
    * index を使わずに確定した書き込みは、どれもこの時刻以下である。index を使う文は、この版を適用したシャードで読むので、
@@ -21,10 +19,13 @@ export interface DdlEntry extends ParsedDdl {
 }
 
 /**
- * 既存の行から index を作る作業の期限。この間、表への書き込みは止まる。作る側 (Worker の 1 回の呼び出し) が途中で
- * 止まっても、期限が来れば Meta が取り消すので、表が書けないままになることはない。
+ * 既存の行から index を作る間は、表への書き込みが止まる。その止め方の期限。
+ * 作る側は、作業の合間に期限を延ばし続ける (Meta.renewBuild)。作る側 (Worker の 1 回の呼び出し) が止まると延長も止まり、
+ * INDEX_LEASE_MS のうちに Meta が取り消す。延ばし続けても、作り始めてから INDEX_BUILD_MAX_MS を過ぎれば取り消す。
+ * 書き込みが止まる時間の上限である。
  */
-export const INDEX_BUILD_MS = 30_000;
+export const INDEX_LEASE_MS = 5_000;
+export const INDEX_BUILD_MAX_MS = 300_000;
 
 /** DDL の版が、呼び出し側の見た版から進んでいた。表定義を取り直してやり直す。 */
 export class SchemaMoved extends Error {
@@ -57,10 +58,15 @@ export class SchemaBusy extends Error {
 /** 表定義、DDL 履歴、範囲表、rowid の採番を持つ。hot path には載せない。 */
 export class MetaCore {
   private rt: Runtime;
-  private buildMs: number;
-  constructor(private b: Backend, private initialShards: string[] = [], opts: { runtime?: Runtime; buildMs?: number } = {}) {
+  private leaseMs: number;
+  private buildMaxMs: number;
+  constructor(
+    private b: Backend, private initialShards: string[] = [],
+    opts: { runtime?: Runtime; leaseMs?: number; buildMaxMs?: number } = {},
+  ) {
     this.rt = opts.runtime ?? systemRuntime;
-    this.buildMs = opts.buildMs ?? INDEX_BUILD_MS;
+    this.leaseMs = opts.leaseMs ?? INDEX_LEASE_MS;
+    this.buildMaxMs = opts.buildMaxMs ?? INDEX_BUILD_MAX_MS;
     b.exec(`CREATE TABLE IF NOT EXISTS __ddl(version INTEGER PRIMARY KEY, entry TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __routing(version INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __seq(name TEXT PRIMARY KEY, next INTEGER NOT NULL)`);
@@ -144,8 +150,38 @@ export class MetaCore {
    */
   private expire(): void {
     const b = this.building();
-    if (!b || this.rt.now() <= (b.deadline ?? 0)) return;
-    this.revoke(b.version, `CREATE INDEX ${b.build!.index} did not finish within ${Math.round(this.buildMs / 1000)} seconds and was withdrawn; the table is unchanged`);
+    if (!b) return;
+    const lease = this.lease();
+    const now = this.rt.now();
+    if (lease?.version === b.version && now <= lease.until) return;
+    const reason = lease?.version === b.version && now > lease.started + this.buildMaxMs
+      ? `CREATE INDEX ${b.build!.index} did not finish within ${Math.round(this.buildMaxMs / 1000)} seconds and was withdrawn; the table is unchanged`
+      : `CREATE INDEX ${b.build!.index} stopped before it finished and was withdrawn; the table is unchanged`;
+    this.revoke(b.version, reason);
+  }
+
+  /** 作っている最中の index の期限。版、作り始めた時刻、いまの期限。 */
+  private lease(): { version: number; started: number; until: number } | null {
+    const r = this.b.exec(`SELECT v FROM __meta WHERE k = 'build_lease'`)[0];
+    return r ? (JSON.parse(r.v as string) as { version: number; started: number; until: number }) : null;
+  }
+  private setLease(l: { version: number; started: number; until: number }): void {
+    this.b.exec(`INSERT INTO __meta(k, v) VALUES ('build_lease', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, JSON.stringify(l));
+  }
+
+  /**
+   * 作っている最中の index の期限を延ばす。version は作り始めた版で、まだ作っている最中でなければ断る。
+   * 取り消された後の延長が、作成を生き返らせることはない (公開と同じ確認。specs/m12_unique_index_build.qnt の ONE_EXIT)。
+   */
+  async renewBuild(version: number): Promise<{ leaseMs: number }> {
+    this.expire();
+    const b = this.building();
+    const lease = this.lease();
+    if (!b || b.version !== version || lease?.version !== version) {
+      throw new SqlError(`CREATE INDEX: the index is no longer being built`);
+    }
+    this.setLease({ ...lease, until: Math.min(this.rt.now() + this.leaseMs, lease.started + this.buildMaxMs) });
+    return { leaseMs: this.leaseMs };
   }
 
   async catalog(): Promise<Catalog> {
@@ -205,7 +241,9 @@ export class MetaCore {
     if (busy) throw new SchemaBusy(busy.build!.index);
     const parsed = parseDdl(sql, cat);
     if (!parsed.noop) {
-      this.append(parsed.build ? { ...parsed, deadline: this.rt.now() + this.buildMs } : parsed, cat.version + 1);
+      this.append(parsed, cat.version + 1);
+      const now = this.rt.now();
+      if (parsed.build) this.setLease({ version: cat.version + 1, started: now, until: now + this.leaseMs });
     }
     return this.current();
   }

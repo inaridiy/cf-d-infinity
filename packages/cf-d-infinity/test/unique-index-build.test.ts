@@ -11,6 +11,7 @@ import { Db } from "../src/client/db";
 import { ownerOf } from "../src/routing";
 import { encode } from "../src/shard/rows";
 import type { Faults } from "../src/types";
+import { INDEX_LEASE_MS } from "../src/meta";
 import { hold, indexAgreement, tenantOn } from "./ddl-harness";
 import { SimCluster } from "./sim";
 
@@ -27,7 +28,10 @@ describe("CREATE UNIQUE INDEX on a table that already has duplicate values, whil
     // 既存の行を埋める処理を、2 つ目のシャードを読むところで止める。1 つ目のシャードの行は、もう項目を持っている。
     let scans = 0;
     const paused = hold(c, "gate", (m) => m.from === "client" && m.method === "exec" && /FROM "t"\s+ORDER BY/.test((m.req as { sql: string }).sql) && ++scans === 2);
-    const ddl = db.ddl("CREATE UNIQUE INDEX u ON t(v)").then(() => "ok", (e: Error) => e.message);
+    // 作る側の延長は、この試験の都合で止めておく。作る側が要求の途中で止まった (Worker が落ちた) のと同じになる。
+    // 延長が続く場合は、下の「a build that keeps renewing」が確かめる。
+    const builder = new Db(Object.assign(Object.create(c) as SimCluster, { renewBuild: () => new Promise<{ leaseMs: number }>(() => {}) }));
+    const ddl = builder.ddl("CREATE UNIQUE INDEX u ON t(v)").then(() => "ok", (e: Error) => e.message);
     await paused.reached;
     const original = [{ tenant_id: A, id: 1, v: 7 }, { tenant_id: A, id: 2, v: 8 }, { tenant_id: B, id: 1, v: 7 }, { tenant_id: B, id: 2, v: 8 }];
     return { c, A, B, paused, ddl, original };
@@ -56,17 +60,18 @@ describe("CREATE UNIQUE INDEX on a table that already has duplicate values, whil
     expect(await rows(c)).toEqual([...original, { tenant_id: A, id: 9, v: 8 }].sort((x, y) => x.tenant_id - y.tenant_id || x.id - y.id));
   });
 
-  it("is withdrawn at its deadline when the statement that builds it stops, and the waiting write goes through", async () => {
+  it("is withdrawn when the statement that builds it stops renewing its lease, and the waiting write goes through", async () => {
     const { c, A, paused, ddl, original } = await setup();
     const before = c.time;
-    // 作る側は、止まったまま戻ってこない。書き込みは、期限が来て Meta が取り消すまで待つ。
+    // 作る側は止まったまま戻ってこない (setup の作る側は、延長を止めてある)。書き込みは、Meta が取り消すまで待つ。
     await new Db(c).query("INSERT INTO t VALUES (?, 9, 8)", [A]);
-    expect(c.time - before).toBeGreaterThanOrEqual(30_000);
+    expect(c.time - before).toBeGreaterThanOrEqual(INDEX_LEASE_MS / 2);
+    expect(c.time - before).toBeLessThan(INDEX_LEASE_MS * 2);
     const cat = await c.catalog();
     expect({ building: cat.tables.t!.building, built: cat.tables.t!.globalIndexes, listed: cat.indexes.u }).toEqual({ building: undefined, built: [], listed: undefined });
     // 遅れて戻ってきた作る側は、公開できない。取り消された理由を受け取る。
     paused.release();
-    expect(await ddl).toMatch(/did not finish within 30 seconds and was withdrawn/);
+    expect(await ddl).toMatch(/stopped before it finished and was withdrawn/);
     expect(await rows(c)).toEqual([...original, { tenant_id: A, id: 9, v: 8 }].sort((x, y) => x.tenant_id - y.tenant_id || x.id - y.id));
     expect((await c.catalog()).tables.t!.globalIndexes).toEqual([]);
   });
@@ -136,5 +141,32 @@ describe("the publication of a UNIQUE index that spans shards", () => {
     const { legacy, aware, outcome } = await afterPublish({ publishWithoutClock: true });
     expect(outcome).toMatch(/UNIQUE constraint failed/);
     expect(aware).toBeLessThan(legacy);
+  });
+});
+
+describe("the lease on a table whose rows are being indexed", () => {
+  const slowBuild = async (o: { leaseMs?: number; buildMaxMs?: number }) => {
+    const c = new SimCluster({ shards: 2, ...o });
+    const db = new Db(c);
+    await db.ddl("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)");
+    await db.query("INSERT INTO t VALUES (1, 1, 1), (2, 1, 2), (3, 1, 3)");
+    // 行を読む要求を、1 回ごとに 2 秒遅らせる。作る作業が、期限より長くかかる。
+    c.net.gate = (m) => (m.from === "client" && m.method === "exec" && /FROM "t"\s+ORDER BY/.test((m.req as { sql: string }).sql) ? c.sleep(2_000) : undefined);
+    const t0 = c.time;
+    const out = await db.ddl("CREATE UNIQUE INDEX u ON t(v)").then(() => "ok", (e: Error) => e.message);
+    return { out, took: c.time - t0, cat: await c.catalog() };
+  };
+
+  it("is kept while a build that takes longer than the lease keeps renewing it", async () => {
+    const r = await slowBuild({ leaseMs: 1_000 });
+    expect(r.took).toBeGreaterThan(3_000);
+    expect(r.out).toBe("ok");
+    expect(r.cat.tables.t!.globalIndexes.map((g) => g.name)).toEqual(["u"]);
+  });
+
+  it("ends at its upper bound even while the build keeps renewing it", async () => {
+    const r = await slowBuild({ leaseMs: 1_000, buildMaxMs: 3_000 });
+    expect(r.out).toMatch(/did not finish within 3 seconds and was withdrawn/);
+    expect({ building: r.cat.tables.t!.building, built: r.cat.tables.t!.globalIndexes }).toEqual({ building: undefined, built: [] });
   });
 });
