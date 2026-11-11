@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 import { Db, type Cluster } from "../src/client/db";
 import type { ShardApi } from "../src/types";
-import { indexAgreement } from "./ddl-harness";
+import { indexAgreement, touchAll } from "./ddl-harness";
 import { SimCluster } from "./sim";
 
 function capped(c: SimCluster, limit: number): { cluster: Cluster; used: () => number } {
@@ -21,7 +21,8 @@ function capped(c: SimCluster, limit: number): { cluster: Cluster; used: () => n
     }),
     catalog: async () => (hit(), c.catalog()),
     applyDdl: async (sql, basedOn) => (hit(), c.applyDdl(sql, basedOn)),
-    publishIndex: async (t, name, basedOn) => (hit(), c.publishIndex(t, name, basedOn)),
+    publishIndex: async (t, name, version, at) => (hit(), c.publishIndex(t, name, version, at)),
+    revokeDdl: async (version, reason) => (hit(), c.revokeDdl(version, reason)),
     allocate: async (t, k, min) => (hit(), c.allocate(t, k, min)),
     switchRange: async (m) => (hit(), c.switchRange(m)),
   };
@@ -54,12 +55,20 @@ describe("statements that loop over rows, within one Worker invocation", () => {
     expect({ state: ix.state, missing: ix.missing, dangling: ix.dangling }).toEqual({ state: "public", missing: [], dangling: [] });
   }, 120_000);
 
-  it("CREATE UNIQUE INDEX that runs out of calls says so, and the index is not used", async () => {
+  it("CREATE UNIQUE INDEX that runs out of calls says so, and the table is left as it was", async () => {
     const c = await seeded(1200);
-    const first = capped(c, 150);
+    const first = capped(c, 30);
     expect(await outcome(new Db(first.cluster).query("CREATE UNIQUE INDEX people_email ON people(email)"))).toMatch(/too many rows to index within one request/);
-    expect((await c.catalog()).tables.people!.globalIndexes.find((g) => g.name === "people_email")?.state).toBe("writeOnly");
-    await new Db(c).query("DROP INDEX people_email");
-    expect((await c.catalog()).tables.people!.globalIndexes).toEqual([]);
+    // 取り消しの要求も出せなかった。期限が来るまで、表は書き込み禁止のままである。
+    expect((await c.catalog()).tables.people!.building?.name).toBe("people_email");
+    // 書き込みは待つ。期限が来れば Meta が取り消し、待っていた書き込みが通る。
+    await new Db(c).query("INSERT INTO people(id, email, city) VALUES (5000, 'u1@example.com', 'c1')");
+    const cat = await c.catalog();
+    expect({ building: cat.tables.people!.building, built: cat.tables.people!.globalIndexes, listed: cat.indexes.people_email })
+      .toEqual({ building: undefined, built: [], listed: undefined });
+    // 取り消しを適用したシャードには、index の表が残らない。同じ email の行が 2 つ入った。
+    await touchAll(c);
+    expect((await indexAgreement(c, "people", "people_email")).leftover).toEqual([]);
+    expect((await new Db(c).query("SELECT count(*) AS n FROM people WHERE email = 'u1@example.com'")).rows).toEqual([{ n: 2 }]);
   }, 120_000);
 });

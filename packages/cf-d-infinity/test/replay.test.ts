@@ -6,8 +6,8 @@
 // 実行は seed で決まる。待ちは仮想の時計で測り、乱数は seed から作る。失敗した seed は、同じ seed で再現する。
 import { writeFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { Db, type Cluster } from "../src/client/db";
-import type { Value } from "../src/types";
+import { Db, Txn, type ClientFaults, type Cluster } from "../src/client/db";
+import type { Faults, Value } from "../src/types";
 import { quiescentProblems } from "./invariants";
 import { replay, type ReplayReport, type StatementRecord, type TxnRecord } from "./replay";
 import { prng, seedsOr, SimCluster } from "./sim";
@@ -87,23 +87,108 @@ const SHAPES: Record<string, (r: Rnd) => [string, Value[]]> = {
   "W delete flat": (r) => ["DELETE FROM flat WHERE id = ?", [flatId(r)]],
 };
 const NAMES = Object.keys(SHAPES);
-const RETRYABLE = /^(conflict|read too old|not owner|migrating|upgrading):/;
 
-async function run(seed: number, o: { clients?: number; rounds?: number } = {}): Promise<{ report: ReplayReport; quiescent: string[]; escapes: number; fingerprint: string }> {
+// 実行の途中で、シャードをまたぐ UNIQUE の index を作る場合の表と文。a は値の種類が多く、index はたいてい作れる。
+// b は重複だらけで、作れない。index があるかないかで結果が変わる文を並べる。
+const TOK = `CREATE TABLE tok(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)`;
+const tokId = (r: Rnd) => int(r, 10);
+const tokA = (r: Rnd) => (r() < 0.1 ? null : int(r, 16));
+const tokB = (r: Rnd) => int(r, 3);
+const TOK_SHAPES: Record<string, (r: Rnd) => [string, Value[]]> = {
+  "R tok by the column being indexed": (r) => ["SELECT id, b FROM tok WHERE a = ? ORDER BY id", [int(r, 16)]],
+  "R tok rows that share a value": () => ["SELECT count(*) FROM tok x JOIN tok y ON x.a = y.a AND x.id < y.id", []],
+  "R every tok": () => ["SELECT id, a, b FROM tok ORDER BY id", []],
+  "W insert tok": (r) => ["INSERT INTO tok(id, a, b) VALUES (?, ?, ?)", [tokId(r), tokA(r), tokB(r)]],
+  "W insert or ignore tok": (r) => ["INSERT OR IGNORE INTO tok(id, a, b) VALUES (?, ?, ?)", [tokId(r), tokA(r), tokB(r)]],
+  "W insert or replace tok": (r) => ["INSERT OR REPLACE INTO tok(id, a, b) VALUES (?, ?, ?)", [tokId(r), tokA(r), tokB(r)]],
+  "W update the column being indexed": (r) => ["UPDATE tok SET a = ? WHERE id = ?", [tokA(r), tokId(r)]],
+  "W update or replace the column being indexed": (r) => ["UPDATE OR REPLACE tok SET a = ? WHERE id = ?", [tokA(r), tokId(r)]],
+  "W update or ignore the column being indexed": (r) => ["UPDATE OR IGNORE tok SET a = ?, b = b + 1 WHERE id = ?", [tokA(r), tokId(r)]],
+  "W update tok across shards": (r) => ["UPDATE tok SET b = ? WHERE a > ?", [tokB(r), int(r, 16)]],
+  "W delete tok": (r) => ["DELETE FROM tok WHERE id = ?", [tokId(r)]],
+};
+const TOK_NAMES = Object.keys(TOK_SHAPES);
+
+interface RunOptions {
+  clients?: number;
+  rounds?: number;
+  /** 実行の途中で、tok にシャードをまたぐ UNIQUE の index を作る。文の半分を tok に向ける。 */
+  ddl?: boolean;
+  faults?: Faults;
+  clientFaults?: ClientFaults;
+}
+interface RunResult {
+  report: ReplayReport;
+  quiescent: string[];
+  escapes: number;
+  fingerprint: string;
+  /** 実行の途中の DDL と、その結果。 */
+  ddl: string[];
+}
+const RETRYABLE = /^(conflict|read too old|not owner|migrating|upgrading):/;
+/** 再起動で捨てられたシャードの実体が返す誤り。要求は何も書いていない。文の結果ではないので、取引ごと捨てる。 */
+const RESTARTED = /^fenced instance/;
+
+async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
   const rnd = prng(seed);
-  const c = new SimCluster({ shards: 3, seed });
+  // index を作る場合は、シャードの時計をずらす。時計の遅いシャードで index を使う文が、時計の進んだシャードの古い書き込みより
+  // 前に並ばないことを確かめるためである。
+  const skew: Record<string, number> = { s0: 0, s1: 200, s2: -200 };
+  const c = new SimCluster({ shards: 3, seed, faults: o.faults, ...(o.ddl ? { skewMs: (id: string) => skew[id] ?? 0 } : {}) });
+  const ddl = o.ddl ? [...DDL, TOK] : DDL;
   c.net.jitter = () => (rnd() < 0.5 ? 0 : rnd() * 3);
   // phase 2 の配送を乱択で遅らせる。確定を返した後、適用が届くまでの間の読み書きを作る。
   c.net.gate = (m) => (m.method === "finalize" && rnd() < 0.4 ? c.sleep(rnd() * 25) : undefined);
   const admin = c.client();
-  for (const s of DDL) await admin.ddl(s);
+  for (const s of ddl) await admin.ddl(s);
   const history: TxnRecord[] = [];
   let tick = 0;
   let next = 0;
   const statement = (): StatementRecord => {
+    if (o.ddl && rnd() < 0.5) {
+      const shape = TOK_NAMES[Math.floor(rnd() * TOK_NAMES.length)]!;
+      const [sql, params] = TOK_SHAPES[shape]!(rnd);
+      return { shape, sql, params };
+    }
     const shape = NAMES[Math.floor(rnd() * NAMES.length)]!;
     const [sql, params] = SHAPES[shape]!(rnd);
     return { shape, sql, params };
+  };
+
+  // 実行の途中の DDL。成功した DDL は、公開の時刻の位置で再生する。index を使わずに確定した書き込みは、その時刻以下で、
+  // index を使う文は、その時刻より後である。失敗した DDL は、何も変えていないはずなので、再生しない。
+  const ddlLog: string[] = [];
+  let working = 0;
+  const schemaChanges = async () => {
+    const made = new Set<string>();
+    for (let i = 0; i < 5 && working > 0; i++) {
+      await c.sleep(10 + rnd() * 60);
+      const col = !made.has("a") && rnd() < 0.7 ? "a" : "b";
+      if (made.has(col)) continue;
+      // シャードを 1 つ再起動する。再起動したシャードの時計は、保存してある上限まで進む (約 1 秒)。その後の書き込みは、
+      // ほかのシャードより大きい時刻で確定する。index を作る直前の書き込みと、作った直後の文の時刻が、離れやすくなる。
+      if (rnd() < 0.5) c.restart(c.shardIds[Math.floor(rnd() * c.shardIds.length)]!);
+      const sql = `CREATE UNIQUE INDEX tok_${col} ON tok(${col})`;
+      const rec: TxnRecord = {
+        id: next++, statements: [{ shape: `D create a UNIQUE index on ${col}`, sql, params: [] }], outcome: "aborted", readOnly: false,
+        start: ++tick, end: 0, shards: new Set(c.shardIds),
+      };
+      history.push(rec);
+      try {
+        await new Db(c).ddl(sql);
+        const at = (await c.meta.ddlSince(0)).ddl.findLast((e) => e.at !== undefined && e.indexes?.[`tok_${col}`] !== undefined)?.at;
+        if (at === undefined) throw new Error(`the version that published tok_${col} carries no timestamp`);
+        rec.statements[0]!.values = [];
+        rec.outcome = "committed";
+        rec.at = at + 0.5;
+        made.add(col);
+        ddlLog.push(`${col}: ok`);
+      } catch (e) {
+        rec.statements[0]!.error = (e as Error).message;
+        ddlLog.push(`${col}: ${(e as Error).message}`);
+      }
+      rec.end = ++tick;
+    }
   };
 
   const client = async () => {
@@ -119,7 +204,7 @@ async function run(seed: number, o: { clients?: number; rounds?: number } = {}):
           return c.shard(shard);
         },
         runtime: c.runtime, reference: c.reference, catalog: () => c.catalog(), applyDdl: (q, b) => c.applyDdl(q, b),
-        publishIndex: (t, n, b) => c.publishIndex(t, n, b), allocate: (t, n, m) => c.allocate(t, n, m), switchRange: (m) => c.switchRange(m),
+        publishIndex: (t, n, v, at) => c.publishIndex(t, n, v, at), revokeDdl: (v, r) => c.revokeDdl(v, r), allocate: (t, n, m) => c.allocate(t, n, m), switchRange: (m) => c.switchRange(m),
       };
       if (rnd() < 0.4) {
         // 取引の外の 1 文。
@@ -138,9 +223,16 @@ async function run(seed: number, o: { clients?: number; rounds?: number } = {}):
           s.error = (e as Error).message;
         }
       } else {
-        const tx = await new Db(seen, { retries: 0 }).begin();
+        let tx = await new Db(seen, { retries: 0 }).begin();
         try {
           for (let k = 1 + Math.floor(rnd() * 4); k > 0; k--) {
+            // 接続をまたぐ取引。状態を書き出し、別の接続で組み立て直して続ける。その接続は、そのときの最新の表定義を持つ。
+            if (o.ddl && rec.statements.length > 0 && rnd() < 0.3) {
+              const other = new Db(seen, { retries: 0, faults: o.clientFaults });
+              tx = Txn.load(other, await other.catalog(), tx.dump());
+            }
+            // 取引を長くして、index を作る作業をまたぎやすくする。
+            if (o.ddl && rnd() < 0.3) await c.sleep(rnd() * 40);
             const s = statement();
             rec.statements.push(s);
             const from = ++tick;
@@ -150,7 +242,7 @@ async function run(seed: number, o: { clients?: number; rounds?: number } = {}):
               if (s.shape.startsWith("W")) s.changes = r.changes;
             } catch (e) {
               s.error = (e as Error).message;
-              if (RETRYABLE.test(s.error)) throw e;
+              if (RETRYABLE.test(s.error) || RESTARTED.test(s.error)) throw e;
             } finally {
               s.readAt = tx.T;
               s.span = [from, ++tick];
@@ -171,7 +263,9 @@ async function run(seed: number, o: { clients?: number; rounds?: number } = {}):
       rec.end = ++tick;
     }
   };
-  await Promise.all(Array.from({ length: o.clients ?? 5 }, client));
+  working = o.clients ?? 5;
+  const clients = Array.from({ length: working }, () => client().finally(() => working--));
+  await Promise.all([...clients, ...(o.ddl ? [schemaChanges()] : [])]);
   c.net.gate = () => undefined;
   await c.settle();
   const quiescent = await quiescentProblems(c);
@@ -180,7 +274,7 @@ async function run(seed: number, o: { clients?: number; rounds?: number } = {}):
     const plain = (_k: string, x: unknown) => (x instanceof Set ? [...x] : x instanceof Uint8Array ? [...x] : x);
     writeFileSync(process.env.REPLAY_DUMP, JSON.stringify({ seed, history, rpc: c.net.log }, plain));
   }
-  return { report: replay(DDL, history), quiescent, escapes: c.spanEscapes.length, fingerprint: c.fingerprint() };
+  return { report: replay(ddl, history), quiescent, escapes: c.spanEscapes.length, fingerprint: c.fingerprint(), ddl: ddlLog };
 }
 
 describe("the simulator is deterministic", () => {
@@ -222,4 +316,56 @@ describe("statement replay against one SQLite, under concurrency", () => {
     // この表定義と文のひな形には、断る理由のあるものがない。断った文があれば、対応が抜けている。
     expect(NAMES.filter((k) => (total[k]?.unsupported ?? 0) > 0)).toEqual([]);
   });
+});
+
+// 行のある表に、シャードをまたぐ UNIQUE の index を、文が流れている最中に作る (specs/m12_unique_index_build.qnt)。
+// index があるかないかで、文の結果は変わる (UNIQUE 違反で失敗する、衝突する行を消す、無視する)。成功した DDL を、公開の時刻の
+// 位置に置いて SQLite で再生し、どの文の結果も同じであることを確かめる。失敗した DDL は、どの文の結果も変えていないはずである。
+describe("statement replay with a UNIQUE index that spans shards built during the run", () => {
+  const total: ReplayReport["coverage"] = {};
+  const outcomes: string[] = [];
+  for (const seed of seedsOr([1, 2, 3, 4, 5, 6, 7, 8])) {
+    it(`seed ${seed}: every committed statement gives the result of a serial execution that includes the schema change`, async () => {
+      const { report, quiescent, ddl } = await run(seed, { ddl: true });
+      for (const [k, x] of Object.entries(report.coverage)) {
+        const t = (total[k] ??= { ok: 0, error: 0, unsupported: 0 });
+        t.ok += x.ok;
+        t.error += x.error;
+        t.unsupported += x.unsupported;
+      }
+      outcomes.push(...ddl);
+      expect(report.problems.slice(0, 5).join("\n\n")).toBe("");
+      expect(quiescent).toEqual([]);
+      expect(report.committed).toBeGreaterThan(40);
+    }, 120_000);
+  }
+
+  it("builds the index in some runs and fails on duplicate values in others, and statements hit the new constraint", () => {
+    expect(outcomes.filter((x) => x.endsWith(": ok")).length).toBeGreaterThan(2);
+    expect(outcomes.filter((x) => /UNIQUE constraint failed/.test(x)).length).toBeGreaterThan(2);
+    // 表への書き込みを止めている間に、ほかの失敗は起きない。
+    expect(outcomes.filter((x) => !x.endsWith(": ok") && !/UNIQUE constraint failed/.test(x))).toEqual([]);
+    expect(TOK_NAMES.filter((k) => (total[k]?.ok ?? 0) < 5)).toEqual([]);
+    expect(TOK_NAMES.filter((k) => (total[k]?.unsupported ?? 0) > 0)).toEqual([]);
+    // index が出来た後の文が、UNIQUE 違反で失敗している (取引の中の文。SQLite でも同じ位置で失敗する)。
+    const failed = ["W insert tok", "W update the column being indexed"].reduce((n, k) => n + (total[k]?.error ?? 0), 0);
+    expect(failed).toBeGreaterThan(0);
+  });
+
+});
+
+// 守りを外した実行が食い違いを起こす seed を探すための入口。MUTATE=lock|repin|clock を付けて scripts/sweep.mjs で流すと、
+// 落ちた seed が、その守りの欠落を見つける seed である。見つかる seed はコードが変わるとずれるので、試験には固定しない。
+// 守りごとの決定的な再現は、test/unique-index-build.test.ts と test/txn-across-schema-change.test.ts にある。
+// 2026-11-11 の測定 (seed 1 から 300): 書き込み禁止を外すと 123 本、版の取り替えを許すと 1 本、公開の時刻を運ばないと 5 本が食い違った。
+describe.skipIf(!process.env.MUTATE)("search: seeds on which a removed guard is caught", () => {
+  const o: RunOptions = process.env.MUTATE === "lock" ? { faults: { ignoreTableLock: true } }
+    : process.env.MUTATE === "repin" ? { clientFaults: { repinOnRestore: true } }
+    : { faults: { publishWithoutClock: true } };
+  for (const seed of seedsOr([1])) {
+    it(`mutation seed ${seed}`, async () => {
+      const r = await run(seed, { ddl: true, ...o });
+      expect([...r.report.problems.slice(0, 2), ...r.quiescent].join("\n\n")).toBe("");
+    }, 120_000);
+  }
 });

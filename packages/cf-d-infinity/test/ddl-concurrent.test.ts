@@ -321,37 +321,37 @@ describe("known bugs, as deterministic interleavings", () => {
   });
 
   /**
-   * BUG-2。古い catalog の Worker も、遅延も要らない。backfill の読みと書きの間に 1 つ書き込みが入ればよい。
-   * 台本: 同じシャードに行 A/1 (v = 7) と A2/1 (v = 8) がある。CREATE INDEX ix ON t(v) の backfill がそのシャードの表を読み終え、
-   *   index への確認の読み (`SELECT "k", "pk" FROM "__gidx_ix" WHERE "k" IN (...)`) を送ったところで止める。
-   *   別の Worker (最新の catalog、index は write-only) が A/1 を v = 9 に更新し、A2/1 を削除する。backfill を再開する。
-   * 観測: __gidx_ix に (7 -> A/1) と (8 -> A2/1) が残る。表には v = 7 も v = 8 もない。
-   * 原因: Db.backfill (db.ts:754-770) は表を exec で読み、その結果を後続の別の取引で index へ書く。
-   *   更新側は古い項目 (7 -> A/1) の削除を書くが、その時点で項目はまだないので何も消えない。backfill は読んだ時点の
-   *   値で項目を足す。backfill の取引がリトライしても、同じ chunk (古い行) を使う。
-   * 影響: 一意でない index では、読み取りはシャードで元の WHERE を評価し直すので結果は変わらず、無駄な往復が増える。
-   *   UNIQUE では下の BUG-2b のとおり、正しい INSERT を拒否する。
+   * BUG-2 と BUG-2b。index を、書き込みを受けながら作っていたときの欠陥である。
+   * 台本: 同じシャードに行 A/1 (v = 7) と A2/1 (v = 8) がある。CREATE UNIQUE INDEX ix ON t(v) が表を読み終え、index の表へ
+   *   項目を書く直前で止める。別の Worker が A/1 を v = 9 に更新し、A2/1 を削除する。作成を再開する。
+   * 以前の観測: 書き込みはすぐに通り、作成は読んだ時点の値で項目を足した。__gidx_ix に (7 -> A/1) と (8 -> A2/1) が残り、
+   *   表には v = 7 も v = 8 もないのに、どちらの INSERT も `UNIQUE constraint failed: t.v` で拒否された。
+   * いま: index を作っている間、表への書き込みは待つ (specs/m12_unique_index_build.qnt)。読んだ後で行が変わることがない。
    */
-  const backfillRace = async (unique: boolean) => {
+  const writesDuringBuild = async () => {
     const { c, db, A } = await two();
     const A2 = await tenantOn(c, "s0", 1);
     await db.query("INSERT INTO t VALUES (?, 1, 7, 0)", [A]);
     await db.query("INSERT INTO t VALUES (?, 1, 8, 0)", [A2]);
     const h = hold(c, "gate", (m) => m.from === "client" && m.method === "exec" && /FROM "__gidx_ix" WHERE "k" IN \(/.test((m.req as { sql: string }).sql));
-    const ddl = outcome(db.ddl(`CREATE ${unique ? "UNIQUE " : ""}INDEX ix ON t(v)`));
+    const ddl = outcome(db.ddl("CREATE UNIQUE INDEX ix ON t(v)"));
     await h.reached;
     const w = new Db(c);
-    await w.query("UPDATE t SET v = 9 WHERE tenant_id = ? AND id = 1", [A]);
-    await w.query("DELETE FROM t WHERE tenant_id = ? AND id = 1", [A2]);
+    const writes = outcome((async () => {
+      await w.query("UPDATE t SET v = 9 WHERE tenant_id = ? AND id = 1", [A]);
+      await w.query("DELETE FROM t WHERE tenant_id = ? AND id = 1", [A2]);
+    })());
+    const waiting = await Promise.race([writes, c.sleep(500).then(() => "waiting")]);
     h.release();
-    return { c, A, A2, ddl: await ddl };
+    return { c, A, A2, waiting, ddl: await ddl, writes: await writes };
   };
-  /** 観測: 表に v = 7 と v = 8 の行はないのに、どちらの INSERT も `UNIQUE constraint failed: t.v` で拒否される。 */
-  it("BUG-2b (fixed): a UNIQUE index built during writes accepts values that no row holds", async () => {
-    const { c, ddl } = await backfillRace(true);
+  it("BUG-2b (fixed): writes wait while a UNIQUE index is built, and the index then accepts values that no row holds", async () => {
+    const { c, waiting, ddl, writes } = await writesDuringBuild();
     const insert7 = await outcome(new Db(c).query("INSERT INTO t VALUES (101, 1, 7, 0)"));
     const insert8 = await outcome(new Db(c).query("INSERT INTO t VALUES (102, 1, 8, 0)"));
-    expect({ ddl, insert7, insert8 }).toEqual({ ddl: "ok", insert7: "ok", insert8: "ok" });
+    expect({ waiting, ddl, writes, insert7, insert8 }).toEqual({ waiting: "waiting", ddl: "ok", writes: "ok", insert7: "ok", insert8: "ok" });
+    const ix = await indexAgreement(c, "t", "ix");
+    expect({ state: ix.state, missing: ix.missing, dangling: ix.dangling }).toEqual({ state: "public", missing: [], dangling: [] });
   });
 
   /**
@@ -715,10 +715,10 @@ describe("the checks are not vacuous", () => {
     expect(await extraViolations(c)).toEqual([`${B}/1 extra=77 n=20`]);
   });
 
-  it("schema check: shards lag after CREATE INDEX returns, and converge once a current request reaches them", async () => {
-    // publishIndex は Meta の版を上げるだけで、シャードへは押し出さない (db.ts:778)。乱択の検査は touchAll の後で比べる。
-    const { c, db } = await two();
-    await db.ddl("CREATE UNIQUE INDEX ix ON t(v)");
+  it("schema check: shards lag behind a version that was only recorded, and converge once a current request reaches them", async () => {
+    // Meta に版を記録するだけで、シャードへは押し出さない。期限切れで取り消された index の版が、こうなる。乱択の検査は touchAll の後で比べる。
+    const { c } = await two();
+    await c.applyDdl("CREATE TABLE lagging(id INTEGER PRIMARY KEY)");
     const lagging = await schemaVersions(c);
     expect(Object.values(lagging.shards).every((v) => v === lagging.meta - 1)).toBe(true);
     await touchAll(c);

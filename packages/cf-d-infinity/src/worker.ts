@@ -236,8 +236,8 @@ export class DinfMeta extends DurableObject<Env> {
   switchRange(move: { start: number; end: number; to: string; from?: string }) {
     return this.core.switchRange(move);
   }
-  publishIndex(table: string, name: string, basedOn?: number) {
-    return this.core.publishIndex(table, name, basedOn);
+  publishIndex(table: string, name: string, version: number, at: number) {
+    return this.core.publishIndex(table, name, version, at);
   }
   allocate(table: string, n: number, min?: number) {
     return this.core.allocate(table, n, min);
@@ -420,7 +420,8 @@ export function clusterOf(env: Env, count?: number, prefix = "shard"): Cluster {
     catalog: () => meta.catalog(initial) as unknown as Promise<Catalog>,
     applyDdl: (sql, basedOn) => meta.applyDdl(sql, initial, basedOn) as unknown as Promise<Catalog>,
     switchRange: (move) => meta.switchRange(move) as never,
-    publishIndex: (table, name, basedOn) => meta.publishIndex(table, name, basedOn) as never,
+    publishIndex: (table, name, version, at) => meta.publishIndex(table, name, version, at) as never,
+    revokeDdl: (version, reason) => meta.revokeDdl(version, reason),
     allocate: (table, n, min) => meta.allocate(table, n, min),
   };
 }

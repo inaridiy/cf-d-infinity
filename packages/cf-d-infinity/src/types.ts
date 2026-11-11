@@ -8,8 +8,6 @@ export interface GlobalIndexDef {
   name: string;
   table: string; // 内部表 __gidx_<name>
   columns: string[];
-  /** writeOnly の間は、書き込みが項目を足すだけである。既存の行の項目を埋め終えると public になる。 */
-  state: "writeOnly" | "public";
 }
 
 export interface TableDef {
@@ -42,7 +40,14 @@ export interface TableDef {
    * この項目のない古い表定義では、省いた列の値は分からないものとして扱う。
    */
   defaults?: string[];
+  /** 出来上がった index だけが入る。作っている最中の index は building にあり、計画からは見えない。 */
   globalIndexes: GlobalIndexDef[];
+  /**
+   * 既存の行から作っている最中の、シャードをまたぐ UNIQUE の index。これがある間、シャードはこの表への書き込みを断る。
+   * 行が止まっているので、既存の行の項目を埋める作業は、並行する書き込みを考えなくてよい (specs/m12_unique_index_build.qnt)。
+   * 公開されると globalIndexes へ移り、取り消されると消える。
+   */
+  building?: GlobalIndexDef;
 }
 
 export type Affinity = "INTEGER" | "REAL" | "NUMERIC" | "TEXT" | "BLOB";
@@ -376,6 +381,10 @@ export interface Faults {
   staleWideRead?: boolean;
   /** 範囲を受け取り終えるとき、渡した側の時計を受け取らない (2026-11 までの挙動。モデル m5b_red_range)。 */
   finishWithoutClock?: boolean;
+  /** index を作っている最中の表への書き込みを、シャードが断らない (モデル m12_red_no_lock)。 */
+  ignoreTableLock?: boolean;
+  /** index を公開する版を適用するとき、その版が運ぶ時刻まで時計を進めない (モデル m12_clock_red_no_clock)。 */
+  publishWithoutClock?: boolean;
   /** 検証で F の代わりに T を使う。 */
   validateFromT?: boolean;
   /** 検証の代わりにロックの保持だけを信じる。ロックを失っても検出できない。 */
@@ -429,6 +438,18 @@ export class NotOwner extends Error {
     this.name = "NotOwner";
   }
 }
+/**
+ * 表定義の変更が、この表への書き込みを止めている。変更が終われば (公開されるか、取り消されれば) 書ける。
+ * 何も書かずに断るので、競合と同じくやり直せる。Worker は表定義が変わるのを待ってやり直し、待ち切れなければ、この誤りを利用者へ返す。
+ */
+export class TableLocked extends ConflictError {
+  constructor(table: string, by: string) {
+    super(`locked: table ${table} is being changed by a schema change (${by}); retry when it has finished`);
+    this.name = "TableLocked";
+  }
+}
+/** TableLocked の誤りか。DO の間ではクラスが落ちるので、メッセージで見分ける。 */
+export const isTableLocked = (e: unknown): boolean => /(^|: )locked: table /.test((e as Error)?.message ?? "");
 export class Migrating extends Error {
   readonly retryable = true;
   constructor() {

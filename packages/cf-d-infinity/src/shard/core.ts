@@ -4,7 +4,7 @@ import type {
   Participant, PrepareReq, PrepareRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts, TxnStatus, Value,
 } from "../types";
 import {
-  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, checkStorageFormat, isWideSpan, spanCovers, utf8Length,
+  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, TableLocked, checkStorageFormat, isWideSpan, spanCovers, utf8Length,
   unprotectedSpans,
 } from "../types";
 import type { DdlEntry } from "../meta";
@@ -431,6 +431,9 @@ export class ShardCore implements ShardApi {
       this.schemaStuck = null;
       if (!skipped) this.loadDefs(e);
       this.schema = e.version;
+      // index を公開する版は、時刻を運ぶ。index を使わずに確定した書き込みは、どのシャードのものも、この時刻以下である。
+      // ここから先、このシャードで読む文は index を使う。その文が、時刻の順で、それらの書き込みの後ろに来るようにする。
+      if (e.at !== undefined && !this.faults.publishWithoutClock) this.observe(e.at);
       // 変更ログの行イメージは DDL より前の形なので、それより古い T は読み戻せない。
       this.ddlFloor = this.issue();
       this.metaSet("ddl_floor", this.ddlFloor);
@@ -1196,7 +1199,11 @@ export class ShardCore implements ShardApi {
    * INSERT ... SELECT のような構文でも Worker 側で解析する必要がない。
    */
   private run(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number } {
-    return this.checked(req, () => this.runStatement(req));
+    const out = this.checked(req, () => this.runStatement(req));
+    // 取引の文は、ここでは変更を返すだけで、確定のときにもう一度確かめられる (assertWriteSetFits)。
+    // ここでも断るのは、COMMIT まで待たずに、文の時点で伝えるためである。
+    this.assertUnlocked(out.changes);
+    return out;
   }
 
   /**
@@ -1567,8 +1574,13 @@ export class ShardCore implements ShardApi {
     }
   }
 
-  /** 取引がこのシャードに書く変更が、変更ログの 1 行に収まるか。収まらなければ確定の前に拒否する。 */
+  /**
+   * 取引がこのシャードに書く変更を、確定の前に確かめる。書き込みは、取引でも autocommit でも、必ずここを通る。
+   *   表が書き込み禁止でないこと。index を既存の行から作っている間、その表の行は変わってはならない。
+   *   変更ログの 1 行に収まること。
+   */
   private assertWriteSetFits(writes: Change[]): void {
+    this.assertUnlocked(writes);
     if (this.faults.noWriteSetLimit || writes.length === 0) return;
     let bytes = 0;
     for (const w of writes) {
@@ -1576,6 +1588,15 @@ export class ShardCore implements ShardApi {
       if (bytes > MAX_WRITE_SET_BYTES) {
         throw new SqlError(`transaction too large: it changes more than ${MAX_WRITE_SET_BYTES} bytes of rows on one shard; split it into smaller transactions`);
       }
+    }
+  }
+
+  /** 書き込む表が、表定義の変更で書き込み禁止になっていないか。 */
+  private assertUnlocked(writes: Pick<Change, "table">[]): void {
+    if (this.faults.ignoreTableLock) return;
+    for (const w of writes) {
+      const building = this.defs.get(w.table)?.building;
+      if (building) throw new TableLocked(w.table, `CREATE INDEX ${building.name}`);
     }
   }
 

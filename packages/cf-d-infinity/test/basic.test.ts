@@ -163,7 +163,8 @@ describe("indexes on tables that already hold data", () => {
     await db.query("INSERT INTO orders VALUES (1,1,1,'a',1),(2,1,1,'b',1),(3,1,1,'c',1)");
     await db.ddl("CREATE UNIQUE INDEX us ON orders(status)");
     await c.settle();
-    expect((await c.catalog()).tables.orders!.globalIndexes[0]!.state).toBe("public");
+    const orders = (await c.catalog()).tables.orders!;
+    expect({ built: orders.globalIndexes.map((g) => g.name), building: orders.building }).toEqual({ built: ["us"], building: undefined });
     await expect(db.query("INSERT INTO orders VALUES (4,1,1,'a',1)")).rejects.toThrow(/UNIQUE/);
   });
   it("fails a UNIQUE global index over duplicates and removes it", async () => {

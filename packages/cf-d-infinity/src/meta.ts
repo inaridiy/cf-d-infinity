@@ -1,5 +1,6 @@
-import { SqlError, checkStorageFormat, type Backend, type TableDef } from "./types";
-import { parseDdl, type IndexInfo, type ParsedDdl, type SchemaView } from "./sql/ddl";
+import { SqlError, checkStorageFormat, type Backend, type TableDef, type Ts } from "./types";
+import { parseDdl, publishBuild, type IndexInfo, type ParsedDdl, type SchemaView } from "./sql/ddl";
+import { systemRuntime, type Runtime } from "./runtime";
 import { CAPTURE_TABLES } from "./shard/rows";
 import { applyMove, initialRouting, type Routing } from "./routing";
 
@@ -9,7 +10,21 @@ export interface DdlEntry extends ParsedDdl {
   reverts?: number;
   /** 取り消しの理由。シャードが適用に失敗したときの SQLite のメッセージ。 */
   reason?: string;
+  /** index を作り始める版 (build のある版) の期限。過ぎると Meta が取り消す。 */
+  deadline?: number;
+  /**
+   * index を公開する版が運ぶ時刻。シャードは、この版を適用するときに、時計をここまで進める。
+   * index を使わずに確定した書き込みは、どれもこの時刻以下である。index を使う文は、この版を適用したシャードで読むので、
+   * この時刻より後になる。公開が、時刻の順の中の 1 点になる (specs/m12_unique_index_build.qnt の m12_clock)。
+   */
+  at?: Ts;
 }
+
+/**
+ * 既存の行から index を作る作業の期限。この間、表への書き込みは止まる。作る側 (Worker の 1 回の呼び出し) が途中で
+ * 止まっても、期限が来れば Meta が取り消すので、表が書けないままになることはない。
+ */
+export const INDEX_BUILD_MS = 30_000;
 
 /** DDL の版が、呼び出し側の見た版から進んでいた。表定義を取り直してやり直す。 */
 export class SchemaMoved extends Error {
@@ -31,9 +46,21 @@ export interface Catalog {
   revoked?: { version: number; reason: string };
 }
 
+/** index を作っている最中で、別の表定義の変更を記録できない。終わるのを待ってやり直す。 */
+export class SchemaBusy extends Error {
+  readonly retryable = true;
+  constructor(readonly index: string) {
+    super(`schema busy: CREATE INDEX ${index} is in progress`);
+  }
+}
+
 /** 表定義、DDL 履歴、範囲表、rowid の採番を持つ。hot path には載せない。 */
 export class MetaCore {
-  constructor(private b: Backend, private initialShards: string[] = []) {
+  private rt: Runtime;
+  private buildMs: number;
+  constructor(private b: Backend, private initialShards: string[] = [], opts: { runtime?: Runtime; buildMs?: number } = {}) {
+    this.rt = opts.runtime ?? systemRuntime;
+    this.buildMs = opts.buildMs ?? INDEX_BUILD_MS;
     b.exec(`CREATE TABLE IF NOT EXISTS __ddl(version INTEGER PRIMARY KEY, entry TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __routing(version INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __seq(name TEXT PRIMARY KEY, next INTEGER NOT NULL)`);
@@ -101,7 +128,32 @@ export class MetaCore {
       .map((r) => JSON.parse(r.entry as string) as DdlEntry);
   }
 
+  /**
+   * 作っている最中の index を記録した版。最新の版がそれであるときだけ、作っている最中である。
+   * 作っている間は、ほかの表定義の変更を記録しない。だから、公開も取り消しも「最新の版がこの版のまま」のときだけ次の版を積み、
+   * どちらか片方しか起きない。
+   */
+  private building(all = this.entries()): DdlEntry | null {
+    const last = all.at(-1);
+    return last?.build ? last : null;
+  }
+
+  /**
+   * 期限を過ぎた index の作成を取り消す。外から呼ばれるたびに、最初に確かめる。
+   * 書き込みを断られた Worker も、版を進めたいシャードも、Meta に尋ねる。だから、タイマーがなくても、待っている者がいれば取り消される。
+   */
+  private expire(): void {
+    const b = this.building();
+    if (!b || this.rt.now() <= (b.deadline ?? 0)) return;
+    this.revoke(b.version, `CREATE INDEX ${b.build!.index} did not finish within ${Math.round(this.buildMs / 1000)} seconds and was withdrawn; the table is unchanged`);
+  }
+
   async catalog(): Promise<Catalog> {
+    this.expire();
+    return this.current();
+  }
+
+  private current(): Catalog {
     const cat: Catalog = { version: 0, tables: {}, views: {}, indexes: {}, ddl: [], routing: this.routing() };
     const all = this.entries();
     const reverted = new Set(all.flatMap((e) => (e.reverts === undefined ? [] : [e.reverts, e.version])));
@@ -122,6 +174,7 @@ export class MetaCore {
   }
 
   async ddlSince(version: number): Promise<{ version: number; ddl: DdlEntry[] }> {
+    this.expire();
     const ddl = this.entries(version);
     return { version: ddl.at(-1)?.version ?? version, ddl };
   }
@@ -145,13 +198,16 @@ export class MetaCore {
    * シャードが適用に失敗した版を取り消せるのは、その後に別の版が積まれていないからである。
    */
   async applyDdl(sql: string, basedOn?: number): Promise<Catalog> {
-    const cat = await this.catalog();
+    this.expire();
+    const cat = this.current();
     if (basedOn !== undefined && basedOn !== cat.version) throw new SchemaMoved(cat.version);
+    const busy = this.building();
+    if (busy) throw new SchemaBusy(busy.build!.index);
     const parsed = parseDdl(sql, cat);
     if (!parsed.noop) {
-      this.append(parsed, cat.version + 1);
+      this.append(parsed.build ? { ...parsed, deadline: this.rt.now() + this.buildMs } : parsed, cat.version + 1);
     }
-    return this.catalog();
+    return this.current();
   }
 
   /**
@@ -159,6 +215,11 @@ export class MetaCore {
    * 取り消せるのは、最新の版で、取り消す文を持つものだけである。
    */
   async revokeDdl(version: number, reason: string): Promise<number | null> {
+    this.expire();
+    return this.revoke(version, reason);
+  }
+
+  private revoke(version: number, reason: string): number | null {
     const all = this.entries();
     const done = all.find((e) => e.reverts === version);
     if (done) return done.version;
@@ -184,14 +245,18 @@ export class MetaCore {
     return version + 1;
   }
 
-  /** backfill が終わった index を検索に使えるようにする。 */
-  async publishIndex(table: string, name: string, basedOn?: number): Promise<Catalog> {
-    const cat = await this.catalog();
-    if (basedOn !== undefined && basedOn !== cat.version) throw new SchemaMoved(cat.version);
-    const def = structuredClone(cat.tables[table]!);
-    for (const g of def.globalIndexes) if (g.name === name) g.state = "public";
-    this.append({ sql: [], defs: [def], drops: [], user: null }, cat.version + 1);
-    return this.catalog();
+  /**
+   * 既存の行の項目を埋め終えた index を公開する。version は index を作り始めた版で、それが最新の版のままでなければ断る。
+   * 期限切れで取り消された後に、遅れてきた公開が通ることはない。at は公開の時刻 (DdlEntry.at)。
+   */
+  async publishIndex(table: string, name: string, version: number, at: Ts): Promise<Catalog> {
+    this.expire();
+    const b = this.building();
+    if (!b || b.version !== version || b.build!.table !== table || b.build!.index !== name) {
+      throw new SqlError(`CREATE INDEX ${name}: the index is no longer being built`);
+    }
+    this.append({ ...publishBuild(this.current().tables[table]!, b.build!), at }, b.version + 1);
+    return this.current();
   }
 
   /** rowid を n 個採番する。min は利用者が明示した値で、これより大きい値から続ける。 */
