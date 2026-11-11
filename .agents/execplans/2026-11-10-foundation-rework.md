@@ -499,7 +499,28 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 - 文を再生する検査は、`db.begin()` の取引オブジェクトで文を流すので、取引の中の DDL (不変条件 9) を乱択で試していない (そこでは DDL を断る)。SQL の `BEGIN` と Hrana の batch で流す接続を混ぜ、DDL の位置を区切りとして再生する。いま不変条件 9 を確かめているのは、モデル M13 と、1 つの接続の決定的な試験 (`test/migration-tools.test.ts`、`test/txn-across-schema-change.test.ts`) だけである。
 - Drizzle の D1 のドライバの移行は、`D1Compatible` を同じプロセスで通して確かめた。利用者が使う `connect(env.DINF_DB)` (Service Binding) を通しては流していない。workerd の試験 (`test/binding.test.ts`) に足す。
 - `Faults` と `spanFaults` を 1 つずつ入れ、個別の回帰テストを使わずに、生成器と検査が見つけるかを表にする。見つからない欠陥は、生成器が薄い場所を示す。
-- 夜間の実行を CI に足し、実行した数、seed、掛け合わせ、省いた数を記録する。
+- 長い乱択の実行は、手元の計算機で流す (検査は手元。Decision Log の 2026-11-11)。`scripts/fault-table.mjs` の表と、`scripts/sweep.mjs` の掃引を、実行した数、seed、掛け合わせ、省いた数と一緒に、この文書の「検査の結果」に記録する。
+
+#### 5 の進め方 (2026-11-11)
+
+区切りは 2 つにする。PR も、この 2 つで 1 本ずつにする。
+
+1. 基準の表。欠陥のスイッチ (`Faults`、`spanFaults`、`ClientFaults`) を環境変数 `FAULT` で 1 つずつ入れ (`test/sim.ts` の `injectedFault`)、文の再生検査、history の検査、DDL と並行する取引の検査の seed ごとの試験を、同じ seed の範囲で流す (`scripts/fault-table.mjs`)。どの検査がどの欠陥を見つけるかと、その割合が、5 全体の物差しで、次に何を足すかを決める。
+2. 最初の切り口: SQL の `BEGIN` と Hrana の batch で、取引の中に DDL を含めて流す接続を、文の再生検査に足す。文の形は、モデルの壊した変種から逆に作る。
+
+| 壊した変種 | 食い違いになる文の形 | 戻すスイッチ |
+|---|---|---|
+| `m13_red_main` / `m13_red_pin_only` (DDL の前に確定しない) | 接続専用の表を作り、行を写し、古い表を消す。書く、DDL、作った表へ書く | なし。`noImplicitCommit` を足す |
+| `m13_red_repin` (計画し直さずに新しい版を名乗る) | 接続をまたぐ取引が書いた表に、別の接続が UNIQUE の index を作る | `repinOnRestore` (index の再生検査で 900 回に 1 回。形でなく頻度が足りない) |
+| `m13_red_retry_whole` (batch を頭からやり直す) | BEGIN から始まる batch の中の DDL の後で、別の接続と競合する | `replayAcrossSchemaChange` |
+| `m13_red_ddl_anyway` (確定に失敗しても DDL を流す) | 読んだ行を別の接続が書き換えた後の DDL | なし。`ddlAfterFailedCommit` を足す |
+| `m14_red_no_lock` / `_no_check` | 共有の表を作り直す取引と、その表への別の接続の書き込み | `ignoreTableLock`、`dropWithoutGuard` |
+| `m14_red_no_drain` | 同上で、書き込みが 2PC の途中 | `ddlIgnoresIntents` |
+| `m14_red_check_early` / `_untied` / `_commit_ts` | 同上 | なし (足すかどうかは、表を見て決める) |
+| M15 の 5 本 (分割と DDL の順序) | 分割と並行する DDL。DDL と並行する取引の検査の分割の場面が、拒否を数える | なし (Meta の側にスイッチがない) |
+
+直列の順序に置けるのは、位置が決まる DDL だけである。接続専用の表への DDL (自分の区切りとの前後だけが効く)、index の公開 (`DdlEntry.at`)、守られた DROP (行を写した区切りの確定の直後) である。共有の表へのそれ以外の DDL には時刻がないので、生成しない (「まだ見ていない」として残す)。
+記録は区切りごとに 1 つにする。先の確定に失敗した DDL の後、接続は取引の外にいる。続く文は 1 文ずつ確定し、COMMIT は誤りになる。だから、区切りは台本からではなく、文ごとの `db.inTransaction` から決める。
 
 ### 6. モデルを先に書く仕事
 
