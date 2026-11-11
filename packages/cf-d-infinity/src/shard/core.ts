@@ -811,12 +811,19 @@ export class ShardCore implements ShardApi {
     }
   }
 
-  async finishMove(req: { start: number; end: number }): Promise<void> {
+  async finishMove(req: { start: number; end: number }): Promise<{ m: Ts }> {
     this.b.exec(`UPDATE __fenced SET done = 1 WHERE start = ? AND end = ?`, req.start, req.end);
     for (const f of this.fenced) if (f.start === req.start && f.end === req.end) f.done = 1;
+    // fence の後、このシャードは範囲の行について何も答えていない。いま発行する時刻は、範囲について答えたどの読みの時刻よりも、
+    // 確定したどの書き込みの時刻よりも大きい。
+    return { m: this.issue() };
   }
 
-  async finishIncoming(req: { start: number; end: number }): Promise<void> {
+  async finishIncoming(req: { start: number; end: number; m: Ts }): Promise<void> {
+    // 行のあるグループは、pull が時刻を運び、時計はそこまで進んでいる (receive)。渡す側に行のなかったグループは運ばれないので、
+    // 渡す側の時計を、ここで受け取る。受け取らないと、渡す側が「行はない」と答えた時刻より小さい時刻で、その行を書いてしまい、
+    // 答え済みの読みが、後から書き込みの後になる (モデル M5b の noWriteBelowRead)。
+    if (!this.faults.finishWithoutClock) this.observe(req.m);
     this.b.exec(`DELETE FROM __incoming WHERE start = ? AND end = ?`, req.start, req.end);
     this.incoming = this.incoming.filter((x) => !(x.start === req.start && x.end === req.end));
   }

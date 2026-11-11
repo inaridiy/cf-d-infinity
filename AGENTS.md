@@ -52,5 +52,9 @@ in the same commit as the change. How plans are written here: `.agents/PLANS.md`
 - A reproduction of a defect that is not fixed goes to `test/open/`, written to assert the correct behaviour.
   Move it to `test/` when it passes.
 - Commit messages and code comments say what and why. Comments in this codebase are in Japanese.
-- Changes go to `main` through a pull request and a squash merge after CI passes. Changing `specs/` makes CI run
-  the model checker (about 75 minutes).
+- Checks run on this machine, not on GitHub. Before a change goes to `main`, run `scripts/check.sh` from the
+  repository root (about ten minutes; `--quick` for typecheck and tests only; add `--models` when `specs/` changed,
+  about an hour). GitHub Actions no longer runs on push or pull request: it is slow and loads GitHub for nothing.
+  It runs only when started by hand, and once a week for the formal models.
+- Changes go to `main` through a pull request and a squash merge once `scripts/check.sh` has passed locally. Finish
+  and verify before pushing, and push once.

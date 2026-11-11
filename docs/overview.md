@@ -188,6 +188,11 @@ progress. A split is a pull-based live migration:
 A split is refused on a shard that is still receiving a range, a range cannot be fenced to a second child, and
 running an interrupted split again continues the same range.
 
+Every group that is copied carries a timestamp from the parent, and the child advances its clock to it. A shard key
+that had no rows is never copied, so when the move finishes the parent hands its clock over once more for the whole
+range. Without that the child could commit a row at a timestamp below one at which the parent had already answered
+"no such row", and that read would end up after a write it did not see.
+
 Ownership moves before the data does, which sheds load from a hot parent immediately instead of making it also pay
 for a bulk copy first. A Worker whose range table predates the split is told so: a request for a moved shard key, and
 a whole-table read that still believes the parent owns the moved slots, both get `NotOwner`, and the Worker refetches

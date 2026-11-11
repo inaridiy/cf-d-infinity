@@ -1,11 +1,11 @@
 name: ci
 
+# push と PR のたびには走らせない。遅く、GitHub に負荷を掛けるからである。
+# 変更を main へ入れる前の検査は、手元で scripts/check.sh を流す。
+# ここは、手で起動したときと、週に 1 回の形式モデルの全探索だけである。
 on:
-  push:
-  pull_request:
   workflow_dispatch:
   schedule:
-    # 形式モデルの全探索は週に 1 回と、specs/ を変えたときだけ回す
     - cron: "0 18 * * 0"
 
 jobs:

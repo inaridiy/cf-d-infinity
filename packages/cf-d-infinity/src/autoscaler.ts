@@ -164,8 +164,9 @@ export async function split(
   await cluster.shard(parent).fence({ ...range, to: child, schema });
   await cluster.switchRange({ ...range, to: child, from: parent });
   const moved = await cluster.shard(child).drain(range);
-  await cluster.shard(parent).finishMove(range);
-  await cluster.shard(child).finishIncoming(range);
+  // 親の時計を子へ渡す。行のないグループは運ばれないので、子の時計は、ここで初めて親に追いつく。
+  const { m } = await cluster.shard(parent).finishMove(range);
+  await cluster.shard(child).finishIncoming({ ...range, m });
   return { parent, child, ...range, ...moved, ms: now() - t0 };
 }
 
