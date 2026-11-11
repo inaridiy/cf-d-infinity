@@ -227,8 +227,13 @@ export interface ShardApi {
   ack(req: { groups: string[] }): Promise<void>;
   /** 子が背景で全グループを引き取る。 */
   drain(req: { start: number; end: number }): Promise<{ groups: number; rows: number; bytes: number }>;
-  finishMove(req: { start: number; end: number }): Promise<void>;
-  finishIncoming(req: { start: number; end: number }): Promise<void>;
+  /**
+   * 範囲を渡し終えた印を付ける。返す m は、このシャードがその範囲について発行した、どの時刻よりも大きい。
+   * 受け取る側の finishIncoming に渡す。
+   */
+  finishMove(req: { start: number; end: number }): Promise<{ m: Ts }>;
+  /** 範囲を受け取り終えた印を付ける。時計を m まで進めてから、届かなかったグループ (渡す側に行がなかった) を受け持ち始める。 */
+  finishIncoming(req: { start: number; end: number; m: Ts }): Promise<void>;
   metrics(req: Record<string, never>): Promise<ShardMetrics>;
   /** このシャードが健全かを運用者に見せるための状態。 */
   health(req: Record<string, never>): Promise<ShardHealth>;
@@ -369,6 +374,8 @@ export interface Faults {
   ignoreFence?: boolean;
   /** 親が、移動を終えた範囲を含む全表の読みを受理する。古い範囲表の読み手が、子へ移った行を読み落とす。 */
   staleWideRead?: boolean;
+  /** 範囲を受け取り終えるとき、渡した側の時計を受け取らない (2026-11 までの挙動。モデル m5b_red_range)。 */
+  finishWithoutClock?: boolean;
   /** 検証で F の代わりに T を使う。 */
   validateFromT?: boolean;
   /** 検証の代わりにロックの保持だけを信じる。ロックを失っても検出できない。 */

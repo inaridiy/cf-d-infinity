@@ -95,7 +95,11 @@ green   $f m5b_green migrationSafe
 for m in m5b_red_s3 m5b_red_s3_parent m5b_red_p2 m5b_red_p2_window m5b_red_intents; do red $f $m migrationSafe; done
 witness $f m5b_green witnessMovedAndWritten
 witness $f m5b_green witnessIntentMovedThenApplied
-for m in m5b_green m5b_red_s3 m5b_red_s3_parent m5b_red_p2 m5b_red_p2_window m5b_red_intents; do tests $f $m; done
+# 範囲の移動を終える手順。pull されなかったグループを子が受け持つとき、親の時計を子へ渡す
+green   $f m5b_green_range migrationSafe
+red     $f m5b_red_range noWriteBelowRead
+witness $f m5b_green_range witnessOpenWritten
+for m in m5b_green m5b_green_range m5b_red_range m5b_red_s3 m5b_red_s3_parent m5b_red_p2 m5b_red_p2_window m5b_red_intents; do tests $f $m; done
 
 echo "== M6 watermark"
 f=m6_watermark.qnt

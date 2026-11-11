@@ -35,6 +35,9 @@ interface RunOpts {
   faults?: Faults;
 }
 
+/** 範囲の移動で時計を渡さない欠陥 (finishWithoutClock) を、行ロック、分割、再起動の掛け合わせが見つける seed。 */
+const PUT_BACK_SEEDS = [147, 219];
+
 async function run(o: RunOpts) {
   const rnd = prng(o.seed);
   const skew = new Map<string, number>();
@@ -232,6 +235,18 @@ describe("history checker with pessimistic transactions", () => {
       const { history, violations } = await run({ seed, skewMs: 20, pessimistic: true, splits: true, restarts: true, ops: 25 });
       expect(history.length).toBeGreaterThan(10);
       expect(violations.slice(0, 3)).toEqual([]);
+    }, 60000);
+  }
+});
+
+// 過去の欠陥を戻して、この検査が見つけることを確かめる。個別の再現テストではなく、乱択の作業負荷が見つける。
+// どの seed が見つけるかは、コードが変わると変わる。下の seed で見つからなくなったら、SEEDS=1..400 で流して、通る seed に替える。
+describe.skipIf(REFERENCE_ONLY)("a defect put back is found by the random workload", () => {
+  for (const seed of seedsOr(PUT_BACK_SEEDS)) {
+    it(`finds a range handed over without the old owner's clock (seed ${seed})`, async () => {
+      const o = { seed, skewMs: 20, pessimistic: true, splits: true, restarts: true, ops: 25 };
+      expect((await run({ ...o, faults: { finishWithoutClock: true } })).violations.length).toBeGreaterThan(0);
+      expect((await run(o)).violations).toEqual([]);
     }, 60000);
   }
 });

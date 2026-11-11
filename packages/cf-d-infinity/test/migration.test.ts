@@ -82,8 +82,8 @@ describe("live split", () => {
     // 親は m を確定したが、応答が子に届かなかった。
     await c.shard("s0").pull({ groups: [JSON.stringify([t])], to: "s2", maxBytes: 1_000_000 });
     await c.shard("s2").drain(range);
-    await c.shard("s0").finishMove(range);
-    await c.shard("s2").finishIncoming(range);
+    const { m } = await c.shard("s0").finishMove(range);
+    await c.shard("s2").finishIncoming({ ...range, m });
     expect(await getN(new Db(c), t)).toBe(5);
     expect(c.backends.get("s0")!.exec("SELECT count(*) c FROM users WHERE tenant_id = ?", t)[0]!.c).toBe(0);
   });

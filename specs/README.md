@@ -44,6 +44,8 @@ red と green は同じ core モジュールを `const` フラグで切り替え
 | M6 `m6_red_skew` | `watermarkSafeOrDetected` | SKEW 2 | 90,863,609 (569 s、HEAVY) | 24 | No violation (遅延検出で補える) |
 | M5b `m5b_green` | `migrationSafe` | P/C、group 2、write 2、intent 1、worker 2、tick 2、T 0..6 | 9,512,226 (生成 9,356 万、112 s) | 22 | No violation |
 | M5b `m5b_red_s3` / `_s3_parent` / `_p2` / `_p2_window` / `_intents` | `migrationSafe` | 同上 | 反例 | | 反例 (5 本すべて) |
+| M5b `m5b_green_range` | `migrationSafe` (`noWriteBelowRead` を含む) | 同上で T 0..3、答えた読みの時刻を覚える、範囲の移動を終える手順あり | 8,306,186 (76 s) | | No violation |
+| M5b `m5b_red_range` | `noWriteBelowRead` | 同上、移動を終えるときに親の時計を子へ渡さない | 25,013 で反例 | | 反例 |
 | M7 `m7_green` | `restoreCorrect` | shard 2、APPROX 1、MARGIN 1、now 0..4、write 2/shard | 46,114,036 (生成 1.5 億、123 s) | 26 | No violation |
 | M7 `m7_red` | `restoreCorrect` | 同上 | 反例 | | 反例 |
 
