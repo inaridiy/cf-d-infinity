@@ -39,6 +39,8 @@ export interface Cluster {
   runtime?: Runtime;
   /** このクラスタへつなぐ Db の、基準経路だけで実行する指定の既定。試験が使う。 */
   reference?: Reference;
+  /** このクラスタへつなぐ Db の、欠陥を再導入するスイッチの既定。検査が欠陥を見つけるかを測る試験だけが使う。 */
+  clientFaults?: ClientFaults;
 }
 
 /** Worker の側の欠陥を再導入するスイッチ (シャードの側は types.ts の Faults)。検査が欠陥を見つけることを確かめる試験だけが使う。 */
@@ -1039,7 +1041,7 @@ export class Db {
   ) {
     this.rt = opts.runtime ?? cluster.runtime ?? systemRuntime;
     this.reference = opts.reference ?? cluster.reference;
-    this.faults = opts.faults ?? {};
+    this.faults = opts.faults ?? cluster.clientFaults ?? {};
     this.token = cleanToken(opts.token);
     this.cached = opts.catalog ?? null;
     this.ids = opts.ids ?? new Map();

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { Db, type Cluster } from "../src/client/db";
+import { Db, type ClientFaults, type Cluster } from "../src/client/db";
 import { MetaCore, type SplitMove, type SplitSlot } from "../src/meta";
 import { shardsOf } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
@@ -224,6 +224,21 @@ export class SimNet {
   reply: (m: Rpc) => Promise<void> | void = () => {};
 }
 
+/** Worker の側の欠陥のスイッチの名前 (src/client/db.ts の ClientFaults)。 */
+const CLIENT_FAULTS = new Set(["repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard"]);
+/** 範囲の作り方の欠陥のスイッチの名前 (src/client/spans.ts の spanFaults)。test/setup.ts が入れる。 */
+export const SPAN_FAULTS = new Set(["rowSpanDespiteUnique"]);
+
+/**
+ * 環境変数 FAULT で、欠陥のスイッチを 1 つ、全部のシミュレータに入れる。乱択の検査が、その欠陥を見つけるかを測るためにある
+ * (scripts/fault-table.mjs)。試験が自分で入れるスイッチには、上書きせずに足す。
+ */
+export function injectedFault(): { name: string; side: "shard" | "client" | "span" } | null {
+  const name = process.env.FAULT;
+  if (!name) return null;
+  return { name, side: CLIENT_FAULTS.has(name) ? "client" : SPAN_FAULTS.has(name) ? "span" : "shard" };
+}
+
 export interface SimOptions {
   shards?: number;
   faults?: Faults;
@@ -259,6 +274,8 @@ export class SimCluster implements Cluster {
   net = new SimNet();
   /** 時刻、待ち、乱数、識別子の出どころ。Db もシャードも、ここから取る。 */
   readonly runtime: Runtime;
+  /** FAULT で入れた Worker の側の欠陥 (下の injectedFault)。 */
+  readonly clientFaults: ClientFaults | undefined;
   /**
    * このクラスタへつなぐ Db を、基準経路だけで実行させる指定。環境変数 REFERENCE (scans か full) から取る。
    * SQLite と突き合わせる検査を、通常の実行と、基準経路だけの実行で流すのに使う。
@@ -280,6 +297,9 @@ export class SimCluster implements Cluster {
   alarms = new Set<string>();
 
   constructor(private o: SimOptions = {}) {
+    const injected = injectedFault();
+    if (injected?.side === "shard") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
+    this.clientFaults = injected?.side === "client" ? { [injected.name]: true } : undefined;
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
     this.runtime = this.virtual ?? systemRuntime;
     this.shardIds = Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
