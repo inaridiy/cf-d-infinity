@@ -23,7 +23,8 @@ in the same commit as the change. How plans are written here: `.agents/PLANS.md`
 4. No behaviour may fail only because rows are on different shards. Users cannot control placement. When one shard
    cannot answer, fall back to gathering rows into the Worker's SQLite and running the statement there. A refusal
    (`unsupported:` error) is acceptable only when it is decided by the statement's shape or the schema, so that it
-   fails every time in development. Resource limits are the exception and must be documented.
+   fails every time in development. Resource limits are the exception and must be documented. An early release
+   gets no exemption: a path that works only while the rows share a shard does not ship.
 5. Transactions stay serializable.
 6. Do not publish to npm and do not deploy to Cloudflare without the owner asking.
 

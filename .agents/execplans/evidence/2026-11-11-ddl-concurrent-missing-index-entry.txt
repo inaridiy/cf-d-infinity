@@ -1,0 +1,93 @@
+== 1. spans-and-replay (6b55ad3 + docs), full 'npx vitest run' while another vitest ran ==
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/ddl-concurrent.test.ts > 2. CREATE UNIQUE INDEX (global) racing with writes that create duplicates > ends with either no index or a public one (seed 1)
+AssertionError: ddl: CREATE UNIQUE INDEX acct_v ON acct(v) => ok: expected { Object (missing) } to deeply equal {}
+
+- Expected
++ Received
+
+- {}
++ {
++   "missing": [
++     "after first CREATE UNIQUE INDEX: acct_v: [1] -> [6,3]",
++   ],
++ }
+
+ ❯ expectOnly test/ddl-concurrent.test.ts:75:54
+     73|     (Object.keys(v) as Kind[]).filter((k) => !known.includes(k) && v[k…
+     74|   );
+     75|   expect(unexpected, `ddl: ${r.ddlLog.join(" | ")}`).toEqual({});
+       |                                                      ^
+     76| }
+     77| 
+ ❯ test/ddl-concurrent.test.ts:213:7
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed | 42 passed | 4 skipped (47)
+      Tests  1 failed | 435 passed | 36 skipped (472)
+   Start at  03:01:15
+   Duration  131.67s (transform 1.18s, setup 10.57s, collect 5.89s, tests 441.23s, environment 12ms, prepare 3.77s)
+
+
+== 2. spans-and-replay, test/ddl-concurrent.test.ts under load (round 2 of 4) ==
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/ddl-concurrent.test.ts > 2. CREATE UNIQUE INDEX (global) racing with writes that create duplicates > ends with either no index or a public one (seed 4)
+Error: Test timed out in 120000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ each test/ddl-concurrent.test.ts:208:5
+    206| function each(name: keyof typeof CASES, title: string, extra: (r: Repo…
+    207|   for (const seed of CASES[name].seeds) {
+    208|     it(`${title} (seed ${seed})`, async () => {
+       |     ^
+    209|       const r = await run(name, seed);
+    210|       const v = violations(r);
+ ❯ test/ddl-concurrent.test.ts:250:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 75 passed (76)
+   Start at  03:15:32
+   Duration  189.83s (transform 285ms, setup 366ms, collect 49ms, tests 188.79s, environment 0ms, prepare 68ms)
+
+
+== 3. main (f2224ce), test/ddl-concurrent.test.ts under load (round 4 of 4) ==
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/ddl-concurrent.test.ts > 2. CREATE UNIQUE INDEX (global) racing with writes that create duplicates > ends with either no index or a public one (seed 1)
+AssertionError: ddl: CREATE UNIQUE INDEX acct_v ON acct(v) => ok: expected { …(2) } to deeply equal {}
+
+- Expected
++ Received
+
+- {}
++ {
++   "missing": [
++     "after first CREATE UNIQUE INDEX: acct_v: [1] -> [6,3]",
++   ],
++   "wrongRead": [
++     "after first CREATE UNIQUE INDEX: acct_v: v=1: index read [], table has [\"[6,3]\"]",
++   ],
++ }
+
+ ❯ expectOnly test/ddl-concurrent.test.ts:75:54
+     73|     (Object.keys(v) as Kind[]).filter((k) => !known.includes(k) && v[k…
+     74|   );
+     75|   expect(unexpected, `ddl: ${r.ddlLog.join(" | ")}`).toEqual({});
+       |                                                      ^
+     76| }
+     77| 
+ ❯ test/ddl-concurrent.test.ts:213:7
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 76 passed (77)
+   Start at  03:20:00
+   Duration  77.95s (transform 225ms, setup 0ms, collect 312ms, tests 77.17s, environment 0ms, prepare 189ms)
