@@ -1,7 +1,7 @@
-// Review of f2224ce, fix 1 (DDL validation, reserved names). Each test asserts the correct behaviour and fails today.
+// Review of f2224ce, fix 1 (DDL validation, reserved names). These were reproductions of open defects; they pass now.
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { SimCluster } from "../sim";
+import { Db } from "../src/client/db";
+import { SimCluster } from "./sim";
 
 const outcome = async <T>(p: Promise<T>) => p.then((v) => ({ ok: v as unknown }), (e: Error) => ({ err: e.message }));
 

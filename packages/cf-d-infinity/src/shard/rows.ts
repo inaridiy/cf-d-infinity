@@ -39,6 +39,21 @@ export function encodeKey(def: TableDef, row: Row): { pk: string; sk: string } {
   };
 }
 
+/**
+ * 書き込まれた行の主キーに NULL がないことを確かめる。
+ *
+ * SQLite は、INTEGER でない主キーの列に NULL を、いくつでも入れられる。主キーの値で行を名指しする仕組み (行イメージの適用、
+ * intent、行ロック、検証) は、そういう行を互いに区別できず、別の行を書き換えてしまう。だから、主キーに NULL のある行は
+ * 作らせない。断るかどうかは文と値だけで決まり、行がどのシャードにあるかには依らない。
+ */
+export function assertKeyed(def: TableDef, row: Row): void {
+  if (def.implicitRowid) return;
+  const col = def.pk.find((c) => (row[c] ?? null) === null);
+  if (col !== undefined) {
+    throw new SqlError(`unsupported: NULL in the primary key column ${col} of ${def.name}; rows are identified by their primary key, so every primary key column needs a value`);
+  }
+}
+
 /** shard key が g のグループの行を全部読む。 */
 export function selectGroup(b: Backend, def: TableDef, g: string): Row[] {
   const vals = decode<Value[]>(g);
@@ -199,6 +214,7 @@ export function capturedChanges(b: Backend, catalog: (t: string) => TableDef): C
     const after = selectRow(b, def, n.pk);
     const image = after ?? n.before;
     if (!image) continue; // 同じ文の中で挿入して消した行
+    if (after) assertKeyed(def, after);
     out.push({ table: n.table, ...encodeKey(def, image), before: n.before, after });
   }
   return out;

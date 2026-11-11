@@ -66,10 +66,12 @@ describe("export followed by import", () => {
       table: "t", columns: ["a", 'b"c'], rows: [[1, "x"], [null, { $blob: "00ff" }]],
     });
   });
-  it("finishes when a page ends on a row whose primary key contains NULL", async () => {
+  it("pages through a composite primary key at every page size", async () => {
+    // 主キーに NULL のある行は作れない (test/admission.test.ts)。以前は、そういう行でページが終わる場合をここで確かめていた。
     const c = new SimCluster({ shards: 1 });
     await c.client().ddl("CREATE TABLE t(a INTEGER NOT NULL, b TEXT, v TEXT, PRIMARY KEY (a, b)) SHARD KEY (a)");
-    const rows: [number, string | null][] = [[1, null], [1, null], [1, "x"], [2, null], [2, "a"], [2, "b"], [3, null], [3, "z"]];
+    await expect(new Db(c).query("INSERT INTO t VALUES (1, NULL, 'x')")).rejects.toThrow(/^unsupported: NULL in the primary key column b of t/);
+    const rows: [number, string][] = [[1, ""], [1, "a"], [1, "x"], [2, ""], [2, "a"], [2, "b"], [3, ""], [3, "z"]];
     for (const [i, [a, b]] of rows.entries()) await new Db(c).query("INSERT INTO t VALUES (?, ?, ?)", [a, b, `v${i}`]);
     for (const limit of [1, 2, 3, 100]) {
       const { lines } = await dump(c, "t", limit);

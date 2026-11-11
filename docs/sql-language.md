@@ -63,6 +63,8 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 | trigger、生成列、`CREATE TABLE ... AS SELECT` | 検査が足りないので断る。エラーは `unsupported:` で始まる |
 | `ALTER TABLE` の `RENAME COLUMN` と `DROP COLUMN` | 同上 |
 | 主キー、shard key、shard key を含まない UNIQUE の列の、BINARY 以外の照合順序 | 同上。行と行き先のシャードを値で決めるので、照合順序で等しい値を同じ行として扱えない |
+| 主キーの列に NULL のある行 | 断る。SQLite は INTEGER でない主キーに NULL をいくつでも入れられるが、行を主キーの値で名指しするので区別できない。`INTEGER PRIMARY KEY` に NULL を渡すと rowid が入るのは SQLite と同じである |
+| 1 シャードで実行する文の中の `sqlite_master` と PRAGMA の関数 (`pragma_table_info(...)` など) | 断る。シャードで実行すると、内部の表について答えてしまう。表定義を調べる文は、それだけで 1 つの文にすれば、利用者の表定義について答える |
 | 取引の中の DDL | DDL は全シャードへの適用を伴うので、取引に含められない |
 
 ### DO の SQLite の制限
@@ -80,7 +82,7 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 
 | 項目 | 差分 |
 |---|---|
-| 2^53 を超える整数 | 精度が落ちる。JavaScript の数値を通るからである |
+| 2^53 を超える整数 | Hrana で引数として渡すと断る (`unsupported:`)。JavaScript の数値を通るので、受け付けると黙って隣の値になる。SQL の中で計算して 2^53 を超えた値は、結果として返るときに精度が落ちる |
 | 暗黙の rowid と `INTEGER PRIMARY KEY` の採番 | 一意で増えるが連続しない。削除された番号は再利用しない。接続を跨ぐと順序も保証しない |
 | 列名 | `x IN ()` は書き換えるので、別名のない列名が変わる |
 

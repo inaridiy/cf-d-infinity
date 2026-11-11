@@ -92,7 +92,7 @@ const UNRESOLVED = (what: string): string =>
  * シミュレータのクラスタは、それぞれ自分の実行環境を持つ。覚えているかどうかで await の回数が変わり、並行する処理の
  * 前後が変わるので、覚え書きをクラスタの間で共有すると、同じ seed の実行が、同じプロセスで前に流したものに依ってしまう。
  */
-const tablesSeenBy = new WeakMap<Runtime, Map<string, string[]>>();
+const tablesSeenBy = new WeakMap<Runtime, Map<string, { tables: string[]; metadata: boolean }>>();
 /** DDL の履歴を表す短いキー。版番号だけだと、同じ isolate の別のクラスタと混ざる。 */
 const historyKeys = new WeakMap<Catalog, string>();
 function historyKey(cat: Catalog): string {
@@ -852,11 +852,11 @@ export class Db {
     const key = `${historyKey(cat)}\0${sql}`;
     let tablesSeen = tablesSeenBy.get(this.rt);
     if (!tablesSeen) tablesSeenBy.set(this.rt, (tablesSeen = new Map()));
-    let names = tablesSeen.get(key);
-    if (names === undefined) {
+    let seen = tablesSeen.get(key);
+    if (seen === undefined) {
       const w = await openScratch(cat);
       try {
-        names = w.tablesUsed(sql);
+        seen = w.reads(sql);
       } catch (e) {
         // Worker の SQLite には利用者の表と view しかない。ここでコンパイルできない文は、内部の表を名指ししているか、
         // SQLite が受け付けない文である。シャードへ送らずに断る。
@@ -865,8 +865,14 @@ export class Db {
         w.close();
       }
       if (tablesSeen.size >= 2000) tablesSeen.delete(tablesSeen.keys().next().value!);
-      tablesSeen.set(key, names);
+      tablesSeen.set(key, seen);
     }
+    // 表定義を読む文は、シャードへ送らない。シャードで実行すると、内部の表 (`__txn` など) について答えてしまう。
+    // 文の形だけで決まるので、開発中に毎回同じように断られる。
+    if (seen.metadata) {
+      throw new SqlError("unsupported: a statement that runs on one shard cannot read sqlite_master or a PRAGMA function inside it; run the schema query as a statement of its own");
+    }
+    const names = seen.tables;
     // プランナが知らない表を、SQLite が開くと答えた。プランナは、知っている表についてだけ「この文が読む行は、送り先の
     // シャードにある」と確かめている。知らない表の行は別のシャードにもあり得るので、そのまま送ると黙って行が欠ける。
     const have = new Set(known.map((d) => d.name));
