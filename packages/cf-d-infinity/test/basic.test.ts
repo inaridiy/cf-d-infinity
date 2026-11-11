@@ -145,14 +145,26 @@ describe("indexes on tables that already hold data", () => {
     await db.ddl("CREATE INDEX lo ON orders(tenant_id, total)");
     expect((await db.query("SELECT total FROM orders WHERE tenant_id = 1 AND total = 1")).rows).toEqual([{ total: 1 }]);
   });
-  it("backfills a global index from existing rows", async () => {
+  it("makes a plain index a local index on every shard: no index table, and writes stay on one shard", async () => {
     const { c, db } = await setup();
     await db.query("INSERT INTO orders VALUES (1,1,1,'paid',1),(2,1,1,'paid',1),(3,1,1,'open',1)");
     await db.ddl("CREATE INDEX st ON orders(status)");
     await c.settle();
     expect((await db.query("SELECT tenant_id FROM orders WHERE status = 'paid' ORDER BY tenant_id")).rows).toHaveLength(2);
-    const { tables } = await c.catalog();
-    expect(tables.orders!.globalIndexes[0]!.state).toBe("public");
+    const cat = await c.catalog();
+    expect(cat.tables.orders!.globalIndexes).toEqual([]);
+    expect(cat.indexes.st).toEqual({ table: "orders", global: false });
+    c.net.log = [];
+    await db.query("INSERT INTO orders VALUES (4,1,1,'paid',1)");
+    expect(c.net.log.some((m) => m.method === "prepare")).toBe(false);
+  });
+  it("backfills a UNIQUE index that spans shards from existing rows", async () => {
+    const { c, db } = await setup();
+    await db.query("INSERT INTO orders VALUES (1,1,1,'a',1),(2,1,1,'b',1),(3,1,1,'c',1)");
+    await db.ddl("CREATE UNIQUE INDEX us ON orders(status)");
+    await c.settle();
+    expect((await c.catalog()).tables.orders!.globalIndexes[0]!.state).toBe("public");
+    await expect(db.query("INSERT INTO orders VALUES (4,1,1,'a',1)")).rejects.toThrow(/UNIQUE/);
   });
   it("fails a UNIQUE global index over duplicates and removes it", async () => {
     const { c, db } = await setup();

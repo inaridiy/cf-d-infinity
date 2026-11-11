@@ -24,7 +24,6 @@ Postgres 互換にしなかったのは、Postgres の構文、型、関数の�
 | 文の形 | 実行場所 | 代表的なレイテンシ |
 |---|---|---|
 | 全表の shard key が同じ値に固定される | そのシャードの SQLite | 31 ms |
-| グローバル index で 1 シャードに絞れる | そのシャードの SQLite | 32 ms |
 | 単純な集約、`ORDER BY LIMIT` | 各シャードで部分実行し Worker で合成 | 63〜68 ms |
 | それ以外 | 条件を押し下げて行を集め、Worker の SQLite で元の SQL を実行 | 77〜95 ms |
 | シャードを跨ぐ書き込み | 同じく Worker の SQLite で実行し、行の変更を取引で確定 | 105 ms から |
@@ -61,7 +60,9 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 | 項目 | 理由 |
 |---|---|
 | TEMP 表、`ATTACH`、仮想表 (FTS5 など) | DO の SQLite が許可しない、または Worker の SQLite に含まれない |
-| `CREATE TABLE ... AS SELECT` の型の引き継ぎ | 結果の列名だけで表を作る |
+| trigger、生成列、`CREATE TABLE ... AS SELECT` | 検査が足りないので断る。エラーは `unsupported:` で始まる |
+| `ALTER TABLE` の `RENAME COLUMN` と `DROP COLUMN` | 同上 |
+| 主キー、shard key、shard key を含まない UNIQUE の列の、BINARY 以外の照合順序 | 同上。行と行き先のシャードを値で決めるので、照合順序で等しい値を同じ行として扱えない |
 | 取引の中の DDL | DDL は全シャードへの適用を伴うので、取引に含められない |
 
 ### DO の SQLite の制限
@@ -88,11 +89,10 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 | 項目 | 差分 |
 |---|---|
 | 外部キー | 強制しない。SQLite の既定と同じである。`PRAGMA foreign_keys = ON` は効かない |
-| `OR REPLACE`、`ON CONFLICT` | PRIMARY KEY には効く。シャードを跨ぐ UNIQUE 列への指定は通常の UNIQUE エラーになる |
+| `INSERT OR IGNORE`、`OR REPLACE`、`ON CONFLICT` | 衝突する行が別のシャードにあっても、SQLite と同じ結果になる。シャードをまたぐ UNIQUE のある表では、衝突し得る行を Worker に集め、元の文を Worker の SQLite で実行して解決させる。DEFAULT のある UNIQUE の列を省いた文は断る (入る値が、行を集める時点で分からない) |
+| `UPDATE OR IGNORE`、`UPDATE OR REPLACE` | 同じシャードの中の衝突は解決する。別のシャードの行との衝突は、いまは `unsupported:` で断る。行の配置で結果が変わるので欠陥として扱っており、公開の前に解消する |
 | 部分 index、式 index | シャード内の index になる。UNIQUE なら shard key を含む必要がある |
-| 生成列 | 使える。行イメージには値を含めるが、書き戻すときは除き、SQLite に計算させる。主キーや shard key にはできない (SQLite の制限) |
-| 照合順序のある主キー、shard key | `COLLATE NOCASE` と `RTRIM` は、照合順序で等しい値を同じ行、同じシャードとして扱う |
-| 予約された名前 | 表、index、view、trigger の名前は `__` と `sqlite_` で始められない。内部の表がこの接頭辞を使う |
+| 予約された名前 | `sqlite_` で始まる名前と、内部の表が使う名前 (`__txn`、`__meta`、`__gidx_` で始まる名前など) は作れない |
 | 1 取引の大きさ | 1 シャードに書く変更は、変更前と変更後の行を合わせて UTF-8 で 1 MB まで。超える取引は commit の前に断る |
 
 ### 取引
@@ -123,11 +123,6 @@ autocommit の読み取りと取引の最初の読み取りでは、開始前に
 読み取り時刻を進められなかった取引は最初のスナップショットのまま読み続けるので、別のシャードに後から確定した書き込みが見えないことがある。
 Serializable は保たれ、書き込みがあれば `COMMIT` の検証で競合になる。
 
-### trigger
-
-trigger は動くが、対象の表と本体が触る表の全行を Worker へ集めて実行する。
-小さな表には向くが、大きな表では行数の上限に当たる。
-
 ### DDL
 
 DDL は全シャードへ適用してから完了を返す。
@@ -142,7 +137,7 @@ Meta が自分の SQLite の空の表で実行して確かめるので、`NOT NU
 シャードの増設の途中は、DDL を記録しない。
 最大 60 秒待ち、終わらなければ、出し直すよう求める。
 
-shard key を含まない列への `CREATE INDEX` は、既存の行から index を埋める。
+shard key を含まない列への `CREATE UNIQUE INDEX` は、既存の行から index の表を埋める。
 1 回の要求で埋めきれない大きさの表では、「同じ文を出し直せ」というエラーで止まる。
 出し直すと、止まった位置から続ける。
 
@@ -164,9 +159,12 @@ CREATE TABLE orders (
 既存のスキーマはそのまま流せるが、関連する行が別のシャードへ分かれるので、性能のためには明示が要る。
 
 index の配置は宣言しない。
-shard key を含む index はシャード内の SQLite index になり、含まない index はグローバル index になる。
+index は、shard key を含むかどうかにかかわらず、各シャードの中の SQLite index になる。
+shard key でない列で引く読みは全シャードへ送り、各シャードが自分の index で引く。
+例外は一意性である。
+shard key を含まない UNIQUE は 1 つのシャードでは確かめられないので、グローバル index (index のキーで配置する表) を作り、行と同じ取引で保守する。
 グローバル index を持つ表の書き込みは 2PC になる。
-データのある表へのグローバル index は、既存の行を埋めてから検索に使い始める。
+グローバル index は一意性の保証と、INSERT が衝突し得る行の場所を知るために使い、読みの経路には使わない。
 
 ## クライアント
 

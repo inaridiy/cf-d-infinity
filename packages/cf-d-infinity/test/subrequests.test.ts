@@ -22,7 +22,6 @@ function capped(c: SimCluster, limit: number): { cluster: Cluster; used: () => n
     catalog: async () => (hit(), c.catalog()),
     applyDdl: async (sql, basedOn) => (hit(), c.applyDdl(sql, basedOn)),
     publishIndex: async (t, name, basedOn) => (hit(), c.publishIndex(t, name, basedOn)),
-    backfillProgress: async (index, value) => (hit(), c.backfillProgress(index, value)),
     allocate: async (t, k, min) => (hit(), c.allocate(t, k, min)),
     switchRange: async (m) => (hit(), c.switchRange(m)),
   };
@@ -49,41 +48,18 @@ describe("statements that loop over rows, within one Worker invocation", () => {
     await new Db(unique.cluster).query("CREATE UNIQUE INDEX people_email ON people(email)");
     expect(plain.used()).toBeLessThan(300);
     expect(unique.used()).toBeLessThan(300);
-    for (const name of ["people_city", "people_email"]) {
-      const ix = await indexAgreement(c, "people", name);
-      expect({ state: ix.state, missing: ix.missing, dangling: ix.dangling }).toEqual({ state: "public", missing: [], dangling: [] });
-    }
+    // 一意でない index は各シャードの中の index なので、埋める作業がない。
+    expect((await c.catalog()).indexes.people_city).toEqual({ table: "people", global: false });
+    const ix = await indexAgreement(c, "people", "people_email");
+    expect({ state: ix.state, missing: ix.missing, dangling: ix.dangling }).toEqual({ state: "public", missing: [], dangling: [] });
   }, 120_000);
 
-  it("CREATE INDEX that runs out of calls says so, and the same statement run again continues where it stopped", async () => {
+  it("CREATE UNIQUE INDEX that runs out of calls says so, and the index is not used", async () => {
     const c = await seeded(1200);
     const first = capped(c, 150);
-    expect(await outcome(new Db(first.cluster).query("CREATE INDEX people_city ON people(city)"))).toMatch(/Run the same statement again/);
-    expect((await c.catalog()).tables.people!.globalIndexes.find((g) => g.name === "people_city")?.state).toBe("writeOnly");
-    // 出し直すたびに先へ進む。先頭からやり直すなら、同じ上限では何度やっても終わらない。
-    let runs = 1;
-    for (; runs < 20; runs++) {
-      if ((await outcome(new Db(capped(c, 150).cluster).query("CREATE INDEX people_city ON people(city)"))) === "ok") break;
-    }
-    expect(runs).toBeLessThan(10);
-    const ix = await indexAgreement(c, "people", "people_city");
-    expect({ state: ix.state, missing: ix.missing, dangling: ix.dangling }).toEqual({ state: "public", missing: [], dangling: [] });
-    expect((await new Db(c).query("SELECT count(*) AS n FROM people WHERE city = 'c3'")).rows).toEqual([{ n: Math.floor((1200 + 4) / 7) }]);
-    expect(await c.backfillProgress("people_city")).toBeNull();
-  }, 120_000);
-
-  it("CREATE TABLE ... AS SELECT inserts in batches, and leaves no table behind when it fails", async () => {
-    const c = await seeded(1200);
-    const w = capped(c, 400);
-    expect(await outcome(new Db(w.cluster).query("CREATE TABLE copy AS SELECT id, email FROM people"))).toBe("ok");
-    expect((await new Db(c).query("SELECT count(*) AS n FROM copy")).rows).toEqual([{ n: 1200 }]);
-    // 行を入れている途中で失敗させる。表ごと消えていること。
-    const drop = c.net.drop;
-    let inserts = 0;
-    c.net.drop = (m) => m.method === "prepare" && ++inserts > 3;
-    const failed = await outcome(new Db(c, { retries: 0 }).query("CREATE TABLE copy2 AS SELECT id, email FROM people"));
-    c.net.drop = drop;
-    expect(failed).not.toBe("ok");
-    expect((await c.catalog()).tables.copy2).toBeUndefined();
+    expect(await outcome(new Db(first.cluster).query("CREATE UNIQUE INDEX people_email ON people(email)"))).toMatch(/too many rows to index within one request/);
+    expect((await c.catalog()).tables.people!.globalIndexes.find((g) => g.name === "people_email")?.state).toBe("writeOnly");
+    await new Db(c).query("DROP INDEX people_email");
+    expect((await c.catalog()).tables.people!.globalIndexes).toEqual([]);
   }, 120_000);
 });

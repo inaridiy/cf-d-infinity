@@ -6,10 +6,10 @@ import { encode, fold, q, selectList } from "../shard/rows";
 import type { GlobalIndexDef, TableDef, Value, WritePlan } from "../types";
 import { SqlError } from "../types";
 import { bindParams, constant, ident, normalize, render, text, walk, type Node, type Params } from "./cst";
+import { isInternalName } from "./ddl";
 
 export type Route =
   | { by: "sk"; sks: string[] }
-  | { by: "gidx"; index: GlobalIndexDef; key: string }
   | { by: "all" };
 
 /** シャードから行を集める 1 回の走査。 */
@@ -21,8 +21,6 @@ export interface Scan {
   sks: string[] | null;
   /** 押し下げた条件。取引の検証は、この条件に関わる変更だけを競合にする。 */
   where?: { alias: string; sql: string; params: Value[] };
-  /** sks はシャードを選ぶためだけに使い、span はシャードの表全体にする。index 経由の読みで立てる。 */
-  wideSpans?: boolean;
 }
 
 export interface WriteTarget {
@@ -32,10 +30,24 @@ export interface WriteTarget {
   write: WritePlan;
   pk: string | null;
   /**
-   * 文を shard key に絞らずに送るときの、表ごとの走査。index 経由の UPDATE と DELETE に付く。
-   * 文はシャードの表を広く読むので、span も index が挙げた shard key に絞らず、この走査の条件にする。
+   * 文が、シャード内の UNIQUE の検査で読む行。範囲を作る関数が、名指しした 1 行に加えて、これを範囲に入れる。
+   *   "none"  UNIQUE の列を書かない (DELETE、UNIQUE の列に触らない UPDATE)。別の行は読まない。
+   *   配列    書く行の UNIQUE の列の値。同じ値を持つ行を読む。
+   *   無指定  分からない。同じ shard key の値の全行を範囲にする。
    */
-  wide?: Scan[];
+  uniqueReads?: "none" | UniqueRead[];
+}
+
+export interface UniqueRead {
+  cols: string[];
+  values: Value[];
+}
+
+/** 挿入する 1 行の、主キーの値と、UNIQUE の列の値。index があれば、シャードをまたぐ UNIQUE である。 */
+export interface ConflictRow {
+  sk: string;
+  pk: Value[];
+  uniques: (UniqueRead & { index?: GlobalIndexDef })[];
 }
 
 export type Plan =
@@ -43,8 +55,6 @@ export type Plan =
       kind: "shard"; route: Route; sql: string; params: Value[]; tables: TableDef[]; pk: string | null;
       /** DO の SQLite が拒否する文 (6 項以上の複合 SELECT) を、Worker の SQLite で実行し直すための計画。 */
       wasm?: Extract<Plan, { kind: "gather" }>;
-      /** グローバル index が 1 シャード以外に当たったときの実行計画。文をシャードごとに流すと集計が割れる。 */
-      fallback?: Extract<Plan, { kind: "gather" }>;
     }
   | { kind: "gather"; scans: Scan[]; sql: string; params: Value[] }
   | { kind: "partial"; scan: Scan; columns: string[]; mergeSql: string; mergeParams: Value[] }
@@ -61,6 +71,12 @@ export type Plan =
   | { kind: "noop" }
   /** 文を 1 つの取引の中で計画し直す。計画の途中で表を読む必要があるときに返す。 */
   | { kind: "inTxn" }
+  /**
+   * 衝突を自分で解決する INSERT (OR IGNORE、OR REPLACE、ON CONFLICT) を、シャードをまたぐ UNIQUE のある表へ入れる。
+   * 衝突する行は別のシャードにあり得るので、挿入先のシャードの SQLite だけでは解決できない。
+   * 衝突し得る行を Worker に集め、元の文を Worker の SQLite で実行して、SQLite に解決させる。rows は、集める行を決めるための値である。
+   */
+  | { kind: "conflictInsert"; def: TableDef; sql: string; params: Value[]; rows: ConflictRow[]; lastRowid: number | null }
   | { kind: "tcl"; op: "begin" | "commit" | "rollback" | "savepoint" | "release" | "rollbackTo"; name?: string; immediate?: boolean };
 
 export interface PlanContext {
@@ -90,7 +106,9 @@ export function fullScan(def: TableDef): Scan {
   return { table: def, sql: `SELECT ${selectList(def)} FROM ${q(def.name)}`, params: [], sks: null };
 }
 
+/** 利用者の文が名指しした表を探す。内部の表 (グローバル index の表) は、利用者の文からは存在しないものとして扱う。 */
 export function findTable(cat: Catalog, name: string): TableDef | null {
+  if (isInternalName(name)) return null;
   const key = Object.keys(cat.tables).find((k) => same(k, name));
   return key ? cat.tables[key]! : null;
 }
@@ -218,6 +236,9 @@ function scopesOf(root: Node, n: Names): Scope[] {
   walk(root, (x) => {
     if (x.type !== "common_table_expr") return;
     const name = lower(ident(x.table));
+    // CTE の名前は文の全体で集めるので、有効範囲の外の同じ名前の参照も CTE として扱われ、文ごとシャードへ送られる。
+    // 内部の表と同じ名前の CTE を認めると、その参照がシャードの内部の表を読む。
+    if (isInternalName(name)) throw new SqlError(`CTE name ${name} is reserved for internal use`);
     // 実在の表と同じ名前の CTE は、文のほかの場所では本物の表を指していることがある。view と同じ扱いにして、
     // 表を条件なしで集め、シャードへ絞り込む経路を使わない。
     if (findTable(n.cat, name)) n.views.add(name);
@@ -393,26 +414,6 @@ function statementPin(scopes: Scope[], values: Value[]): string | null {
     key = p;
   }
   return key;
-}
-
-function gidxRoute(s: Scope, values: Value[]): Route | null {
-  if (s.refs.length !== 1 || !s.refs[0]!.def) return null;
-  // `x IN t` の t は FROM に現れないが、別のシャードの行も読む。index が挙げたシャードだけで実行すると行が欠ける。
-  if (hasTableOperand(s.node)) return null;
-  const ref = s.refs[0]!;
-  const def = ref.def!;
-  const conj = conjuncts(s.where);
-  for (const ix of def.globalIndexes) {
-    if (ix.state !== "public" || ix.columns.some((c) => def.collated.includes(c))) continue;
-    const vals: Value[] = [];
-    for (const c of ix.columns) {
-      const v = equalities(conj, ref, c, s, values);
-      if (v?.length !== 1 || v[0] === null) break;
-      vals.push(normalize(v[0]!, def.affinity[c] ?? "BLOB"));
-    }
-    if (vals.length === ix.columns.length) return { by: "gidx", index: ix, key: encode(vals) };
-  }
-  return null;
 }
 
 // ---- 条件の押し下げ ----
@@ -700,12 +701,9 @@ function planRead(stmt: Node, values: Value[], cat: Catalog): Plan {
       const wasm = { kind: "gather" as const, scans: scansFor(scopes, n, values), sql, params };
       return { kind: "shard", route: { by: "sk", sks: [key] }, sql, params, tables: defs, pk, wasm };
     }
+    // グローバル index は、読み書きの経路には使わない (一意性の保証にだけ使う)。index が挙げた shard key でシャードを選び、
+    // 文を絞らずに送る経路は、読む範囲と検証する範囲がずれやすかった。index の列で引く文は、全シャードへ条件を押し下げて集める。
     if (scopes.length === 1) {
-      const route = gidxRoute(scopes[0]!, values);
-      if (route) {
-        const fallback = { kind: "gather" as const, scans: scansFor(scopes, n, values), sql, params };
-        return { kind: "shard", route, sql, params, tables: defs, pk: null, fallback };
-      }
       const partial = partialAggregate(stmt, scopes[0]!, values);
       if (partial) return partial;
     }
@@ -802,13 +800,17 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   let last: number | null = null;
 
   const outCols = auto && idAt < 0 ? [auto, ...names] : names;
+  // 衝突を自分で解決する文で、表にシャードをまたぐ UNIQUE がある。衝突する行が別のシャードにあり得る。
+  const resolves = /^(REPLACE|INSERT OR (IGNORE|REPLACE))$/.test(keyword) || tailClauses.some((c) => c.type === "upsert_clause");
+  const viaWorker = resolves && def.globalIndexes.length > 0;
+  const conflictRows: ConflictRow[] = [];
   const skAt = def.shardKey.map((c) => outCols.findIndex((n2) => same(n2, c) || (c === "rowid" && ROWID_NAMES.has(lower(n2)))));
-  type Built = { sk: string; pk: string | null; sql: string; params: Value[] };
+  type Built = { sk: string; pk: string | null; sql: string; params: Value[]; uniq: UniqueRead[] | null };
   const built: Built[] = [];
   for (const [i, r] of rows.entries()) {
     const id = assigned.get(i);
-    const parts: { sql: string; params: Value[]; value: () => Promise<Value>; late?: () => Promise<Value> }[] = r.map((node, j) => {
-      if (j === idAt && id !== undefined) return { sql: "?", params: [id], value: async () => id };
+    const parts: { sql: string; params: Value[]; value: () => Promise<Value>; late?: () => Promise<Value>; fixed?: { value: Value } }[] = r.map((node, j) => {
+      if (j === idAt && id !== undefined) return { sql: "?", params: [id], value: async () => id, fixed: { value: id } };
       const rr = render(node, values);
       if (reads[i]![j]) {
         let v: Promise<Value> | undefined;
@@ -816,10 +818,25 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
         return { sql: "?", params: [], value, late: value };
       }
       const c = constant(node, values);
-      return { sql: rr.sql, params: rr.params, value: async () => (c ? c.value : ctx.evaluate(`SELECT ${rr.sql}`, rr.params)) };
+      return { sql: rr.sql, params: rr.params, value: async () => (c ? c.value : ctx.evaluate(`SELECT ${rr.sql}`, rr.params)), fixed: c ?? undefined };
     });
     if (auto && idAt < 0) parts.unshift({ sql: "?", params: [id!], value: async () => id! });
     for (const p of parts) if (p.late) p.params = [await p.late()];
+    // UNIQUE の列の値が、文から定数として決まるか。決まれば、UNIQUE の検査が読む行を「その値を持つ行」と言える。
+    const uniq: UniqueRead[] | null = (() => {
+      const out: UniqueRead[] = [];
+      for (const cols of def.uniques) {
+        const vals: Value[] = [];
+        for (const c of cols) {
+          const at = outCols.findIndex((n2) => same(n2, c));
+          const fixed = at < 0 ? undefined : (parts[at]!.fixed ?? (parts[at]!.late ? { value: parts[at]!.params[0] ?? null } : undefined));
+          if (!fixed) return null;
+          vals.push(fixed.value);
+        }
+        out.push({ cols, values: vals });
+      }
+      return out;
+    })();
     const skVals: Value[] = [];
     for (const [k, at] of skAt.entries()) {
       const v = at < 0 ? null : await parts[at]!.value();
@@ -837,13 +854,37 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
         if (id === undefined) ctx.sawId(def.name, v);
       }
     }
+    if (viaWorker) {
+      const uniques: ConflictRow["uniques"] = [];
+      for (const u of [...def.uniques.map((cols) => ({ cols, index: undefined })), ...def.globalIndexes.map((ix) => ({ cols: ix.columns, index: ix }))]) {
+        const vals: Value[] = [];
+        for (const c of u.cols) {
+          const at = outCols.findIndex((n2) => same(n2, c));
+          // 値を省いた列には、DEFAULT がなければ NULL が入る。NULL はどの行とも衝突しない。
+          // DEFAULT のある列を省くと、入る値がここでは分からないので、衝突する行を集められない。
+          if (at < 0 && (!def.defaults || def.defaults.includes(c))) {
+            throw new SqlError(`unsupported: ${keyword}${tailSql ? " ... ON CONFLICT" : ""} into ${def.name} must give a value for the UNIQUE column ${c}, which has a DEFAULT`);
+          }
+          vals.push(at < 0 ? null : await parts[at]!.value());
+        }
+        uniques.push({ cols: u.cols, values: vals, index: u.index });
+      }
+      conflictRows.push({ sk: encode(skVals), pk: pkVals, uniques });
+    }
     built.push({
-      sk: encode(skVals), pk: encode(pkVals),
+      sk: encode(skVals), pk: encode(pkVals), uniq,
       sql: `(${parts.map((p) => p.sql).join(", ")})`, params: parts.flatMap((p) => p.params),
     });
   }
 
   const colSql = outCols.length ? ` (${outCols.map((c) => q(ROWID_NAMES.has(lower(c)) ? "rowid" : c)).join(", ")})` : "";
+  if (viaWorker) {
+    return {
+      kind: "conflictInsert", def, rows: conflictRows, lastRowid: last,
+      sql: `${prefix}${colSql} VALUES ${built.map((b) => b.sql).join(", ")}${tailSql ? ` ${tailSql}` : ""}`,
+      params: [...built.flatMap((b) => b.params), ...tailParams],
+    };
+  }
   // シャード単位にまとめる。shard key の値ごとに分けると、主キーでハッシュする表では 1 行 1 RPC になる。
   const groups = new Map<string, Built[]>();
   for (const b of built) {
@@ -869,6 +910,8 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
         params: [...chunk.flatMap((b) => b.params), ...tailParams],
         write: { sk: sks.length === 1 ? sks[0]! : null, capture },
         pk: chunk.length === 1 ? chunk[0]!.pk : null,
+        // UPSERT は、衝突した行を書き換える。書き換えた後の値で、もう一度 UNIQUE の検査が走り得るので、値が決まるとは言えない。
+        uniqueReads: chunk.length === 1 && chunk[0]!.uniq && !tailClauses.some((c) => c.type === "upsert_clause") ? chunk[0]!.uniq : undefined,
       });
     }
   }
@@ -909,11 +952,10 @@ function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog): Plan {
     const key = statementPin(scopes, values);
     if (key !== null) {
       const pk = scopes.length === 1 && top.refs.length === 1 ? pkOf(conjuncts(top.where), ref, top, values) : null;
-      return { kind: "write", def, tables: defs, lastRowid: null, targets: [{ route: { by: "sk", sks: [key] }, sql, params, write: { sk: key, capture: captureOf(stmt, pk) }, pk }] };
-    }
-    if (scopes.length === 1 && top.refs.length === 1) {
-      const route = gidxRoute(top, values);
-      if (route) return { kind: "write", def, lastRowid: null, targets: [{ route, sql, params, write: { sk: null }, pk: null, wide: scansFor(scopes, n, values) }] };
+      // DELETE と、UNIQUE の列に触らない UPDATE は、UNIQUE の検査で別の行を読まない。
+      const touchesUnique = stmt.type === "update_stmt" && (assigned.length !== (set?.assignments?.items ?? []).length || assigned.some((c) => def.uniques.some((u) => u.some((k) => same(k, c)))));
+      const uniqueReads = stmt.type === "delete_stmt" || (!touchesUnique && !def.partialUnique) ? "none" as const : undefined;
+      return { kind: "write", def, tables: defs, lastRowid: null, targets: [{ route: { by: "sk", sks: [key] }, sql, params, write: { sk: key, capture: captureOf(stmt, pk) }, pk, uniqueReads }] };
     }
   }
   return { kind: "wasmWrite", scans: scansFor(scopes, n, values), sql, params, tables: defs };
@@ -933,9 +975,8 @@ export async function planStatement(stmt: Node, input: Params, cat: Catalog, ctx
       return planUpdateDelete(stmt, values, cat);
     case "create_table_stmt": {
       const as = clause(stmt, "as_clause");
-      if (as) {
-        return { kind: "ctas", name: ident(stmt.name), select: planRead(as.expr, values, cat), ifNotExists: !!stmt.ifNotExistsKw };
-      }
+      // 表の作成と行の挿入を 1 文で行うと、途中で失敗したときの後始末が要る。CREATE TABLE と INSERT ... SELECT に分けて書ける。
+      if (as) throw new SqlError("unsupported: CREATE TABLE ... AS SELECT; create the table, then INSERT ... SELECT");
       return { kind: "ddl", sql: text(stmt) };
     }
     case "create_index_stmt":

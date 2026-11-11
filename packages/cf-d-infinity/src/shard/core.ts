@@ -40,7 +40,26 @@ export interface ShardDeps {
   txnRetainMs?: number;
   /** 直近の書き込みの索引に持つ項目の上限。超えたら索引を捨てて、それより前から続く検証を失敗させる。 */
   recentMax?: number;
+  /**
+   * 試験用の検査。文が、宣言した範囲 (span) の外の行に依存していたら呼ばれる。
+   * 指定すると、文ごとに、範囲の外の行を消した状態でも同じ結果になるかを確かめる。本番では指定しない。
+   */
+  spanEscape?: (e: SpanEscape) => void;
 }
+
+/** 文の結果が、宣言した範囲の外の行に依存していた。範囲の外の行は決着も検証もされないので、取引の検証が成り立たない。 */
+export interface SpanEscape {
+  shard: string;
+  sql: string;
+  params: Value[];
+  spans: Span[];
+  /** 全部の行がある状態での結果と、範囲の外の行を消した状態での結果。 */
+  full: string;
+  narrowed: string;
+}
+
+/** 範囲の検査をする行数の上限。全行を読んで消すので、大きな表を使う試験では検査を省く。 */
+const SPAN_CHECK_MAX_ROWS = 3000;
 
 /** 受け取る時刻が、このシャードの時計よりこれ以上先なら断る。DO の間の時計のずれと、再起動後の先取り (1 秒) より十分に大きい。 */
 export const MAX_CLOCK_AHEAD_MS = 10 * 60_000;
@@ -1004,10 +1023,17 @@ export class ShardCore implements ShardApi {
         this.count("writes", req.spans);
         this.renew(me.txn);
         const overlay = (req.overlay ?? []).map((c) => ({ table: c.table, pk: c.pk, image: c.after }));
-        const out = this.rollback(() => {
-          if (overlay.length) setBasedRestore(this.b, (t) => this.def(t), overlay);
-          return this.run(req);
-        });
+        let out: { columns: string[]; values: Value[][]; changes: Change[] };
+        try {
+          out = this.rollback(() => {
+            if (overlay.length) setBasedRestore(this.b, (t) => this.def(t), overlay);
+            return this.run(req);
+          });
+        } catch (e) {
+          if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner) throw e;
+          // 文は F の状態を読んだうえで失敗した。読んだ時刻を付けて返し、呼び出し側に範囲を記録させる (ExecRes.error)。
+          return { columns: [], values: [], changes: [], error: asSqlError(e).message, F, T: req.T ?? F, hlc: this.hlc.value, epoch: this.epoch };
+        }
         const rows = [...out.changes, ...(req.lockRows ?? [])] as Pick<Change, "table" | "pk">[];
         const blocked = this.blockedBy(rows, me);
         if (!blocked) {
@@ -1163,6 +1189,68 @@ export class ShardCore implements ShardApi {
    * INSERT ... SELECT のような構文でも Worker 側で解析する必要がない。
    */
   private run(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[] } {
+    return this.checked(req, () => this.runStatement(req));
+  }
+
+  /**
+   * 範囲の検査 (試験用)。範囲の外の行を消した状態で同じ文を実行し、全部の行がある状態と結果を比べる。
+   * 結果が違えば、文は宣言していない行を読んでいる。そういう行は intent の決着も commit の検証も受けない。
+   * どの文の形にも同じ検査が掛かるので、範囲の作り方を文の形ごとに確かめなくてよい。
+   */
+  private checked<T>(req: ExecReq, exec: () => T): T {
+    const report = this.deps.spanEscape;
+    if (!report || this.checking) return exec();
+    this.checking = true;
+    try {
+      const probe = (): string => {
+        try {
+          return encode(exec());
+        } catch (e) {
+          return `error: ${e === FALLBACK ? "fallback" : ((e as Error)?.message ?? String(e))}`;
+        }
+      };
+      const narrowed = this.rollback(() => (this.deleteOutside(req) ? probe() : null));
+      if (narrowed !== null) {
+        const full = this.rollback(probe);
+        // random() などで実行のたびに結果が変わる文は、比べても意味がない。同じ状態で 2 回実行して確かめる。
+        const stable = full === this.rollback(probe);
+        if (stable && full !== narrowed) report({ shard: this.id, sql: req.sql, params: req.params, spans: req.spans, full, narrowed });
+      }
+    } finally {
+      this.checking = false;
+    }
+    return exec();
+  }
+  private checking = false;
+
+  /** 範囲の外の行を、利用者の表と index の表から消す。行が多すぎて検査を省くときは false を返す。 */
+  private deleteOutside(req: ExecReq): boolean {
+    const own = new Set((req.overlay ?? []).map((c) => `${c.table}\0${c.pk}`));
+    const doomed: { def: TableDef; pk: string }[] = [];
+    let seen = 0;
+    for (const def of this.defs.values()) {
+      const spans = req.spans.filter((s) => s.table === def.name || s.table === "*");
+      // 条件の span は、条件に合う行の主キーを先に求める。
+      const matching = spans.flatMap((s) => {
+        if (s.kind !== "pred") return [];
+        const keys = this.b.exec(`SELECT ${selectList(def)} FROM ${q(def.name)} AS ${q(s.alias)} WHERE (${s.where})`, ...s.params)
+          .map((row) => encodeKey(def, row)).filter((k) => s.sk === undefined || s.sk === k.sk);
+        return [new Set(keys.map((k) => k.pk))];
+      });
+      for (const row of this.b.exec(`SELECT ${selectList(def)} FROM ${q(def.name)}`)) {
+        if (++seen > SPAN_CHECK_MAX_ROWS) return false;
+        const key = encodeKey(def, row);
+        // 取引が自分で書いた行は、ほかの取引から守る必要がないので、範囲に入っていなくてよい。
+        if (own.has(`${def.name}\0${key.pk}`)) continue;
+        const covered = spans.some((s) => s.kind !== "pred" && spanCovers(s, def.name, key.pk, key.sk)) || matching.some((m) => m.has(key.pk));
+        if (!covered) doomed.push({ def, pk: key.pk });
+      }
+    }
+    for (const d of doomed) deleteRow(this.b, d.def, d.pk);
+    return true;
+  }
+
+  private runStatement(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[] } {
     if (!req.write) return { ...this.readLimited(req), changes: [] };
     const captured = this.runCaptured(req);
     if (captured) return captured;
@@ -1246,7 +1334,8 @@ export class ShardCore implements ShardApi {
       return { ...out, T, hlc: this.hlc.value, epoch: this.epoch };
     } catch (e) {
       if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner) throw e;
-      throw asSqlError(e);
+      // 文は T の状態を読んだうえで失敗した。読んだ時刻を付けて返し、呼び出し側に範囲を記録させる。
+      return { columns: [], values: [], changes: [], error: asSqlError(e).message, T, hlc: this.hlc.value, epoch: this.epoch };
     }
   }
 
@@ -1310,7 +1399,8 @@ export class ShardCore implements ShardApi {
   private runCaptured(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[] } | null {
     const capture = req.write?.capture;
     const span = req.spans[0];
-    if (!capture || this.faults.triggerCapture || !span || req.spans.length !== 1) return null;
+    // 2 つ目以降の範囲は、同じ表の、UNIQUE の検査で読む行だけである (spans.ts の規則 3)。ほかの表を読む文は、ここでは扱わない。
+    if (!capture || this.faults.triggerCapture || !span || req.spans.some((s) => s.table !== span.table)) return null;
     if (capture === "update" && span.kind !== "pk") return null;
     const def = this.def(span.table);
     const sk = req.write!.sk;
@@ -1356,7 +1446,7 @@ export class ShardCore implements ShardApi {
         let out: { changes: Change[]; c: Ts } | undefined;
         try {
           out = this.b.tx(() => {
-            const r = this.runCaptured(req);
+            const r = this.checked(req, () => this.runCaptured(req));
             if (!r) throw FALLBACK;
             hit.key = this.blockedBy(r.changes, me);
             if (hit.key !== null) throw BLOCKED;

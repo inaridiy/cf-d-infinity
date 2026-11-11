@@ -9,7 +9,7 @@ import { SimCluster } from "./sim";
 
 const attempt = async <T>(p: Promise<T>) => p.then((v) => ({ ok: v as unknown }), (e: Error) => ({ err: e.message }));
 
-describe("split + DROP COLUMN + a committed transaction waiting to be applied", () => {
+describe("split + a schema change + a committed transaction waiting to be applied", () => {
   it("ends in a state that recovers by itself", async () => {
     const c = new SimCluster({ shards: 2 });
     const db = c.client();
@@ -51,10 +51,10 @@ describe("split + DROP COLUMN + a committed transaction waiting to be applied", 
     const splitting = attempt(split(c, "s0", "s2"));
     await pullStarted;
 
-    // 増設の途中で列を消す。親も子も、増設が終わるまで DDL を適用しないので、DDL は待つ。待ち時間を短くすると、はっきり断る。
-    const impatient = await attempt(new Db(c, { splitWaitMs: 100 }).ddl("ALTER TABLE t DROP COLUMN y"));
+    // 増設の途中で列を足す。親も子も、増設が終わるまで DDL を適用しないので、DDL は待つ。待ち時間を短くすると、はっきり断る。
+    const impatient = await attempt(new Db(c, { splitWaitMs: 100 }).ddl("ALTER TABLE t ADD COLUMN z INTEGER"));
     expect(impatient).toEqual({ err: "a shard split is in progress; retry the schema change when it finishes" });
-    const ddl = attempt(new Db(c).ddl("ALTER TABLE t DROP COLUMN y"));
+    const ddl = attempt(new Db(c).ddl("ALTER TABLE t ADD COLUMN z INTEGER"));
     await new Promise((r) => setTimeout(r, 50));
     releasePull();
     releaseFinalize();
@@ -70,6 +70,6 @@ describe("split + DROP COLUMN + a committed transaction waiting to be applied", 
     const problems = await quiescentProblems(c);
     expect(read).toEqual({ ok: [{ x: 1 }] });
     expect(problems).toEqual([]);
-    expect((await c.catalog()).tables.t!.columns).toEqual(["tenant_id", "id", "x"]);
+    expect((await c.catalog()).tables.t!.columns).toEqual(["tenant_id", "id", "x", "y", "z"]);
   });
 });

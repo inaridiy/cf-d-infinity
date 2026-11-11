@@ -45,9 +45,43 @@ export interface ParsedDdl {
 }
 
 /** 内部の表は `__` で始まる。利用者の表と名前が衝突すると、内部の状態を利用者の SQL で書き換えられる。 */
+const INTERNAL_NAMES = new Set([
+  "__arrived", "__cap", "__cap_on", "__ddl", "__fenced", "__incoming", "__intents", "__meta", "__moved", "__moved_txn",
+  "__p", "__raw", "__routing", "__seq", "__slow", "__txn",
+]);
+/**
+ * 内部で使う名前か。`__` で始まる名前を全部は取らない。移行の道具が `__new_<表名>` のような名前を使うからである。
+ * 利用者の文が内部の表を名指しできないことは、名前の検査ではなく、Worker の SQLite でのコンパイルが守る
+ * (そこには利用者の表しかない。Db.tablesOf)。ここで断るのは、内部の表と物理的に衝突する名前を作ることである。
+ */
+export const isInternalName = (name: string): boolean =>
+  INTERNAL_NAMES.has(name.toLowerCase()) || /^(sqlite_|__gidx_|__cap_|__capv_|__log_g)/i.test(name);
+
+/** 対応していない機能は、黙って通さずに断る。エラーは必ず `unsupported:` で始める。 */
+const unsupported = (what: string): never => {
+  throw new SqlError(`unsupported: ${what}`);
+};
+
 function userName(name: string, what: string): string {
-  if (/^(__|sqlite_)/i.test(name)) throw new SqlError(`${what} name ${name} is reserved: names starting with "__" or "sqlite_" are internal`);
+  if (isInternalName(name)) throw new SqlError(`${what} name ${name} is reserved for internal use`);
   return name;
+}
+
+/** 既存の表を名指しする。内部の表 (グローバル index の表など) は、利用者の DDL からは存在しないものとして扱う。 */
+function existingTable(schema: SchemaView, name: string): TableDef | undefined {
+  return isInternalName(name) ? undefined : schema.tables[name];
+}
+
+/**
+ * 表、view、index は SQLite では 1 つの名前空間にあり、大文字と小文字を区別しない。
+ * ここで断らないと、シャードの文は通るのに、Worker の SQLite で履歴を再生する文が失敗する。履歴は書き換えられないので、
+ * 以後、行を Worker に集める文がすべて失敗する。
+ */
+function assertFree(schema: SchemaView, name: string): void {
+  const hit = (keys: string[]) => keys.some((k) => k.toLowerCase() === name.toLowerCase());
+  if (hit(Object.keys(schema.tables))) throw new SqlError(`there is already a table named ${name}`);
+  if (hit(Object.keys(schema.views))) throw new SqlError(`there is already a view named ${name}`);
+  if (hit(Object.keys(schema.indexes))) throw new SqlError(`there is already an index named ${name}`);
 }
 
 const NOOP: ParsedDdl = { sql: [], defs: [], drops: [], user: null, noop: true };
@@ -65,6 +99,14 @@ export function globalIndexTable(ix: Pick<GlobalIndexDef, "name" | "unique">): {
   };
 }
 
+/**
+ * シャードをまたぐ UNIQUE の列には、各シャードの表にも同じ列の (一意でない) index を作る。
+ * 一意性は index の表 (`__gidx_*`) が守る。こちらは、行のシャードがその列で行を引くための、ただの索引である。
+ */
+const rowIndexName = (ix: Pick<GlobalIndexDef, "name">): string => `__gidx_${ix.name}__rows`;
+const rowIndexSql = (ix: Pick<GlobalIndexDef, "name" | "columns">, table: string): string =>
+  `CREATE INDEX ${q(rowIndexName(ix))} ON ${q(table)} (${ix.columns.map(q).join(", ")})`;
+
 const isFk = (c: Node) => c.type === "references_specification" || c.type === "constraint_foreign_key";
 const inner = (item: Node) => (item.type === "constraint" ? item.constraint : item);
 const specCols = (c: Node): string[] => c.columns.expr.items.map((i: Node) => ident(i.type === "index_specification" ? i.expr : i));
@@ -76,12 +118,14 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
     if (stmt.ifNotExistsKw) return NOOP;
     throw new SqlError(`table ${name} already exists`);
   }
+  assertFree(schema, name);
   const items: Node[] = stmt.columns.expr.items;
   const columns: string[] = [];
   const types = new Map<string, string | null>();
   const collated = new Set<string>();
   const collation: Record<string, string> = {};
   const generated: string[] = [];
+  const defaults: string[] = [];
   let pk: string[] = [];
   const uniqueSets: string[][] = [];
   for (const item of items) {
@@ -102,7 +146,8 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
         collated.add(col);
         collation[col] = ident(c.collation).toUpperCase();
       }
-      if (c.type === "constraint_generated") generated.push(col);
+      if (c.type === "constraint_generated") unsupported("generated columns");
+      if (c.type === "constraint_default") defaults.push(col);
     }
   }
   const withoutRowid = (stmt.options?.items ?? stmt.options?.options?.items ?? []).some((o: Node) => /WITHOUT/i.test(text(o)));
@@ -113,6 +158,15 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
   const sk = shardKey ?? [pk[0]!];
   for (const c of sk) {
     if (!pk.includes(c)) throw new SqlError(`SHARD KEY column ${c} must be part of the PRIMARY KEY`);
+  }
+  // 行と shard key の同一性は、値をそのまま比べて決める。照合順序で等しい値 ('abc' と 'ABC') を同じ行として扱うには、
+  // 経路、分割、ロック、検証のすべてで同じ規則が要る。その規則を確かめきるまで、キーの列の照合順序は受け付けない。
+  for (const c of new Set([...pk, ...sk])) {
+    if ((collation[c] ?? "BINARY") !== "BINARY") unsupported(`COLLATE ${collation[c]} on the primary key or shard key column ${c}`);
+  }
+  for (const cols of uniqueSets) {
+    const bad = cols.find((c) => (collation[c] ?? "BINARY") !== "BINARY");
+    if (bad && !sk.every((c) => cols.includes(c))) unsupported(`COLLATE ${collation[bad]} on column ${bad} of a UNIQUE constraint that does not include the shard key`);
   }
 
   // 外部キーは SQLite の既定どおり強制しない。親の行が別のシャードにあるからである。
@@ -143,6 +197,7 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
     affinity: Object.fromEntries(columns.map((c) => [c, affinityOf(types.get(c) ?? null)])),
     collated: [...collated],
     collation,
+    defaults,
     ...(generated.length ? { generated } : {}),
   };
   const sql = [text(stmt), ...captureDdl(def)];
@@ -153,7 +208,7 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
       const ix: GlobalIndexDef = { name: `${name}_${i}_key`, table: `__gidx_${name}_${i}_key`, columns: cols, unique: true, state: "public" };
       const t = globalIndexTable(ix);
       def.globalIndexes.push(ix);
-      sql.push(t.sql);
+      sql.push(t.sql, rowIndexSql(ix, name));
       defs.push(t.def);
     } else def.uniques.push(cols);
   });
@@ -166,10 +221,15 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
   if (schema.indexes[name]) {
     // 既存の行で埋めている途中の index は、まだ作り終えていない。同じ文の出し直しは、続きを埋める指示として受ける。
     const half = schema.tables[schema.indexes[name]!.table]?.globalIndexes.find((g) => g.name === name && g.state === "writeOnly");
-    if (stmt.ifNotExistsKw || (half && schema.indexes[name]!.table === table)) return NOOP;
+    // 出し直しとして受けるのは、列と UNIQUE の指定が同じ文だけである。違う文を「続き」にすると、頼んだのと違う index ができる。
+    const sameShape = half && half.unique === (stmt.indexTypeKw?.name === "UNIQUE")
+      && stmt.columns.expr.items.every((s: Node) => s.expr.type === "identifier")
+      && JSON.stringify(stmt.columns.expr.items.map((s: Node) => ident(s.expr))) === JSON.stringify(half.columns);
+    if (stmt.ifNotExistsKw || (sameShape && schema.indexes[name]!.table === table)) return NOOP;
     throw new SqlError(`index ${name} already exists`);
   }
-  const found = schema.tables[table];
+  assertFree(schema, name);
+  const found = existingTable(schema, table);
   if (!found) throw new SqlError(`no such table: main.${table}`);
   const def = structuredClone(found);
   const unique = stmt.indexTypeKw?.name === "UNIQUE";
@@ -178,20 +238,26 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
   const partial = !!(stmt.clauses ?? []).some((c: Node) => c.type === "where_clause");
   const cols = plain ? specs.map((s) => ident(s.expr)) : [];
   for (const c of cols) if (!def.columns.includes(c) && c !== "rowid") throw new SqlError(`no such column: ${c}`);
-  const local = (plain && def.shardKey.every((c) => cols.includes(c))) || !plain || partial;
+  // 一意でない index は、shard key を含まなくても、各シャードの中の index にする。行の置き場所を変えず、書き込みの費用も増やさない。
+  // shard key で絞れない検索は全シャードへ送られるが、各シャードはこの index で引ける。
+  // シャードをまたいで保守する index は、一意性の保証に必要な UNIQUE だけにする。
+  const local = (plain && def.shardKey.every((c) => cols.includes(c))) || !plain || partial || !unique;
   if (local) {
     if (unique && !(plain && def.shardKey.every((c) => cols.includes(c)))) {
       throw new SqlError("UNIQUE partial or expression indexes must include the shard key");
     }
     // 部分 index も記録する。記録しないと、書き込みの UNIQUE の検査がこの表を飛ばし、確定した後の適用で初めて違反になる。
     if (unique) def.uniques.push(cols);
+    if (unique && partial) def.partialUnique = true;
     const drop = `DROP INDEX IF EXISTS ${q(name)}`;
-    return { sql: [source], defs: [def], drops: [], user: source, indexes: { [name]: { table, global: false } }, undo: { sql: [drop], user: drop } };
+    return { sql: [text(stmt)], defs: [def], drops: [], user: source, indexes: { [name]: { table, global: false } }, undo: { sql: [drop], user: drop } };
   }
+  const collatedCol = unique ? cols.find((c) => (def.collation[c] ?? "BINARY") !== "BINARY") : undefined;
+  if (collatedCol) unsupported(`COLLATE ${def.collation[collatedCol]} on column ${collatedCol} of a UNIQUE index that does not include the shard key`);
   const ix: GlobalIndexDef = { name, table: `__gidx_${name}`, columns: cols, unique, state: "writeOnly" };
   const t = globalIndexTable(ix);
   def.globalIndexes.push(ix);
-  return { sql: [t.sql], defs: [def, t.def], drops: [], user: source, indexes: { [name]: { table, global: true } } };
+  return { sql: [t.sql, rowIndexSql(ix, table)], defs: [def, t.def], drops: [], user: source, indexes: { [name]: { table, global: true } } };
 }
 
 function triggerTables(stmt: Node): string[] {
@@ -215,6 +281,9 @@ function triggerTables(stmt: Node): string[] {
 }
 
 function createTrigger(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
+  // trigger のある表への書き込みは、行を Worker に集めて Worker の SQLite で発火させる、別の実行経路を通る。
+  // その経路の読みと検証を確かめきるまで、trigger は受け付けない。
+  unsupported("CREATE TRIGGER");
   const name = userName(ident(stmt.name), "trigger");
   if (schema.triggers[name]) {
     if (stmt.ifNotExistsKw) return NOOP;
@@ -222,7 +291,7 @@ function createTrigger(source: string, stmt: Node, schema: SchemaView): ParsedDd
   }
   const t = stmt.target.table;
   const table = ident(t.type === "member_expr" ? t.property : t);
-  if (!schema.tables[table] && !schema.views[table]) throw new SqlError(`no such table: main.${table}`);
+  if (!existingTable(schema, table) && !schema.views[table]) throw new SqlError(`no such table: main.${table}`);
   // シャードには作らない。trigger のある表への書き込みは Worker の SQLite で実行し、そこで発火させる。
   return { sql: [], defs: [], drops: [], user: null, triggers: { [name]: { table, sql: source, tables: triggerTables(stmt) } } };
 }
@@ -231,7 +300,7 @@ function dropTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
   const out: ParsedDdl = { sql: [], defs: [], drops: [], user: source, dropIndexes: [], dropTriggers: [] };
   for (const t of stmt.tables.items) {
     const name = ident(t.type === "member_expr" ? t.property : t);
-    const def = schema.tables[name];
+    const def = existingTable(schema, name);
     if (!def) {
       if (stmt.ifExistsKw) continue;
       throw new SqlError(`no such table: ${name}`);
@@ -255,24 +324,26 @@ function dropIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
     if (stmt.ifExistsKw) return NOOP;
     throw new SqlError(`no such index: ${name}`);
   }
-  if (!info.global) return { sql: [source], defs: [], drops: [], user: source, dropIndexes: [name] };
+  if (!info.global) return { sql: [text(stmt)], defs: [], drops: [], user: source, dropIndexes: [name] };
   const def = structuredClone(schema.tables[info.table]!);
   const ix = def.globalIndexes.find((g) => g.name === name)!;
   def.globalIndexes = def.globalIndexes.filter((g) => g.name !== name);
-  return { sql: [`DROP TABLE IF EXISTS ${q(ix.table)}`], defs: [def], drops: [ix.table], user: source, dropIndexes: [name] };
+  return { sql: [`DROP TABLE IF EXISTS ${q(ix.table)}`, `DROP INDEX IF EXISTS ${q(rowIndexName(ix))}`], defs: [def], drops: [ix.table], user: source, dropIndexes: [name] };
 }
 
 function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
   const name = ident(stmt.table);
-  const found = schema.tables[name];
+  const found = existingTable(schema, name);
   if (!found) throw new SqlError(`no such table: ${name}`);
   const def = structuredClone(found);
+  if (stmt.actions.items.length !== 1) throw new SqlError("ALTER TABLE takes one action per statement");
   const action = stmt.actions.items[0];
   const sql: string[] = dropCaptureDdl(name);
   switch (action.type) {
     case "alter_action_rename": {
       const to = userName(ident(action.newName), "table");
       if (schema.tables[to]) throw new SqlError(`there is already another table or index with this name: ${to}`);
+      assertFree(schema, to);
       sql.push(`ALTER TABLE ${q(name)} RENAME TO ${q(to)}`);
       def.name = to;
       sql.push(...captureDdl(def));
@@ -290,7 +361,8 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       def.affinity[added] = affinityOf(col.dataType ? text(col.dataType) : null);
       for (const raw of col.constraints ?? []) {
         const c = inner(raw);
-        if (c.type === "constraint_generated") def.generated = [...(def.generated ?? []), added];
+        if (c.type === "constraint_generated") unsupported("generated columns");
+        if (c.type === "constraint_default" && def.defaults) def.defaults.push(added);
         if (c.type !== "constraint_collate") continue;
         def.collated.push(added);
         def.collation[added] = ident(c.collation).toUpperCase();
@@ -301,6 +373,9 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       return { sql, defs: [def], drops: [], user: source, undo: { sql: [...dropCaptureDdl(name), drop, ...captureDdl(found)], user: drop } };
     }
     case "alter_action_rename_column": {
+      // 列の名前や数を変える DDL は、未決着の intent と変更ログの行イメージの形を変える。分割と重なる場合も含めて
+      // 確かめきるまで、受け付けない。表を作り直して移す (CREATE、INSERT ... SELECT、DROP、RENAME TO) ことはできる。
+      unsupported("ALTER TABLE ... RENAME COLUMN");
       const from = ident(action.oldName);
       const to = ident(action.newName);
       if (!def.columns.includes(from)) throw new SqlError(`no such column: "${from}"`);
@@ -319,6 +394,7 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       break;
     }
     case "alter_action_drop_column": {
+      unsupported("ALTER TABLE ... DROP COLUMN");
       const col = ident(action.column);
       if (!def.columns.includes(col)) throw new SqlError(`no such column: "${col}"`);
       if (def.pk.includes(col)) throw new SqlError(`cannot drop PRIMARY KEY column: "${col}"`);
@@ -347,7 +423,11 @@ export function parseDdl(source: string, schema: SchemaView): ParsedDdl {
     })
     .trim()
     .replace(/;$/, "");
-  const stmt = parseStatements(clean)[0];
+  // 1 回の DDL は 1 文だけにする。先頭の文しか調べないので、後ろに文が続いていると、調べていない SQL が
+  // Meta と全シャードの SQLite でそのまま実行され、履歴にも残る。
+  const stmts = parseStatements(clean);
+  if (stmts.length !== 1) throw new SqlError("a schema change must be exactly one statement");
+  const stmt = stmts[0];
   switch (stmt.type) {
     case "create_table_stmt": return createTable(clean, stmt, schema, shardKey);
     case "create_index_stmt": return createIndex(clean, stmt, schema);
@@ -369,6 +449,7 @@ export function parseDdl(source: string, schema: SchemaView): ParsedDdl {
         if (stmt.ifNotExistsKw) return NOOP;
         throw new SqlError(`view ${name} already exists`);
       }
+      assertFree(schema, name);
       return { sql: [], defs: [], drops: [], user: clean, views: { [name]: clean } };
     }
     case "drop_view_stmt": {

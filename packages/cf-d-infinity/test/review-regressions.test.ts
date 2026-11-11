@@ -3,6 +3,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { split } from "../src/autoscaler";
 import { Db } from "../src/client/db";
+import { spanFaults } from "../src/client/spans";
 import { ownerOf } from "../src/routing";
 import type { Faults } from "../src/types";
 import { quiescentProblems } from "./invariants";
@@ -16,8 +17,11 @@ async function tenantOn(c: SimCluster, shard: string): Promise<number> {
 describe("a UNIQUE value held by another transaction's intent", () => {
   // 2 シャードの取引を commit した直後は、anchor でない側に intent だけが残る。
   // そこへ同じ UNIQUE の値を autocommit で INSERT できると、後から届く phase 2 が UNIQUE 違反で永久に適用できない。
-  const run = async (faults: Faults) => {
-    const c = new SimCluster({ shards: 2, faults });
+  // いまは 2 つの層がこれを防ぐ。書き込みの範囲が同じ shard key の値の全行に広がるので、未決着の intent があれば
+  // 文の実行の前に断る。それとは別に、シャードが未決着の UNIQUE の値を SQLite で確かめる。欠陥を再現するには、両方を外す。
+  const run = async (faults: Faults, narrow = false) => {
+    spanFaults.rowSpanDespiteUnique = narrow;
+    const c = new SimCluster({ shards: 2, faults, noSpanCheck: narrow });
     const db = c.client();
     await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
     await db.ddl(`CREATE UNIQUE INDEX p_code ON p(tenant_id, code)`);
@@ -36,11 +40,22 @@ describe("a UNIQUE value held by another transaction's intent", () => {
     for (let i = 0; i < 3; i++) await c.fireAlarms();
     const committed = await Promise.all(tenants.map((t) =>
       new Db(c).query("SELECT id FROM p WHERE tenant_id = ? AND id = 5", [t]).then((r) => r.rows.length, (e: Error) => e.message)));
+    spanFaults.rowSpanDespiteUnique = false;
     return { duplicate, committed, problems: await quiescentProblems(c) };
   };
 
   it("is refused to an autocommit insert, so the committed transaction can always be applied", async () => {
     const r = await run({});
+    expect(r.duplicate.filter((d) => d === "accepted")).toEqual([]);
+    // 範囲が同じ shard key の値の全行なので、シャードは先に、確定済みで適用待ちの取引を適用する。
+    // そのうえで文を実行するので、SQLite が本物の UNIQUE 違反を返す。やり直しても通らない、正しい答えである。
+    expect(r.duplicate).toEqual(["UNIQUE constraint failed: p.tenant_id, p.code", "UNIQUE constraint failed: p.tenant_id, p.code"]);
+    expect(r.committed).toEqual([1, 1]);
+    expect(r.problems).toEqual([]);
+  });
+
+  it("is still refused by the shard's own check when the write's span is narrowed to one row", async () => {
+    const r = await run({}, true);
     expect(r.duplicate.filter((d) => d === "accepted")).toEqual([]);
     expect(r.duplicate.some((d) => /unique pending/.test(d))).toBe(true);
     expect(r.committed).toEqual([1, 1]);
@@ -48,7 +63,7 @@ describe("a UNIQUE value held by another transaction's intent", () => {
   });
 
   it("without the check, the committed transaction is stuck forever (the bug)", async () => {
-    const r = await run({ autoIgnoresUniqueIntents: true });
+    const r = await run({ autoIgnoresUniqueIntents: true }, true);
     expect(r.duplicate).toContain("accepted");
     // 終了時の検査が、この欠陥を 3 通りに報告する: 残った intent、適用されない確定済みの取引、失敗し続ける再駆動。
     expect(r.problems.some((p) => /intents remain/.test(p))).toBe(true);

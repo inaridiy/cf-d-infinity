@@ -34,6 +34,16 @@ export interface TableDef {
   collation: Record<string, string>;
   /** シャード内の UNIQUE (shard key を含むもの)。部分 index (WHERE 付き) の列も含む。 */
   uniques: string[][];
+  /**
+   * 条件付きの UNIQUE index (WHERE 付き) がある。条件の列を書き換えると、UNIQUE の列に触らなくても、行が index に入り、
+   * UNIQUE の検査が別の行を読む。どの列が条件に関わるかは追わないので、UPDATE は別の行を読み得るものとして扱う。
+   */
+  partialUnique?: boolean;
+  /**
+   * DEFAULT のある列。INSERT で値を省いた列に何が入るかを知るのに使う。ここにない列は、省くと NULL になる。
+   * この項目のない古い表定義では、省いた列の値は分からないものとして扱う。
+   */
+  defaults?: string[];
   /** 生成列。値は SQLite が計算するので、行イメージを書き戻すときは除く。 */
   generated?: string[];
   globalIndexes: GlobalIndexDef[];
@@ -152,6 +162,12 @@ export interface ExecRes {
   T: Ts;
   hlc: Ts;
   epoch: number;
+  /**
+   * 文が SQLite のエラーで失敗した (制約の違反など)。例外にせず、読んだ時刻と一緒に結果として返す。
+   * 失敗した文も、状態を読んでいる (「同じ主キーの行がある」など)。取引は、その読みも commit で検証しなければならない。
+   * 例外にすると、呼び出し側は読んだ時刻を知れず、読んだ範囲を記録できない。
+   */
+  error?: string;
 }
 
 export interface PrepareReq {

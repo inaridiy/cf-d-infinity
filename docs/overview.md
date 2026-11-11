@@ -38,9 +38,14 @@ shards. The shard key defaults to the first primary-key column; `SHARD KEY (...)
 Rows with the same shard key value live on the same shard across tables, so a tenant's `users` and `orders` are
 colocated and a typical transaction touches one shard.
 
-An index that contains the shard key is a plain SQLite index inside each shard. An index that does not contain it
-becomes a **global index**: its entries are placed by the index key, on the same set of shards, and are updated as
-participants of the same transaction. A write to a table with a global index is therefore a cross-shard commit.
+An index is a plain SQLite index inside each shard, whether or not it contains the shard key. A read by an indexed
+column that is not the shard key is sent to every shard, and each shard answers from its own index.
+
+Uniqueness is the exception, because one shard cannot check it. A `UNIQUE` constraint or index that does not contain
+the shard key gets a **global index**: a table of entries (index key, primary key, shard key) placed by the index key
+on the same set of shards and updated as a participant of the same transaction. A write to a table with a global
+index is therefore a cross-shard commit. The global index enforces uniqueness and tells an `INSERT` where the rows
+it may conflict with are; reads are not routed through it.
 
 ## Time and isolation
 
@@ -118,9 +123,14 @@ statement into something else silently.
 
 Whatever a statement reads on a shard is recorded as a *span* and validated at commit: a primary key, a shard-key
 group, a pushed-down condition, or a whole table. The span has to cover everything the shard-side statement can
-read, not just the rows the Worker expects. A statement routed through a global index is sent without pinning the
-shard key, so its span is the pushed-down condition, not the shard keys the index listed. A subquery inside
-`INSERT ... VALUES` is evaluated first, as a read of the transaction, and sent as a constant.
+read, not just the rows the Worker expects. A subquery inside `INSERT ... VALUES` is evaluated first, as a read of
+the transaction, and sent as a constant. In the simulator every statement a shard runs is checked against its spans:
+the rows outside them are deleted and the statement is run again, and a different result fails the test.
+
+An `INSERT` that resolves conflicts itself (`OR IGNORE`, `OR REPLACE`, `ON CONFLICT`) into a table with a global index
+cannot be decided by one shard. The Worker gathers the rows it can conflict with (the same primary key, the same
+`UNIQUE` values, located through the global index) and runs the statement in its own SQLite, so SQLite decides what
+is ignored, replaced or updated.
 
 ## Schema changes
 
@@ -141,8 +151,8 @@ Five rules keep a schema change from tearing a transaction that is under way:
   and a committed one could never be applied after its table or column is gone.
 - A write rechecks the schema version after any wait (a row lock, a group still arriving, the prepare round at the
   anchor), because DDL may have been applied meanwhile.
-- A new global index is written first, backfilled, and only then used for reads. The backfill treats the rows it
-  scanned as read at the scan's timestamp, so commit-time validation rejects an entry for a row that changed since.
+- A new global index is written by every transaction first and backfilled afterwards. The backfill treats the rows
+  it scanned as read at the scan's timestamp, so commit-time validation rejects an entry for a row that changed since.
 - A shard born from a split catches up to its parent's schema before it accepts the parent's rows.
 - A shard that is handing over or receiving a range applies no schema change until the move is finished, and the
   parent catches up to the child's version before it fences the range. Rows and intents in transit then always have
