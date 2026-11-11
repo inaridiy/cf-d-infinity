@@ -43,6 +43,13 @@ export interface UniqueRead {
   values: Value[];
 }
 
+/** 挿入する 1 行の、主キーの値と、UNIQUE の列の値。index があれば、シャードをまたぐ UNIQUE である。 */
+export interface ConflictRow {
+  sk: string;
+  pk: Value[];
+  uniques: (UniqueRead & { index?: GlobalIndexDef })[];
+}
+
 export type Plan =
   | {
       kind: "shard"; route: Route; sql: string; params: Value[]; tables: TableDef[]; pk: string | null;
@@ -64,6 +71,12 @@ export type Plan =
   | { kind: "noop" }
   /** 文を 1 つの取引の中で計画し直す。計画の途中で表を読む必要があるときに返す。 */
   | { kind: "inTxn" }
+  /**
+   * 衝突を自分で解決する INSERT (OR IGNORE、OR REPLACE、ON CONFLICT) を、シャードをまたぐ UNIQUE のある表へ入れる。
+   * 衝突する行は別のシャードにあり得るので、挿入先のシャードの SQLite だけでは解決できない。
+   * 衝突し得る行を Worker に集め、元の文を Worker の SQLite で実行して、SQLite に解決させる。rows は、集める行を決めるための値である。
+   */
+  | { kind: "conflictInsert"; def: TableDef; sql: string; params: Value[]; rows: ConflictRow[]; lastRowid: number | null }
   | { kind: "tcl"; op: "begin" | "commit" | "rollback" | "savepoint" | "release" | "rollbackTo"; name?: string; immediate?: boolean };
 
 export interface PlanContext {
@@ -787,6 +800,10 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   let last: number | null = null;
 
   const outCols = auto && idAt < 0 ? [auto, ...names] : names;
+  // 衝突を自分で解決する文で、表にシャードをまたぐ UNIQUE がある。衝突する行が別のシャードにあり得る。
+  const resolves = /^(REPLACE|INSERT OR (IGNORE|REPLACE))$/.test(keyword) || tailClauses.some((c) => c.type === "upsert_clause");
+  const viaWorker = resolves && def.globalIndexes.length > 0;
+  const conflictRows: ConflictRow[] = [];
   const skAt = def.shardKey.map((c) => outCols.findIndex((n2) => same(n2, c) || (c === "rowid" && ROWID_NAMES.has(lower(n2)))));
   type Built = { sk: string; pk: string | null; sql: string; params: Value[]; uniq: UniqueRead[] | null };
   const built: Built[] = [];
@@ -837,6 +854,23 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
         if (id === undefined) ctx.sawId(def.name, v);
       }
     }
+    if (viaWorker) {
+      const uniques: ConflictRow["uniques"] = [];
+      for (const u of [...def.uniques.map((cols) => ({ cols, index: undefined })), ...def.globalIndexes.map((ix) => ({ cols: ix.columns, index: ix }))]) {
+        const vals: Value[] = [];
+        for (const c of u.cols) {
+          const at = outCols.findIndex((n2) => same(n2, c));
+          // 値を省いた列には、DEFAULT がなければ NULL が入る。NULL はどの行とも衝突しない。
+          // DEFAULT のある列を省くと、入る値がここでは分からないので、衝突する行を集められない。
+          if (at < 0 && (!def.defaults || def.defaults.includes(c))) {
+            throw new SqlError(`unsupported: ${keyword}${tailSql ? " ... ON CONFLICT" : ""} into ${def.name} must give a value for the UNIQUE column ${c}, which has a DEFAULT`);
+          }
+          vals.push(at < 0 ? null : await parts[at]!.value());
+        }
+        uniques.push({ cols: u.cols, values: vals, index: u.index });
+      }
+      conflictRows.push({ sk: encode(skVals), pk: pkVals, uniques });
+    }
     built.push({
       sk: encode(skVals), pk: encode(pkVals), uniq,
       sql: `(${parts.map((p) => p.sql).join(", ")})`, params: parts.flatMap((p) => p.params),
@@ -844,6 +878,13 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   }
 
   const colSql = outCols.length ? ` (${outCols.map((c) => q(ROWID_NAMES.has(lower(c)) ? "rowid" : c)).join(", ")})` : "";
+  if (viaWorker) {
+    return {
+      kind: "conflictInsert", def, rows: conflictRows, lastRowid: last,
+      sql: `${prefix}${colSql} VALUES ${built.map((b) => b.sql).join(", ")}${tailSql ? ` ${tailSql}` : ""}`,
+      params: [...built.flatMap((b) => b.params), ...tailParams],
+    };
+  }
   // シャード単位にまとめる。shard key の値ごとに分けると、主キーでハッシュする表では 1 行 1 RPC になる。
   const groups = new Map<string, Built[]>();
   for (const b of built) {

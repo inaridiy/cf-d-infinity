@@ -88,7 +88,8 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 | 項目 | 差分 |
 |---|---|
 | 外部キー | 強制しない。SQLite の既定と同じである。`PRAGMA foreign_keys = ON` は効かない |
-| `OR REPLACE`、`ON CONFLICT` | PRIMARY KEY には効く。シャードを跨ぐ UNIQUE 列への指定は通常の UNIQUE エラーになる |
+| `INSERT OR IGNORE`、`OR REPLACE`、`ON CONFLICT` | 衝突する行が別のシャードにあっても、SQLite と同じ結果になる。シャードをまたぐ UNIQUE のある表では、衝突し得る行を Worker に集め、元の文を Worker の SQLite で実行して解決させる。DEFAULT のある UNIQUE の列を省いた文は断る (入る値が、行を集める時点で分からない) |
+| `UPDATE OR IGNORE`、`UPDATE OR REPLACE` | 同じシャードの中の衝突は解決する。別のシャードの行との衝突は、`unsupported` で断る |
 | 部分 index、式 index | シャード内の index になる。UNIQUE なら shard key を含む必要がある |
 | 生成列 | 使える。行イメージには値を含めるが、書き戻すときは除き、SQLite に計算させる。主キーや shard key にはできない (SQLite の制限) |
 | 照合順序のある主キー、shard key | `COLLATE NOCASE` と `RTRIM` は、照合順序で等しい値を同じ行、同じシャードとして扱う |

@@ -125,6 +125,7 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
   const collated = new Set<string>();
   const collation: Record<string, string> = {};
   const generated: string[] = [];
+  const defaults: string[] = [];
   let pk: string[] = [];
   const uniqueSets: string[][] = [];
   for (const item of items) {
@@ -146,6 +147,7 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
         collation[col] = ident(c.collation).toUpperCase();
       }
       if (c.type === "constraint_generated") unsupported("generated columns");
+      if (c.type === "constraint_default") defaults.push(col);
     }
   }
   const withoutRowid = (stmt.options?.items ?? stmt.options?.options?.items ?? []).some((o: Node) => /WITHOUT/i.test(text(o)));
@@ -195,6 +197,7 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
     affinity: Object.fromEntries(columns.map((c) => [c, affinityOf(types.get(c) ?? null)])),
     collated: [...collated],
     collation,
+    defaults,
     ...(generated.length ? { generated } : {}),
   };
   const sql = [text(stmt), ...captureDdl(def)];
@@ -359,6 +362,7 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       for (const raw of col.constraints ?? []) {
         const c = inner(raw);
         if (c.type === "constraint_generated") unsupported("generated columns");
+        if (c.type === "constraint_default" && def.defaults) def.defaults.push(added);
         if (c.type !== "constraint_collate") continue;
         def.collated.push(added);
         def.collation[added] = ident(c.collation).toUpperCase();

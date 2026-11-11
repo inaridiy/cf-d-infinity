@@ -61,6 +61,8 @@ export function replay(ddl: string[], history: TxnRecord[]): ReplayReport {
   const lite = new DatabaseSync(":memory:");
   for (const s of ddl) lite.exec(s.replace(/\bSHARD\s+KEY\s*\([^)]*\)/i, ""));
 
+  // 断った文は、確定しなかった取引の中のものも数える。取引の外の文は、断られると確定しないからである。
+  for (const t of history) for (const s of t.statements) if (s.error !== undefined && /^unsupported:/.test(s.error)) count(s.shape, "unsupported");
   const done = history.filter((t) => t.outcome === "committed");
   for (const t of done) if (t.at === undefined) problems.push(`txn ${t.id}: committed without a timestamp (${t.statements.map((s) => s.shape).join(", ")})`);
   // 同じ時刻なら、書き込みが先、読みが後。読みは、その時刻までの確定を全部見る。
@@ -69,10 +71,7 @@ export function replay(ddl: string[], history: TxnRecord[]): ReplayReport {
   for (const t of order) {
     lite.exec("BEGIN");
     for (const s of t.statements) {
-      if (s.error !== undefined && /^unsupported:/.test(s.error)) {
-        count(s.shape, "unsupported");
-        continue;
-      }
+      if (s.error !== undefined && /^unsupported:/.test(s.error)) continue;
       let got: { values?: unknown[][]; error?: string };
       try {
         const st = lite.prepare(s.sql);

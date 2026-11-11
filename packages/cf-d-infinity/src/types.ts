@@ -39,6 +39,11 @@ export interface TableDef {
    * UNIQUE の検査が別の行を読む。どの列が条件に関わるかは追わないので、UPDATE は別の行を読み得るものとして扱う。
    */
   partialUnique?: boolean;
+  /**
+   * DEFAULT のある列。INSERT で値を省いた列に何が入るかを知るのに使う。ここにない列は、省くと NULL になる。
+   * この項目のない古い表定義では、省いた列の値は分からないものとして扱う。
+   */
+  defaults?: string[];
   /** 生成列。値は SQLite が計算するので、行イメージを書き戻すときは除く。 */
   generated?: string[];
   globalIndexes: GlobalIndexDef[];

@@ -268,3 +268,22 @@ Codex は `foundation-3` の 51032ed を読み、型検査と範囲の検査の�
 - 生成器の文のひな形は手書きの 30 種で、表定義は 1 組だけである。表定義の機能の一覧と、分割・DDL・再起動との掛け合わせは、まだない。
 - 応答が失われて結果が分からない取引は、まだ生成していない。
 
+### 2026-11-11 衝突を自分で解決する INSERT を、シャードをまたいで解決する (利用者の指摘)
+
+前の節の 3 で、別のシャードの行との衝突を `unsupported` で断るようにしたが、利用者は「嫌な挙動」と指摘した。そのとおりで、
+普段は通り、衝突が実際に起きたときだけ失敗する。`INSERT OR IGNORE` や UPSERT は、UNIQUE な email のような列で「無ければ作る」ための書き方である。
+調べると、`ON CONFLICT (email) ...` は、シャードの表に UNIQUE (email) がないので、衝突がなくても SQLite のエラーになっていた。
+
+- シャードをまたぐ UNIQUE のある表への、OR IGNORE、OR REPLACE、REPLACE、ON CONFLICT の INSERT は、新しい計画 `conflictInsert` になる (`src/sql/plan.ts`)。
+- 実行 (`Txn.conflictInsert`): 挿入する行と同じ主キーの行、同じ UNIQUE の値を持つ行を集める。シャードをまたぐ UNIQUE は、index を引いて行の場所を知る。
+  集めた行を載せた Worker の SQLite で元の文を実行し、捕捉した行の変更を、行を持つシャードへ振り分ける。既にある `wasmWrite` をそのまま使う。
+  範囲は、集めるための走査と同じ物から作る。文の意味は解釈しない。
+- index の項目は、消すほうを全部済ませてから足す。REPLACE が行を消して同じ値の行を入れるとき、先に足そうとすると衝突する。
+- 表定義に、DEFAULT のある列を記録した (`TableDef.defaults`)。省いた UNIQUE の列は、DEFAULT がなければ NULL で、衝突しない。DEFAULT のある UNIQUE の列を省いた文は断る。
+- `test/conflict-clauses.test.ts`: 文ごとの変更行数と最後の全行を、本物の SQLite と比べる。再生の検査の文のひな形 (OR IGNORE、OR REPLACE、UPSERT) も、断られずに実行され、
+  並行の下で SQLite と一致する。再生の検査は、断った文が 1 つもないことも確かめるようにした。
+- 費用: UNIQUE の値ごとに index を 1 回引く。衝突する行が別のシャードにあれば、シャードをまたぐ確定になる。Worker の SQLite を 1 回開く。計測はしていない。
+- 残り: `UPDATE OR IGNORE` と `UPDATE OR REPLACE` が別のシャードの行と衝突する場合は、断る。
+
+全 436 件と課金行数の検査が通る。
+

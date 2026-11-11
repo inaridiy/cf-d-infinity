@@ -5,7 +5,7 @@ import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isWideSpan, u
 import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, fold, q, selectList } from "../shard/rows";
 import type { Catalog } from "../meta";
 import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
-import { parseStatements, text, type Node, type Params } from "../sql/cst";
+import { normalize, parseStatements, text, type Node, type Params } from "../sql/cst";
 import { findTable, fullScan, planStatement, type Plan, type PlanContext, type Route, type Scan, type WriteTarget } from "../sql/plan";
 import { parseDdl } from "../sql/ddl";
 import { openScratch, ScratchDb } from "../sql/scratch";
@@ -78,7 +78,7 @@ const UNKNOWN_SCHEMA = /^(no such (table|column|index)|table \S+ has no column)/
  * シャードの中の衝突は SQLite が解決する。行が別のシャードにある衝突 (シャードをまたぐ UNIQUE、集めなかった行の主キー) は、
  * ここでは解決できない。SQLite なら行を無視するか置き換える場面なので、UNIQUE 違反ではなく、対応していない文として断る。
  */
-const resolvesConflicts = (sql: string): boolean => /^\s*(INSERT|UPDATE)\s+OR\s+|^\s*REPLACE\b|\bON\s+CONFLICT\b/i.test(sql);
+const resolvesConflicts = (sql: string): boolean => /^\s*(INSERT|UPDATE)\s+OR\s+(IGNORE|REPLACE)\b|^\s*REPLACE\b|\bON\s+CONFLICT\b/i.test(sql);
 const UNRESOLVED = (what: string): string =>
   `unsupported: this statement resolves conflicts itself (OR IGNORE, OR REPLACE or ON CONFLICT), but the conflicting row of ${what} is on another shard`;
 
@@ -515,6 +515,7 @@ export class Txn extends ReadScope {
       case "write": return this.atomically(() => this.write(p));
       case "wasmWrite": return this.atomically(() => this.wasmWrite(p));
       case "insertSelect": return this.atomically(() => this.insertSelect(p));
+      case "conflictInsert": return this.atomically(() => this.conflictInsert(p));
       case "noop":
         return new QueryResult([], []);
       case "ddl":
@@ -557,7 +558,49 @@ export class Txn extends ReadScope {
   }
 
   /** 行を集めて Worker の SQLite で文を実行し、捕捉した行の変更を所有シャードへ振り分ける。 */
-  private async wasmWrite(p: Extract<Plan, { kind: "wasmWrite" }>): Promise<QueryResult> {
+  /**
+   * 衝突を自分で解決する INSERT を、衝突し得る行を集めた Worker の SQLite で実行する。
+   * 集めるのは、挿入する行と同じ主キーの行と、同じ UNIQUE の値を持つ行である。シャードをまたぐ UNIQUE は、index を引いて行の場所を知る。
+   * 無視するか、置き換えるか、書き換えるかは、SQLite が決める。ここでは、文の意味を解釈しない。
+   */
+  private async conflictInsert(p: Extract<Plan, { kind: "conflictInsert" }>): Promise<QueryResult> {
+    const def = p.def;
+    const name = q(def.name);
+    // shard key の値ごとに、集める行の条件をまとめる。1 つの行が 2 つの条件に当たっても、1 回だけ集まる。
+    const wanted = new Map<string, { sql: string; params: Value[] }[]>();
+    const want = (sk: string, cols: string[], vals: Value[]) => {
+      if (vals.some((v) => v === null)) return; // NULL は、どの行とも衝突しない
+      const list = wanted.get(sk) ?? [];
+      wanted.set(sk, list);
+      list.push({ sql: `(${cols.map((c) => `${name}.${q(c)} = ?`).join(" AND ")})`, params: vals });
+    };
+    for (const row of p.rows) {
+      want(row.sk, def.pk, row.pk);
+      for (const u of row.uniques) {
+        if (!u.index) {
+          want(row.sk, u.cols, u.values);
+          continue;
+        }
+        if (u.values.some((v) => v === null)) continue;
+        const k = encode(u.values.map((v, i) => fold(normalize(v, def.affinity[u.cols[i]!] ?? "BLOB"), def.collation[u.cols[i]!])));
+        const sk = encode([k]);
+        const hit = await this.call(ownerOf(this.cat.routing, sk), {
+          sql: `SELECT "pk", "sk" FROM ${q(u.index.table)} WHERE "k" = ?`, params: [k],
+          spans: [rowSpan(u.index.table, encode([k]), sk)],
+        });
+        for (const [pk, at] of hit.values) want(at as string, def.pk, decode<Value[]>(pk as string));
+      }
+    }
+    const scans: Scan[] = [...wanted].map(([sk, list]) => {
+      const where = list.map((c) => c.sql).join(" OR ");
+      const params = list.flatMap((c) => c.params);
+      return { table: def, sql: `SELECT ${selectList(def)} FROM ${name} WHERE ${where}`, params, sks: [sk], where: { alias: def.name, sql: where, params } };
+    });
+    const r = await this.wasmWrite({ kind: "wasmWrite", scans, sql: p.sql, params: p.params, tables: [def] }, true);
+    return new QueryResult(r.columns, r.values, r.changes, p.lastRowid ?? r.lastInsertRowid);
+  }
+
+  private async wasmWrite(p: Extract<Plan, { kind: "wasmWrite" }>, conflictsGathered = false): Promise<QueryResult> {
     const w = await this.gather(p.scans, p.sql);
     try {
       const catalog = (t: string) => {
@@ -573,8 +616,12 @@ export class Txn extends ReadScope {
       w.exec(`INSERT INTO __cap_on VALUES (1)`);
       const r = w.raw(p.sql, ...p.params);
       const last = w.raw(`SELECT last_insert_rowid()`).values[0]?.[0] as number;
+      // 変更した行の数は、SQLite の数え方に合わせる。REPLACE が消した行は数えない。
+      const counted = conflictsGathered ? (w.raw(`SELECT changes()`).values[0]?.[0] as number) : null;
       const changes = capturedChanges(w, catalog);
-      const soft = resolvesConflicts(p.sql);
+      // 衝突し得る行を集めてあれば、文は自分の衝突を解決し終えている。それでも残る衝突 (DO UPDATE が書いた値が、別の行と衝突するなど) は、
+      // SQLite でも UNIQUE 違反である。集めていない文が、別のシャードの行と衝突したら、解決できなかったものとして断る。
+      const soft = !conflictsGathered && resolvesConflicts(p.sql);
       for (const c of changes) {
         if (c.before === null) await this.assertAbsent(catalog(c.table), c, soft);
         this.buffer(ownerOf(this.cat.routing, c.sk), c);
@@ -583,7 +630,7 @@ export class Txn extends ReadScope {
         if (typeof id === "number") this.db.planContext(this.cat).sawId(def.name, id);
       }
       await this.indexChanges(changes, soft);
-      const target = changes.filter((c) => c.table === p.tables[0]?.name).length;
+      const target = counted ?? changes.filter((c) => c.table === p.tables[0]?.name).length;
       return new QueryResult(r.columns, r.values, target, last || null);
     } finally {
       w.close();
@@ -621,6 +668,7 @@ export class Txn extends ReadScope {
 
   /** グローバル index を同じ取引の参加者として更新する。 */
   private async indexChanges(changes: Change[], soft = false): Promise<void> {
+    const adds: { def: TableDef; ix: GlobalIndexDef; k: string; c: Change }[] = [];
     for (const c of changes) {
       const def = this.cat.tables[c.table];
       for (const ix of def?.globalIndexes ?? []) {
@@ -633,11 +681,14 @@ export class Txn extends ReadScope {
         const newK = keyOf(c.after);
         if (oldK === newK) continue;
         if (oldK !== null) this.indexWrite(ix, { k: oldK, pk: c.pk, sk: c.sk }, true);
-        if (newK !== null) {
-          if (ix.unique) await this.assertUnique(def!, ix, newK, c.pk, soft);
-          this.indexWrite(ix, { k: newK, pk: c.pk, sk: c.sk }, false);
-        }
+        if (newK !== null) adds.push({ def: def!, ix, k: newK, c });
       }
+    }
+    // 項目を消すほうを全部済ませてから、足す。1 つの文が、ある行を消して同じ値の行を入れる (REPLACE) とき、
+    // 先に足そうとすると、消える行の項目と衝突する。
+    for (const a of adds) {
+      if (a.ix.unique) await this.assertUnique(a.def, a.ix, a.k, a.c.pk, soft);
+      this.indexWrite(a.ix, { k: a.k, pk: a.c.pk, sk: a.c.sk }, false);
     }
   }
 

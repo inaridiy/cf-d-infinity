@@ -186,12 +186,11 @@ describe("statement replay against one SQLite, under concurrency", () => {
     }, 120_000);
   }
 
-  it("exercises every statement shape: each one succeeded in committed transactions, or is refused as unsupported every time", () => {
+  it("exercises every statement shape: each one succeeded in committed transactions, and none was refused", () => {
     // 断れば合格、で検査が空にならないようにする。対応している形は、確定した取引の中で成功した実行が要る。
-    const thin = NAMES.filter((k) => {
-      const t = total[k] ?? { ok: 0, error: 0, unsupported: 0 };
-      return t.ok < 5 && !(t.unsupported > 0 && t.ok === 0);
-    });
+    const thin = NAMES.filter((k) => (total[k]?.ok ?? 0) < 5);
     expect(thin).toEqual([]);
+    // この表定義と文のひな形には、断る理由のあるものがない。断った文があれば、対応が抜けている。
+    expect(NAMES.filter((k) => (total[k]?.unsupported ?? 0) > 0)).toEqual([]);
   });
 });
