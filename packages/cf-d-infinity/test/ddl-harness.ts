@@ -506,6 +506,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   /** 乱数はここで全部引く。取引の本体はリトライで再実行されるので、乱数を引かない。 */
   const plan = (): {
     mode: "txn" | "pess" | "slow" | "autoUpdate" | "autoInsert" | "vread"; p: Plan; x: { t: number; i: number }; n: number; v: number | null; extra: boolean;
+    readOnly: boolean;
   } => {
     const name = `w${++seq}`;
     const n = seq * 10;
@@ -554,11 +555,15 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
     };
     const body = kind < 0.12 ? "read" : kind < 0.32 ? "one" : kind < 0.55 ? "two" : kind < 0.65 ? "del" : "one";
     const usesSide = side && (body === "one" || body === "two") && (mode === "txn" || mode === "pess" || mode === "slow");
-    return { mode, p: { name, body: bodies[body]!, side: usesSide ? side : undefined }, x: a, n, v: va, extra };
+    return { mode, p: { name, body: bodies[body]!, side: usesSide ? side : undefined }, x: a, n, v: va, extra, readOnly: mode === "vread" || body === "read" };
   };
 
-  const one = async (db: Db) => {
-    const { mode, p, x, n, v, extra } = plan();
+  /** シャードをまたぐ UNIQUE の index が、一度でも公開されたか。 */
+  let everUnique = false;
+  /** note には、この操作が読むだけかを渡す。UNIQUE の誤りを分類するのに使う。 */
+  const one = async (db: Db, note: (readOnly: boolean) => void) => {
+    const { mode, p, x, n, v, extra, readOnly: ro } = plan();
+    note(ro);
     const begun = env.tick();
     const w1 = (): Writes => Object.assign([{ key: k(x), value: n }], { v: [v] });
     if (mode === "vread") {
@@ -615,14 +620,23 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
       if (rnd() < 0.1) db = client();
       while (paused) await c.sleep(1);
       active++;
+      let readOnly = false;
       try {
-        await one(db);
+        await one(db, (ro) => (readOnly = ro));
       } catch (e) {
         const m = e instanceof Error ? e.message : String(e);
         if (SCHEMA_ERR.test(m)) db = client(); // 古い表定義を捨てる。利用者のリトライに当たる。
         const sideGone = /no such table: (main\.)?(side|__gidx_)/.test(m);
         const extraUnknown = /extra/.test(m) && SCHEMA_ERR.test(m);
-        if (!(EXPECTED.test(m) || /UNIQUE constraint failed/.test(m) || sideGone || extraUnknown)) errors.push(m);
+        // UNIQUE の誤りは、書き込みだけが受け取ってよい。主キーの衝突はいつでも起きる。v の衝突は、v の UNIQUE の index が
+        // 公開された後だけである。作っている最中の index と、取り消された index は、どの文の結果も変えてはならない。
+        // 読みが UNIQUE で失敗するのは、どの場合も誤りである。
+        let uniqueOk = false;
+        if (/UNIQUE constraint failed/.test(m) && !readOnly) {
+          everUnique ||= ((await c.catalog()).tables.acct?.globalIndexes.length ?? 0) > 0;
+          uniqueOk = /acct\.tenant_id, acct\.id/.test(m) || everUnique;
+        }
+        if (!(EXPECTED.test(m) || uniqueOk || sideGone || extraUnknown)) errors.push(readOnly && /UNIQUE/.test(m) ? `a read failed: ${m}` : m);
       } finally {
         active--;
         done++;
