@@ -9,9 +9,6 @@
 // 新しい取引になる (MySQL と同じ。持ち主の決定、2026-11-11。specs/m13_txn_schema_boundary.qnt)。batch も DDL の位置で区切る。
 //
 // ここでは、本物の Drizzle の移行と @libsql/client を、シミュレータにつないで流す。
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { drizzle as drizzleD1 } from "drizzle-orm/d1";
 import { migrate as migrateD1 } from "drizzle-orm/d1/migrator";
 import { drizzle } from "drizzle-orm/libsql";
@@ -21,39 +18,9 @@ import { drizzleMigrationsTable } from "../src/binding";
 import { D1Compatible } from "../src/client/d1";
 import { Db, type ClientFaults } from "../src/client/db";
 import { handlePipeline, type PipelineReq } from "../src/client/hrana";
+import { ADD, INIT, REBUILD, migrations } from "./drizzle-fixtures";
 import { clientOf } from "./libsql";
 import { SimCluster } from "./sim";
-
-/** drizzle-kit が書き出す形の移行の置き場を作る。 */
-function migrations(list: { tag: string; sql: string[] }[]): string {
-  const dir = mkdtempSync(join(tmpdir(), "dinf-drizzle-"));
-  mkdirSync(join(dir, "meta"));
-  list.forEach((m) => writeFileSync(join(dir, `${m.tag}.sql`), m.sql.join("\n--> statement-breakpoint\n")));
-  const entries = list.map((m, i) => ({ idx: i, version: "6", when: 1_700_000_000_000 + i * 1000, tag: m.tag, breakpoints: true }));
-  writeFileSync(join(dir, "meta", "_journal.json"), JSON.stringify({ version: "7", dialect: "sqlite", entries }));
-  return dir;
-}
-
-const INIT = {
-  tag: "0000_init",
-  sql: [
-    "CREATE TABLE `users` (`id` integer PRIMARY KEY NOT NULL, `email` text NOT NULL, `name` text);",
-    "CREATE TABLE `posts` (`id` integer PRIMARY KEY NOT NULL, `user_id` integer NOT NULL, `title` text NOT NULL);",
-  ],
-};
-const ADD = { tag: "0001_add_age", sql: ["ALTER TABLE `users` ADD `age` integer;"] };
-// drizzle-kit が、列の制約を変えるときに作る形 (SQLite は ALTER COLUMN を持たない)。
-const REBUILD = {
-  tag: "0002_name_not_null",
-  sql: [
-    "PRAGMA foreign_keys=OFF;",
-    "CREATE TABLE `__new_users` (`id` integer PRIMARY KEY NOT NULL, `email` text NOT NULL, `name` text DEFAULT '' NOT NULL, `age` integer);",
-    "INSERT INTO `__new_users`(\"id\", \"email\", \"name\", \"age\") SELECT \"id\", \"email\", coalesce(\"name\", ''), \"age\" FROM `users`;",
-    "DROP TABLE `users`;",
-    "ALTER TABLE `__new_users` RENAME TO `users`;",
-    "PRAGMA foreign_keys=ON;",
-  ],
-};
 
 const outcome = (p: Promise<unknown>) => p.then(() => "ok", (e: Error) => e.message);
 
@@ -93,6 +60,9 @@ describe("Drizzle's libSQL migrator", () => {
       { id: 3, email: "c@x", name: "C", age: null },
     ]);
     expect((await client.execute("SELECT hash FROM __drizzle_migrations")).rows.length).toBe(3);
+    // 作り直した index が、行を全部持って公開され、重複を断る。
+    expect((await c.catalog()).tables.users!.globalIndexes.map((g) => g.name)).toEqual(["users_email_unique"]);
+    expect(await outcome(client.execute("INSERT INTO users(id, email, name) VALUES (9, 'b@x', 'B')"))).toMatch(/UNIQUE constraint failed/);
   });
 });
 
@@ -106,6 +76,7 @@ describe("Drizzle's D1 migrator", () => {
     expect(await outcome(migrateD1(drizzleD1(d1 as never), { migrationsFolder: migrations([INIT, ADD, REBUILD]) }))).toBe("ok");
     expect((await d1.prepare("SELECT id, email, name, age FROM users").all()).results).toEqual([{ id: 1, email: "a@x", name: "", age: 30 }]);
     expect((await d1.prepare("SELECT count(*) AS n FROM __drizzle_migrations").first("n"))).toBe(3);
+    expect(await outcome(d1.prepare("INSERT INTO users(id, email, name) VALUES (9, 'a@x', 'B')").run())).toMatch(/UNIQUE constraint failed/);
   });
 
   it("keeps a batch without schema changes all or nothing", async () => {

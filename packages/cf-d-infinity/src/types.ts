@@ -48,6 +48,11 @@ export interface TableDef {
    * 公開されると globalIndexes へ移り、取り消されると消える。
    */
   building?: GlobalIndexDef;
+  /**
+   * 表定義の変更が、この表への書き込みを止めている理由。取引が読んだ表を DROP する前に掛ける (specs/m14_rebuild_guard.qnt)。
+   * 掛けた版の次の版が、その DROP か、取り消しである。
+   */
+  locked?: string;
 }
 
 export type Affinity = "INTEGER" | "REAL" | "NUMERIC" | "TEXT" | "BLOB";
@@ -214,6 +219,11 @@ export interface ShardApi {
   commit(req: CommitReq): Promise<CommitRes>;
   prepare(req: PrepareReq): Promise<PrepareRes>;
   refresh(req: { txn: string; spans: Span[]; from: Ts; to: Ts }): Promise<{ ok: boolean; reason?: string }>;
+  /**
+   * 表を消す前の確認。schema の版 (表の書き込み禁止) を適用した後で、spans に from より後の変更も intent もないかを答える。
+   * from は、取引がその範囲を読んだ時刻である。読みの要求が時刻を運ぶので、このシャードは from を見ている。
+   */
+  unchanged(req: { spans: Span[]; from: Ts; schema: number }): Promise<{ ok: boolean; reason?: string }>;
   /** groups は移動先への転送で使う。未到着ならそのグループを先に引き取る。 */
   finalize(req: { txn: string; c: Ts; groups?: string[] }): Promise<void>;
   abort(req: { txn: string; groups?: string[] }): Promise<void>;

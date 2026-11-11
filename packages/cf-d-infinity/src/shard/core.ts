@@ -1595,8 +1595,9 @@ export class ShardCore implements ShardApi {
   private assertUnlocked(writes: Pick<Change, "table">[]): void {
     if (this.faults.ignoreTableLock) return;
     for (const w of writes) {
-      const building = this.defs.get(w.table)?.building;
-      if (building) throw new TableLocked(w.table, `CREATE INDEX ${building.name}`);
+      const def = this.defs.get(w.table);
+      if (def?.building) throw new TableLocked(w.table, `CREATE INDEX ${def.building.name}`);
+      if (def?.locked) throw new TableLocked(w.table, def.locked);
     }
   }
 
@@ -1733,6 +1734,26 @@ export class ShardCore implements ShardApi {
       if (this.faults.ignoreIntentsInValidation) continue;
       const hit = this.overlapping([s], req.to).find((i) => i.txn !== req.txn);
       if (hit) return { ok: false, reason: `refresh: intent ${hit.txn}` };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * 表を消す前の確認 (Db の guardedDrop、specs/m14_rebuild_guard.qnt)。
+   * 先に、表を書き込み禁止にする版を適用する。適用の前に intent を全部決着させ、適用の後は、その表への書き込みを断る。
+   * だから、ここで変更がなければ、表を消すまで、読んだ範囲は変わらない。
+   */
+  async unchanged(req: { spans: Span[]; from: Ts; schema: number }): Promise<{ ok: boolean; reason?: string }> {
+    try {
+      await this.ensureSchema(req.schema);
+      this.assertOwned(req.spans, [], req.from);
+    } catch (e) {
+      return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+    }
+    for (const s of req.spans) {
+      if (this.changedSince(s, Math.max(req.from, s.since ?? 0))) return { ok: false, reason: `${s.table} changed after it was read` };
+      const hit = this.overlapping([s], Number.MAX_SAFE_INTEGER)[0];
+      if (hit) return { ok: false, reason: `${s.table} has a pending write of ${hit.txn}` };
     }
     return { ok: true };
   }

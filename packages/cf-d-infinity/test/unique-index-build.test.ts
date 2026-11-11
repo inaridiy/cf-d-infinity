@@ -30,7 +30,7 @@ describe("CREATE UNIQUE INDEX on a table that already has duplicate values, whil
     const paused = hold(c, "gate", (m) => m.from === "client" && m.method === "exec" && /FROM "t"\s+ORDER BY/.test((m.req as { sql: string }).sql) && ++scans === 2);
     // 作る側の延長は、この試験の都合で止めておく。作る側が要求の途中で止まった (Worker が落ちた) のと同じになる。
     // 延長が続く場合は、下の「a build that keeps renewing」が確かめる。
-    const builder = new Db(Object.assign(Object.create(c) as SimCluster, { renewBuild: () => new Promise<{ leaseMs: number }>(() => {}) }));
+    const builder = new Db(Object.assign(Object.create(c) as SimCluster, { renewLock: () => new Promise<{ leaseMs: number }>(() => {}) }));
     const ddl = builder.ddl("CREATE UNIQUE INDEX u ON t(v)").then(() => "ok", (e: Error) => e.message);
     await paused.reached;
     const original = [{ tenant_id: A, id: 1, v: 7 }, { tenant_id: A, id: 2, v: 8 }, { tenant_id: B, id: 1, v: 7 }, { tenant_id: B, id: 2, v: 8 }];

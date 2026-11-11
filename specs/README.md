@@ -84,6 +84,8 @@ red と green は同じ core モジュールを `const` フラグで切り替え
 | M12 `m12_clock_red_no_clock` / `_skip_empty` | `publishIsAPoint` | 公開の版が時刻を運ばない / 行のないシャードを読まない | 反例 | 反例は 13 / 9 状態 | 反例 (2 本とも) |
 | M13 `m13_green` | `boundarySafe` (= prefixOfScript ∧ pinned ∧ ownDdlVisible ∧ completeWhenOk) | 1 つの接続の文 (書き込み、DDL、書き込み、DDL、書き込み、COMMIT)、別の接続の DDL 1 回、確定の競合、1 度のやり直し | 52 | 10 | No violation |
 | M13 `m13_red_main` / `_pin_only` / `_repin` / `_retry_whole` / `_ddl_anyway` | `prefixOfScript` / `ownDdlVisible` / `pinned` / `prefixOfScript` / `prefixOfScript` | 決めた設計から条件を 1 つずつ外す (`_main` は 2026-11 までの実装) | 反例 | 反例は 4 / 5 / 11 / 10 / 10 手 | 反例 (5 本すべて) |
+| M14 `m14_green` | `guardSafe` (= noLostWrite ∧ oneExit) | 古い表の行を持つシャード 2、別の接続の書き込み 2 回 (prepare と確定)、時計 0〜5、禁止の期限切れあり | 92,634 | 20 | No violation |
+| M14 `m14_red_no_lock` / `_no_check` / `_check_early` / `_no_drain` / `_untied` / `_commit_ts` | `noLostWrite` | 決めた設計から条件を 1 つずつ外す | 反例 | 反例は 15 / 11 / 14 / 14 / 17 / 15 手 | 反例 (6 本すべて) |
 
 witness (vacuous でないことの確認。`not(到達したい状態)` を invariant にして違反 = 到達可能):
 
@@ -112,6 +114,7 @@ witness (vacuous でないことの確認。`not(到達したい状態)` を inv
 | M12 | `witnessRefusedByLock` (`m12_green_shard_only`) | 作っている最中の版で計画された書き込みを、シャードが断る |
 | M12 | `witnessAwareOnSlowShard` (`m12_clock_green`) | 時計の遅いシャードが公開の版を適用し、そこで index を使う文が、別のシャードの古い書き込みを全部見る |
 | M13 | `witnessRetriedAndDone` / `witnessOtherDdlThenDone` | 確定を断られた区切りをやり直して最後まで進む / 別の接続の DDL の後で最後まで進む |
+| M14 | `witnessDroppedAfterWrites` / `witnessRefusedByCheck` | 別の接続の書き込みの後で DROP まで進む / copy の後の書き込みを見つけて禁止を取り消す |
 
 ## 新しく見つかった設計バグ (M1、green が破れた)
 
@@ -433,6 +436,29 @@ invariant は 4 つである。
 
 モデルにないもの。シャードが古い版の計画を断ることは前提にした (M11)。区切りの中の取引の直列可能性は M1 と M9 に任せた。
 取引の中で表を作り直すとき、行を写した区切りの確定から古い表を消すまでの間に、別の接続が古い表へ書いた行は消える。MySQL と同じで、この設計の範囲の外である。
+
+### M14 `m14_rebuild_guard.qnt` — 取引の中で表を作り直すとき、別の接続の書き込みを失わない
+
+2026-11-11 に書いた。表を作り直す移行 (新しい表を作る、行を写す、古い表を消す、名前を変える) は、DDL の前に取引を確定するので (M13)、行を写す区切り (copy) の確定と、古い表の DROP の間に、古い表を守るものがない。
+
+決めた設計は、取引が読んだ表を DROP するとき、次の順に進む。
+
+1. copy の区切りは、いままでどおり確定する。
+2. Meta が、古い表を書き込み禁止にする版を記録する (index の作成と同じ枠と期限)。
+3. 各シャードは、その版を適用した後で、copy が読んだ範囲に、copy の読んだ時刻より後の変更がないかを確かめる。
+4. 全シャードで変更がなければ、Meta が DROP を、禁止の唯一の終わり方として記録する。変更があれば、禁止を取り消し、DDL を競合として失敗させる。
+
+禁止を先に掛けてから copy を確定する順にはできない。禁止の版が先にシャードへ届くと、copy の区切りが名乗る版が古くなり、シャードが断るからである (M13 の版の固定)。
+このため、copy と同時に書き込みがあると、行は失われないが、移行が失敗し、作りかけの新しい表が残る。
+
+| 外した条件 | インスタンス | 反例 |
+|---|---|---|
+| 禁止の版を適用したシャードは、古い表への書き込みを断る | `m14_red_no_lock` | 確かめた後、DROP までの間の書き込みが消える |
+| DROP の前に確かめる | `m14_red_no_check` | copy の確定から禁止までの間の書き込みが消える |
+| 確かめるのは、禁止の版を適用した後 | `m14_red_check_early` | 確かめた後、禁止の版を適用するまでの間の書き込みが消える |
+| 禁止の版を適用する前に intent を決着させる | `m14_red_no_drain` | 禁止の前に prepare した書き込みが、確かめた後で確定する |
+| DROP は禁止の唯一の終わり方 | `m14_red_untied` | 期限切れで禁止が解けた後に、DROP が通る |
+| copy の読んだ時刻と比べる | `m14_red_commit_ts` | copy の確定の時刻を見ていないシャードで、それより小さい時刻の書き込みを見逃す |
 
 ### M5b `m5b_live_migration.qnt` — pull 型ライブ再構成 (S2 + S3)
 

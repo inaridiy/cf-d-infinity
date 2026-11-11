@@ -435,8 +435,14 @@ export class SimCluster implements Cluster {
   revokeDdl(version: number, reason: string) {
     return this.meta.revokeDdl(version, reason);
   }
-  renewBuild(version: number) {
-    return this.meta.renewBuild(version);
+  renewLock(version: number) {
+    return this.meta.renewLock(version);
+  }
+  lockTables(tables: string[], basedOn?: number) {
+    return this.meta.lockTables(tables, basedOn);
+  }
+  finishLock(version: number, sql: string) {
+    return this.meta.finishLock(version, sql);
   }
   allocate(table: string, n: number, min?: number) {
     return this.meta.allocate(table, n, min);

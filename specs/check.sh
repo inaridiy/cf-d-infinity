@@ -222,6 +222,18 @@ witness $f m13_green witnessOtherDdlThenDone
 tests   $f m13_green
 tests   $f m13_red_main
 
+echo "== M14 取引の中で表を作り直すとき、別の接続の書き込みを失わない"
+f=m14_rebuild_guard.qnt
+green   $f m14_green guardSafe
+red     $f m14_red_no_lock noLostWrite        # 確かめるが禁止しない
+red     $f m14_red_no_check noLostWrite       # 禁止するが確かめない
+red     $f m14_red_check_early noLostWrite    # 禁止の版を適用する前に確かめる
+red     $f m14_red_no_drain noLostWrite       # intent を決着させずに禁止の版を適用する
+red     $f m14_red_untied noLostWrite         # DROP が禁止と結び付いていない (期限切れの後に通る)
+red     $f m14_red_commit_ts noLostWrite      # copy の確定の時刻と比べる
+witness $f m14_green witnessDroppedAfterWrites
+witness $f m14_green witnessRefusedByCheck
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect

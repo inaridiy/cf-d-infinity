@@ -23,7 +23,9 @@ function capped(c: SimCluster, limit: number): { cluster: Cluster; used: () => n
     applyDdl: async (sql, basedOn) => (hit(), c.applyDdl(sql, basedOn)),
     publishIndex: async (t, name, version, at) => (hit(), c.publishIndex(t, name, version, at)),
     revokeDdl: async (version, reason) => (hit(), c.revokeDdl(version, reason)),
-    renewBuild: async (version) => (hit(), c.renewBuild(version)),
+    renewLock: async (version) => (hit(), c.renewLock(version)),
+    lockTables: async (tables, basedOn) => (hit(), c.lockTables(tables, basedOn)),
+    finishLock: async (version, sql) => (hit(), c.finishLock(version, sql)),
     allocate: async (t, k, min) => (hit(), c.allocate(t, k, min)),
     switchRange: async (m) => (hit(), c.switchRange(m)),
   };
