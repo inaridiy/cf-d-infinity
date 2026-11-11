@@ -75,6 +75,13 @@ red と green は同じ core モジュールを `const` フラグで切り替え
 | M11 `m11_impl` | `schemaSafe` | 実装どおり (修正案を 5 つとも外す)、取引 2 件 | 約 15 万で反例 | 反例は 12 状態 | 反例 (実装の欠陥) |
 | M11 `m11_impl_wait` / `_inflight` / `_backfill` / `_chunk` / `_drop` | `schemaSafe` | 修正案を 1 つずつ外す、取引 1 件 | 各 約 700〜3,900 で反例 | 反例は 12 / 13 / 11 / 12 / 8 状態 | 反例 (5 本すべて、実装の欠陥) |
 | M11 `m11_red_no_reject` / `_early_public` / `_no_write_only` / `_no_sync` | `schemaSafe` | 実装にある防御を 1 つずつ外す、取引 1 件 | 各 約 80〜3,000 で反例 | 反例は 12 / 3 / 11 / 7 状態 | 反例 (4 本すべて) |
+| M12 `m12_green` | `buildSafe` (= indexMatches ∧ noWriteWhileLocked ∧ notRelied ∧ oneExit ∧ noIntentWhileLocked) | 行 2 (シャード 2)、値 0〜2 (最初の値は任意、重複あり)、取引 2 件、DDL は CREATE UNIQUE INDEX 1 本、期限切れあり | 50,428 (生成 174,301、1 s) | 13 | No violation |
+| M12 `m12_green_shard_only` | `buildSafe` | 同上、Worker は先に断らない | 99,418 (生成 365,322、1 s) | 13 | No violation |
+| M12 `m12_red_online` | `indexMatches` / `notRelied` | 2026-11 までの設計 (作りながら書く) | 反例 | 反例は 11 / 4 状態 | 反例 (実装の欠陥) |
+| M12 `m12_red_repin` | `indexMatches` | 取引が、計画し直さずに新しい版を名乗る | 反例 | 反例は 12 状態 | 反例 (実装の欠陥) |
+| M12 `m12_red_no_lock` / `_visible` / `_no_drain` / `_stale` / `_two_exits` / `_scan_early` | `indexMatches` / `notRelied` / `noWriteWhileLocked` / `indexMatches` / `oneExit` / `indexMatches` | 決めた設計から条件を 1 つずつ外す | 反例 | 反例は 10 / 3 / 6 / 11 / 7 / 8 状態 | 反例 (6 本すべて) |
+| M12 `m12_clock_green` | `publishIsAPoint` | シャード 2、時計 0〜3、index を使わない書き込みと使う文、公開の版が時刻を運ぶ | 1,788 (生成 5,213、1 s) | 15 | No violation |
+| M12 `m12_clock_red_no_clock` / `_skip_empty` | `publishIsAPoint` | 公開の版が時刻を運ばない / 行のないシャードを読まない | 反例 | 反例は 13 / 9 状態 | 反例 (2 本とも) |
 | M13 `m13_green` | `boundarySafe` (= prefixOfScript ∧ pinned ∧ ownDdlVisible ∧ completeWhenOk) | 1 つの接続の文 (書き込み、DDL、書き込み、DDL、書き込み、COMMIT)、別の接続の DDL 1 回、確定の競合、1 度のやり直し | 52 | 10 | No violation |
 | M13 `m13_red_main` / `_pin_only` / `_repin` / `_retry_whole` / `_ddl_anyway` | `prefixOfScript` / `ownDdlVisible` / `pinned` / `prefixOfScript` / `prefixOfScript` | 決めた設計から条件を 1 つずつ外す (`_main` は 2026-11 までの実装) | 反例 | 反例は 4 / 5 / 11 / 10 / 10 手 | 反例 (5 本すべて) |
 
@@ -100,6 +107,10 @@ witness (vacuous でないことの確認。`not(到達したい状態)` を inv
 | M11 | `witnessCrossDuringDdl` | 2PC の取引が DDL の途中で確定し、両方のシャードに適用された後で public になる |
 | M11 | `witnessUniqueFailed` / `witnessUniquePublic` | 重複があって UNIQUE index の作成が失敗する。重複がなければ 2 行を持って public になる |
 | M11 | `witnessRecreateWritten` | 表を作り直した後に書いた行が残る |
+| M12 | `witnessPublicThenWrite` | index が公開された後で、index を使う書き込みが 2 件確定し、2 行とも値と項目を持つ |
+| M12 | `witnessWithdrawnOnDuplicate` | 最初から同じ値の行が 2 つあり、index の作成が取り消される |
+| M12 | `witnessRefusedByLock` (`m12_green_shard_only`) | 作っている最中の版で計画された書き込みを、シャードが断る |
+| M12 | `witnessAwareOnSlowShard` (`m12_clock_green`) | 時計の遅いシャードが公開の版を適用し、そこで index を使う文が、別のシャードの古い書き込みを全部見る |
 | M13 | `witnessRetriedAndDone` / `witnessOtherDdlThenDone` | 確定を断られた区切りをやり直して最後まで進む / 別の接続の DDL の後で最後まで進む |
 
 ## 新しく見つかった設計バグ (M1、green が破れた)
@@ -322,6 +333,78 @@ backfill の読みが新しい版の要求なので、読まれたシャード�
 このほか、分割と DDL の並行 (BUG-6) と、index で引いた読み取りの span の不足 (BUG-7) はテストで見つけたが、このモデルにはない。
 シャードの数と範囲表が固定で、読み取りの取引がないからである。
 
+### M12 `m12_unique_index_build.qnt` — 行のある表に、シャードをまたぐ UNIQUE の index を作る
+
+2026-11-11 に書いた。M11 が通っているのに、実装は index を壊した (`test/ddl-concurrent.test.ts` の seed 100 と 364、`test/open/unique-index-build.test.ts`)。
+M11 は index を (値, 行) の組の集合として持ち、項目を消すときに行を名指しする。
+実装の index は値を主キーにした 1 行で、行が値を手放すと、その値の項目を、誰のものかを確かめずに消す。
+M12 は index を実装と同じ形で持つ。
+
+比べるのは 2 つの作り方である。
+
+- **作りながら書く** (2026-11 までの設計、`m12_red_online`)：index を記録した時点から、取引が index を保守し、一意性を index で確かめる。既存の行の項目は後から埋める。
+- **書き込みを止めて作る** (決めた設計、`m12_green`)：index を記録する版が、表を書き込み禁止にする。出来上がるまで、index は Worker の計画から見えない。既存の行を、止まった状態で埋める。
+
+`m12_red_online` の反例は seed 364 と同じ形になる。
+2 行が同じ値 k を持つ。片方の行の項目を埋めた後で、もう片方の行が k を手放し、k の項目 (他人のもの) を消す。
+index は公開され、k を持つ行に項目がない。
+
+invariant は 5 つである。
+
+- `indexMatches`: 公開された index は、値を持つ行のすべてについて、その行を指す項目を持ち、行のない項目を持たない。
+- `noWriteWhileLocked`: 書き込み禁止の版にいるシャードで、行の書き込みが確定しない。
+- `notRelied`: 出来上がっていない index を、文が使わない (一意性の確認にも、項目の保守にも)。
+- `oneExit`: 終わり方は、公開か取り消しのどちらか 1 回だけである。
+- `noIntentWhileLocked`: 書き込み禁止の版にいるシャードに、その表の intent がない。
+
+禁止が必ず解けることは、時相の性質としては検査していない。
+代わりに、解くための 2 つの遷移がいつでも起きられることを示した。
+期限切れ (`expire`) の条件は「作っている最中である」だけで、Meta が自分で起こす。
+終わった版の適用 (`applyVer`) の条件は「そのシャードに intent がない」で、これは `noIntentWhileLocked` が保証する。
+
+決めた設計は、次の条件の上に立つ。1 つ外すと反例が出る。
+
+| 条件 (定数) | 外したインスタンス | 反例 | 実装 |
+|---|---|---|---|
+| シャードが、作っている間、表への書き込みを断る (`SHARD_LOCK`) | `m12_red_no_lock` | 行を埋めた後でその行が変わり、項目が古いまま公開される | これから入れる |
+| 作っている最中の index を、計画が使わない (`BUILD_VISIBLE` が false) | `m12_red_visible` | 書き込みは確定しないが、文が、出来上がっていない index による UNIQUE 違反を受け取る | これから入れる |
+| シャードは、版を進める前に intent を決着させる (`DRAIN_INTENTS`) | `m12_red_no_drain` | 禁止の前に prepare した取引が、行を埋めた後で確定する | ある (M11 の修正案) |
+| シャードは、自分より古い版の計画を断る (`REJECT_STALE`) | `m12_red_stale` | index を知らない計画が、公開の後で確定する | ある |
+| 公開と取り消しは、最新の版が「作っている最中」のときだけ起きる (`ONE_EXIT`) | `m12_red_two_exits` | 期限切れで取り消した後に、遅れてきた公開が通る | これから入れる (Meta は版の比較で断るが、やり直しが通り抜ける) |
+| 取引は、書き込みを計画した版を、確定まで持ち続ける (`PIN_VERSION`) | `m12_red_repin` | index を知らない計画が、公開の後の版を名乗って確定する | **守られていなかった** (`test/open/txn-across-schema-change.test.ts`) |
+| 行を埋める処理が読むシャードは、index を記録した版を適用してから答える (`SCAN_AT_VERSION`) | `m12_red_scan_early` | 読んだ後で、まだ書き込みを止めていないシャードの行が変わる | ある (読む要求が版を名乗る) |
+
+`PIN_VERSION` は、モデルを実装と突き合わせて見つけた。
+`REJECT_STALE` は「要求が名乗る版は、その計画に使った版である」ことを前提にする。
+実装では、接続をまたぐ取引 (Hrana の baton) と、知らない表を読んだ後の取引が、溜めた書き込みを計画し直さずに、新しい版を名乗っていた。
+これは index の作り方とは無関係で、取引の途中に DDL が挟まれば起きる。
+
+守っているのはシャードである。
+`m12_green_shard_only` は、Worker が先に断らなくても成り立つ。
+逆に、すべての Worker が先に断るなら (`m12_green`)、シャードが禁止を理由に断る場面は起きない (`witnessRefusedByLock` に到達しない)。
+古い版の計画は `REJECT_STALE` が断り、作っている最中の版の計画は Worker が出さないからである。
+それでもシャードに置くのは、書き込みが必ず通る場所がシャードの 1 箇所だけだからで、Worker の経路が増えても確認が漏れない。
+
+公開の時刻は、別の小さなモデル (`m12_clock_*`) で扱う。
+取引の直列な順序は時刻の順である。index の公開は文の意味を変える (UNIQUE 違反で失敗する、衝突する行を消す) ので、公開も時刻の順の中に 1 点を持たなければならない。
+版はシャードごとに、ばらばらの実時間に適用され、時計もずれている。
+何もしなければ、時計の遅いシャードで index を使う文が、時計の進んだシャードの古い書き込みより小さい時刻を持つ (`m12_clock_red_no_clock`)。
+決めた設計では、行を埋める処理が、各シャードの行を読んだ時刻の最大 m を公開の版に載せる。シャードは、公開の版を適用するときに、時計を m まで進める。
+範囲の移動で親の時計を子へ渡す仕組み (M5b の `finishRange`) と同じ形である。
+行のないシャードも読んで、その時刻を m に入れる (`m12_clock_red_skip_empty`)。
+
+`publishIsAPoint`: index を使う文が読む時刻は、index を使わない書き込みの確定の時刻のどれよりも小さくない。
+
+シャードは版を適用するたびに、それより古い時刻の読みを断る (`ddlFloor`)。
+このため、公開の版が時刻を運ばなくても、直列でない実行は作れないと考えている。
+ただし、その直列な順序は時刻の順と一致しない。試験の検査は時刻の順に並べて確かめるので、公開に時刻を持たせて、順序を 1 つにする。
+
+モデルにないもの。
+
+- 分割と index の作成が重なる場合。行が止まっているので、範囲表が変わったら全体を読み直せば足りる (同じ項目を 2 度書いても変わらない)。DDL と分割の順序 (不変条件 4) は別に扱う。
+- 取り消された後に届く、行を埋める処理の遅い書き込み。index の表は取り消しの版で捨てる。版 1 を名乗る書き込みは、捨てる前の表に入るか、`REJECT_STALE` で断られる。
+- index の表そのものの 2PC (M1、M9)。項目の intent が衝突することだけを写した。
+- シャードの中で完結する UNIQUE index (shard key を含むもの)。各シャードの SQLite が作る。
 ### M13 `m13_txn_schema_boundary.qnt` — 取引の中の DDL と、取引が名乗る表定義の版
 
 2026-11-11 に書いた。

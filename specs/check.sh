@@ -186,6 +186,29 @@ witness $f m11_green_unique witnessUniquePublic
 witness $f m11_green_recreate witnessRecreateWritten
 for m in m11_green m11_impl_wait m11_impl_inflight m11_impl_backfill m11_impl_chunk m11_impl_drop m11_red_no_reject m11_red_early_public m11_red_no_write_only m11_red_no_sync; do tests $f $m; done
 
+echo "== M12 行のある表に、シャードをまたぐ UNIQUE の index を作る (書き込みを止めて作る)"
+f=m12_unique_index_build.qnt
+green   $f m12_green buildSafe
+green   $f m12_green_shard_only buildSafe        # 守るのはシャード。Worker が先に断らなくても成り立つ
+red     $f m12_red_online indexMatches           # 2026-11 までの設計 (作りながら書く)。他人の項目を消す
+red     $f m12_red_online notRelied              # 同上。出来上がっていない index で一意性を確かめる
+red     $f m12_red_no_lock indexMatches          # 書き込みを止めない
+red     $f m12_red_visible notRelied             # 止めるが、作っている最中の index を計画が使う
+red     $f m12_red_no_drain noWriteWhileLocked   # intent を持ったまま版を進める
+red     $f m12_red_stale indexMatches            # 古い版の計画を断らない
+red     $f m12_red_two_exits oneExit             # 取り消された後に公開が通る
+red     $f m12_red_repin indexMatches            # 取引が、計画し直さずに新しい版を名乗る (実装にあった欠陥)
+red     $f m12_red_scan_early indexMatches       # 書き込みを止める前のシャードの行を読んで埋める
+witness $f m12_green witnessPublicThenWrite
+witness $f m12_green witnessWithdrawnOnDuplicate
+witness $f m12_green_shard_only witnessRefusedByLock
+tests   $f m12_green_shard_only
+# 公開の時刻。index を使う文は、時刻の順で、index を使わない書き込みの後ろにいる
+green   $f m12_clock_green publishIsAPoint
+red     $f m12_clock_red_no_clock publishIsAPoint     # 公開の版が時刻を運ばない
+red     $f m12_clock_red_skip_empty publishIsAPoint   # 行のないシャードを読まず、その時刻が入らない
+witness $f m12_clock_green witnessAwareOnSlowShard
+tests   $f m12_clock_red_no_clock
 echo "== M13 取引の中の DDL と、取引が名乗る表定義の版"
 f=m13_txn_schema_boundary.qnt
 green   $f m13_green boundarySafe
