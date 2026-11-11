@@ -1,16 +1,13 @@
 name: ci
 
-# push と PR のたびには走らせない。遅く、GitHub に負荷を掛けるからである。
-# 変更を main へ入れる前の検査は、手元で scripts/check.sh を流す。
-# ここは、手で起動したときと、週に 1 回の形式モデルの全探索だけである。
+# 自動では走らせない。遅く、GitHub に負荷を掛けるからである。
+# 変更を main へ入れる前の検査は、手元で scripts/check.sh を流す (specs/ を変えたら、形式モデルの検査も流れる)。
+# ここは、手で起動したときだけ走る。別の計算機で同じ検査を確かめたいときに使う。
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 18 * * 0"
 
 jobs:
   test:
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -35,7 +32,6 @@ jobs:
       - run: npm pack --dry-run
 
   cli:
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -52,26 +48,7 @@ jobs:
       - run: npm test
       - run: npm pack --dry-run
 
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      specs: ${{ steps.filter.outputs.specs }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-      - id: filter
-        # 直前のコミットとの差分に specs/ があるかを見る。最初のコミットでは回す
-        run: |
-          if ! git rev-parse HEAD~1 >/dev/null 2>&1 || ! git diff --quiet HEAD~1 HEAD -- specs; then
-            echo "specs=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "specs=false" >> "$GITHUB_OUTPUT"
-          fi
-
   models:
-    needs: changes
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.specs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     defaults:

@@ -6,7 +6,10 @@
 #
 #   scripts/check.sh            型検査、全テスト、課金行数、sqllogictest、パッケージの作成確認、CLI の試験 (10 分ほど)
 #   scripts/check.sh --quick    型検査と全テストだけ (2 分ほど)
-#   scripts/check.sh --models   加えて、形式モデルの検査 (specs/check.sh。1 時間ほど)。specs/ を変えたときに流す
+#   scripts/check.sh --models   加えて、形式モデルの検査 (specs/check.sh。1 時間ほど)
+#
+# specs/ が main と違っていれば、--models を付けなくても、形式モデルの検査を流す。モデルを変えたのに検査を流さないまま
+# main へ入れる、ということが起きないようにするためである。
 #
 # 失敗した段があれば、最後に一覧を出して、0 でない値で終わる。段ごとの出力は、表示するディレクトリに残る。
 set -u
@@ -20,6 +23,12 @@ for a in "$@"; do
     *) echo "usage: scripts/check.sh [--quick] [--models]" >&2; exit 2 ;;
   esac
 done
+
+# specs/ に、main との差分か、コミットしていない変更があるか。
+if ! git diff --quiet main -- specs 2>/dev/null || [ -n "$(git status --porcelain -- specs 2>/dev/null)" ]; then
+  if [ "$models" = 0 ]; then echo "specs/ differs from main: the formal models will be checked too"; fi
+  models=1
+fi
 
 logs=$(mktemp -d "${TMPDIR:-/tmp}/dinf-check-XXXXXX")
 failed=()

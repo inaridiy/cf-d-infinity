@@ -384,6 +384,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   let paused = false;
   let active = 0;
   const checkpoints: Report["checkpoints"] = [];
+  const snapshots: unknown[] = [];
   const env: Env = {
     c, rnd, admin,
     at: async (frac) => {
@@ -407,6 +408,13 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
         await c.settle();
         for (const core of c.cores.values()) await core.redrive().catch(() => {});
         await c.settle();
+        // 調べるための書き出し用に、止めた時点の行と index の項目を取っておく (SIM_DUMP)。
+        if (process.env.SIM_DUMP) {
+          const names = ((await c.catalog()).tables.acct?.globalIndexes ?? []).map((g) => g.table);
+          const index: unknown[] = [];
+          for (const n of names) index.push(...(await rawRows(c, n)));
+          snapshots.push({ label, at: c.net.log.length, rows: await rawRows(c, "acct"), index });
+        }
         checkpoints.push({ label, ...(await indexAgreementAll(c)), duplicates: await duplicates(c) });
       } finally {
         paused = false;
@@ -706,7 +714,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   // 失敗した seed を調べるための書き出し。SIM_DUMP=<ファイル> で、取引の記録と RPC の記録を JSON で残す。
   if (process.env.SIM_DUMP) {
     const plain = (_k: string, x: unknown) => (x instanceof Map ? [...x] : x instanceof Uint8Array ? [...x] : x);
-    writeFileSync(process.env.SIM_DUMP, JSON.stringify({ seed, history, rpc: c.net.log }, plain));
+    writeFileSync(process.env.SIM_DUMP, JSON.stringify({ seed, history, snapshots, rpc: c.net.log }, plain));
   }
   return {
     history: checkHistory(history),
