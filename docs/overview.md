@@ -177,8 +177,12 @@ Five rules keep a schema change from tearing a transaction that is under way:
 - A shard born from a split catches up to its parent's schema before it accepts the parent's rows.
 - A shard that is handing over or receiving a range applies no schema change until the move is finished, and the
   parent catches up to the child's version before it fences the range. Rows and intents in transit then always have
-  the shape of the table that receives them. The DDL driver waits for a split in progress instead of recording a
-  version the moving shards cannot take.
+  the shape of the table that receives them. Splits and schema changes take turns through a maintenance slot at
+  Meta: a split takes it only after every shard has applied the latest version, uses the version Meta returns with
+  it, and holds it until the child has received the range; Meta records no schema change meanwhile, so no request
+  planned at the current version is refused by a moving shard. Splits share the slot with each other; an index build
+  or a pre-drop lock holds it alone. A split that stops before the child starts receiving releases the slot after 5
+  seconds; one that has started cannot be undone, so the autoscaler resumes it. Model M15.
 
 The first four came out of randomized tests and a model (M11) that found six ways the first implementation got it
 wrong; the fifth, and the validation and withdrawal above, came out of a second design review and are covered by

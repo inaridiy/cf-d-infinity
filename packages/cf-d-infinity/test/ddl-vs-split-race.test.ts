@@ -1,13 +1,13 @@
-// Review of f2224ce, fix 6 (schema changes and splits exclude each other). Asserts the correct behaviour; fails today.
+// Review of f2224ce, fix 6 (schema changes and splits exclude each other). Passes since 2026-11-11: a split holds the maintenance slot at Meta, which records no schema change while it does, and the split uses the version Meta gives with the slot (invariant 4, specs/m15_maintenance_slot.qnt).
 //
 // Db.record() asks every shard "are you moving?" (syncSchema) and then records the new version at Meta. The two steps
 // are not atomic. If a split fences the shard in between, the version is recorded anyway. From then on every Worker
 // plans with the new version, and the parent and the child refuse it ("schema change is waiting for a shard split")
 // until the split has moved all its data - for every statement that touches them, not only for DDL.
 import { describe, expect, it } from "vitest";
-import { split } from "../../src/autoscaler";
-import { Db } from "../../src/client/db";
-import { SimCluster } from "../sim";
+import { split } from "../src/autoscaler";
+import { Db } from "../src/client/db";
+import { SimCluster } from "./sim";
 
 const outcome = async <T>(p: Promise<T>) => p.then((v) => ({ ok: v as unknown }), (e: Error) => ({ err: e.message }));
 

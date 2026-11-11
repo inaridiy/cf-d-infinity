@@ -4,7 +4,7 @@ import { exportPage, importRows, type ExportCursor } from "./transfer";
 
 export { importRows, type ExportCursor };
 import { collectMetrics, decide, DEFAULTS, healthProblems, needsFollowUp, nextShardNumber, split, type AutoscalerState, type Thresholds } from "./autoscaler";
-import { MetaCore, type Catalog } from "./meta";
+import { MetaCore, type Catalog, type SplitMove } from "./meta";
 import { planSplit, shardsOf } from "./routing";
 import { ShardCore } from "./shard/core";
 import { batonSealer, handlePipeline, serveHranaSocket, type PipelineReq } from "./client/hrana";
@@ -132,6 +132,8 @@ export class DinfShard extends DurableObject<Env> {
       meta: {
         ddlSince: (v) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).ddlSince(v) as never,
         revokeDdl: (v, reason) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).revokeDdl(v, reason),
+        startSplit: (id, move) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).startSplit(id, move),
+        checkSplit: (id, move) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).checkSplit(id, move),
       },
       background: (p) => ctx.waitUntil(p),
       // 予約済みの alarm は後ろへずらさない。負荷が続くと毎回ずれて、いつまでも発火しなくなる。
@@ -244,6 +246,21 @@ export class DinfMeta extends DurableObject<Env> {
   }
   lockTables(tables: string[], basedOn?: number) {
     return this.core.lockTables(tables, basedOn);
+  }
+  beginSplit(move: SplitMove, basedOn: number) {
+    return this.core.beginSplit(move, basedOn);
+  }
+  startSplit(id: string, move: SplitMove) {
+    return this.core.startSplit(id, move);
+  }
+  checkSplit(id: string, move: SplitMove) {
+    return this.core.checkSplit(id, move);
+  }
+  endSplit(id: string) {
+    return this.core.endSplit(id);
+  }
+  splits() {
+    return this.core.splits();
   }
   finishLock(version: number, sql: string) {
     return this.core.finishLock(version, sql);
@@ -364,6 +381,12 @@ export class DinfAutoscaler extends DurableObject<Env> {
     this.event("tick", metrics.map((m) => ({ id: m.id, w: m.writes, r: m.reads, ms: m.elapsedMs, size: m.size, mig: m.migrating, probe: m.probeMs })));
     // 途中で失敗した増設は同じ範囲で再開する。各段は冪等である。
     for (const job of c.pending) this.runSplit(cluster, job);
+    // Meta に残っている分割の枠も再開する。別の進め方 (手で始めた分割など) が途中で止まると、枠が残り、
+    // 表定義の変更がいつまでも記録できなくなる。子が受け取り始めた分割は取り消せないので、終わらせる。
+    for (const s of await cluster.splits()) {
+      if (!s.started || c.pending.some((j) => j.child === s.child)) continue;
+      this.runSplit(cluster, { parent: s.parent, child: s.child, range: { start: s.start, end: s.end } });
+    }
     const { routing } = await cluster.catalog();
     // 持続回数と cooldown は永続化する。メモリだけだと、再起動のたびに cooldown が消えて続けて割る。
     const saved = this.ctx.storage.sql.exec(`SELECT v FROM conf WHERE k = 'state'`).toArray()[0];
@@ -408,7 +431,8 @@ export class DinfAutoscaler extends DurableObject<Env> {
         this.save(c);
         this.event("split-done", r);
       },
-      (e) => this.event("split-failed", { child: job.child, error: String(e) }),
+      // 表定義の変更が枠を持っている間は、分割を待たせる。次の判断のときに、もう一度始める。
+      (e) => this.event(/split busy:/.test(String(e)) ? "split-waiting" : "split-failed", { child: job.child, error: String(e) }),
     ).finally(() => this.running.delete(job.child)));
   }
 }
@@ -433,6 +457,9 @@ export function clusterOf(env: Env, count?: number, prefix = "shard"): Cluster {
     revokeDdl: (version, reason) => meta.revokeDdl(version, reason),
     renewLock: (version) => meta.renewLock(version),
     lockTables: (tables, basedOn) => meta.lockTables(tables, basedOn) as never,
+    beginSplit: (move, basedOn) => meta.beginSplit(move, basedOn) as never,
+    endSplit: (id) => meta.endSplit(id),
+    splits: () => meta.splits() as never,
     finishLock: (version, sql) => meta.finishLock(version, sql) as never,
     allocate: (table, n, min) => meta.allocate(table, n, min),
   };
@@ -537,6 +564,8 @@ export async function clusterStatus(env: Env, name = "shard", shards?: number) {
   }))));
   return {
     routing: cat.routing, shards: ids, schema: cat.version, health, problems: healthProblems(health),
+    // 進行中の分割。終わるまで、表定義の変更は待つ。長く残っているなら、分割が進めなくなっている。
+    splits: await cluster.splits(),
     scaler: await env.DINF_AUTOSCALER.getByName(name).status(),
   };
 }

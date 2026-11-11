@@ -232,9 +232,11 @@ export interface ShardApi {
   flush(req: { upTo?: Ts }): Promise<FlushRes>;
   /** 子が受け入れの準備をする。親の fence より先に呼ぶ。 */
   /** 範囲を受け取る準備をする。子の表定義の版を返す。親は、fence の前にその版まで追いつく。 */
-  beginIncoming(req: { start: number; end: number; from: string; schema: number }): Promise<{ schema: number }>;
+  /** 子が範囲を受け取り始める。slot は Meta が分割に渡した枠で、子は Meta に枠を示し、Meta が返す版で受け取り始める。 */
+  beginIncoming(req: { start: number; end: number; from: string; slot: string }): Promise<{ schema: number }>;
   /** 親がスロットの受理を止める。以後は NotOwner を返す。 */
-  fence(req: { start: number; end: number; to: string; schema?: number }): Promise<void>;
+  /** 親が範囲を送り出し始める。slot は分割の枠で、子が受け取り始めていなければ断る。 */
+  fence(req: { start: number; end: number; to: string; schema?: number; slot: string }): Promise<void>;
   /** 終わっていない範囲の移動。増設をやり直すとき、同じ範囲を続けるのに使う。 */
   moves(req: Record<string, never>): Promise<{ outgoing: { start: number; end: number; to: string }[]; incoming: { start: number; end: number; from: string }[] }>;
   listGroups(req: { start: number; end: number; limit: number; cursor?: GroupCursor | null }): Promise<{ groups: string[]; cursor: GroupCursor | null }>;

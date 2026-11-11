@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Db, type Cluster } from "../src/client/db";
-import { MetaCore } from "../src/meta";
+import { MetaCore, type SplitMove, type SplitSlot } from "../src/meta";
+import { shardsOf } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
 import { ShardCore, type SpanEscape } from "../src/shard/core";
@@ -212,6 +213,8 @@ export class SimNet {
   gate: (m: Rpc) => Promise<void> | void = () => {};
   drop: (m: Rpc) => boolean = () => false;
   log: Rpc[] = [];
+  /** 失敗した RPC と、その誤りの文。検査が、断られた理由を数えるのに使う。 */
+  failed: { m: Rpc; message: string }[] = [];
   jitter: (() => number) | null = null;
   /**
    * 応答の配送を止める。処理は終わっていて、結果だけが呼び出し側へ届かない状態を作る。
@@ -354,7 +357,10 @@ export class SimCluster implements Cluster {
       clock: { now: () => (this.o.now?.() ?? this.time) + this.ahead + (this.o.skewMs?.(id) ?? 0) },
       runtime: this.runtime,
       peer: (to) => this.stub(id, to),
-      meta: { ddlSince: (v) => this.meta.ddlSince(v), revokeDdl: (v, reason) => this.meta.revokeDdl(v, reason) },
+      meta: {
+        ddlSince: (v) => this.meta.ddlSince(v), revokeDdl: (v, reason) => this.meta.revokeDdl(v, reason),
+        startSplit: (id, move) => this.meta.startSplit(id, move), checkSplit: (id, move) => this.meta.checkSplit(id, move),
+      },
       background: (p) => {
         this.background.add(p);
         void p.finally(() => this.background.delete(p));
@@ -406,7 +412,10 @@ export class SimCluster implements Cluster {
           else await new Promise((r) => (delay > 0 ? setTimeout(r, delay) : setImmediate(r)));
           // JSON を通して、DO の RPC と同じく参照を共有しないようにする。
           const core = this.core(to);
-          const out = await (core[method] as (r: unknown) => Promise<unknown>).call(core, structuredClone(req));
+          const out = await (core[method] as (r: unknown) => Promise<unknown>).call(core, structuredClone(req)).catch((e: unknown) => {
+            this.net.failed.push({ m, message: e instanceof Error ? e.message : String(e) });
+            throw e;
+          });
           const hold = this.net.reply(m);
           if (hold) await hold;
           return out === undefined ? undefined : structuredClone(out);
@@ -440,6 +449,24 @@ export class SimCluster implements Cluster {
   }
   lockTables(tables: string[], basedOn?: number) {
     return this.meta.lockTables(tables, basedOn);
+  }
+  beginSplit(move: SplitMove, basedOn: number) {
+    return this.meta.beginSplit(move, basedOn);
+  }
+  endSplit(id: string) {
+    return this.meta.endSplit(id);
+  }
+  splits() {
+    return this.meta.splits();
+  }
+  /**
+   * 試験が分割の段を自分で進めるための、分割の枠。Autoscaler の split と同じく、全シャードに最新の版を適用させてから取る。
+   * 返る id を、beginIncoming と fence に渡す。
+   */
+  async reserveSplit(parent: string, child: string, range: { start: number; end: number }): Promise<SplitSlot> {
+    const cat = await this.catalog();
+    for (const id of shardsOf(cat.routing)) await this.shard(id).syncSchema({ version: cat.version });
+    return this.meta.beginSplit({ parent, child, ...range }, cat.version);
   }
   finishLock(version: number, sql: string) {
     return this.meta.finishLock(version, sql);

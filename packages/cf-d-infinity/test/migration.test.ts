@@ -49,8 +49,9 @@ describe("live split", () => {
     const c = await setup();
     const { t, range } = await movingTenant(c);
     await insert(c, t, 7);
-    await c.shard("s2").beginIncoming({ ...range, from: "s0", schema: (await c.catalog()).version });
-    await c.shard("s0").fence({ ...range, to: "s2" });
+    const slot = await c.reserveSplit("s0", "s2", range);
+    await c.shard("s2").beginIncoming({ ...range, from: "s0", slot: slot.id });
+    await c.shard("s0").fence({ ...range, to: "s2", slot: slot.id });
     await c.switchRange({ ...range, to: "s2" });
     const db = new Db(c);
     expect(await getN(db, t)).toBe(7); // 所有権の切替だけで読める
@@ -76,8 +77,9 @@ describe("live split", () => {
     const c = await setup();
     const { t, range } = await movingTenant(c);
     await insert(c, t, 5);
-    await c.shard("s2").beginIncoming({ ...range, from: "s0", schema: (await c.catalog()).version });
-    await c.shard("s0").fence({ ...range, to: "s2" });
+    const slot = await c.reserveSplit("s0", "s2", range);
+    await c.shard("s2").beginIncoming({ ...range, from: "s0", slot: slot.id });
+    await c.shard("s0").fence({ ...range, to: "s2", slot: slot.id });
     await c.switchRange({ ...range, to: "s2" });
     // 親は m を確定したが、応答が子に届かなかった。
     await c.shard("s0").pull({ groups: [JSON.stringify([t])], to: "s2", maxBytes: 1_000_000 });
@@ -92,9 +94,9 @@ describe("live split", () => {
     const c = await setup();
     const { t, range } = await movingTenant(c);
     await insert(c, t, 5);
-    const schema = (await c.catalog()).version;
-    await c.shard("s2").beginIncoming({ ...range, from: "s0", schema });
-    await c.shard("s0").fence({ ...range, to: "s2" });
+    const slot = await c.reserveSplit("s0", "s2", range);
+    await c.shard("s2").beginIncoming({ ...range, from: "s0", slot: slot.id });
+    await c.shard("s0").fence({ ...range, to: "s2", slot: slot.id });
     await c.switchRange({ ...range, to: "s2" });
     c.restart("s0");
     c.restart("s2");
@@ -109,8 +111,9 @@ describe("live split", () => {
     const c = await setup();
     const { t, range } = await movingTenant(c);
     await insert(c, t, 5);
-    await c.shard("s2").beginIncoming({ ...range, from: "s0", schema: (await c.catalog()).version });
-    await c.shard("s0").fence({ ...range, to: "s2" });
+    const slot = await c.reserveSplit("s0", "s2", range);
+    await c.shard("s2").beginIncoming({ ...range, from: "s0", slot: slot.id });
+    await c.shard("s0").fence({ ...range, to: "s2", slot: slot.id });
     await c.switchRange({ ...range, to: "s2" });
     const db = new Db(c);
     const [n] = await Promise.all([getN(db, t), c.shard("s2").drain(range), getN(new Db(c), t)]);
@@ -149,9 +152,9 @@ describe("counterexamples from m5b_live_migration", () => {
     await w.query("UPDATE users SET n = 1 WHERE tenant_id = ? AND id = 1", row(t));
     await w.query("UPDATE users SET n = 1 WHERE tenant_id = ? AND id = 1", row(other));
     await w.commit(); // commit 済みで phase 2 が親に未達
-    const schema = (await c.catalog()).version;
-    await c.shard("s2").beginIncoming({ ...range, from: "s0", schema });
-    await c.shard("s0").fence({ ...range, to: "s2" });
+    const slot = await c.reserveSplit("s0", "s2", range);
+    await c.shard("s2").beginIncoming({ ...range, from: "s0", slot: slot.id });
+    await c.shard("s0").fence({ ...range, to: "s2", slot: slot.id });
     await c.switchRange({ ...range, to: "s2" });
     // 親は応答を返したが子の処理はまだで、グループは飛行中である。
     const inFlight = await c.shard("s0").pull({ groups: [JSON.stringify([t])], to: "s2", maxBytes: 1_000_000 });

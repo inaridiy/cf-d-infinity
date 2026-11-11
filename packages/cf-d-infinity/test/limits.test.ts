@@ -172,7 +172,9 @@ describe("a shard split", () => {
     await expect(c.shard("s0").pull({ groups: [JSON.stringify([7])], to: "s1", maxBytes: 1_000_000 }).catch(async (e: Error) => {
       // fence していない範囲の pull は別の理由で断られるので、fence してから試す。
       if (!/unfenced/.test(e.message)) throw e;
-      await c.shard("s0").fence({ ...range, to: "s1" });
+      const slot = await c.reserveSplit("s0", "s1", range);
+      await c.shard("s1").beginIncoming({ ...range, from: "s0", slot: slot.id });
+      await c.shard("s0").fence({ ...range, to: "s1", slot: slot.id });
       return c.shard("s0").pull({ groups: [JSON.stringify([7])], to: "s1", maxBytes: 1_000_000 });
     })).rejects.toThrow(/group too large to move: shard key \[7\]/);
   }, 60000);

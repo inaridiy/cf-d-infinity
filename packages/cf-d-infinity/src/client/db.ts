@@ -3,7 +3,7 @@ import type {
 } from "../types";
 import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, utf8Length } from "../types";
 import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, q, selectList } from "../shard/rows";
-import type { Catalog } from "../meta";
+import type { Catalog, SplitMove, SplitSlot } from "../meta";
 import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import { ident, normalize, parseStatements, text, type Node, type Params } from "../sql/cst";
@@ -25,6 +25,12 @@ export interface Cluster {
   lockTables(tables: string[], basedOn?: number): Promise<Catalog>;
   /** 書き込み禁止の版を、その DROP で終える。 */
   finishLock(version: number, sql: string): Promise<Catalog>;
+  /** 分割のために、保守の操作の枠を取る (meta.ts の beginSplit)。basedOn は、全シャードへ適用させた版。 */
+  beginSplit(move: SplitMove, basedOn: number): Promise<SplitSlot>;
+  /** 分割が終わり、枠を返す。 */
+  endSplit(id: string): Promise<void>;
+  /** 進行中の分割の枠。 */
+  splits(): Promise<SplitSlot[]>;
   /** 版を取り消す。取り消す版を返す。取り消せなければ null。 */
   revokeDdl(version: number, reason: string): Promise<number | null>;
   allocate(table: string, n: number, min?: number): Promise<number>;
@@ -1188,17 +1194,20 @@ export class Db {
    * 前の版を適用していないシャードが残ったまま次の版を積むと、前の版がそのシャードで失敗したときに取り消せなくなる。
    */
   private async record(write: (basedOn: number, before: Catalog) => Promise<Catalog>): Promise<{ before: Catalog; cat: Catalog }> {
+    // 保守の操作 (シャードの分割、index の作成、DROP の前の禁止) の途中は、Meta が記録を断る (meta.ts の assertFreeForDdl)。
+    // 終わるのを待つ。待つ時間は 1 つの期限で測る。
     const deadline = this.rt.now() + (this.opts.splitWaitMs ?? SPLIT_WAIT_MS);
-    const busyUntil = this.rt.now() + SCHEMA_WAIT_MS;
+    const wait = async (what: string) => {
+      if (this.rt.now() > deadline) throw new SqlError(`${what} is in progress; retry the schema change when it finishes`);
+      await sleep(this.rt, 20);
+    };
     for (let attempt = 0; ; attempt++) {
       const before = await this.cluster.catalog();
       const { failed, moving } = await this.syncAll(before);
-      // シャードの増設の途中は、新しい版を記録しない。増設の間、親と子は DDL を適用しないので、記録すると、
-      // 新しい版で計画した要求がそのシャードで通らなくなる。終わるのを待つ。
+      // 分割の途中のシャードがある。Meta の枠より前に始まった分割の名残でも、待つ。
       if (moving) {
-        if (this.rt.now() > deadline) throw new SqlError("a shard split is in progress; retry the schema change when it finishes");
         attempt = Math.min(attempt, 3);
-        await sleep(this.rt, 20);
+        await wait("a shard split");
         continue;
       }
       if (failed) {
@@ -1211,10 +1220,10 @@ export class Db {
       } catch (e) {
         const m = (e as Error)?.message ?? "";
         if (attempt < 5 && /schema moved to version/.test(m)) continue;
-        // 別の接続が index を作っている最中である。終わるか、期限で取り消されるまで待つ。
-        if (/schema busy:/.test(m) && this.rt.now() <= busyUntil) {
+        // 別の保守の操作が、枠を持っている。終わるか、期限で取り消されるまで待つ。
+        if (/schema busy:/.test(m)) {
           attempt = Math.min(attempt, 3);
-          await sleep(this.rt, 50);
+          await wait(m.replace(/^schema busy: | is in progress$/g, ""));
           continue;
         }
         throw e;
@@ -1472,56 +1481,31 @@ export class Db {
    * 全シャードの行を読んで、index の項目を集める。値ごとに 1 行。同じ値を持つ行が 2 つあれば失敗する。
    * 返す at は、読んだシャードの時計の最大である。index を使わずに確定した書き込みは、どれもこの時刻以下である。
    * 行のないシャードも読む。そのシャードで行を消した書き込みの時刻も、at に入れなければならないからである。
-   * 増設が挟まると、行が別のシャードへ移る。行そのものは変わらないので、範囲表が変わらなくなるまで、全体を読み直せば足りる。
+   * index を作っている間は、分割が始まらない (保守の操作の枠。specs/m15_maintenance_slot.qnt)。範囲表は変わらないので、1 度読めば足りる。
    */
   private async scanForIndex(def: TableDef, ix: GlobalIndexDef, version: number): Promise<{ entries: Map<string, { pk: string; sk: string }>; at: Ts }> {
+    const cat = await this.stillBuilding(version);
+    const entries = new Map<string, { pk: string; sk: string }>();
     let at: Ts = 0;
-    for (let round = 0; ; round++) {
-      const cat = await this.stillBuilding(version);
-      const entries = new Map<string, { pk: string; sk: string }>();
-      let moved = false;
-      for (const shard of shardsOf(cat.routing)) {
-        const seen = await this.scanShard(def, ix, shard, cat, entries);
-        if (seen === null) {
-          moved = true;
-          break;
-        }
-        at = Math.max(at, seen);
-      }
-      if (!moved && (await this.stillBuilding(version)).routing.version === cat.routing.version) return { entries, at };
-      if (round >= 20) throw new SqlError(`CREATE INDEX ${ix.name}: shards kept splitting while the index was being built`);
-    }
+    for (const shard of shardsOf(cat.routing)) at = Math.max(at, await this.scanShard(def, ix, shard, cat, entries));
+    return { entries, at };
   }
 
-  /** 1 シャードの行を主キーの順に少しずつ読む。読んだ時点のシャードの時計を返す。途中で範囲が移ったら null を返す。 */
+  /** 1 シャードの行を主キーの順に少しずつ読む。読んだ時点のシャードの時計を返す。 */
   private async scanShard(
     def: TableDef, ix: GlobalIndexDef, shard: string, cat: Catalog, entries: Map<string, { pk: string; sk: string }>,
-  ): Promise<Ts | null> {
+  ): Promise<Ts> {
     // 要るのは、行の同一性 (主キーと shard key) と、index の列だけである。
     const cols = [...new Set([...def.pk, ...def.shardKey, ...ix.columns])].map(q).join(", ");
     const pkCols = def.pk.map(q).join(", ");
     let after: Value[] | null = null;
     let at: Ts = 0;
-    for (let attempt = 0; ; ) {
-      let res: ExecRes;
-      try {
-        res = await this.shardOf(shard).exec({
-          sql: `SELECT ${cols} FROM ${q(def.name)} ${after ? `WHERE (${pkCols}) > (${def.pk.map(() => "?").join(", ")})` : ""} ORDER BY ${pkCols} LIMIT ${BUILD_PAGE}`,
-          params: after ?? [], spans: withSlots(cat.routing, shard, [tableSpan(def.name)]), schema: cat.version,
-        });
-      } catch (e) {
-        const m = (e as Error)?.message ?? "";
-        // 範囲の持ち主が変わったか、表定義の版が進んだ。呼び出し側が取り直して、全体をやり直す (取り消されていれば、そこで失敗する)。
-        if (/^not owner|stale schema/.test(m)) return null;
-        // 移動の途中は表全体を読めない。終わるのを待つ。
-        if (/^migrating|group not arrived|read too old/.test(m) && attempt++ < BUILD_RETRIES) {
-          await backoff(this.rt, attempt);
-          continue;
-        }
-        throw e;
-      }
+    for (;;) {
+      const res = await this.shardOf(shard).exec({
+        sql: `SELECT ${cols} FROM ${q(def.name)} ${after ? `WHERE (${pkCols}) > (${def.pk.map(() => "?").join(", ")})` : ""} ORDER BY ${pkCols} LIMIT ${BUILD_PAGE}`,
+        params: after ?? [], spans: withSlots(cat.routing, shard, [tableSpan(def.name)]), schema: cat.version,
+      });
       if (res.error !== undefined) throw new SqlError(res.error);
-      attempt = 0;
       at = Math.max(at, res.T, res.hlc);
       const rows = new QueryResult(res.columns, res.values).rows;
       for (const row of rows) {

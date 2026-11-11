@@ -234,6 +234,15 @@ red     $f m14_red_commit_ts noLostWrite      # copy の確定の時刻と比べ
 witness $f m14_green witnessDroppedAfterWrites
 witness $f m14_green witnessRefusedByCheck
 
+echo "== M15 表定義の変更とシャードの分割の順序 (保守の操作の枠)"
+f=m15_maintenance_slot.qnt
+green   $f m15_green servable
+red     $f m15_red_no_slot servable          # 2026-11 までの実装: 分割の途中かを確かめてから記録する (原子的でない)
+red     $f m15_red_stale_begin servable      # 分割が、枠を取る前に読んだ版を使う (子が親より古い版で受け取る)
+red     $f m15_red_early_release servable    # 枠を、子が受け取り終える前に返す
+red     $f m15_red_no_based_on servable      # 全シャードが最新の版を適用する前に枠を取る (分割の途中に取り消しが入る)
+witness $f m15_green witnessRecordedBeforeAndServed
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect
