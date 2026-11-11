@@ -64,7 +64,7 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 | `ALTER TABLE` の `RENAME COLUMN` と `DROP COLUMN` | 同上 |
 | 主キー、shard key、shard key を含まない UNIQUE の列の、BINARY 以外の照合順序 | 同上。行と行き先のシャードを値で決めるので、照合順序で等しい値を同じ行として扱えない |
 | 主キーの列に NULL のある行 | 断る。SQLite は INTEGER でない主キーに NULL をいくつでも入れられるが、行を主キーの値で名指しするので区別できない。`INTEGER PRIMARY KEY` に NULL を渡すと rowid が入るのは SQLite と同じである |
-| 1 シャードで実行する文の中の `sqlite_master` と PRAGMA の関数 (`pragma_table_info(...)` など) | 断る。シャードで実行すると、内部の表について答えてしまう。表定義を調べる文は、それだけで 1 つの文にすれば、利用者の表定義について答える |
+| 書き込みの文の中の `sqlite_master` と PRAGMA の関数 (`pragma_table_info(...)` など) | 断る。読みの文の中なら、利用者の表定義について答える (シャードの内部の表は見えない) |
 | 取引の中の DDL | DDL は全シャードへの適用を伴うので、取引に含められない |
 
 ### DO の SQLite の制限
@@ -91,8 +91,7 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 | 項目 | 差分 |
 |---|---|
 | 外部キー | 強制しない。SQLite の既定と同じである。`PRAGMA foreign_keys = ON` は効かない |
-| `INSERT OR IGNORE`、`OR REPLACE`、`ON CONFLICT` | 衝突する行が別のシャードにあっても、SQLite と同じ結果になる。シャードをまたぐ UNIQUE のある表では、衝突し得る行を Worker に集め、元の文を Worker の SQLite で実行して解決させる。DEFAULT のある UNIQUE の列を省いた文は断る (入る値が、行を集める時点で分からない) |
-| `UPDATE OR IGNORE`、`UPDATE OR REPLACE` | 同じシャードの中の衝突は解決する。別のシャードの行との衝突は、いまは `unsupported:` で断る。行の配置で結果が変わるので欠陥として扱っており、公開の前に解消する |
+| `INSERT OR IGNORE`、`OR REPLACE`、`ON CONFLICT`、`UPDATE OR IGNORE`、`UPDATE OR REPLACE` | 衝突する行がどのシャードにあっても、SQLite と同じ結果になる。1 シャードで解決できないときは、文を Worker の SQLite で実行し、変更後の行と主キーか UNIQUE の値が同じ行を集め足して、SQLite に解決させる |
 | 部分 index、式 index | シャード内の index になる。UNIQUE なら shard key を含む必要がある |
 | 予約された名前 | `sqlite_` で始まる名前と、内部の表が使う名前 (`__txn`、`__meta`、`__gidx_` で始まる名前など) は作れない |
 | 1 取引の大きさ | 1 シャードに書く変更は、変更前と変更後の行を合わせて UTF-8 で 1 MB まで。超える取引は commit の前に断る |

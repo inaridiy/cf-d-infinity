@@ -69,22 +69,3 @@ describe("a statement that reads another row through a local UNIQUE index", () =
     expect(ins).toEqual({ ok: 1 });
   });
 });
-
-describe("INSERT ... VALUES with `x IN table`", () => {
-  // 右辺の表は FROM に現れないので、プランナは読むことを知らない。行を受け取るシャードだけで実行すると、別のシャードにある行が欠ける。
-  // SQLite のコンパイル結果と突き合わせて、知らない表を読む文は断る。
-  it("is refused instead of reading only the rows on the shard that receives the row", async () => {
-    const c = new SimCluster({ shards: 2 });
-    const db = c.client();
-    await db.ddl("CREATE TABLE allowed(id INTEGER PRIMARY KEY)");
-    await db.ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, ok INTEGER)");
-    const { routing } = await c.catalog();
-    const on = (s: string) => { for (let t = 1; ; t++) if (ownerOf(routing, JSON.stringify([t])) === s) return t; };
-    const [a, b] = [on("s0"), on("s1")];
-    await db.query("INSERT INTO allowed VALUES (?)", [a]);
-    await expect(db.query("INSERT INTO t VALUES (?, ? IN allowed)", [b, a])).rejects.toThrow(/unsupported: the statement reads allowed/);
-    // 同じことを、サブクエリで書けば通り、正しい値が入る。
-    await db.query("INSERT INTO t VALUES (?, (SELECT count(*) FROM allowed WHERE id = ?))", [b, a]);
-    expect((await db.query("SELECT ok FROM t WHERE id = ?", [b])).rows).toEqual([{ ok: 1 }]);
-  });
-});

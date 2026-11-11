@@ -1,7 +1,7 @@
 // Worker の中の SQLite。シャードと同じエンジンで元の SQL を実行するので、式の意味を再実装せずに済む。
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js";
 import type { Catalog } from "../meta";
-import type { Backend, Row, Value } from "../types";
+import { SqlError, type Backend, type Row, type Value } from "../types";
 
 // Emscripten の glue が self.location を参照する。Workers にはないので補う。
 if (typeof globalThis.location === "undefined") {
@@ -31,22 +31,42 @@ function sqlJs(): Promise<SqlJsStatic> {
   return engine;
 }
 
+/** 文を SQLite がコンパイルした結果から読み取ったこと。 */
+export interface Compiled {
+  /** 文が開く表。読むだけの表も、書く表も入る。 */
+  tables: string[];
+  /**
+   * 文が読むために開く表。INSERT ... VALUES の挿入先のように、書くためにだけ開く表は入らない。
+   * 行を集めるときは、こちらを見る。挿入先の表を全部集める必要はない (衝突し得る行は、実行した後で探して集める)。
+   */
+  read: string[];
+  /** 文が表定義そのものを読む。 */
+  metadata: boolean;
+}
+
 export class ScratchDb implements Backend {
   constructor(private db: Database) {}
   iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
     const { columns, values } = this.raw(sql, ...params);
     return { columns, rows: values };
   }
+  /**
+   * 文を実行する。SQLite のエラー (構文、制約の違反) は SqlError にして投げる。
+   * シャードで実行した文のエラーも SqlError で届くので、文がどちらで実行されたかで、エラーの型が変わらない。
+   */
   raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] } {
-    const st = this.db.prepare(sql);
+    let st: ReturnType<Database["prepare"]> | undefined;
     try {
+      st = this.db.prepare(sql);
       st.bind(params as never);
       const columns = st.getColumnNames();
       const values: Value[][] = [];
       while (st.step()) values.push(st.get() as Value[]);
       return { columns, values };
+    } catch (e) {
+      throw e instanceof SqlError ? e : new SqlError(e instanceof Error ? e.message : String(e));
     } finally {
-      st.free();
+      st?.free();
     }
   }
   exec(sql: string, ...params: Value[]): Row[] {
@@ -86,23 +106,27 @@ export class ScratchDb implements Backend {
    * PRAGMA の関数は仮想表として開かれる。`json_each` なども仮想表なので、仮想表を開き、かつ文面に `pragma_` で始まる
    * 名前があるときに、表定義を読む文として扱う。
    */
-  reads(sql: string): { tables: string[]; metadata: boolean } {
+  reads(sql: string): Compiled {
     const roots = new Map<number, string>();
     for (const r of this.exec(`SELECT rootpage, tbl_name FROM sqlite_master WHERE rootpage > 0`)) {
       roots.set(r.rootpage as number, r.tbl_name as string);
     }
     const out = new Set<string>();
+    const read = new Set<string>();
     let schema = false;
     let virtual = false;
     for (const op of this.exec(`EXPLAIN ${sql}`)) {
       if (op.opcode === "OpenRead" || op.opcode === "OpenWrite") {
         if (op.p2 === 1) schema = true;
         const t = roots.get(op.p2 as number);
-        if (t && !t.startsWith("sqlite_")) out.add(t);
+        if (t && !t.startsWith("sqlite_")) {
+          out.add(t);
+          if (op.opcode === "OpenRead") read.add(t);
+        }
       } else if (op.opcode === "VOpen") virtual = true;
     }
     const text = sql.replace(/'(?:[^']|'')*'/g, "''").replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, " ");
-    return { tables: [...out], metadata: schema || (virtual && /\bpragma_/i.test(text)) };
+    return { tables: [...out], read: [...read], metadata: schema || (virtual && /\bpragma_/i.test(text)) };
   }
 
   /** 行をまとめて投入する。1 回の取引で流すと 10 万行で 100 ms 前後である。 */
@@ -116,6 +140,9 @@ export class ScratchDb implements Backend {
     try {
       for (const r of rows) st.run((keep.length === columns.length ? r : keep.map((i) => r[i]!)) as never);
       this.db.run("COMMIT");
+    } catch (e) {
+      // 集めた行が表の制約に反した (同じ UNIQUE の値の行が 2 つあるなど)。文のエラーと同じ型で返す。
+      throw e instanceof SqlError ? e : new SqlError(e instanceof Error ? e.message : String(e));
     } finally {
       st.free();
     }

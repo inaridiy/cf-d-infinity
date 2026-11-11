@@ -33,6 +33,13 @@ const out = mkdtempSync(join(tmpdir(), "sweep-"));
 const chunks = Math.min(procs, to - from + 1);
 const size = Math.ceil((to - from + 1) / chunks);
 const t0 = Date.now();
+const children = [];
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    for (const c of children) c.kill(signal);
+    process.exit(130);
+  });
+}
 const runs = Array.from({ length: chunks }, (_, i) => {
   const a = from + i * size;
   const b = Math.min(to, a + size - 1);
@@ -40,9 +47,11 @@ const runs = Array.from({ length: chunks }, (_, i) => {
   const json = join(out, `${i}.json`);
   // seed ごとの試験だけを流す。名前に「seed 数字」のない試験 (決定性の検査、決まった並びの再現テストなど) は、ここでは要らない。
   const names = `^(?=.*seed \\d+)${pattern ? `(?=.*${pattern})` : ""}`;
-  const argv = ["vitest", "run", file, "--reporter=json", `--outputFile=${json}`, "-t", names];
+  // vitest を npx を介さずに起動する。介すと、この道具を止めたときに、vitest のプロセスが残る。
+  const argv = ["node_modules/vitest/vitest.mjs", "run", file, "--reporter=json", `--outputFile=${json}`, "-t", names];
   return new Promise((done) => {
-    const child = spawn("npx", argv, { env: { ...process.env, SEEDS: `${a}..${b}` }, stdio: "ignore" });
+    const child = spawn(process.execPath, argv, { env: { ...process.env, SEEDS: `${a}..${b}` }, stdio: "ignore" });
+    children.push(child);
     child.on("exit", () => done(json));
   });
 }).filter(Boolean);

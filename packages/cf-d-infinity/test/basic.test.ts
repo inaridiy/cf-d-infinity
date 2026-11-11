@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { logRows, ORDERS, SimCluster, USERS } from "./sim";
+import { logRows, ORDERS, REFERENCE_ONLY, SimCluster, USERS } from "./sim";
 import { slotOf } from "../src/routing";
 
 async function setup(opts = {}) {
@@ -145,7 +145,7 @@ describe("indexes on tables that already hold data", () => {
     await db.ddl("CREATE INDEX lo ON orders(tenant_id, total)");
     expect((await db.query("SELECT total FROM orders WHERE tenant_id = 1 AND total = 1")).rows).toEqual([{ total: 1 }]);
   });
-  it("makes a plain index a local index on every shard: no index table, and writes stay on one shard", async () => {
+  it.skipIf(REFERENCE_ONLY)("makes a plain index a local index on every shard: no index table, and writes stay on one shard", async () => {
     const { c, db } = await setup();
     await db.query("INSERT INTO orders VALUES (1,1,1,'paid',1),(2,1,1,'paid',1),(3,1,1,'open',1)");
     await db.ddl("CREATE INDEX st ON orders(status)");

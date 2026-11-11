@@ -8,7 +8,7 @@ import { split } from "../src/autoscaler";
 import { runListAppend } from "../src/listappend";
 import { planSplit, shardsOf } from "../src/routing";
 import type { Faults } from "../src/types";
-import { seedsOr, SimCluster } from "./sim";
+import { REFERENCE_ONLY, seedsOr, SimCluster } from "./sim";
 
 function prng(seed: number) {
   let a = seed >>> 0;
@@ -91,7 +91,8 @@ describe("black-box list-append check on the simulator", () => {
   }
 });
 
-describe("the black-box check is not vacuous", () => {
+// 欠陥を戻して、検査が気付くことを確かめる。欠陥は最適化の経路の上で現れるものなので、基準経路だけの実行では流さない。
+describe.skipIf(REFERENCE_ONLY)("the black-box check is not vacuous", () => {
   // 実行は実時間のタイマーで進むので、同じ seed でも毎回同じ履歴にはならない。
   // 12 個では約 1 割の実行でどの seed にも異常が出ず、テストが落ちた。見つかった時点で打ち切る。
   const detects = async (faults: Faults) => {

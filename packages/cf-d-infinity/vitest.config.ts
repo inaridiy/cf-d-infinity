@@ -18,6 +18,15 @@ const tests = [
 ].filter((f) => f.endsWith(".test.ts"));
 const workerd = tests.filter((f) => /from "miniflare"/.test(readFileSync(join(import.meta.dirname, f), "utf8")));
 
+// reference-scans、reference-full: SQLite と突き合わせる検査を、全部の文を基準経路で実行して流す (src/sql/plan.ts の Reference)。
+//          通常の実行 (sim) と同じ答えになれば、行がどのシャードにあるかで答えが変わる経路がないことになる。
+//          対象は、合格の条件が「SQLite と同じ」か「直列な実行と同じ」である検査に限る。計画の種類や行ロックの挙動を確かめる
+//          試験は、最適化の経路そのものの試験なので、入れない。
+const oracles = [
+  "compat", "fuzz", "slt-more", "conflict-clauses", "basic", "insert-subquery", "autowrite-subquery", "collated-keys",
+  "admission", "unique-reads", "export-import", "replay", "history", "elle-sim",
+].map((name) => `test/${name}.test.ts`);
+
 export default defineConfig({
   test: {
     testTimeout: 30000,
@@ -27,6 +36,14 @@ export default defineConfig({
       {
         extends: true,
         test: { name: "sim", include: ["test/**/*.test.ts"], exclude: ["node_modules/**", ...workerd, ...open], sequence: { groupOrder: 0 } },
+      },
+      {
+        extends: true,
+        test: { name: "reference-scans", include: oracles, env: { REFERENCE: "scans" }, sequence: { groupOrder: 0 } },
+      },
+      {
+        extends: true,
+        test: { name: "reference-full", include: oracles, env: { REFERENCE: "full" }, sequence: { groupOrder: 0 } },
       },
       {
         extends: true,

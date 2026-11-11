@@ -44,18 +44,10 @@ export interface UniqueRead {
 }
 
 /** 挿入する 1 行の、主キーの値と、UNIQUE の列の値。index があれば、シャードをまたぐ UNIQUE である。 */
-export interface ConflictRow {
-  sk: string;
-  pk: Value[];
-  uniques: (UniqueRead & { index?: GlobalIndexDef })[];
-}
-
 export type Plan =
-  | {
-      kind: "shard"; route: Route; sql: string; params: Value[]; tables: TableDef[]; pk: string | null;
-      /** DO の SQLite が拒否する文 (6 項以上の複合 SELECT) を、Worker の SQLite で実行し直すための計画。 */
-      wasm?: Extract<Plan, { kind: "gather" }>;
-    }
+  /** 最適化の経路。全部の表が 1 つの shard key の値に固定される読みを、そのシャードへそのまま送る。 */
+  | { kind: "shard"; route: Route; sql: string; params: Value[]; tables: TableDef[]; pk: string | null }
+  /** 読みの基準経路。走査で行を集め、元の文を Worker の SQLite で実行する。 */
   | { kind: "gather"; scans: Scan[]; sql: string; params: Value[] }
   | { kind: "partial"; scan: Scan; columns: string[]; mergeSql: string; mergeParams: Value[] }
   | { kind: "meta"; sql: string; params: Value[] }
@@ -64,19 +56,18 @@ export type Plan =
       /** 文が読む全表。サブクエリの表も検証の対象にする。 */
       tables?: TableDef[];
     }
-  | { kind: "wasmWrite"; scans: Scan[]; sql: string; params: Value[]; tables: TableDef[] }
+  /**
+   * 書き込みの基準経路。走査で行を集め、元の文を Worker の SQLite で実行し、捕捉した変更をシャードへ振り分ける。
+   * 文の結果が衝突し得る行は、実行してから集め足す (Txn.wasmWrite)。INSERT は、文が読む行がないので scans が空になる。
+   * lastRowid は、プランナが rowid を採番したときの、最後の値である。
+   */
+  | { kind: "wasmWrite"; scans: Scan[]; sql: string; params: Value[]; tables: TableDef[]; lastRowid?: number | null }
   | { kind: "insertSelect"; def: TableDef; select: Plan; head: string; columns: string[] | null; tail: string; tailParams: Value[] }
   | { kind: "ddl"; sql: string }
   | { kind: "ctas"; name: string; select: Plan; ifNotExists: boolean }
   | { kind: "noop" }
   /** 文を 1 つの取引の中で計画し直す。計画の途中で表を読む必要があるときに返す。 */
   | { kind: "inTxn" }
-  /**
-   * 衝突を自分で解決する INSERT (OR IGNORE、OR REPLACE、ON CONFLICT) を、シャードをまたぐ UNIQUE のある表へ入れる。
-   * 衝突する行は別のシャードにあり得るので、挿入先のシャードの SQLite だけでは解決できない。
-   * 衝突し得る行を Worker に集め、元の文を Worker の SQLite で実行して、SQLite に解決させる。rows は、集める行を決めるための値である。
-   */
-  | { kind: "conflictInsert"; def: TableDef; sql: string; params: Value[]; rows: ConflictRow[]; lastRowid: number | null }
   | { kind: "tcl"; op: "begin" | "commit" | "rollback" | "savepoint" | "release" | "rollbackTo"; name?: string; immediate?: boolean };
 
 export interface PlanContext {
@@ -91,7 +82,21 @@ export interface PlanContext {
    * 取引の外では呼べないので、無いときは計画が `inTxn` を返し、呼び出し側が取引の中で計画し直す。
    */
   read?(sql: string, params: Value[]): Promise<Value>;
+  /** 最適化の経路を使わず、基準経路だけで計画する (Reference)。試験が使う。 */
+  reference?: Reference;
 }
+
+/**
+ * 基準経路だけで実行する指定。基準経路は、文が読む表の行を走査で集め、元の文を Worker の SQLite で実行する。
+ * 文を 1 シャードへそのまま送る、集約を分けて押し下げる、上位 N 件を押し下げる、といった最適化の経路は使わない。
+ *
+ * - "scans": 条件を押し下げた走査で集める。最適化の経路が 1 シャードで答えられないときに落ちる先と同じである。
+ * - "full": 条件を押し下げず、表の全行を集める。プランナの判断は、どの表を読むかだけになる (それも SQLite が確かめる)。
+ *
+ * SQLite と突き合わせる検査を、通常の実行とこの 2 つで流す。3 つが同じ答えなら、行がどのシャードにあるかで答えが変わる
+ * 経路がないことになる。
+ */
+export type Reference = "scans" | "full";
 
 const lower = (s: string) => s.toLowerCase();
 const same = (a: string, b: string) => lower(a) === lower(b);
@@ -685,21 +690,27 @@ function topN(stmt: Node, s: Scope, scan: Scan, values: Value[]): Scan {
   return { ...scan, sql: `${scan.sql} ORDER BY ${orderSql} LIMIT ${n.value + Math.max(0, off.value)}` };
 }
 
-function planRead(stmt: Node, values: Value[], cat: Catalog): Plan {
+/** 基準経路の走査。"full" なら条件を押し下げず、表の全行を集める。 */
+function referenceScans(scopes: Scope[], n: Names, values: Value[], reference: Reference | undefined): Scan[] {
+  const scans = scansFor(scopes, n, values);
+  return reference === "full" ? scans.map((s) => fullScan(s.table)) : scans;
+}
+
+function planRead(stmt: Node, values: Value[], cat: Catalog, reference?: Reference): Plan {
   const n: Names = { cat, ctes: new Set(), meta: { used: false }, views: new Set() };
   const scopes = scopesOf(stmt, n);
   const { sql, params } = render(stmt, values);
   const defs = [...new Set(scopes.flatMap((s) => s.refs.flatMap((r) => (r.def ? [r.def] : []))))];
   if (n.views.size === 0 && defs.length === 0) return { kind: "meta", sql, params };
   if (n.meta.used) return { kind: "meta", sql, params };
+  if (reference) return { kind: "gather", scans: referenceScans(scopes, n, values, reference), sql, params };
   if (n.views.size === 0) {
     const key = statementPin(scopes, values);
     if (key !== null) {
       const top = scopes.find((s) => s.node === stmt);
       const only = scopes.length === 1 && top?.refs.length === 1 ? top : null;
       const pk = only ? pkOf(conjuncts(only.where), only.refs[0]!, only, values) : null;
-      const wasm = { kind: "gather" as const, scans: scansFor(scopes, n, values), sql, params };
-      return { kind: "shard", route: { by: "sk", sks: [key] }, sql, params, tables: defs, pk, wasm };
+      return { kind: "shard", route: { by: "sk", sks: [key] }, sql, params, tables: defs, pk };
     }
     // グローバル index は、読み書きの経路には使わない (一意性の保証にだけ使う)。index が挙げた shard key でシャードを選び、
     // 文を絞らずに送る経路は、読む範囲と検証する範囲がずれやすかった。index の列で引く文は、全シャードへ条件を押し下げて集める。
@@ -759,7 +770,7 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
 
   if (body.type !== "values_clause" && body.type !== "default_values") {
     return {
-      kind: "insertSelect", def, select: planRead(body, values, cat), head: prefix, columns: cols, tail: tailSql, tailParams,
+      kind: "insertSelect", def, select: planRead(body, values, cat, ctx.reference), head: prefix, columns: cols, tail: tailSql, tailParams,
     };
   }
 
@@ -770,7 +781,6 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   // 先に取引の読みとして値を求め、定数に置き換えてから送る。
   const reads = rows.map((r) => r.map(hasSubquery));
   if (reads.some((r) => r.some(Boolean)) && !ctx.read) return { kind: "inTxn" };
-  if (tailClauses.some(hasSubquery)) throw new SqlError("subqueries in ON CONFLICT or RETURNING of an INSERT are not supported");
   const names = cols ?? (body.type === "default_values" ? [] : [...def.columns]);
   for (const r of rows) {
     if (body.type === "values_clause" && r.length !== names.length) {
@@ -800,10 +810,11 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   let last: number | null = null;
 
   const outCols = auto && idAt < 0 ? [auto, ...names] : names;
-  // 衝突を自分で解決する文で、表にシャードをまたぐ UNIQUE がある。衝突する行が別のシャードにあり得る。
+  // 衝突を自分で解決する文で、表にシャードをまたぐ UNIQUE がある。衝突する行が別のシャードにあり得るので、挿入先のシャードの
+  // SQLite だけでは解決できない。最初から基準経路で実行する。基準経路だけで実行する指定のときも、そうする。
   const resolves = /^(REPLACE|INSERT OR (IGNORE|REPLACE))$/.test(keyword) || tailClauses.some((c) => c.type === "upsert_clause");
-  const viaWorker = resolves && def.globalIndexes.length > 0;
-  const conflictRows: ConflictRow[] = [];
+  // ON CONFLICT や RETURNING の中のサブクエリは、表を読む。挿入先のシャードだけでは答えられないので、これも基準経路で実行する。
+  const viaWorker = ctx.reference !== undefined || (resolves && def.globalIndexes.length > 0) || tailClauses.some(hasSubquery);
   const skAt = def.shardKey.map((c) => outCols.findIndex((n2) => same(n2, c) || (c === "rowid" && ROWID_NAMES.has(lower(n2)))));
   type Built = { sk: string; pk: string | null; sql: string; params: Value[]; uniq: UniqueRead[] | null };
   const built: Built[] = [];
@@ -854,23 +865,6 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
         if (id === undefined) ctx.sawId(def.name, v);
       }
     }
-    if (viaWorker) {
-      const uniques: ConflictRow["uniques"] = [];
-      for (const u of [...def.uniques.map((cols) => ({ cols, index: undefined })), ...def.globalIndexes.map((ix) => ({ cols: ix.columns, index: ix }))]) {
-        const vals: Value[] = [];
-        for (const c of u.cols) {
-          const at = outCols.findIndex((n2) => same(n2, c));
-          // 値を省いた列には、DEFAULT がなければ NULL が入る。NULL はどの行とも衝突しない。
-          // DEFAULT のある列を省くと、入る値がここでは分からないので、衝突する行を集められない。
-          if (at < 0 && (!def.defaults || def.defaults.includes(c))) {
-            throw new SqlError(`unsupported: ${keyword}${tailSql ? " ... ON CONFLICT" : ""} into ${def.name} must give a value for the UNIQUE column ${c}, which has a DEFAULT`);
-          }
-          vals.push(at < 0 ? null : await parts[at]!.value());
-        }
-        uniques.push({ cols: u.cols, values: vals, index: u.index });
-      }
-      conflictRows.push({ sk: encode(skVals), pk: pkVals, uniques });
-    }
     built.push({
       sk: encode(skVals), pk: encode(pkVals), uniq,
       sql: `(${parts.map((p) => p.sql).join(", ")})`, params: parts.flatMap((p) => p.params),
@@ -879,9 +873,10 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
 
   const colSql = outCols.length ? ` (${outCols.map((c) => q(ROWID_NAMES.has(lower(c)) ? "rowid" : c)).join(", ")})` : "";
   if (viaWorker) {
+    const isDefault = body.type === "default_values" && outCols.length === 0;
     return {
-      kind: "conflictInsert", def, rows: conflictRows, lastRowid: last,
-      sql: `${prefix}${colSql} VALUES ${built.map((b) => b.sql).join(", ")}${tailSql ? ` ${tailSql}` : ""}`,
+      kind: "wasmWrite", scans: [], tables: [def], lastRowid: last,
+      sql: `${prefix}${colSql} ${isDefault ? "DEFAULT VALUES" : `VALUES ${built.map((b) => b.sql).join(", ")}`}${tailSql ? ` ${tailSql}` : ""}`,
       params: [...built.flatMap((b) => b.params), ...tailParams],
     };
   }
@@ -932,7 +927,7 @@ function captureOf(stmt: Node, pk: string | null): WritePlan["capture"] {
   return "update";
 }
 
-function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog): Plan {
+function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog, reference?: Reference): Plan {
   const n: Names = { cat, ctes: new Set(), meta: { used: false }, views: new Set() };
   const scopes = scopesOf(stmt, n);
   const top = scopes.find((s) => s.node === stmt)!;
@@ -948,7 +943,7 @@ function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog): Plan {
   );
   const movesRow = assigned.some((c) => def.shardKey.some((k) => same(k, c)) || def.pk.some((k) => same(k, c)));
   const defs = [...new Set(scopes.flatMap((s) => s.refs.flatMap((r) => (r.def ? [r.def] : []))))];
-  if (!movesRow && n.views.size === 0) {
+  if (!reference && !movesRow && n.views.size === 0) {
     const key = statementPin(scopes, values);
     if (key !== null) {
       const pk = scopes.length === 1 && top.refs.length === 1 ? pkOf(conjuncts(top.where), ref, top, values) : null;
@@ -958,7 +953,7 @@ function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog): Plan {
       return { kind: "write", def, tables: defs, lastRowid: null, targets: [{ route: { by: "sk", sks: [key] }, sql, params, write: { sk: key, capture: captureOf(stmt, pk) }, pk, uniqueReads }] };
     }
   }
-  return { kind: "wasmWrite", scans: scansFor(scopes, n, values), sql, params, tables: defs };
+  return { kind: "wasmWrite", scans: referenceScans(scopes, n, values, reference), sql, params, tables: defs };
 }
 
 // ---- 入口 ----
@@ -968,11 +963,11 @@ export async function planStatement(stmt: Node, input: Params, cat: Catalog, ctx
   switch (stmt.type) {
     case "select_stmt":
     case "compound_select_stmt":
-      return planRead(stmt, values, cat);
+      return planRead(stmt, values, cat, ctx.reference);
     case "insert_stmt": return planInsert(stmt, values, cat, ctx);
     case "update_stmt":
     case "delete_stmt":
-      return planUpdateDelete(stmt, values, cat);
+      return planUpdateDelete(stmt, values, cat, ctx.reference);
     case "create_table_stmt": {
       const as = clause(stmt, "as_clause");
       // 表の作成と行の挿入を 1 文で行うと、途中で失敗したときの後始末が要る。CREATE TABLE と INSERT ... SELECT に分けて書ける。
