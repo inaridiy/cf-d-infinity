@@ -112,7 +112,10 @@ const inner = (item: Node) => (item.type === "constraint" ? item.constraint : it
 const specCols = (c: Node): string[] => c.columns.expr.items.map((i: Node) => ident(i.type === "index_specification" ? i.expr : i));
 
 function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: string[] | null): ParsedDdl {
-  if (stmt.kind?.name === "TEMP" || stmt.kind?.name === "TEMPORARY") throw new SqlError("TEMP tables are not supported");
+  // TEMP の表は接続ごとのもので、シャードにも、Worker の SQLite にも置き場がない。普通の表として作ってしまうと、消えない。
+  const kind = stmt.kind?.kindKw?.name;
+  const schemaName = stmt.name?.type === "member_expr" ? ident(stmt.name.object).toLowerCase() : null;
+  if (kind === "TEMP" || kind === "TEMPORARY" || schemaName === "temp") unsupported("TEMP tables");
   const name = userName(ident(stmt.name), "table");
   if (schema.tables[name] || schema.views[name]) {
     if (stmt.ifNotExistsKw) return NOOP;

@@ -1028,7 +1028,7 @@ export class ShardCore implements ShardApi {
         this.count("writes", req.spans);
         this.renew(me.txn);
         const overlay = (req.overlay ?? []).map((c) => ({ table: c.table, pk: c.pk, image: c.after }));
-        let out: { columns: string[]; values: Value[][]; changes: Change[] };
+        let out: { columns: string[]; values: Value[][]; changes: Change[]; count?: number };
         try {
           out = this.rollback(() => {
             if (overlay.length) setBasedRestore(this.b, (t) => this.def(t), overlay);
@@ -1193,7 +1193,7 @@ export class ShardCore implements ShardApi {
    * 文の意味は SQLite が解釈し、変更行は trigger が捕捉するので、UPSERT や
    * INSERT ... SELECT のような構文でも Worker 側で解析する必要がない。
    */
-  private run(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[] } {
+  private run(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number } {
     return this.checked(req, () => this.runStatement(req));
   }
 
@@ -1255,7 +1255,7 @@ export class ShardCore implements ShardApi {
     return true;
   }
 
-  private runStatement(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[] } {
+  private runStatement(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number } {
     if (!req.write) return { ...this.readLimited(req), changes: [] };
     const captured = this.runCaptured(req);
     if (captured) return captured;
@@ -1263,6 +1263,9 @@ export class ShardCore implements ShardApi {
     this.b.exec(`PRAGMA recursive_triggers = ON`);
     this.b.exec(`INSERT INTO __cap_on VALUES (1)`);
     const out = this.b.raw(req.sql, ...req.params);
+    // 文が変更した行の数は、SQLite に尋ねる。捕捉した変更の数とは違う。REPLACE が消した行は、SQLite は数えない。
+    // 捕捉のための trigger の中の書き込みは、changes() に入らない。
+    const count = this.b.exec(`SELECT changes() AS n`)[0]!.n as number;
     const changes = capturedChanges(this.b, (t) => this.def(t));
     const sk = req.write.sk;
     if (sk !== null) {
@@ -1270,7 +1273,7 @@ export class ShardCore implements ShardApi {
         if (c.sk !== sk) throw new SqlError(`row of shard key ${c.sk} written through shard key ${sk}`);
       }
     }
-    return { ...out, changes };
+    return { ...out, changes, count };
   }
 
   /** 読み取りの文を実行し、上限を超えた時点で打ち切る。全行を集めてから数えると、数える前にメモリが尽きる。 */

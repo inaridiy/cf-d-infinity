@@ -114,23 +114,34 @@ Waiting uses wound-wait; prepared transactions cannot be wounded and never wait,
 
 ## Queries across shards
 
-The planner (the only part written from scratch) decides where a statement runs. If it can prove that one shard owns
-all the rows, the statement is sent there unchanged. Otherwise it pushes filters down to the shards, gathers the
-rows into a SQLite instance inside the Worker (sql.js, WebAssembly), and **runs the original SQL there**. Expression
-evaluation is never reimplemented, which is why the same statement gives the same answer on one shard and on many.
-Multi-shard `UPDATE` and `DELETE` run only when the statement spells them out; the planner does not rewrite a
-statement into something else silently.
+Every statement has one **reference path**: gather the rows it reads into a SQLite instance inside the Worker (sql.js,
+WebAssembly) and **run the original SQL there**. Scans with the filters pushed down fetch the rows, and the tables a
+statement opens are taken from SQLite's own compilation of it, not from the planner's reading of the text. Expression
+evaluation is never reimplemented, which is why the same statement gives the same answer wherever its rows are.
+
+Everything else the planner (the only part written from scratch) does is an optimization of that path. If it can
+prove that one shard owns all the rows, the statement is sent there unchanged; a simple aggregate is computed per
+shard and merged. When an optimized path finds out while running that one shard cannot answer (the statement reads
+a table that is not in its `FROM` clause, it resolves a conflict with a row on another shard, a shard's SQLite
+refuses it), the statement is planned again on the reference path and run there. That switch is in one place, and
+nothing is refused because of where rows happen to be. Multi-shard `UPDATE` and `DELETE` run only when the statement
+spells them out; the planner does not rewrite a statement into something else silently.
+
+A write on the reference path is run in the Worker's SQLite and the rows it changed are captured and sent to the
+shards that own them. What it can conflict with is not known before it runs, because the values it writes come from
+expressions and defaults. So the write is run, then the rows that share a primary key or a `UNIQUE` value with a
+changed row and were not gathered yet are fetched (through the global index when the `UNIQUE` spans shards), and the
+write is run again, until nothing is missing. With those rows present SQLite itself decides what is ignored, replaced,
+updated or a constraint violation. The lookups are reads of the transaction, so a conflicting row that appears later
+fails validation at commit.
 
 Whatever a statement reads on a shard is recorded as a *span* and validated at commit: a primary key, a shard-key
 group, a pushed-down condition, or a whole table. The span has to cover everything the shard-side statement can
 read, not just the rows the Worker expects. A subquery inside `INSERT ... VALUES` is evaluated first, as a read of
 the transaction, and sent as a constant. In the simulator every statement a shard runs is checked against its spans:
-the rows outside them are deleted and the statement is run again, and a different result fails the test.
-
-An `INSERT` that resolves conflicts itself (`OR IGNORE`, `OR REPLACE`, `ON CONFLICT`) into a table with a global index
-cannot be decided by one shard. The Worker gathers the rows it can conflict with (the same primary key, the same
-`UNIQUE` values, located through the global index) and runs the statement in its own SQLite, so SQLite decides what
-is ignored, replaced or updated.
+the rows outside them are deleted and the statement is run again, and a different result fails the test. The tests
+that compare against real SQLite also run with every statement forced onto the reference path, with and without
+pushed-down filters; all three must agree.
 
 ## Schema changes
 

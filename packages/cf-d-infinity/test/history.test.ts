@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { expectQuiescent } from "./invariants";
 import { describe, expect, it } from "vitest";
-import { seedsOr, SimCluster, USERS } from "./sim";
+import { REFERENCE_ONLY, seedsOr, SimCluster, USERS } from "./sim";
 import { checkHistory, type Read, type TxRecord } from "./history";
 import { SqlError, type Faults } from "../src/types";
 import type { Txn } from "../src/client/db";
@@ -246,7 +246,8 @@ describe("the simulator is deterministic for this workload", () => {
   });
 });
 
-describe("the checker is not vacuous", () => {
+// 欠陥を戻して、検査が気付くことを確かめる。欠陥は最適化の経路の上で現れるものなので、基準経路だけの実行では流さない。
+describe.skipIf(REFERENCE_ONLY)("the checker is not vacuous", () => {
   // 欠陥を入れた実装で異常を検出できなければ、上の合格は意味を持たない。
   const detects = async (faults: Faults, skewMs = 40) => {
     for (let seed = 100; seed < 112; seed++) {

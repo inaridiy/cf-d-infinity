@@ -3,6 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { Db, type Cluster } from "../src/client/db";
 import { MetaCore } from "../src/meta";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
+import type { Reference } from "../src/sql/plan";
 import { ShardCore, type SpanEscape } from "../src/shard/core";
 import type { Backend, Faults, Row, ShardApi, Value } from "../src/types";
 
@@ -52,6 +53,19 @@ export function seedsOr(defaults: number[]): number[] {
     if (!/^\d+$/.test(part.trim())) throw new Error(`SEEDS: cannot read "${part}"; write 1..500 or 3,17,204`);
     return [Number(part)];
   });
+}
+
+/**
+ * 基準経路だけの実行 (環境変数 REFERENCE) か。最適化の経路そのものを確かめる試験 (文が 1 シャードで済むこと、行ロックの待ち、
+ * 欠陥を戻したときにその経路で検査が気付くこと) は、`it.skipIf(REFERENCE_ONLY)` で外す。
+ */
+export const REFERENCE_ONLY = Boolean(process.env.REFERENCE);
+
+function referenceFromEnv(): Reference | undefined {
+  const v = process.env.REFERENCE;
+  if (!v) return undefined;
+  if (v !== "scans" && v !== "full") throw new Error(`REFERENCE: cannot read "${v}"; write scans or full`);
+  return v;
 }
 
 /**
@@ -239,6 +253,11 @@ export class SimCluster implements Cluster {
   net = new SimNet();
   /** 時刻、待ち、乱数、識別子の出どころ。Db もシャードも、ここから取る。 */
   readonly runtime: Runtime;
+  /**
+   * このクラスタへつなぐ Db を、基準経路だけで実行させる指定。環境変数 REFERENCE (scans か full) から取る。
+   * SQLite と突き合わせる検査を、通常の実行と、基準経路だけの実行で流すのに使う。
+   */
+  readonly reference: Reference | undefined = referenceFromEnv();
   private virtual: VirtualRuntime | null;
   private fixedTime = 1_000_000;
   /** 全シャードの時計をまとめて進める量 (ms)。時計の出所が実時間でも効く。 */

@@ -159,6 +159,12 @@ export interface ExecRes {
   columns: string[];
   values: Value[][];
   changes: Change[];
+  /**
+   * 書き込みの文が変更した行の数。SQLite の changes() の値である。
+   * changes の長さとは違うことがある。REPLACE が消した行は、変更としては捕捉するが、SQLite は数えない。
+   * 無ければ、changes の長さと同じである。
+   */
+  count?: number;
   T: Ts;
   hlc: Ts;
   epoch: number;

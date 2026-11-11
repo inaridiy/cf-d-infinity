@@ -19,6 +19,7 @@ const DDL = [
   `CREATE TABLE item(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, acct_id INTEGER, qty INTEGER NOT NULL DEFAULT 0,
      PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`,
   `CREATE TABLE flat(id INTEGER PRIMARY KEY, v INTEGER, tag TEXT)`,
+  `CREATE TABLE one(id INTEGER PRIMARY KEY)`,
 ];
 
 type Rnd = () => number;
@@ -60,6 +61,16 @@ const SHAPES: Record<string, (r: Rnd) => [string, Value[]]> = {
   "W update by primary key": (r) => ["UPDATE acct SET n = n + 1 WHERE tenant_id = ? AND id = ?", [tenant(r), id(r)]],
   "W update a local UNIQUE column": (r) => ["UPDATE acct SET code = ? WHERE tenant_id = ? AND id = ?", [code(r), tenant(r), id(r)]],
   "W update a UNIQUE column that spans shards": (r) => ["UPDATE acct SET email = ? WHERE tenant_id = ? AND id = ?", [email(r), tenant(r), id(r)]],
+  // 1 シャードへ送った文が、別のシャードの行と衝突する。衝突を自分で解決する文は、基準経路で実行し直される。
+  "W update or replace a UNIQUE column that spans shards": (r) => ["UPDATE OR REPLACE acct SET email = ? WHERE tenant_id = ? AND id = ?", [email(r), tenant(r), id(r)]],
+  "W update or ignore a UNIQUE column that spans shards": (r) => ["UPDATE OR IGNORE acct SET email = ?, n = n + 1 WHERE tenant_id = ? AND id = ?", [email(r), tenant(r), id(r)]],
+  "W update or replace a UNIQUE column inside one shard key": (r) => ["UPDATE OR REPLACE acct SET code = ? WHERE tenant_id = ? AND id = ?", [code(r), tenant(r), id(r)]],
+  // FROM に現れない表を読む文 (`x IN 表名`)。その表の行は、どのシャードにもある。
+  "W insert one": (r) => ["INSERT OR IGNORE INTO one VALUES (?)", [flatId(r)]],
+  "W delete one": (r) => ["DELETE FROM one WHERE id = ?", [flatId(r)]],
+  "W insert with a table operand": (r) => ["INSERT OR IGNORE INTO flat(id, v, tag) VALUES (?, ? IN one, ?)", [flatId(r), flatId(r), tag(r)]],
+  "W update with a table operand": (r) => ["UPDATE flat SET v = v + 1 WHERE id = ? AND ? IN one", [flatId(r), flatId(r)]],
+  "R with a table operand": (r) => ["SELECT id, ? IN one FROM flat WHERE id = ?", [flatId(r), flatId(r)]],
   "W update one shard key": (r) => ["UPDATE acct SET v = (v + 1) % 4 WHERE tenant_id = ?", [tenant(r)]],
   "W update across shards": (r) => ["UPDATE acct SET n = n + 1 WHERE v = ?", [v(r)]],
   "W delete by primary key": (r) => ["DELETE FROM acct WHERE tenant_id = ? AND id = ?", [tenant(r), id(r)]],
@@ -107,7 +118,7 @@ async function run(seed: number, o: { clients?: number; rounds?: number } = {}):
           first ??= shard;
           return c.shard(shard);
         },
-        runtime: c.runtime, catalog: () => c.catalog(), applyDdl: (q, b) => c.applyDdl(q, b),
+        runtime: c.runtime, reference: c.reference, catalog: () => c.catalog(), applyDdl: (q, b) => c.applyDdl(q, b),
         publishIndex: (t, n, b) => c.publishIndex(t, n, b), allocate: (t, n, m) => c.allocate(t, n, m), switchRange: (m) => c.switchRange(m),
       };
       if (rnd() < 0.4) {

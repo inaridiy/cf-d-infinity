@@ -47,9 +47,10 @@ describe("NULL in a declared primary key (invariant 6: one identity per row)", (
   });
 });
 
-describe("the schema read inside a statement that runs on one shard (invariant 5: internal tables are not addressable)", () => {
+describe("the schema read inside a statement that touches a table (invariant 5: internal tables are not addressable)", () => {
   // Worker の SQLite には利用者の表しかないが、`pragma_table_info('名前')` や `sqlite_master` は、表がなくてもコンパイルできる。
-  // その文をシャードへ送ると、同じ式がシャードの内部の表について答える。
+  // その文をシャードへ送ると、同じ式がシャードの内部の表について答える。読みは、利用者の表しかない Worker の SQLite で答える。
+  // 書き込みは断る。書き込みを Worker の SQLite で実行するときは、変更を捕捉する表をそこに作るので、利用者の表定義だけにならない。
   const setup = async () => {
     const c = new SimCluster({ shards: 2 });
     const db = c.client();
@@ -57,14 +58,13 @@ describe("the schema read inside a statement that runs on one shard (invariant 5
     await db.query("INSERT INTO t VALUES (1, 1, 0, '[\"a\",\"b\"]')");
     return { c, db };
   };
-  const REFUSED = /^unsupported: a statement that runs on one shard cannot read sqlite_master or a PRAGMA function/;
+  const REFUSED = /^unsupported: a statement that writes cannot read sqlite_master or a PRAGMA function/;
 
-  it("in a read, is refused or answered from the user's schema, whatever name the schema table goes by", async () => {
-    const { db } = await setup();
+  it("in a read, is answered from the user's schema, whatever name the schema table goes by", async () => {
+    const { c, db } = await setup();
     const lite = new DatabaseSync(":memory:");
     lite.exec("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER, tags TEXT, PRIMARY KEY (tenant_id, id))");
     lite.exec("INSERT INTO t VALUES (1, 1, 0, '[\"a\",\"b\"]')");
-    const outcomes: string[] = [];
     for (const inner of [
       "SELECT count(*) FROM pragma_table_info('__txn')",
       "SELECT count(*) FROM sqlite_master WHERE name LIKE '\\_\\_%' ESCAPE '\\'",
@@ -72,15 +72,12 @@ describe("the schema read inside a statement that runs on one shard (invariant 5
       "SELECT count(*) FROM main.sqlite_master",
       "SELECT count(*) FROM \"pragma_table_list\"",
     ]) {
+      // 利用者の表しかない SQLite と同じ答えを返す。シャードで実行すると、内部の表を数えた答えになる。
       const sql = `SELECT n, (${inner}) AS x FROM t WHERE tenant_id = 1 AND id = 1`;
-      const ours = await db.query(sql).then((r) => r.rows, (e: Error) => e.message);
-      // 断るか、利用者の表しかない SQLite と同じ答えを返す。シャードの内部の表を数えた答えは、どちらでもない。
-      if (typeof ours === "string") expect(ours, inner).toMatch(REFUSED);
-      else expect(ours, inner).toEqual(lite.prepare(sql).all().map((r) => ({ ...r })));
-      outcomes.push(typeof ours === "string" ? "refused" : "answered");
+      expect((await db.query(sql)).rows, inner).toEqual(lite.prepare(sql).all().map((r) => ({ ...r })));
     }
-    // プランナが FROM の名前で気付く形は Worker で答え、気付かない形 (PRAGMA の関数) は、シャードへ送る前の確認が断る。
-    expect(outcomes).toContain("refused");
+    // どの文も、シャードへは送られていない。行を集める走査だけが届く。
+    expect(c.net.log.filter((m) => m.method === "exec" && /pragma_|sqlite_/i.test((m.req as { sql: string }).sql))).toEqual([]);
   });
 
   it("is refused in a write, and the row is not written", async () => {
