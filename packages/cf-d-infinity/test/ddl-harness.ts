@@ -1,6 +1,7 @@
 // DDL と取引を並行に流す乱択の実行と、その後の不変条件の検査。ddl-concurrent.test.ts が使う。
 // スケジュールは実時間のタイマーに依存するので、seed は作業負荷と遅延の列を固定するだけである。
 // 同じ seed でも割り込みの順序は完全には再現しない。失敗した seed は台本の再現テストへ落とす。
+import { writeFileSync } from "node:fs";
 import { SimCluster, logRows, type Rpc } from "./sim";
 import { checkHistory, type Read, type TxRecord, type Violation } from "./history";
 import { Db, type Txn } from "../src/client/db";
@@ -338,6 +339,9 @@ export interface Report {
 }
 
 const EXPECTED = /^(conflict|read too old|not owner|migrating|upgrading)/;
+/** 実行が終わらないと見なす上限。仮想の時刻で 10 分、出来事 60 万個。 */
+const STALL_MS = 10 * 60_000;
+const STALL_STEPS = 600_000;
 const SCHEMA_ERR = /no such (table|column|index)|has no column/;
 
 interface SideAck { t: number; id: number; n: number; begun: number; acked: number }
@@ -346,11 +350,14 @@ export async function runScenario(seed: number, s: Scenario): Promise<Report> {
   const rnd = prng(seed);
   const sched = prng(seed ^ 0x5bd1e995);
   // backoff と sync の乱数、txn id の乱数部分は、クラスタの実行環境が同じ seed から作る。
-  return runSeeded(seed, s, rnd, sched);
+  const c = new SimCluster({ shards: s.shards ?? 3, faults: s.faults, seed });
+  // 終わらない実行は、実時間の制限を待たずに、原因の分かる失敗にする。普通の実行は、仮想の時刻で 1 秒ほど、出来事は数万個で終わる。
+  const report = await Promise.race([runSeeded(c, seed, s, rnd, sched), c.stalled(STALL_MS, STALL_STEPS)]);
+  if (process.env.SIM_STATS) console.info(`seed ${seed}: ${c.runtime.now() - 1_000_000} ms simulated, ${c.net.log.length} RPCs`);
+  return report;
 }
 
-async function runSeeded(seed: number, s: Scenario, rnd: () => number, sched: () => number): Promise<Report> {
-  const c = new SimCluster({ shards: s.shards ?? 3, faults: s.faults, seed });
+async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => number, sched: () => number): Promise<Report> {
   c.net.jitter = () => (sched() < 0.5 ? 0 : sched() * 3);
   // 応答の遅延。まれに長く遅らせて、2PC の途中で DDL が最後まで進む割り込みを作る。
   if (s.replyJitter || s.slowPrepare) {
@@ -394,12 +401,16 @@ async function runSeeded(seed: number, s: Scenario, rnd: () => number, sched: ()
     },
     checkpoint: async (label) => {
       paused = true;
-      while (active > 0) await c.sleep(1);
-      await c.settle();
-      for (const core of c.cores.values()) await core.redrive().catch(() => {});
-      await c.settle();
-      checkpoints.push({ label, ...(await indexAgreementAll(c)), duplicates: await duplicates(c) });
-      paused = false;
+      // 途中で失敗しても、作業負荷を止めたままにしない。止めたままだと、失敗が記録されるだけで、実行が終わらなくなる。
+      try {
+        while (active > 0) await c.sleep(1);
+        await c.settle();
+        for (const core of c.cores.values()) await core.redrive().catch(() => {});
+        await c.settle();
+        checkpoints.push({ label, ...(await indexAgreementAll(c)), duplicates: await duplicates(c) });
+      } finally {
+        paused = false;
+      }
     },
     tick: () => ++clock,
     marks: {},
@@ -409,8 +420,6 @@ async function runSeeded(seed: number, s: Scenario, rnd: () => number, sched: ()
   };
 
   const history: Rec[] = [];
-  const initial = new Map<string, number>();
-  const initialV = new Map<string, { n: number; v: number | null }>();
   const errors: string[] = [];
   /** 成功を返した acct への書き込み。n は書き込みごとに一意である。 */
   const acked: { key: string; n: number; v: number | null; ts?: number; name: string }[] = [];
@@ -437,9 +446,13 @@ async function runSeeded(seed: number, s: Scenario, rnd: () => number, sched: ()
       if ((t + i) % 2) continue;
       const n = ++seq * 10;
       const v = s.values === "dup" || s.values === "dupTenant" ? 1000 + n : pick(6);
-      await admin.query("INSERT INTO acct(tenant_id, id, v, n) VALUES (?, ?, ?, ?)", [t, i, v, n]);
-      initial.set(`${t}/${i}`, n);
-      initialV.set(`${t}/${i}`, { n, v });
+      const r = await admin.query("INSERT INTO acct(tenant_id, id, v, n) VALUES (?, ?, ?, ?)", [t, i, v, n]);
+      // 初期データも、確定の時刻を持つ書き込みとして履歴に入れる。「どの取引よりも前にある状態」として扱うと、誤って違反を報告する。
+      // シャードの時計は、同じ ms の中でも発行した数だけ先へ進んでいる。取引の読む時点が別のシャードの小さい時刻で決まると、
+      // その取引の 2 文目以降は、応答まで返った初期データを見ないことがある。複数シャードの取引は serializable で、
+      // 実時間の順序までは約束していないので、これは違反ではない。時刻の順に並べれば、読みは初期データの前に来る。
+      if (r.ts === undefined) throw new Error("the initial INSERT returned no commit timestamp");
+      history.push({ name: `init ${t}/${i}`, ts: r.ts, readOnly: false, reads: [], writes: [{ key: `${t}/${i}`, value: n }], vreads: [], wv: [v] });
     }
   }
   for (const sql of s.before ?? []) await admin.ddl(sql);
@@ -690,9 +703,14 @@ async function runSeeded(seed: number, s: Scenario, rnd: () => number, sched: ()
   };
   if (env.marks.dropIssued === undefined) side.resurrected = [];
 
+  // 失敗した seed を調べるための書き出し。SIM_DUMP=<ファイル> で、取引の記録と RPC の記録を JSON で残す。
+  if (process.env.SIM_DUMP) {
+    const plain = (_k: string, x: unknown) => (x instanceof Map ? [...x] : x instanceof Uint8Array ? [...x] : x);
+    writeFileSync(process.env.SIM_DUMP, JSON.stringify({ seed, history, rpc: c.net.log }, plain));
+  }
   return {
-    history: checkHistory(history, initial),
-    indexReads: checkIndexReads(history, initialV),
+    history: checkHistory(history),
+    indexReads: checkIndexReads(history, new Map()),
     ackedNotApplied,
     errors: [...new Set(errors)],
     stuck,

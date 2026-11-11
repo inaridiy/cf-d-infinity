@@ -4,12 +4,13 @@
 // どの試験にも掛かる範囲の検査 (test/setup.ts) も、ここで流した文のすべてに掛かる。
 //
 // 実行は seed で決まる。待ちは仮想の時計で測り、乱数は seed から作る。失敗した seed は、同じ seed で再現する。
+import { writeFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { Db, type Cluster } from "../src/client/db";
 import type { Value } from "../src/types";
 import { quiescentProblems } from "./invariants";
 import { replay, type ReplayReport, type StatementRecord, type TxnRecord } from "./replay";
-import { prng, SimCluster } from "./sim";
+import { prng, seedsOr, SimCluster } from "./sim";
 
 const DDL = [
   `CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT, code TEXT, v INTEGER NOT NULL DEFAULT 0, n INTEGER NOT NULL DEFAULT 0,
@@ -116,9 +117,12 @@ async function run(seed: number, o: { clients?: number; rounds?: number } = {}):
         try {
           const r = await new Db(seen).query(s.sql, s.params);
           s.values = r.values;
+          if (s.shape.startsWith("W")) s.changes = r.changes;
           rec.outcome = "committed";
           rec.at = r.ts;
-          rec.readOnly = s.shape.startsWith("R");
+          // 何も書かなかった文 (無視された INSERT OR IGNORE、該当する行のない UPDATE など) は、読んだだけである。
+          // 返る時刻は確定の時刻ではなく、読んだ時刻である。同じ時刻の書き込みを見ているので、読みとして、その後に並べる。
+          rec.readOnly = s.shape.startsWith("R") || r.changes === 0;
         } catch (e) {
           s.error = (e as Error).message;
         }
@@ -130,7 +134,9 @@ async function run(seed: number, o: { clients?: number; rounds?: number } = {}):
             rec.statements.push(s);
             const from = ++tick;
             try {
-              s.values = (await tx.query(s.sql, s.params)).values;
+              const r = await tx.query(s.sql, s.params);
+              s.values = r.values;
+              if (s.shape.startsWith("W")) s.changes = r.changes;
             } catch (e) {
               s.error = (e as Error).message;
               if (RETRYABLE.test(s.error)) throw e;
@@ -158,6 +164,11 @@ async function run(seed: number, o: { clients?: number; rounds?: number } = {}):
   c.net.gate = () => undefined;
   await c.settle();
   const quiescent = await quiescentProblems(c);
+  // 失敗した seed を調べるための書き出し。REPLAY_DUMP=<ファイル> で、取引の記録と RPC の記録を JSON で残す。
+  if (process.env.REPLAY_DUMP) {
+    const plain = (_k: string, x: unknown) => (x instanceof Set ? [...x] : x instanceof Uint8Array ? [...x] : x);
+    writeFileSync(process.env.REPLAY_DUMP, JSON.stringify({ seed, history, rpc: c.net.log }, plain));
+  }
   return { report: replay(DDL, history), quiescent, escapes: c.spanEscapes.length, fingerprint: c.fingerprint() };
 }
 
@@ -178,7 +189,7 @@ describe("the simulator is deterministic", () => {
 
 describe("statement replay against one SQLite, under concurrency", () => {
   const total: ReplayReport["coverage"] = {};
-  for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) {
+  for (const seed of seedsOr([1, 2, 3, 4, 5, 6, 7, 8])) {
     it(`seed ${seed}: every committed statement gives the result of a serial execution in commit order`, async () => {
       const { report, quiescent } = await run(seed);
       for (const [k, x] of Object.entries(report.coverage)) {

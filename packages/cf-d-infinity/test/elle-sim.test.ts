@@ -8,7 +8,7 @@ import { split } from "../src/autoscaler";
 import { runListAppend } from "../src/listappend";
 import { planSplit, shardsOf } from "../src/routing";
 import type { Faults } from "../src/types";
-import { SimCluster } from "./sim";
+import { seedsOr, SimCluster } from "./sim";
 
 function prng(seed: number) {
   let a = seed >>> 0;
@@ -82,7 +82,7 @@ async function run(seed: number, o: { faults?: Faults; restarts?: boolean; split
 }
 
 describe("black-box list-append check on the simulator", () => {
-  for (const seed of [1, 2, 3]) {
+  for (const seed of seedsOr([1, 2, 3])) {
     it(`passes with clock skew, restarts and splits (seed ${seed})`, async () => {
       const r = await run(seed, { restarts: true, splits: true, skewMs: 40 });
       expect(r.anomalies).toEqual({});
