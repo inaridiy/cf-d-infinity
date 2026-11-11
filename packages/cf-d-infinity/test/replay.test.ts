@@ -6,7 +6,8 @@
 // 実行は seed で決まる。待ちは仮想の時計で測り、乱数は seed から作る。失敗した seed は、同じ seed で再現する。
 import { writeFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { Db, Txn, type ClientFaults, type Cluster } from "../src/client/db";
+import { changesSchema, Db, Txn, type ClientFaults, type Cluster } from "../src/client/db";
+import { handlePipeline, type PipelineReq } from "../src/client/hrana";
 import type { Faults, Value } from "../src/types";
 import { quiescentProblems } from "./invariants";
 import { replay, type ReplayReport, type StatementRecord, type TxnRecord } from "./replay";
@@ -109,9 +110,64 @@ const TOK_SHAPES: Record<string, (r: Rnd) => [string, Value[]]> = {
 };
 const TOK_NAMES = Object.keys(TOK_SHAPES);
 
+/**
+ * 取引の中に DDL を含む台本 (計画書の Plan of Work の 5、「5 の進め方」の表)。DDL は接続専用の表 (名前に k を含む) にだけ掛ける。
+ * 共有の表への DDL には直列の順序の中の位置がないので、ここでは作らない。どの台本も、壊した変種のどれかを食い違いにする。
+ *   copy: 表を作り、行を写し、古い表を消し、名前を変える (m13_red_main、m14 の守り)
+ *   write: 書く、DDL、作った表へ書く (m13_red_pin_only)
+ *   read: 読んだ後に DDL (別の接続が読んだ行を書き換えると、先の確定が競合で失敗する。m13_red_ddl_anyway)
+ *   batch: BEGIN から始まる Hrana の batch の中の DDL の後で、別の接続と競合しうる (m13_red_retry_whole)
+ */
+type Script = { kind: "session" | "batch"; steps: [string, Value[]][] };
+const SCRIPTS: Record<string, (k: string, r: Rnd) => Script> = {
+  copy: (k, r) => ({ kind: "session", steps: [
+    ["BEGIN", []],
+    [`CREATE TABLE ${k}_t(id INTEGER PRIMARY KEY, v INTEGER)`, []],
+    [`INSERT INTO ${k}_t(id, v) SELECT id, v FROM flat WHERE tag = ?`, [tag(r)]],
+    [`CREATE TABLE ${k}_new(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)`, []],
+    [`INSERT INTO ${k}_new(id, v) SELECT id, v FROM ${k}_t`, []],
+    [`DROP TABLE ${k}_t`, []],
+    [`ALTER TABLE ${k}_new RENAME TO ${k}_t`, []],
+    [`SELECT id, v, w FROM ${k}_t ORDER BY id`, []],
+    ["UPDATE flat SET v = v + 1 WHERE id = ?", [flatId(r)]],
+    ["COMMIT", []],
+    [`SELECT count(*) FROM ${k}_t`, []],
+  ] }),
+  write: (k, r) => ({ kind: "session", steps: [
+    ["BEGIN", []],
+    ["UPDATE flat SET v = v + 1 WHERE id = ?", [flatId(r)]],
+    [`CREATE TABLE ${k}_a(id INTEGER PRIMARY KEY, n INTEGER)`, []],
+    [`INSERT INTO ${k}_a VALUES (1, (SELECT coalesce(sum(v), 0) FROM flat))`, []],
+    [`SELECT n FROM ${k}_a`, []],
+    ["INSERT OR IGNORE INTO one VALUES (?)", [flatId(r)]],
+    ["COMMIT", []],
+    [`SELECT n FROM ${k}_a`, []],
+  ] }),
+  read: (k, r) => ({ kind: "session", steps: [
+    ["BEGIN", []],
+    ["SELECT v FROM flat WHERE id = ?", [flatId(r)]],
+    ["INSERT OR IGNORE INTO one VALUES (?)", [flatId(r)]],
+    [`CREATE TABLE ${k}_b(id INTEGER PRIMARY KEY)`, []],
+    [`INSERT INTO ${k}_b VALUES (1)`, []],
+    ["COMMIT", []],
+    [`SELECT count(*) FROM ${k}_b`, []],
+  ] }),
+  batch: (k, r) => ({ kind: "batch", steps: [
+    ["BEGIN", []],
+    ["UPDATE acct SET n = n + 1 WHERE tenant_id = ? AND id = ?", [tenant(r), id(r)]],
+    [`CREATE TABLE ${k}_c(id INTEGER PRIMARY KEY)`, []],
+    [`INSERT INTO ${k}_c VALUES (1)`, []],
+    ["UPDATE acct SET n = n + 1 WHERE tenant_id = ? AND id = ?", [tenant(r), id(r)]],
+    ["COMMIT", []],
+  ] }),
+};
+const SCRIPT_NAMES = Object.keys(SCRIPTS);
+
 interface RunOptions {
   clients?: number;
   rounds?: number;
+  /** 取引の中に DDL を含む接続 (SQL の BEGIN と Hrana の batch) を、この数だけ足す。 */
+  sessions?: number;
   /** 実行の途中で、tok にシャードをまたぐ UNIQUE の index を作る。文の半分を tok に向ける。 */
   ddl?: boolean;
   faults?: Faults;
@@ -263,9 +319,186 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
       rec.end = ++tick;
     }
   };
+  const sessionProblems: string[] = [];
+  /** 触ったシャードを note に知らせる Cluster。ほかは c のまま。 */
+  const observed = (note: (shard: string) => void): Cluster => new Proxy(c as unknown as Cluster, {
+    get(target, prop, receiver) {
+      if (prop === "shard") return (id: string) => (note(id), c.shard(id));
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+  /**
+   * 取引の中に DDL を含む接続。区切り (DDL で区切られた取引) ごとに 1 つの記録にし、DDL も 1 つの記録にする。
+   * 区切りの確定の時刻は、Db の onCommit で受け取る。DDL は、閉じた区切りの時刻の直後 (+0.5) に置く。次の区切りの読みは、
+   * 接続が見た時刻より後の時刻で読むので、必ずそれより後に並ぶ。区切りは台本からではなく、文ごとの db.inTransaction で決める。
+   * 先の確定に失敗した DDL の後は、接続は取引の外にいて、続く文は 1 文ずつ確定する。
+   */
+  const session = async (n: number) => {
+    for (let round = 0; round < (o.rounds ?? 25); round++) {
+      const name = SCRIPT_NAMES[Math.floor(rnd() * SCRIPT_NAMES.length)]!;
+      const script = SCRIPTS[name]!(`p${n}_${round}`, rnd);
+      // この台本が作って、まだ消していない表。この表が無いという誤りは、どの並びでも起きない (取引が自分の DDL を見ない欠陥)。
+      // 確定しない取引の文の誤りなので、再生では見えない。ここで数える。
+      const alive = new Set<string>();
+      const noteDdl = (sql: string) => {
+        const created = /^CREATE TABLE (\w+)/i.exec(sql)?.[1];
+        if (created) alive.add(created);
+        const dropped = /^DROP TABLE (?:IF EXISTS )?(\w+)/i.exec(sql)?.[1];
+        if (dropped) alive.delete(dropped);
+        const renamed = /^ALTER TABLE (\w+) RENAME TO (\w+)/i.exec(sql);
+        if (renamed) {
+          alive.delete(renamed[1]!);
+          alive.add(renamed[2]!);
+        }
+      };
+      const checkMissing = (sql: string, error: string) => {
+        const missing = /no such table: (?:main\.)?(\w+)/.exec(error)?.[1];
+        if (missing && alive.has(missing)) sessionProblems.push(`${name}: ${sql} failed with "${error}", although this transaction created ${missing}`);
+      };
+      let seg: TxnRecord | null = null;
+      let current: TxnRecord | null = null;
+      const commits: { at: number | undefined; readOnly: boolean }[] = [];
+      const cluster = observed((shard) => current?.shards.add(shard));
+      const record = (shape: string): TxnRecord => {
+        const r: TxnRecord = { id: next++, statements: [], outcome: "aborted", readOnly: true, start: ++tick, end: 0, shards: new Set() };
+        history.push(r);
+        void shape;
+        return r;
+      };
+      const close = (r: TxnRecord, c: { at: number | undefined; readOnly: boolean }) => {
+        r.at = c.at;
+        r.readOnly = c.readOnly;
+        if (r.at !== undefined || r.statements.some((x) => x.error === undefined)) r.outcome = "committed";
+        r.end = ++tick;
+      };
+      const ddlRecord = (sql: string, after: number | undefined, token: number) => {
+        const r = record("D");
+        r.statements.push({ shape: `D ${name}`, sql, params: [], values: [] });
+        r.outcome = "committed";
+        r.readOnly = false;
+        r.at = (after ?? token) + 0.5;
+        r.end = ++tick;
+      };
+      if (script.kind === "session") {
+        const db = new Db(cluster, { retries: 0, faults: o.clientFaults, onCommit: (x) => commits.push(x) });
+        const take = () => commits.shift();
+        for (const [sql, params] of script.steps) {
+          const shape = `S ${name}: ${sql.replace(/p\d+_\d+_/g, "p_").slice(0, 40)}`;
+          if (sql === "BEGIN") {
+            await db.query("BEGIN");
+            seg = current = record(shape);
+            continue;
+          }
+          if (sql === "COMMIT") {
+            if (!db.inTransaction) continue;
+            const ok = await db.query("COMMIT").then(() => true, () => false);
+            const c = take();
+            if (seg && ok && c) close(seg, c);
+            seg = current = null;
+            continue;
+          }
+          if (changesSchema(sql)) {
+            const before = seg;
+            const res = await db.query(sql).then(() => null, (e: Error) => e.message);
+            // 先の確定が通っていれば、閉じた区切りの時刻が届いている。
+            const c = before ? take() : undefined;
+            if (before && c) close(before, c);
+            if (res === null) {
+              ddlRecord(sql, c?.at, db.token);
+              noteDdl(sql);
+            } else checkMissing(sql, res);
+            seg = current = db.inTransaction ? record(shape) : null;
+            continue;
+          }
+          const st: StatementRecord = { shape, sql, params };
+          const target = seg ?? record(shape);
+          current = target;
+          target.statements.push(st);
+          const from = ++tick;
+          try {
+            const r = await db.query(sql, params);
+            st.values = r.values;
+            if (!/^\s*SELECT/i.test(sql)) st.changes = r.changes;
+            if (!seg) {
+              target.outcome = "committed";
+              target.at = r.ts;
+              target.readOnly = /^\s*SELECT/i.test(sql) || r.changes === 0;
+              target.end = ++tick;
+            }
+          } catch (e) {
+            st.error = (e as Error).message;
+            checkMissing(sql, st.error);
+            // やり直せる誤り (競合など) は、SQLite では起きない。取引を捨てて、残りの文は取引の外で流す。
+            if (seg && RETRYABLE.test(st.error)) {
+              await db.query("ROLLBACK").catch(() => undefined);
+              seg = null;
+            }
+          } finally {
+            st.span = [from, ++tick];
+          }
+          current = seg;
+        }
+        if (db.inTransaction) await db.query("ROLLBACK").catch(() => undefined);
+      } else {
+        // Hrana の batch。@libsql/client と同じく、BEGIN の後の文と COMMIT は、前の文が通って取引の中にいることを条件にする。
+        const steps = script.steps.map(([sql, params], i) => ({
+          stmt: { sql, args: params.map((v) => (v === null ? { type: "null" } : typeof v === "number" ? { type: "integer", value: String(v) } : { type: "text", value: String(v) })) },
+          condition: i === 0 ? null : { type: "and", conds: [{ type: "ok", step: i - 1 }, { type: "not", cond: { type: "is_autocommit" } }] },
+        }));
+        const req = { baton: null, requests: [{ type: "batch", batch: { steps } }] } as unknown as PipelineReq;
+        current = record("B");
+        const segRecords: TxnRecord[] = [current];
+        let opened: Db | undefined;
+        const db = (token: number) => Promise.resolve((opened = new Db(cluster, { token, faults: o.clientFaults, onCommit: (x) => commits.push(x) })));
+        const res = await handlePipeline(req, db);
+        const fromH = (v: { type: string; value?: string | number }): Value =>
+          v.type === "null" ? null : v.type === "integer" ? Number(v.value) : v.type === "float" ? Number(v.value) : (v.value as string);
+        const result = (res.results[0] as unknown as { response?: { result: { step_results: ({ rows: unknown[][]; affected_row_count: number } | null)[]; step_errors: ({ message: string } | null)[] } } }).response?.result;
+        // 返った結果を、区切りごとに並べ直す。区切りが閉じた順に、確定の時刻が届いている。
+        let segRec = segRecords[0]!;
+        for (const [i, [sql, params]] of script.steps.entries()) {
+          if (i === 0 || sql === "COMMIT") {
+            if (sql === "COMMIT" && result?.step_results[i]) {
+              const c = commits.shift();
+              if (c) close(segRec, c);
+            }
+            continue;
+          }
+          const ok = result?.step_results[i];
+          const err = result?.step_errors[i];
+          if (!ok && !err) continue; // 条件で飛ばされた
+          if (changesSchema(sql)) {
+            const c = commits.shift();
+            if (c) close(segRec, c);
+            if (ok) {
+              ddlRecord(sql, c?.at, opened?.token ?? 0);
+              noteDdl(sql);
+            } else if (err) checkMissing(sql, err.message);
+            segRec = record("B");
+            continue;
+          }
+          const st: StatementRecord = { shape: `B ${name}: ${sql.replace(/p\d+_\d+_/g, "p_").slice(0, 40)}`, sql, params };
+          if (ok) {
+            st.values = ok.rows.map((row) => row.map((v) => fromH(v as { type: string; value?: string | number })));
+            if (!/^\s*SELECT/i.test(sql)) st.changes = ok.affected_row_count;
+          } else {
+            st.error = err!.message;
+            checkMissing(sql, st.error);
+          }
+          segRec.statements.push(st);
+        }
+      }
+      // 接続専用の表は、台本の後で消す (表の数が増え続けないように)。ほかの文は、この表を読まないので、再生には入れない。
+      const left = [...new Set(script.steps.map(([sql]) => /CREATE TABLE (p\d+_\d+_\w+)/.exec(sql)?.[1]).filter((x): x is string => !!x))];
+      for (const t of left) await new Db(c).query(`DROP TABLE IF EXISTS ${t}`).catch(() => undefined);
+    }
+  };
+
   working = o.clients ?? 5;
   const clients = Array.from({ length: working }, () => client().finally(() => working--));
-  await Promise.all([...clients, ...(o.ddl ? [schemaChanges()] : [])]);
+  const sessions = Array.from({ length: o.sessions ?? 0 }, (_, n) => session(n));
+  await Promise.all([...clients, ...sessions, ...(o.ddl ? [schemaChanges()] : [])]);
   c.net.gate = () => undefined;
   await c.settle();
   const quiescent = await quiescentProblems(c);
@@ -274,7 +507,9 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
     const plain = (_k: string, x: unknown) => (x instanceof Set ? [...x] : x instanceof Uint8Array ? [...x] : x);
     writeFileSync(process.env.REPLAY_DUMP, JSON.stringify({ seed, history, rpc: c.net.log }, plain));
   }
-  return { report: replay(ddl, history), quiescent, escapes: c.spanEscapes.length, fingerprint: c.fingerprint(), ddl: ddlLog };
+  const report = replay(ddl, history);
+  report.problems.push(...sessionProblems);
+  return { report, quiescent, escapes: c.spanEscapes.length, fingerprint: c.fingerprint(), ddl: ddlLog };
 }
 
 describe("the simulator is deterministic", () => {
@@ -368,4 +603,22 @@ describe.skipIf(!process.env.MUTATE)("search: seeds on which a removed guard is 
       expect([...r.report.problems.slice(0, 2), ...r.quiescent].join("\n\n")).toBe("");
     }, 120_000);
   }
+});
+
+// 取引の中に DDL を含む接続を混ぜる (不変条件 9、specs/m13_txn_schema_boundary.qnt、m14_rebuild_guard.qnt)。
+// 区切りごとに、確定の時刻の位置で再生する。DDL は、閉じた区切りの直後に置く。
+describe("statement replay with transactions that change the schema, through SQL BEGIN and Hrana batches", () => {
+  const scripts = new Map<string, number>();
+  for (const seed of seedsOr([1, 2, 3, 4, 5, 6, 7, 8])) {
+    it(`seed ${seed}: every committed part gives the result of a serial execution, with the schema changes in between`, async () => {
+      const { report, quiescent } = await run(seed, { sessions: 3, rounds: 12 });
+      for (const [k, x] of Object.entries(report.coverage)) if (/^[SBD] /.test(k)) scripts.set(k, (scripts.get(k) ?? 0) + x.ok);
+      expect(report.problems.slice(0, 5).join("\n\n")).toBe("");
+      expect(quiescent).toEqual([]);
+    }, 120_000);
+  }
+  it("runs every script, with its schema changes", () => {
+    for (const n of SCRIPT_NAMES) expect([...scripts].filter(([k, v]) => k.includes(` ${n}:`) && v > 0).length, n).toBeGreaterThan(0);
+    expect([...scripts].filter(([k, v]) => k.startsWith("D ") && v > 0).length).toBeGreaterThan(0);
+  });
 });

@@ -225,7 +225,7 @@ export class SimNet {
 }
 
 /** Worker の側の欠陥のスイッチの名前 (src/client/db.ts の ClientFaults)。 */
-const CLIENT_FAULTS = new Set(["repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard"]);
+const CLIENT_FAULTS = new Set(["repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit"]);
 /** 範囲の作り方の欠陥のスイッチの名前 (src/client/spans.ts の spanFaults)。test/setup.ts が入れる。 */
 export const SPAN_FAULTS = new Set(["rowSpanDespiteUnique"]);
 

@@ -51,6 +51,10 @@ export interface ClientFaults {
   replayAcrossSchemaChange?: boolean;
   /** 取引が読んだ表を、書き込みを止めず、確かめずに DROP する (2026-11 までの挙動。モデル m14_red_no_lock と m14_red_no_check)。 */
   dropWithoutGuard?: boolean;
+  /** 取引の中の DDL が、開いている取引を先に確定しない。取引の版はそのままである (モデル m13_red_pin_only)。 */
+  noImplicitCommit?: boolean;
+  /** 取引の中の DDL が、先の確定に失敗しても実行される (モデル m13_red_ddl_anyway)。 */
+  ddlAfterFailedCommit?: boolean;
 }
 
 /**
@@ -1037,6 +1041,11 @@ export class Db {
       reference?: Reference;
       /** 検証済みの欠陥を再導入するスイッチ。試験だけが使う。 */
       faults?: ClientFaults;
+      /**
+       * 接続の取引が確定するたびに呼ぶ (COMMIT、取引の中の DDL の前の確定、batch の区切り)。at は確定の時刻、読むだけなら読んだ時刻。
+       * 文を再生する検査が、区切りを直列の順序に置くのに使う。Hrana の応答には時刻がないので、ここで受け取る。
+       */
+      onCommit?: (c: { at: Ts | undefined; readOnly: boolean }) => void;
     } = {},
   ) {
     this.rt = opts.runtime ?? cluster.runtime ?? systemRuntime;
@@ -1245,13 +1254,16 @@ export class Db {
   async ddl(sql: string, reads: ReadRecord[] = []): Promise<void> {
     const open = this.current;
     if (!open) return this.changeSchema(sql, reads);
+    if (this.faults.noImplicitCommit) return this.changeSchema(sql, reads);
     this.current = null;
     try {
       await open.commit();
     } catch (e) {
       await open.unlockAll().catch(() => undefined);
+      if (this.faults.ddlAfterFailedCommit) await this.changeSchema(sql, reads).catch(() => undefined);
       throw e;
     }
+    this.committed(open);
     this.boundaries++;
     const next = new Txn(this, await this.catalog(), this.nextTxnId());
     next.pessimistic = open.pessimistic;
@@ -1669,6 +1681,7 @@ export class Db {
         return results;
       })));
       reads.push(...done!.readRecord());
+      this.committed(done!);
     };
     for (const s of statements) {
       if (!changesSchema(s.sql)) {
@@ -1685,6 +1698,11 @@ export class Db {
     }
     await flush();
     return out;
+  }
+
+  /** 接続の取引が確定したことを、試験の観察者 (opts.onCommit) に知らせる。 */
+  private committed(tx: Txn): void {
+    this.opts.onCommit?.({ at: tx.commitTs ?? tx.T, readOnly: tx.commitTs === undefined });
   }
 
   /**
@@ -1879,6 +1897,7 @@ export class Db {
           await tx.unlockAll(); // 取引は終わったので、他のシャードのロックも手放す
           throw e;
         }
+        this.committed(tx);
         return empty;
       }
       case "rollback": {
