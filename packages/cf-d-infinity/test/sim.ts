@@ -39,6 +39,22 @@ export function prng(seed: number): () => number {
 }
 
 /**
+ * 乱択の検査が流す seed。既定は、試験に書いてある数個である。環境変数 SEEDS を与えると、それに替える。
+ * `SEEDS=1..500` は範囲、`SEEDS=3,17,204` は列挙である。失敗した seed を再現するときと、seed を大量に流して
+ * 失敗を探すとき (scripts/sweep.mjs) に使う。
+ */
+export function seedsOr(defaults: number[]): number[] {
+  const spec = process.env.SEEDS;
+  if (!spec) return defaults;
+  return spec.split(",").flatMap((part) => {
+    const m = /^(\d+)\.\.(\d+)$/.exec(part.trim());
+    if (m) return Array.from({ length: Number(m[2]) - Number(m[1]) + 1 }, (_, i) => Number(m[1]) + i);
+    if (!/^\d+$/.test(part.trim())) throw new Error(`SEEDS: cannot read "${part}"; write 1..500 or 3,17,204`);
+    return [Number(part)];
+  });
+}
+
+/**
  * 仮想の実行環境。同じ seed なら、同じ実行になる。
  *
  * 時刻は、予約された出来事 (待ちの終わり、RPC の配送) が起きるときにだけ進む。乱数と識別子は seed から決まる。
@@ -55,6 +71,9 @@ export class VirtualRuntime implements Runtime {
   private pumping = false;
   /** 起こした出来事の数。 */
   steps = 0;
+  /** 出来事の数か時刻がこれを超えたら、onStall を 1 度だけ呼ぶ。終わらない実行を、制限時間ではなく原因の分かる失敗にする。 */
+  budget: { steps: number; until: number } | null = null;
+  onStall: ((why: string) => void) | null = null;
   readonly random: () => number;
   constructor(readonly seed = 1, start = 1_000_000) {
     this.t = start;
@@ -93,6 +112,11 @@ export class VirtualRuntime implements Runtime {
       if (!e) return;
       if (e.at > this.t) this.t = e.at;
       this.steps++;
+      if (this.budget && this.onStall && (this.steps > this.budget.steps || this.t > this.budget.until)) {
+        const stalled = this.onStall;
+        this.onStall = null;
+        stalled(this.steps > this.budget.steps ? `more than ${this.budget.steps} events` : `simulated time passed ${Math.floor(this.budget.until)} ms`);
+      }
       const fn = e.fn!;
       if (this.queue.length > 0) this.pump();
       fn();
@@ -225,6 +249,8 @@ export class SimCluster implements Cluster {
   backends = new Map<string, SqliteBackend>();
   meta: MetaCore;
   background = new Set<Promise<unknown>>();
+  /** 送ったが、まだ応答も失敗も返っていない RPC。終わらない実行で、どの要求が返らないのかを知るのに使う。 */
+  private unanswered = new Set<{ m: Rpc; at: number }>();
   /** alarm を予約したシャード。DO の alarm の代わりに fireAlarms で発火させる。 */
   alarms = new Set<string>();
 
@@ -253,6 +279,34 @@ export class SimCluster implements Cluster {
     const h = createHash("sha256");
     for (const m of this.net.log) h.update(JSON.stringify([m.from, m.to, m.method, m.req], (_k, x) => (x instanceof Uint8Array ? [...x] : x)));
     return `${this.net.log.length} rpcs ${h.digest("hex").slice(0, 16)}`;
+  }
+
+  /**
+   * 実行が終わらないときに失敗する Promise。work と Promise.race で競わせる。
+   * 仮想の時刻で ms を過ぎるか、出来事が steps 個を超えたら、最後の RPC の内訳を付けて失敗する。
+   * 仮想の時刻は待ちがあるかぎり進むので、進まなくなった実行 (同じ再試行を繰り返すなど) は、実時間の制限を待たずに分かる。
+   */
+  stalled(ms: number, steps: number): Promise<never> {
+    return new Promise((_, reject) => {
+      if (!this.virtual) return;
+      this.virtual.budget = { steps: this.virtual.steps + steps, until: this.virtual.now() + ms };
+      this.virtual.onStall = (why) => {
+        const tail = this.net.log.slice(-400);
+        const count = new Map<string, number>();
+        for (const m of tail) {
+          const k = `${m.from}->${m.to} ${String(m.method)}`;
+          count.set(k, (count.get(k) ?? 0) + 1);
+        }
+        const top = [...count].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${k} x${n}`).join(", ");
+        const waiting = [...this.unanswered].sort((a, b) => a.at - b.at).slice(0, 6).map(({ m, at }) =>
+          `${m.from}->${m.to} ${String(m.method)} sent at ${at}: ${JSON.stringify(m.req, (_k, x) => (x instanceof Uint8Array ? "<blob>" : x)).slice(0, 300)}`);
+        reject(new Error(
+          `the run did not finish: ${why} (${this.net.log.length} RPCs, simulated time ${this.time}).\n` +
+          `RPCs that never returned (${this.unanswered.size}):\n  ${waiting.join("\n  ") || "none"}\n` +
+          `Last 400 RPCs: ${top}`,
+        ));
+      };
+    });
   }
 
   /** ms だけ待つ。仮想の実行環境では、実時間は掛からない。試験の中の待ちは、これで書く。 */
@@ -320,17 +374,23 @@ export class SimCluster implements Cluster {
       get: (_t, method: keyof ShardApi) => async (req: unknown) => {
         const m: Rpc = { from, to, method, req };
         this.net.log.push(m);
-        await this.net.gate(m);
-        if (this.net.drop(m)) throw new Error(`rpc dropped: ${String(method)}`);
-        const delay = this.net.jitter?.() ?? 0;
-        if (this.virtual) await this.sleep(delay);
-        else await new Promise((r) => (delay > 0 ? setTimeout(r, delay) : setImmediate(r)));
-        // JSON を通して、DO の RPC と同じく参照を共有しないようにする。
-        const core = this.core(to);
-        const out = await (core[method] as (r: unknown) => Promise<unknown>).call(core, structuredClone(req));
-        const hold = this.net.reply(m);
-        if (hold) await hold;
-        return out === undefined ? undefined : structuredClone(out);
+        const sent = { m, at: this.time };
+        this.unanswered.add(sent);
+        try {
+          await this.net.gate(m);
+          if (this.net.drop(m)) throw new Error(`rpc dropped: ${String(method)}`);
+          const delay = this.net.jitter?.() ?? 0;
+          if (this.virtual) await this.sleep(delay);
+          else await new Promise((r) => (delay > 0 ? setTimeout(r, delay) : setImmediate(r)));
+          // JSON を通して、DO の RPC と同じく参照を共有しないようにする。
+          const core = this.core(to);
+          const out = await (core[method] as (r: unknown) => Promise<unknown>).call(core, structuredClone(req));
+          const hold = this.net.reply(m);
+          if (hold) await hold;
+          return out === undefined ? undefined : structuredClone(out);
+        } finally {
+          this.unanswered.delete(sent);
+        }
       },
     });
   }

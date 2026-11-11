@@ -17,6 +17,8 @@ export interface StatementRecord {
   /** 返った行。エラーなら error。 */
   values?: Value[][];
   error?: string;
+  /** 書き込みの文が変更した行の数。SQLite の changes() と同じ数え方である。 */
+  changes?: number;
   /** 文の後の、取引の読む時点。取引は読む時点を先へ進めることがある。食い違いを調べるときに見る。 */
   readAt?: Ts;
   /** 文を出した時点と、応答が返った時点の通し番号。 */
@@ -72,12 +74,11 @@ export function replay(ddl: string[], history: TxnRecord[]): ReplayReport {
     lite.exec("BEGIN");
     for (const s of t.statements) {
       if (s.error !== undefined && /^unsupported:/.test(s.error)) continue;
-      let got: { values?: unknown[][]; error?: string };
+      let got: { values?: unknown[][]; error?: string; changes?: number };
       try {
         const st = lite.prepare(s.sql);
         if (st.columns().length === 0) {
-          st.run(...(s.params as never[]));
-          got = { values: [] };
+          got = { values: [], changes: Number(st.run(...(s.params as never[])).changes) };
         } else {
           st.setReturnArrays(true);
           got = { values: st.all(...(s.params as never[])) as unknown as unknown[][] };
@@ -98,6 +99,10 @@ export function replay(ddl: string[], history: TxnRecord[]): ReplayReport {
           const near = order.slice(Math.max(0, i - 6), i + 7).map((x) =>
             `    ${x === t ? ">" : " "} txn ${x.id} at ${x.at} ${x.readOnly ? "R" : "W"} [${x.start}..${x.end}] shards ${[...x.shards].sort().join(",")}: ${x.statements.map((y) => `${y.sql.slice(0, 70)} ${JSON.stringify(y.params)}${y.error ? " ERR" : ""}${y.readAt ? ` @${y.readAt}` : ""}${y.span ? ` [${y.span.join("..")}]` : ""}`).join(" ; ")}`);
           problems.push(`${where}\n  ours:   ${a.join(" ")}\n  sqlite: ${b.join(" ")}\n${near.join("\n")}`);
+        } else if (s.changes !== undefined && got.changes !== undefined && s.changes !== got.changes) {
+          // 返る行のない書き込みは、変更した行の数を比べる。無視されるはずの INSERT OR IGNORE が行を入れた、といった誤りは、
+          // 後の読みを待たずに、ここで分かる。
+          problems.push(`${where}\n  ours:   ${s.changes} rows changed\n  sqlite: ${got.changes} rows changed`);
         }
       }
       count(s.shape, s.error === undefined ? "ok" : "error");

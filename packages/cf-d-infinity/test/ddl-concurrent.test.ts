@@ -21,7 +21,7 @@
 // 乱択の検査は、既知の欠陥に当たる種類の違反だけを許し、それ以外は 1 件でも失敗にする。
 // 許す種類は scenario ごとに KNOWN で列挙する。欠陥を直したら KNOWN から消す。
 import { afterAll, describe, expect, it } from "vitest";
-import { SimCluster } from "./sim";
+import { seedsOr, SimCluster } from "./sim";
 import { Db } from "../src/client/db";
 import { split } from "../src/autoscaler";
 import { ownerOf, shardsOf } from "../src/routing";
@@ -204,7 +204,7 @@ afterAll(() => {
   if (hits.size > 0) console.info(`known-bug violations tolerated (seeds hit):\n${[...hits].map(([k, n]) => `  ${k}: ${n}`).join("\n")}`);
 });
 function each(name: keyof typeof CASES, title: string, extra: (r: Report) => void = () => {}) {
-  for (const seed of CASES[name].seeds) {
+  for (const seed of seedsOr(CASES[name].seeds)) {
     it(`${title} (seed ${seed})`, async () => {
       const r = await run(name, seed);
       const v = violations(r);

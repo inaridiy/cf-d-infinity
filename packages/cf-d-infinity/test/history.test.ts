@@ -1,6 +1,7 @@
+import { writeFileSync } from "node:fs";
 import { expectQuiescent } from "./invariants";
 import { describe, expect, it } from "vitest";
-import { SimCluster, USERS } from "./sim";
+import { seedsOr, SimCluster, USERS } from "./sim";
 import { checkHistory, type Read, type TxRecord } from "./history";
 import { SqlError, type Faults } from "../src/types";
 import type { Txn } from "../src/client/db";
@@ -173,18 +174,23 @@ async function run(o: RunOpts) {
   await c.settle();
   // 欠陥を入れていない実行では、後始末が済んでいることも確かめる。
   if (!o.faults) await expectQuiescent(c);
+  // 失敗した seed を調べるための書き出し。SIM_DUMP=<ファイル> で、取引の記録と RPC の記録を JSON で残す。
+  if (process.env.SIM_DUMP) {
+    const plain = (_k: string, x: unknown) => (x instanceof Uint8Array ? [...x] : x);
+    writeFileSync(process.env.SIM_DUMP, JSON.stringify({ seed: o.seed, history, rpc: c.net.log }, plain));
+  }
   return { history, violations: checkHistory(history), unknown, c, splits };
 }
 
 describe("history checker on the real shard code", () => {
-  for (const seed of [1, 2, 3, 4, 5, 6]) {
+  for (const seed of seedsOr([1, 2, 3, 4, 5, 6])) {
     it(`stays serializable with clock skew (seed ${seed})`, async () => {
       const { history, violations } = await run({ seed, skewMs: 40 });
       expect(history.filter((h) => !h.readOnly).length).toBeGreaterThan(20);
       expect(violations.slice(0, 3)).toEqual([]);
     });
   }
-  for (const seed of [11, 12, 13, 14]) {
+  for (const seed of seedsOr([11, 12, 13, 14])) {
     it(`stays serializable with restarts (seed ${seed})`, async () => {
       const { history, violations, unknown } = await run({ seed, skewMs: 20, restarts: true });
       expect(history.length).toBeGreaterThan(20);
@@ -195,7 +201,7 @@ describe("history checker on the real shard code", () => {
 });
 
 describe("history checker across live splits", () => {
-  for (const seed of [21, 22, 23, 24, 25, 26]) {
+  for (const seed of seedsOr([21, 22, 23, 24, 25, 26])) {
     it(`stays serializable while shards are added (seed ${seed})`, async () => {
       const { history, violations, splits } = await run({ seed, skewMs: 20, splits: true, ops: 60 });
       expect(splits).toBeGreaterThan(0);
@@ -203,7 +209,7 @@ describe("history checker across live splits", () => {
       expect(violations.slice(0, 3)).toEqual([]);
     });
   }
-  for (const seed of [31, 32, 33, 34]) {
+  for (const seed of seedsOr([31, 32, 33, 34])) {
     it(`stays serializable with splits and restarts together (seed ${seed})`, async () => {
       const { history, violations, splits } = await run({ seed, skewMs: 20, splits: true, restarts: true, ops: 60 });
       expect(splits).toBeGreaterThan(0);
@@ -214,14 +220,14 @@ describe("history checker across live splits", () => {
 });
 
 describe("history checker with pessimistic transactions", () => {
-  for (const seed of [41, 42, 43, 44, 45, 46]) {
+  for (const seed of seedsOr([41, 42, 43, 44, 45, 46])) {
     it(`stays serializable (seed ${seed})`, async () => {
       const { history, violations } = await run({ seed, skewMs: 20, pessimistic: true, ops: 25 });
       expect(history.filter((h) => !h.readOnly).length).toBeGreaterThan(10);
       expect(violations.slice(0, 3)).toEqual([]);
     }, 60000);
   }
-  for (const seed of [51, 52, 53, 54]) {
+  for (const seed of seedsOr([51, 52, 53, 54])) {
     it(`stays serializable with splits and restarts (seed ${seed})`, async () => {
       const { history, violations } = await run({ seed, skewMs: 20, pessimistic: true, splits: true, restarts: true, ops: 25 });
       expect(history.length).toBeGreaterThan(10);
