@@ -38,7 +38,7 @@ describe("UPDATE routed through a global index while an earlier commit is still 
       if (armed && m.to === "s1" && (m.method === "prepare" || m.method === "commit" || m.method === "commitLocal")) {
         armed = false;
         release();
-        return new Promise<void>((r) => setTimeout(r, 30));
+        return c.sleep(30);
       }
       return undefined;
     };

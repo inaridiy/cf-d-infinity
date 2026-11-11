@@ -1,7 +1,6 @@
 // DDL と取引を並行に流す乱択の実行と、その後の不変条件の検査。ddl-concurrent.test.ts が使う。
 // スケジュールは実時間のタイマーに依存するので、seed は作業負荷と遅延の列を固定するだけである。
 // 同じ seed でも割り込みの順序は完全には再現しない。失敗した seed は台本の再現テストへ落とす。
-import { vi } from "vitest";
 import { SimCluster, logRows, type Rpc } from "./sim";
 import { checkHistory, type Read, type TxRecord, type Violation } from "./history";
 import { Db, type Txn } from "../src/client/db";
@@ -31,7 +30,6 @@ export const INDEX = "acct_v";
 
 export const TENANTS = 6;
 export const IDS = 3;
-export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export async function tenantOn(c: SimCluster, shard: string, skip = 0): Promise<number> {
   const { routing } = await c.catalog();
@@ -335,6 +333,8 @@ export interface Report {
   commits: number;
   splits: number;
   ddlLog: string[];
+  /** 実行の指紋 (SimCluster.fingerprint)。同じ seed なら同じ値になる。 */
+  fingerprint: string;
 }
 
 const EXPECTED = /^(conflict|read too old|not owner|migrating|upgrading)/;
@@ -345,33 +345,23 @@ interface SideAck { t: number; id: number; n: number; begun: number; acked: numb
 export async function runScenario(seed: number, s: Scenario): Promise<Report> {
   const rnd = prng(seed);
   const sched = prng(seed ^ 0x5bd1e995);
-  // backoff と sync の乱数も seed から取る。txn id の乱数部分も同じである。
-  const random = vi.spyOn(Math, "random").mockImplementation(sched);
-  const uuid = vi.spyOn(globalThis.crypto, "randomUUID").mockImplementation(() => {
-    const h = () => Math.floor(sched() * 0x100000000).toString(16).padStart(8, "0");
-    return `${h()}-${h().slice(0, 4)}-${h().slice(0, 4)}-${h().slice(0, 4)}-${h()}${h().slice(0, 4)}` as ReturnType<typeof crypto.randomUUID>;
-  });
-  try {
-    return await runSeeded(seed, s, rnd, sched);
-  } finally {
-    random.mockRestore();
-    uuid.mockRestore();
-  }
+  // backoff と sync の乱数、txn id の乱数部分は、クラスタの実行環境が同じ seed から作る。
+  return runSeeded(seed, s, rnd, sched);
 }
 
 async function runSeeded(seed: number, s: Scenario, rnd: () => number, sched: () => number): Promise<Report> {
-  const c = new SimCluster({ shards: s.shards ?? 3, faults: s.faults, now: () => Date.now() });
+  const c = new SimCluster({ shards: s.shards ?? 3, faults: s.faults, seed });
   c.net.jitter = () => (sched() < 0.5 ? 0 : sched() * 3);
   // 応答の遅延。まれに長く遅らせて、2PC の途中で DDL が最後まで進む割り込みを作る。
   if (s.replyJitter || s.slowPrepare) {
     c.net.reply = (m) => {
       const x = sched();
       if (x < 0.6) return undefined;
-      return sleep(m.method === "prepare" && x > (s.slowPrepare ? 0.75 : 0.95) ? 30 + sched() * 90 : sched() * 4);
+      return c.sleep(m.method === "prepare" && x > (s.slowPrepare ? 0.75 : 0.95) ? 30 + sched() * 90 : sched() * 4);
     };
   }
   // phase 2 は応答の後に非同期で送られる。届くのが遅れても redrive が回収する前提なので、遅らせてよい。
-  if (s.slowPhase2) c.net.gate = (m) => (m.method === "finalize" && sched() < 0.3 ? sleep(sched() * 40) : undefined);
+  if (s.slowPhase2) c.net.gate = (m) => (m.method === "finalize" && sched() < 0.3 ? c.sleep(sched() * 40) : undefined);
   s.inject?.(c);
   let nextClient = 0;
   const client = () => new Db(c, { idPrefix: `s${seed}c${nextClient++}` });
@@ -390,7 +380,7 @@ async function runSeeded(seed: number, s: Scenario, rnd: () => number, sched: ()
   const env: Env = {
     c, rnd, admin,
     at: async (frac) => {
-      while (done < frac * total) await sleep(1);
+      while (done < frac * total) await c.sleep(1);
     },
     ddl: async (sql) => {
       let out = "ok";
@@ -404,7 +394,7 @@ async function runSeeded(seed: number, s: Scenario, rnd: () => number, sched: ()
     },
     checkpoint: async (label) => {
       paused = true;
-      while (active > 0) await sleep(1);
+      while (active > 0) await c.sleep(1);
       await c.settle();
       for (const core of c.cores.values()) await core.redrive().catch(() => {});
       await c.settle();
@@ -585,7 +575,7 @@ async function runSeeded(seed: number, s: Scenario, rnd: () => number, sched: ()
       await p.body(tx, reads, writes);
       if (mode === "slow") {
         hot = x;
-        await sleep(60 + rnd() * 200);
+        await c.sleep(60 + rnd() * 200);
       }
       await tx.commit();
     } catch (e) {
@@ -599,7 +589,7 @@ async function runSeeded(seed: number, s: Scenario, rnd: () => number, sched: ()
     let db = client();
     for (let i = 0; i < ops; i++) {
       if (rnd() < 0.1) db = client();
-      while (paused) await sleep(1);
+      while (paused) await c.sleep(1);
       active++;
       try {
         await one(db);
@@ -621,7 +611,7 @@ async function runSeeded(seed: number, s: Scenario, rnd: () => number, sched: ()
   const grower = (async () => {
     let next = c.shardIds.length;
     while (!stop && s.splits && next < c.shardIds.length + 5) {
-      await sleep(40);
+      await c.sleep(40);
       const { routing } = await c.catalog();
       const list = shardsOf(routing);
       const parent = list[Math.floor(rnd() * list.length)]!;
@@ -636,7 +626,7 @@ async function runSeeded(seed: number, s: Scenario, rnd: () => number, sched: ()
         } catch (e) {
           // 子が古い表定義のまま親の行を受け取ると drain が失敗する。要求が届けば子は追い付くので、やり直す。
           if (attempt === 19) errors.push(`split: ${e instanceof Error ? e.message : String(e)}`);
-          await sleep(5);
+          await c.sleep(5);
         }
       }
     }
@@ -716,5 +706,6 @@ async function runSeeded(seed: number, s: Scenario, rnd: () => number, sched: ()
     commits,
     splits,
     ddlLog: env.ddlLog,
+    fingerprint: c.fingerprint(),
   };
 }

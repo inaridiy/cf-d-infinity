@@ -39,7 +39,7 @@ describe("a transaction that advances its read timestamp while another shard's a
 
     // s1 は「読む時点より後に変わった」と答える。X は読む時点を進めて s1 を読み直す。そこへ s0 の古い応答が届く。
     s1Gate.release();
-    await new Promise((r) => setTimeout(r, 30));
+    await c.sleep(30);
     s0Reply.release();
     const got = await sum;
     // 順に並べられる結果は、両方の書き換えの前 (3)、s0 の後 (12)、両方の後 (111) のどれかである。

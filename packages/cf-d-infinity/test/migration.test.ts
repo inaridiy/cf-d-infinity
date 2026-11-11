@@ -158,7 +158,7 @@ describe("counterexamples from m5b_live_migration", () => {
     c.net.gate = () => {};
     release();
     await c.settle();
-    await new Promise((r) => setTimeout(r, 5));
+    await c.sleep(5);
     // 飛行中だった応答がここで子へ届く。
     await (c.cores.get("s2") as unknown as { receive(p: unknown): Promise<void> }).receive(inFlight);
     return { c, t, range };

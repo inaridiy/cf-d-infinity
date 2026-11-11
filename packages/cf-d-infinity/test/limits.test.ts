@@ -81,9 +81,9 @@ describe("the size of a transaction", () => {
     await expect(tx.commit()).rejects.toThrow(/transaction too large/);
     expect(await count(c)).toBe(0);
     // ロックを残していないので、同じ行への次の書き込みは待たされない。
-    const t0 = Date.now();
+    const t0 = c.time;
     await new Db(c).query("INSERT INTO docs VALUES (1, 1, 'small')");
-    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(c.time - t0).toBeLessThan(1000);
     expect(await quiescentProblems(c)).toEqual([]);
   });
 

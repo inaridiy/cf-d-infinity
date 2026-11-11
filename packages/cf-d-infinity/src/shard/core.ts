@@ -9,6 +9,7 @@ import {
 } from "../types";
 import type { DdlEntry } from "../meta";
 import { slotOf } from "../routing";
+import { type Runtime, sleep, systemRuntime } from "../runtime";
 import {
   CAPTURE_TABLES, applyChanges, asSqlError, capturedChanges, decode, deleteRow, encode, encodeKey, fold, insertRow, q,
   rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore, writable,
@@ -24,6 +25,8 @@ export interface ShardDeps {
     /** 適用できなかった版の取り消しを求める。取り消す版の番号か、取り消せなければ null が返る。 */
     revokeDdl(version: number, reason: string): Promise<number | null>;
   };
+  /** 実時間、待ち、乱数の出どころ。指定しなければ実物を使う。シミュレータは seed から決まる実装を渡す。 */
+  runtime?: Runtime;
   /** 応答後も続ける処理。DO では ctx.waitUntil に渡す。 */
   background?(p: Promise<unknown>): void;
   /** phase 2 の再駆動を予約する。DO では storage.setAlarm に渡す。 */
@@ -155,10 +158,12 @@ export class ShardCore implements ShardApi {
   private stats = { at: 0, reads: 0, writes: 0, groups: new Map<string, number>() };
   private faults: Faults;
   private K: number;
+  private rt: Runtime;
 
   constructor(private deps: ShardDeps) {
     this.id = deps.id;
     this.b = deps.backend;
+    this.rt = deps.runtime ?? systemRuntime;
     this.faults = deps.faults ?? {};
     this.K = deps.K ?? 50;
     this.boot();
@@ -451,7 +456,7 @@ export class ShardCore implements ShardApi {
    */
   private async settleAllIntents(): Promise<void> {
     // 待ちは実時間のタイマーなので、期限も実時間で測る。
-    const deadline = Date.now() + SCHEMA_WAIT_MS;
+    const deadline = this.rt.now() + SCHEMA_WAIT_MS;
     for (;;) {
       const pending = this.b.exec(`SELECT DISTINCT txn, anchor FROM __intents`) as unknown as Intent[];
       if (pending.length === 0) return;
@@ -461,10 +466,10 @@ export class ShardCore implements ShardApi {
         else if (res.status === "aborted") await this.abort({ txn: i.txn });
       }
       if ((this.b.exec(`SELECT count(*) n FROM __intents`)[0]!.n as number) === 0) return;
-      if (Date.now() > deadline) {
+      if (this.rt.now() > deadline) {
         throw new ConflictError("schema change is waiting for transactions on this shard to finish");
       }
-      await new Promise((r) => setTimeout(r, 5));
+      await sleep(this.rt, 5);
     }
   }
 
@@ -956,29 +961,29 @@ export class ShardCore implements ShardApi {
       const leave = () => {
         const at = list.indexOf(w);
         if (at >= 0) list.splice(at, 1);
-        clearTimeout(timer);
-        clearTimeout(wound);
-        clearTimeout(expiry);
+        this.rt.cancel(timer);
+        this.rt.cancel(wound);
+        this.rt.cancel(expiry);
       };
-      const timer = setTimeout(() => {
+      const timer = this.rt.after(Math.max(1, deadline - this.deps.clock.now()), () => {
         leave();
         reject(new ConflictError("lock wait timeout"));
-      }, Math.max(1, deadline - this.deps.clock.now()));
+      });
       const wound = held && this.older(me, held)
-        ? setTimeout(() => {
+        ? this.rt.after(WOUND_DELAY_MS, () => {
             if (this.locks.get(key)?.txn !== held.txn) return;
             this.locks.delete(key);
             leave();
             resolve();
-          }, WOUND_DELAY_MS)
+          })
         : undefined;
       // 保持者の Worker が死ぬと誰もロックを解放しない。期限で確かめないと待ち手が眠ったままになる。
-      let expiry: ReturnType<typeof setTimeout> | undefined;
+      let expiry: unknown;
       const watch = () => {
         const l = this.liveLock(key); // 切れていれば wakeNext が先頭を起こす
-        if (l) expiry = setTimeout(watch, Math.max(1, l.expires - this.deps.clock.now() + 1));
+        if (l) expiry = this.rt.after(Math.max(1, l.expires - this.deps.clock.now() + 1), watch);
       };
-      if (held) expiry = setTimeout(watch, Math.max(1, held.expires - this.deps.clock.now() + 1));
+      if (held) expiry = this.rt.after(Math.max(1, held.expires - this.deps.clock.now() + 1), watch);
       const w: Waiter = { ...me, wake: () => { leave(); resolve(); } };
       // 古い取引を先に起こす。同じ開始時刻の間は到着順である。
       const at = list.findIndex((x) => this.older(me, x));

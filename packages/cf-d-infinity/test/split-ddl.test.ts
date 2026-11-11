@@ -55,7 +55,7 @@ describe("split + a schema change + a committed transaction waiting to be applie
     const impatient = await attempt(new Db(c, { splitWaitMs: 100 }).ddl("ALTER TABLE t ADD COLUMN z INTEGER"));
     expect(impatient).toEqual({ err: "a shard split is in progress; retry the schema change when it finishes" });
     const ddl = attempt(new Db(c).ddl("ALTER TABLE t ADD COLUMN z INTEGER"));
-    await new Promise((r) => setTimeout(r, 50));
+    await c.sleep(50);
     releasePull();
     releaseFinalize();
     expect(await splitting).toHaveProperty("ok");

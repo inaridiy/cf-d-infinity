@@ -2,23 +2,14 @@
 // いくつかの接続が、文のひな形から乱択で文を作り、取引の中と外で並行に流す。phase 2 の配送は乱択で遅らせる。
 // 終わったら、確定した取引を確定の時刻の順に並べ、同じ文を 1 つの SQLite で再生して、結果を 1 文ずつ比べる (test/replay.ts)。
 // どの試験にも掛かる範囲の検査 (test/setup.ts) も、ここで流した文のすべてに掛かる。
+//
+// 実行は seed で決まる。待ちは仮想の時計で測り、乱数は seed から作る。失敗した seed は、同じ seed で再現する。
 import { describe, expect, it } from "vitest";
 import { Db, type Cluster } from "../src/client/db";
 import type { Value } from "../src/types";
 import { quiescentProblems } from "./invariants";
 import { replay, type ReplayReport, type StatementRecord, type TxnRecord } from "./replay";
-import { SimCluster } from "./sim";
-
-function prng(seed: number) {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 2 ** 32;
-  };
-}
+import { prng, SimCluster } from "./sim";
 
 const DDL = [
   `CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT, code TEXT, v INTEGER NOT NULL DEFAULT 0, n INTEGER NOT NULL DEFAULT 0,
@@ -86,12 +77,12 @@ const SHAPES: Record<string, (r: Rnd) => [string, Value[]]> = {
 const NAMES = Object.keys(SHAPES);
 const RETRYABLE = /^(conflict|read too old|not owner|migrating|upgrading):/;
 
-async function run(seed: number, o: { clients?: number; rounds?: number } = {}): Promise<{ report: ReplayReport; quiescent: string[]; escapes: number }> {
+async function run(seed: number, o: { clients?: number; rounds?: number } = {}): Promise<{ report: ReplayReport; quiescent: string[]; escapes: number; fingerprint: string }> {
   const rnd = prng(seed);
-  const c = new SimCluster({ shards: 3 });
+  const c = new SimCluster({ shards: 3, seed });
   c.net.jitter = () => (rnd() < 0.5 ? 0 : rnd() * 3);
   // phase 2 の配送を乱択で遅らせる。確定を返した後、適用が届くまでの間の読み書きを作る。
-  c.net.gate = (m) => (m.method === "finalize" && rnd() < 0.4 ? new Promise<void>((r) => setTimeout(r, rnd() * 25)) : undefined);
+  c.net.gate = (m) => (m.method === "finalize" && rnd() < 0.4 ? c.sleep(rnd() * 25) : undefined);
   const admin = c.client();
   for (const s of DDL) await admin.ddl(s);
   const history: TxnRecord[] = [];
@@ -115,7 +106,7 @@ async function run(seed: number, o: { clients?: number; rounds?: number } = {}):
           first ??= shard;
           return c.shard(shard);
         },
-        catalog: () => c.catalog(), applyDdl: (q, b) => c.applyDdl(q, b),
+        runtime: c.runtime, catalog: () => c.catalog(), applyDdl: (q, b) => c.applyDdl(q, b),
         publishIndex: (t, n, b) => c.publishIndex(t, n, b), allocate: (t, n, m) => c.allocate(t, n, m), switchRange: (m) => c.switchRange(m),
       };
       if (rnd() < 0.4) {
@@ -166,8 +157,24 @@ async function run(seed: number, o: { clients?: number; rounds?: number } = {}):
   await Promise.all(Array.from({ length: o.clients ?? 5 }, client));
   c.net.gate = () => undefined;
   await c.settle();
-  return { report: replay(DDL, history), quiescent: await quiescentProblems(c), escapes: c.spanEscapes.length };
+  const quiescent = await quiescentProblems(c);
+  return { report: replay(DDL, history), quiescent, escapes: c.spanEscapes.length, fingerprint: c.fingerprint() };
 }
+
+describe("the simulator is deterministic", () => {
+  // これが落ちたら、実行のどこかに、本物のタイマー、本物の時計、seed から作っていない乱数が混ざっている。
+  // そうなると、検査が見つけた失敗を seed から再現できない。
+  it("the same seed gives the same run, down to every RPC", async () => {
+    const a = await run(3);
+    const b = await run(3);
+    expect(b.fingerprint).toBe(a.fingerprint);
+    expect(b.report.coverage).toEqual(a.report.coverage);
+    // 別のクラスタと同時に流しても変わらない。クラスタは、時計も、乱数も、覚え書きも、ほかと共有しない。
+    const [c, other] = await Promise.all([run(3), run(4)]);
+    expect(c.fingerprint).toBe(a.fingerprint);
+    expect(other.fingerprint).not.toBe(a.fingerprint);
+  }, 120_000);
+});
 
 describe("statement replay against one SQLite, under concurrency", () => {
   const total: ReplayReport["coverage"] = {};

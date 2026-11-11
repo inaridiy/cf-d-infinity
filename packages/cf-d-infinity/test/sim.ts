@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Db, type Cluster } from "../src/client/db";
 import { MetaCore } from "../src/meta";
+import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import { ShardCore, type SpanEscape } from "../src/shard/core";
 import type { Backend, Faults, Row, ShardApi, Value } from "../src/types";
 
@@ -24,10 +26,86 @@ function checkDoLimits(sql: string, params: Value[] = []): void {
   }
 }
 
+/** seed から決まる乱数 (mulberry32)。 */
+export function prng(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 2 ** 32;
+  };
+}
+
+/**
+ * 仮想の実行環境。同じ seed なら、同じ実行になる。
+ *
+ * 時刻は、予約された出来事 (待ちの終わり、RPC の配送) が起きるときにだけ進む。乱数と識別子は seed から決まる。
+ * 出来事は、時刻の順 (同じ時刻なら予約した順) に 1 つずつ起こす。1 つ起こすたびに、本物の setImmediate を挟んで、
+ * その出来事が起こした処理が待ちに入るまで進ませる。だから出来事の順序は、実時間の経過にも、計算機の負荷にも依らない。
+ *
+ * 決定的でなくなるのは、試験が本物のタイマーや入出力を混ぜたときである。待ちは sleep() で書く。
+ */
+export class VirtualRuntime implements Runtime {
+  private t: number;
+  private seq = 0;
+  private ids = 0;
+  private queue: { at: number; seq: number; fn: (() => void) | null }[] = [];
+  private pumping = false;
+  /** 起こした出来事の数。 */
+  steps = 0;
+  readonly random: () => number;
+  constructor(readonly seed = 1, start = 1_000_000) {
+    this.t = start;
+    this.random = prng(seed);
+  }
+  /** 本物の時計と同じく、整数の ms を返す。出来事の順序は、端数まで含めた時刻で決める。 */
+  now(): number {
+    return Math.floor(this.t);
+  }
+  /** 時計だけを進める。予約済みの出来事は、進めた後の時刻で順に起きる。 */
+  set(ms: number): void {
+    this.t = ms;
+  }
+  after(ms: number, fn: () => void): unknown {
+    const e = { at: this.t + Math.max(0, ms), seq: this.seq++, fn };
+    // 時刻、予約の順で並べておく。件数は少ないので、挿入位置は後ろから探す。
+    let i = this.queue.length;
+    while (i > 0 && (this.queue[i - 1]!.at > e.at)) i--;
+    this.queue.splice(i, 0, e);
+    this.pump();
+    return e;
+  }
+  cancel(handle: unknown): void {
+    if (handle) (handle as { fn: (() => void) | null }).fn = null;
+  }
+  uuid(): string {
+    return `${(this.ids++).toString(36)}-${Math.floor(this.random() * 2 ** 32).toString(16).padStart(8, "0")}`;
+  }
+  private pump(): void {
+    if (this.pumping) return;
+    this.pumping = true;
+    setImmediate(() => {
+      this.pumping = false;
+      let e = this.queue.shift();
+      while (e && e.fn === null) e = this.queue.shift(); // 取り消された予約
+      if (!e) return;
+      if (e.at > this.t) this.t = e.at;
+      this.steps++;
+      const fn = e.fn!;
+      if (this.queue.length > 0) this.pump();
+      fn();
+    });
+  }
+}
+
 /** node:sqlite の Backend。fence() 後の操作は失敗する (DO 基盤が旧 instance を止めるのと同じ)。 */
 export class SqliteBackend implements Backend {
   fenced = false;
   depth = 0;
+  /** quorum の確定の待ちに使う。SimCluster が自分のものに差し替える。 */
+  rt: Runtime = systemRuntime;
   constructor(readonly db = new DatabaseSync(":memory:")) {}
   exec(sql: string, ...params: Value[]): Row[] {
     if (this.fenced) throw new Error("fenced instance");
@@ -76,7 +154,7 @@ export class SqliteBackend implements Backend {
   }
   /** quorum の確定には本番で約 10 ms かかる。ここで処理が譲られないと、待ちの間のレースを再現できない。 */
   async sync(): Promise<void> {
-    await new Promise((r) => setTimeout(r, Math.random() * 2));
+    await sleep(this.rt, this.rt.random() * 2);
   }
   size(): number {
     const r = this.db.prepare(`SELECT page_count * page_size s FROM pragma_page_count(), pragma_page_size()`).get() as { s: number };
@@ -118,6 +196,13 @@ export interface SimOptions {
   recentMax?: number;
   /** 範囲の検査 (ShardDeps.spanEscape) を切る。既定では掛ける。 */
   noSpanCheck?: boolean;
+  /** 仮想の実行環境の seed。同じ seed なら同じ実行になる。 */
+  seed?: number;
+  /**
+   * 本物の時計とタイマーで動かす。実行は再現できない。本物のタイマーで待つ、まだ移していない試験のためにある。
+   * now を渡したときも、こちらになる。
+   */
+  realTime?: boolean;
 }
 
 /** Worker と DO の間の RPC だけをシミュレートしたクラスタ。ShardCore は本物を動かす。 */
@@ -128,7 +213,10 @@ export class SimCluster implements Cluster {
   /** 起動時のシャード。増設後の一覧は catalog の routing を見る。 */
   shardIds: string[];
   net = new SimNet();
-  time = 1_000_000;
+  /** 時刻、待ち、乱数、識別子の出どころ。Db もシャードも、ここから取る。 */
+  readonly runtime: Runtime;
+  private virtual: VirtualRuntime | null;
+  private fixedTime = 1_000_000;
   /** 全シャードの時計をまとめて進める量 (ms)。時計の出所が実時間でも効く。 */
   ahead = 0;
   cores = new Map<string, ShardCore>();
@@ -141,15 +229,43 @@ export class SimCluster implements Cluster {
   alarms = new Set<string>();
 
   constructor(private o: SimOptions = {}) {
+    this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
+    this.runtime = this.virtual ?? systemRuntime;
     this.shardIds = Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
     this.meta = new MetaCore(new SqliteBackend(), this.shardIds);
     for (const id of this.shardIds) this.core(id);
   }
 
+  /** シャードの時計の元になる時刻 (ms)。仮想の実行環境では、出来事が起きるときに進む。試験が直に進めてもよい。 */
+  get time(): number {
+    return this.virtual ? this.virtual.now() : this.fixedTime;
+  }
+  set time(ms: number) {
+    if (this.virtual) this.virtual.set(ms);
+    else this.fixedTime = ms;
+  }
+
+  /**
+   * 実行の指紋。RPC の記録 (送り元、宛先、種類、要求の中身) を順に畳んだもの。同じ実行なら同じ値になる。
+   * 同じ seed で値が変わったら、実行のどこかに、本物のタイマー、本物の時計、seed から作っていない乱数が混ざっている。
+   */
+  fingerprint(): string {
+    const h = createHash("sha256");
+    for (const m of this.net.log) h.update(JSON.stringify([m.from, m.to, m.method, m.req], (_k, x) => (x instanceof Uint8Array ? [...x] : x)));
+    return `${this.net.log.length} rpcs ${h.digest("hex").slice(0, 16)}`;
+  }
+
+  /** ms だけ待つ。仮想の実行環境では、実時間は掛からない。試験の中の待ちは、これで書く。 */
+  sleep(ms: number): Promise<void> {
+    return sleep(this.runtime, ms);
+  }
+
   /** DO と同じく、触った時に存在し始める。 */
   private core(id: string): ShardCore {
     if (!this.cores.has(id)) {
-      this.backends.set(id, new SqliteBackend());
+      const b = new SqliteBackend();
+      b.rt = this.runtime;
+      this.backends.set(id, b);
       this.boot(id);
     }
     return this.cores.get(id)!;
@@ -160,6 +276,7 @@ export class SimCluster implements Cluster {
       id,
       backend: this.backends.get(id)!,
       clock: { now: () => (this.o.now?.() ?? this.time) + this.ahead + (this.o.skewMs?.(id) ?? 0) },
+      runtime: this.runtime,
       peer: (to) => this.stub(id, to),
       meta: { ddlSince: (v) => this.meta.ddlSince(v), revokeDdl: (v, reason) => this.meta.revokeDdl(v, reason) },
       background: (p) => {
@@ -193,6 +310,7 @@ export class SimCluster implements Cluster {
     const old = this.backends.get(id)!;
     old.fenced = true;
     const fresh = new SqliteBackend(old.db);
+    fresh.rt = this.runtime;
     this.backends.set(id, fresh);
     this.boot(id);
   }
@@ -205,7 +323,8 @@ export class SimCluster implements Cluster {
         await this.net.gate(m);
         if (this.net.drop(m)) throw new Error(`rpc dropped: ${String(method)}`);
         const delay = this.net.jitter?.() ?? 0;
-        await new Promise((r) => (delay > 0 ? setTimeout(r, delay) : setImmediate(r)));
+        if (this.virtual) await this.sleep(delay);
+        else await new Promise((r) => (delay > 0 ? setTimeout(r, delay) : setImmediate(r)));
         // JSON を通して、DO の RPC と同じく参照を共有しないようにする。
         const core = this.core(to);
         const out = await (core[method] as (r: unknown) => Promise<unknown>).call(core, structuredClone(req));
