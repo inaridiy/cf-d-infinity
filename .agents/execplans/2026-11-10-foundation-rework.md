@@ -169,7 +169,7 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 | 範囲の検査 | `src/shard/core.ts` の `checked`、`test/setup.ts` | シミュレータでシャードが実行した文のすべてについて、範囲の外の行を消して再実行し、結果が同じか。どの試験にも掛かる | 範囲の外の行を全部消すので、打ち消し合う依存を見逃す。3,000 行を超える状態では省く。時点は確かめない。読むべき行が別のシャードにある場合は見つけない |
 | 文を再生する検査 | `test/replay.ts`、`test/replay.test.ts` | 並行に流した文を、確定の時刻の順に 1 つの SQLite で再生し、1 文ずつ結果が同じか。文のひな形ごとに成功した実行の下限、断った文が 0 | 文のひな形は手書き、表定義は 1 組。分割、DDL、再起動、応答の喪失を掛けていない。シミュレータが決定的でないので、同じ seed で再現しない |
 | SQLite との差分 (逐次) | `test/diff.ts`、`test/compat.test.ts`、`test/fuzz.test.ts` | 1 接続で流した文の結果とエラー | 並行がない。表定義が固定 |
-| DDL と並行する取引 | `test/ddl-harness.ts`、`test/ddl-concurrent.test.ts` | DDL、分割、取引を並行に流した後の、index と行の一致、読みの正しさ | 決定的でない。未解決の問題 2 は、ここで 1 回だけ出た |
+| DDL と並行する取引 | `test/ddl-harness.ts`、`test/ddl-concurrent.test.ts` | DDL、分割、取引を並行に流した後の、index と行の一致、読みの正しさ | 決定的でない。未解決の問題 2 と 11 は、ここでまれに出る。CI が、欠陥と関係のない変更で落ちることがある |
 | 終了時の不変条件 | `test/invariants.ts` | intent の残り、適用されない確定済みの取引、index と行の一致 | |
 | 未解決の再現テスト | `test/open/` | 見つかっているが直していない欠陥。正しい挙動を期待して書いてあるので落ちる。既定の実行から外してある | `OPEN=1 npx vitest run test/open` で実行する |
 
@@ -224,6 +224,13 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 8. UNIQUE のある表での競合の頻度を、負荷を掛けて測っていない。衝突を解決する INSERT の費用も測っていない。
 9. `test/autoscale-cron.test.ts` が、CI で 1 回落ちたことがある (`main` の PR #4 のマージ直後)。原因は調べていない。
 10. 内部の名前の予約を狭めた理由は「drizzle-kit が `__new_<表名>` を使う」という記憶で、確かめていない。Plan of Work の 8 で、実際の移行の道具が出す文で確かめる。
+11. **`test/ddl-concurrent.test.ts` の「ALTER TABLE ADD COLUMN (seed 2)」が、PR #8 の CI で 1 回落ちた (2026-11-11)。**
+    `ALTER TABLE acct ADD COLUMN extra INTEGER DEFAULT 5` と並行する取引の文が、`column index out of range` で失敗した。
+    これは SQLite が、文の `?` の数と渡した値の数が合わないときに出すエラーである。
+    列が増える前後で、行の形と文の形が食い違った可能性があるが、調べていない。
+    同じコミットのもう 1 つの CI の実行と、手元の 10 回あまりの実行では出ていない。`main` に元からあるかも分からない。
+    出力は `.agents/execplans/evidence/2026-11-11-ci-add-column-column-index-out-of-range.txt`。
+    不変条件 4 の周辺 (表定義の版と、運ばれる行の形)。決定的なシミュレータができてから再現させる。
 
 ## Surprises & Discoveries
 
@@ -234,6 +241,7 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 - `ON CONFLICT (email)` は、シャードの表に UNIQUE (email) がないので、衝突がなくても SQLite のエラーになっていた。持ち主の指摘で分かった。
 - 主キーに NULL のある行の取り違えと、`pragma_table_info('__txn')` でシャードの内部の表が読めることは、Codex の指摘を手元で再現した。
 - (2026-11-11) シミュレータが決定的でない原因は、タイマーだけではなかった。取引の ID が `crypto.randomUUID()` で作られ、その ID のハッシュが anchor の選び方に使われる (`Txn.commit`)。待ちの長さにも `Math.random()` が使われている (`backoff`、`SqliteBackend.sync`)。
+- (2026-11-11) DDL と並行する取引の試験 (`test/ddl-concurrent.test.ts`) は、1 日のうちに 3 種類の失敗を 1 回ずつ出した。index の項目の欠け、制限時間の超過、`column index out of range` である (未解決の問題 2 と 11)。どれも同じ seed の次の実行では出ない。
 - (2026-11-11) 全件の実行で 1 回、UNIQUE の index の項目の欠けが出た (未解決の問題 2)。`main` にも元からあった。別の試験を同時に流すと実行のタイミングが変わり、普段は出ない並びが出る。3 回のレビューと、これまでの繰り返しの実行では見つかっていなかった。
 - (2026-11-11) `6b55ad3` には、規則 4 に反する拒否が残っていた (未解決の問題 5)。`docs/sql-language.md` には書いてあったが、この計画の「対応する範囲」には載っていなかった。
 
@@ -264,12 +272,13 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 ### 1. ここまでを `main` へ入れる
 
 `spans-and-replay` を push して PR を作り、CI が通ったら squash merge する。
-未解決の問題 2 の試験が CI で落ちたら、やり直す前に、落ちた seed と出力を証拠に足す。
+未解決の問題 2 と 11 の試験は、まれに落ちる。CI で落ちたら、やり直す前に、落ちた seed と出力を証拠に足す。
+同じ失敗でなければ、新しい問題として記録する。
 
 ### 2. シミュレータを決定的にする
 
 同じ seed で同じ実行になるようにする。
-これがないと、検査が見つけたものを再現できず、未解決の問題 1 と 2 に手を付けられない。
+これがないと、検査が見つけたものを再現できず、未解決の問題 1、2、11 に手を付けられない。
 
 - 時計、待ち、乱数、取引の ID を、`Db` と `ShardCore` へ外から渡す。いま直に呼んでいる場所は、`src/client/db.ts` の `backoff`、分割の待ち、`nextTxnId`、`startStamp`、`src/shard/core.ts` の表定義の待ちと行ロックの待ちである。本番の既定は、いまと同じ実物にする。
 - シミュレータ (`test/sim.ts`) に、仮想の時計と、seed で次の出来事 (RPC の配送、応答の配送、タイマー) を選ぶスケジューラを持たせる。`setTimeout`、`setImmediate`、`Math.random()` を使わない。
@@ -278,7 +287,7 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 - `test/replay.test.ts`、`test/ddl-concurrent.test.ts`、`test/history.test.ts`、`test/elle-sim.test.ts` を、このスケジューラの上へ移す。
 - workerd を使う結合テストは、本物を動かすので対象にしない。
 
-できたら、未解決の問題 1 と 2 を、seed を数千個流して探す。
+できたら、未解決の問題 1、2、11 を、seed を数千個流して探す。
 見つかった seed は、再現テストとして `test/open/` に置く。
 直すのは、不変条件と持ち主に割り当ててからである。
 
