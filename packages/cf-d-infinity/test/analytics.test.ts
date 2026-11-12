@@ -7,7 +7,7 @@ import { collect } from "../src/analytics";
 import { keyString } from "../src/keys";
 import { ownerOf } from "../src/routing";
 import type { Faults } from "../src/types";
-import { ORDERS, SimCluster, USERS } from "./sim";
+import { logRows, ORDERS, SimCluster, USERS } from "./sim";
 
 describe("analytics path", () => {
   it("rebuilds the latest state in DuckDB and agrees with the OLTP tier", async () => {
@@ -78,8 +78,10 @@ describe("the analytics flush stops below unresolved intents (m6_red_resolved)",
     await c.settle();
     c.time += 10;
     const second = await collect(c);
+    // 前提: intent は c で適用され、s1 の変更ログにある。flush に入らないのは、適用されなかったからではない。
+    const logged = logRows(c.backends.get("s1")!).some((r) => r.commit_ts === commitTs);
     const seen = [...first.changes, ...second.changes].some((x) => x.commit_ts === commitTs && x.table === "users");
-    return { c: commitTs, pts, W1: first.W, W2: second.W, seen };
+    return { c: commitTs, pts, W1: first.W, W2: second.W, logged, seen };
   };
 
   it("put back: flushing at the clock passes over the intent, and its commit never reaches the analytics path", async () => {
@@ -88,6 +90,7 @@ describe("the analytics flush stops below unresolved intents (m6_red_resolved)",
     expect(s.W1).toBeGreaterThanOrEqual(s.c);
     // W 以下の commit が、どの flush にも入らない (watermarkSafe の違反)。
     expect(s.W2).toBeGreaterThanOrEqual(s.c);
+    expect(s.logged).toBe(true);
     expect(s.seen).toBe(false);
   });
 
@@ -96,6 +99,7 @@ describe("the analytics flush stops below unresolved intents (m6_red_resolved)",
     expect(s.c).toBeGreaterThanOrEqual(s.pts);
     expect(s.W1).toBeLessThan(s.pts);
     expect(s.W2).toBeGreaterThanOrEqual(s.c);
+    expect(s.logged).toBe(true);
     expect(s.seen).toBe(true);
   });
 });
