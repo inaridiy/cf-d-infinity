@@ -1,0 +1,118 @@
+# Model counterexamples, fault switches and deterministic replays (2026-11-12)
+
+For every `red` module in `specs/check.sh` (a model configuration that TLC must find a counterexample for), this table
+names the fault switch that puts the same flaw into the code and a deterministic simulator test that replays the
+scenario. It answers the owner's question of whether model checking can stand in front of the random tests: the
+models find the design flaws; the replays check that the implementation behaves on the dangerous orderings the
+models found, without waiting for a random seed to produce them (Decision Log 2026-11-12).
+
+Survey made read-only by a subagent on `fa1a2cd`; rows `m5b_red_range`, `m5b_red_p2_window`, `m3_red` and the
+`validateFromT` note were checked by hand. Test references are `packages/cf-d-infinity/test/<file>.test.ts:<line>`.
+"fixed" means the test runs only the fixed code; "guard-only" means it checks the guard step, not the whole
+counterexample.
+
+Categories:
+- A: the implementation has the guard, and a replay test exists (45)
+- B: implemented guard, fault switch exists, no deterministic replay (5)
+- C: implemented guard, no fault switch (18)
+- D: a design alternative the implementation never had or no longer has; no switch needed (8)
+
+| module | flaw modelled | fault switch | deterministic replay | cat |
+|---|---|---|---|---|
+| m1_red_a | read-only participants not prepared, so their reads go unvalidated | skipReadOnlyPrepare | counterexamples:153 | A |
+| m1_red_b | anchor does not absorb participants' prepare_ts | anchorNoAbsorb | counterexamples:127 | A |
+| m1_red_c | commit-time refresh does not advance participant HLC to c | refreshNoBump | counterexamples:217 | A |
+| m1_red_d | predicate reads counted as protected, so phantom missed | predicateProtected | counterexamples:189 | A |
+| m1_red_e | validation ignores others' intents (cross-shard write skew) | ignoreIntentsInValidation | counterexamples:94 | A |
+| m1_red_g | push accepted after c is decided (refresh window) | pushAfterDecide | counterexamples:307 | A |
+| m2_red | reader passes an in-flight intent on timeout | readerTimeoutPass | counterexamples:66 | A |
+| m3_red | phase 2 and reply sent before anchor record is synced | none (guard at core.ts:1825) | none (sim's sync never loses writes) | C |
+| m4_red | only commit ts persisted, so HLC falls behind served read | hlcNoCeiling | counterexamples:242 | A |
+| m5_red_switch | old push handoff: route switch before fence gives two owners | none (nearest: ignoreFence) | none (nearest: migration:223, symptom only) | D |
+| m5_red_intents | handoff does not carry intents | dropIntentsOnMove | migration:182 | A |
+| m5b_red_s3 | move as a transaction; child answers T<m by undo | servePastMove | migration:202 | A |
+| m5b_red_s3_parent | parent answers T<m read of a moved group | ignoreFence (broader) | none (migration:223 is a write) | B |
+| m5b_red_p2 | phase 2 applied at parent, not forwarded | applyAfterMoved | none (:170 drives the window variant) | B |
+| m5b_red_p2_window | phase 2 applied at parent while the pull reply is in flight | applyAfterMoved | migration:170 | A |
+| m5b_red_intents | pull does not carry intents | dropIntentsOnMove | migration:182 | A |
+| m5b_red_range | finishing a move does not pass the parent clock to the child | finishWithoutClock | move-timestamp:54 | A |
+| m6_red_dirty | dirty reported only on intent write | none | none | D |
+| m6_red_resolved | flush at HLC instead of resolved ts | none (guard at core.ts:1972-1974) | none | C |
+| m6_red_skew | clock skew plus report delay exceeds MARGIN | none | none | D |
+| m7_red | undo-based restore to W | none | none | D |
+| m1b_green (freshReadPicked) | autocommit read takes T before settling intents | noRealtimeBump (multi-shard path only) | counterexamples:320 (1-shard, fixed); review-regressions:144 | A |
+| m1b_green_bump (freshReadSeq) | claim 3 not promised for a transaction's 2nd statement (scope limit) | none | none | D |
+| m1b_red_ra | read-time refresh does not advance HLC | refreshNoBump | none (:217 is the commit-time case) | B |
+| m1b_red_rc | T advanced after a failed read refresh | none | review2-regressions:18 (fixed, indirect) | A |
+| m8_red_drop | generation DROP does not raise logLowWater | none | none | C |
+| m9_red_ro_skip | read-only transaction with locked reads skips validation | none (nearest: skipReadOnlyPrepare) | none | C |
+| m9_red_second_f | 2nd DML on a row resets since to the new F | none | none | C |
+| m9_red_imm_read_t | IMMEDIATE key read at T, validated from F | none | none | C |
+| m9_red_skip_lost | trusts a held lock and skips validation | trustLocks | counterexamples:492 | A |
+| m9_red_f_is_t | DML dry-run at T instead of F | none (nearest: validateFromT) | none | C |
+| m9_red_wound_prepared | wound steals a prepared transaction's lock and intent | none | none | C |
+| m9_red_no_pred | DML predicate / referenced-table spans not validated | none | counterexamples:419 (fixed) | A |
+| m9_red_prepare_waits | prepare waits on others' locks (deadlock) | none | none | C |
+| m9_red_wait_die | wait-die instead of wound-wait | none | none | D |
+| m9_impl_wake | lock-TTL expiry never wakes the waiter | none | counterexamples:498 (fixed) | A |
+| m9_red_leave_silent | woken waiter leaves without waking the next one | none | counterexamples:510 (fixed) | A |
+| m10_red_no_guard | no COMMIT age check; commit after tombstone GC | none | gc:102 (fixed, guard-only) | A |
+| m10_red_gc_undone | committed record GC'd before all participants applied | none | none | C |
+| m10_red_guard_too_long | accepted COMMIT age G ≥ retention R | none | gc:102 (pins G=R/2) | A |
+| m11_impl | all five M11 fixes removed | noSchemaRecheck+ddlIgnoresIntents+ignoreTableLock (BUG-1 none) | ddl-concurrent:334–509, one test per BUG | A |
+| m11_impl_wait | BUG-3: no version recheck after lock wait | noSchemaRecheck | ddl-concurrent:416 | A |
+| m11_impl_inflight | BUG-4: in-flight 2PC commits after index public | noSchemaRecheck+ddlIgnoresIntents (both) | ddl-concurrent:436 (fixed) | A |
+| m11_impl_backfill | BUG-2: row changes between backfill read and write | ignoreTableLock | unique-index-build:109; ddl-concurrent:368 | A |
+| m11_impl_chunk | BUG-1: same-shard duplicate overwritten in backfill | none | ddl-concurrent:334 (fixed) | A |
+| m11_impl_drop | BUG-5: committed intent applied to recreated table | ddlIgnoresIntents | review-regressions:181; ddl-concurrent:495 | A |
+| m11_red_no_reject | shard accepts stale-version requests | none (check at core.ts:347) | migration:234 (fixed, guard-only) | A |
+| m11_red_early_public | index public before backfill finishes | none | none | C |
+| m11_red_no_write_only | writes skip a write-only index | none | none | D |
+| m11_red_no_sync | DDL returns before all shards applied it | none (stub at ddl-concurrent:687, seed sweep) | migration:247 (fixed) | A |
+| m12_red_online | index used and maintained while being built (old design) | none | ddl-concurrent:368; unique-index-build:51 (fixed design) | D |
+| m12_red_no_lock | shard accepts writes during the build | ignoreTableLock | unique-index-build:109 | A |
+| m12_red_visible | planner uses the unfinished index | none | unique-index-build:41 (fixed) | A |
+| m12_red_no_drain | version advanced while intents are held | ddlIgnoresIntents | ddl-concurrent:436 (fixed) | A |
+| m12_red_stale | shard accepts stale-version plans | none | migration:234 (fixed, guard-only) | A |
+| m12_red_two_exits | late publish after expiry withdrawal | none | unique-index-build:63 (fixed) | A |
+| m12_red_repin | transaction takes new version without replanning | repinOnRestore | txn-across-schema-change:53 | A |
+| m12_red_scan_early | scan before the shard applied the lock version | none | none | C |
+| m12_clock_red_no_clock | publish version carries no timestamp | publishWithoutClock | unique-index-build:140 | A |
+| m12_clock_red_skip_empty | build skips empty shards' clocks | none | none | C |
+| m13_red_main | DDL takes effect before buffered writes, plus repin | noImplicitCommit (+repinOnRestore) | migration-tools:122 (fixed) | A |
+| m13_red_pin_only | DDL does not commit first; own new table unwritable | noImplicitCommit | migration-tools:161 (fixed) | A |
+| m13_red_repin | transaction takes new version without replanning | repinOnRestore | txn-across-schema-change:53 | A |
+| m13_red_retry_whole | batch retried from the top, replaying committed parts | replayAcrossSchemaChange | migration-tools:195 | A |
+| m13_red_ddl_anyway | DDL runs after the preceding commit failed | ddlAfterFailedCommit | migration-tools:145 (fixed) | A |
+| m14_red_no_lock | DROP guard checks but does not lock | ignoreTableLock / dropWithoutGuard | rebuild-guard:181 (fixed, guard-only) | A |
+| m14_red_no_check | DROP guard locks but does not check | dropWithoutGuard | rebuild-guard:81 | A |
+| m14_red_check_early | check before the lock version is applied | none | rebuild-guard:74 (fixed) | A |
+| m14_red_no_drain | lock version applied with intents unsettled | ddlIgnoresIntents | none | B |
+| m14_red_untied | DROP passes after the lock expires | none | none | C |
+| m14_red_commit_ts | check from the copy's commit ts instead of read ts | none | none | C |
+| m15_red_no_slot | DDL recorded mid-split (not atomic) | none | ddl-vs-split-race:15 (fixed) | A |
+| m15_red_stale_begin | split uses version read before taking the slot | none | split-hazards:79; child-behind-parent:17 | A |
+| m15_red_early_release | slot returned before the child finishes | none | split-slot:62 (fixed) | A |
+| m15_red_no_based_on | slot taken before all shards applied the latest version | none | none | C |
+| m15_red_late_start | child starts after the slot expired | none | none | C |
+
+## Switches that match no red module
+
+- `rowSpanDespiteUnique`: narrows a write's span to one row despite an in-shard UNIQUE. Used in span-check:25 and :32, review-regressions:57, health:76.
+- `autoIgnoresUniqueIntents`: autocommit write ignores UNIQUE values held by other transactions' intents. Used in review-regressions:65, health:76.
+- `noWriteSetLimit`: no write-set size check before commit. Used in limits:115.
+- `rowwiseUndo`: undo row by row, so a UNIQUE swap breaks the snapshot. Used in counterexamples:269.
+- `staleWideRead`: parent answers whole-table reads after a move (BUG-8, which no model covers). Used in ddl-concurrent:614 and :645.
+- `childKeepsOldSchema`: split child does not catch up its schema when groups arrive. Only the `FAULT=` sweep uses it.
+- `validateFromT`: validates from T instead of F, which widens the window. Not the same as M9's `RED_F_IS_T`. No test uses it.
+- `triggerCapture`: not a defect; it only forces the slower capture path. No test uses it.
+
+## Notes
+
+1. A also covers rows with no switch when a test replays the scenario on fixed code ("fixed"). Such a replay shows the
+   guard works on that ordering but cannot show that the check would notice the guard missing.
+2. `m11_impl_inflight` needs both switches on; the specs README says either fix alone closes it.
+3. `m3_red` cannot be replayed: the simulator's `sync()` never loses unsynced writes on restart. Replaying it needs a
+   backend that drops writes not yet synced when the shard restarts.
+4. `noImplicitCommit` and `ddlAfterFailedCommit` have no "put back" test; the `FAULT=` sweep and fixed-code tests use them.
+5. `test/open/*` covers open availability and cost problems and replays no red module.
