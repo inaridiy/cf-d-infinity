@@ -15,7 +15,10 @@ import { describe, expect, it } from "vitest";
 import { drizzleMigrationsTable } from "../src/binding";
 import { D1Compatible } from "../src/client/d1";
 import { Db, type ClientFaults } from "../src/client/db";
+import { keyString } from "../src/keys";
 import type { Catalog } from "../src/meta";
+import { ownerOf } from "../src/routing";
+import type { Faults } from "../src/types";
 import { ADD, INIT, REBUILD, migrations } from "./drizzle-fixtures";
 import { clientOf } from "./libsql";
 import { SimCluster } from "./sim";
@@ -96,6 +99,81 @@ describe("a transaction that rebuilds a table another connection writes to", () 
     expect(await RESULT(c, "SELECT id, v, w FROM t ORDER BY id")).toEqual([{ id: 1, v: 1, w: null }, { id: 2, v: 2, w: null }]);
     // 書き込み禁止を掛けた版と、それを終えた DROP の版がある。
     expect((await c.meta.ddlSince(0)).ddl.filter((e) => e.guard).map((e) => e.guard!.tables)).toEqual([["t"]]);
+  });
+});
+
+// specs/m14_rebuild_guard.qnt の m14_red_no_drain。書き込み禁止の版を適用するシャードは、その表の intent を決着させてからでないと、
+// 読んだ後の変更の有無を確かめられない。モデルの反例と同じ順で流す: 作り直す取引が表を読んで写す。別の取引が、その表の行を
+// 書いて確定する (anchor は別のシャードで、行のシャードへの phase 2 は届かないまま、intent が残る)。作り直す取引が DROP する。
+describe("the guard settles intents before it checks for changes (m14_red_no_drain)", () => {
+  const scenario = async (faults: Faults = {}) => {
+    const c = new SimCluster({ shards: 2, faults });
+    await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)");
+    await new Db(c).ddl("CREATE TABLE u(id INTEGER PRIMARY KEY, v INTEGER)");
+    const { routing } = await c.catalog();
+    const on = (shard: string, from: number) => { for (let i = from; ; i++) if (ownerOf(routing, keyString([i])) === shard) return i; };
+    const [t1, t4, u1, u2] = [on("s0", 1), on("s0", 100), on("s1", 1), on("s1", on("s1", 1) + 1)];
+    await new Db(c).query("INSERT INTO t VALUES (?, 1)", [t1]);
+    await new Db(c).query("INSERT INTO u VALUES (?, 1), (?, 1)", [u1, u2]);
+    const db = new Db(c);
+    await db.query("BEGIN");
+    await db.query("CREATE TABLE __new_t(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)");
+    await db.query("INSERT INTO __new_t(id, v) SELECT id, v FROM t");
+    // 別の取引: s1 で守られていない読みを持つので、anchor は s1 になる。s0 への phase 2 を止めて、s0 に intent を残す。
+    const w = await new Db(c).begin();
+    await w.query("SELECT v FROM u WHERE id = ?", [u1]);
+    await w.query("UPDATE u SET v = 2 WHERE id = ?", [u2]);
+    await w.query("INSERT INTO t VALUES (?, 4)", [t4]);
+    // DROP は、写した部分を先に確定し、それから書き込み禁止の版を記録してシャードに適用させる。その適用を止めている間に、
+    // 別の取引を確定させる。写した部分の確定の後なので、その検証には当たらない。
+    const lock = (await c.catalog()).version + 1;
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let releaseLock!: () => void;
+    const lockHeld = new Promise<void>((r) => (releaseLock = r));
+    let reached!: () => void;
+    const hit = new Promise<void>((r) => (reached = r));
+    c.net.gate = (m) => {
+      if (m.method === "finalize" && m.to === "s0") return held;
+      if (m.method === "syncSchema" && (m.req as { version: number }).version === lock) {
+        reached();
+        return lockHeld;
+      }
+      return undefined;
+    };
+    const dropping = outcome(db.query("DROP TABLE t"));
+    await hit;
+    await w.commit();
+    const pending = c.backends.get("s0")!.exec("SELECT count(*) AS n FROM __intents WHERE tbl = 't'")[0]!.n;
+    releaseLock();
+    const drop = await dropping;
+    const rename = drop === "ok" ? await outcome(db.query("ALTER TABLE __new_t RENAME TO t")) : "skipped";
+    await outcome(db.query(drop === "ok" ? "COMMIT" : "ROLLBACK"));
+    c.net.gate = () => undefined;
+    release();
+    await c.settle();
+    return { pending, drop, rename, rows: await RESULT(c, "SELECT id FROM t ORDER BY id"), t1, t4 };
+  };
+
+  it("fails the rebuild with a conflict and keeps the row that was still pending", async () => {
+    const r = await scenario();
+    expect(r.pending).toBe(1);
+    expect(r.drop).toMatch(/^conflict: another connection wrote to t after this transaction read it/);
+    expect(r.rows).toEqual([{ id: r.t1 }, { id: r.t4 }].sort((a, b) => a.id - b.id));
+  });
+
+  it("put back the drain alone: the check still counts the pending write", async () => {
+    const r = await scenario({ ddlIgnoresIntents: true });
+    expect(r.pending).toBe(1);
+    expect(r.drop).toMatch(/^conflict: another connection wrote to t after this transaction read it/);
+  });
+
+  it("put back both guards: the guard passes over the pending write, as in the model's counterexample", async () => {
+    const r = await scenario({ ddlIgnoresIntents: true, unchangedIgnoresIntents: true });
+    expect(r.pending).toBe(1);
+    // 守りは、読んだ後に確定した書き込みを見落として DROP を通す。モデルではこの書き込みが失われる。実装では、残った intent が
+    // 作り直した新しい表に適用されるので (specs/m11 の BUG-5 の経路。これも ddlIgnoresIntents が戻す)、この表では行が残る。
+    expect(r.drop).toBe("ok");
   });
 });
 

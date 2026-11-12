@@ -365,6 +365,8 @@ export interface Faults {
   autoIgnoresUniqueIntents?: boolean;
   /** DDL を、持っている intent を決着させずに適用する。表や列が消えた後では、確定済みの取引の intent を適用できない。 */
   ddlIgnoresIntents?: boolean;
+  /** DROP の守りの確認 (unchanged) が、決着していない intent を変更として数えない (specs/m14_rebuild_guard.qnt の m14_red_no_drain の 2 つ目の守り)。 */
+  unchangedIgnoresIntents?: boolean;
   /** 増設の子が、親からグループを受け取るときに表定義を追いつかせない。 */
   childKeepsOldSchema?: boolean;
   /** 行ロックや intent を待った後で、表定義を確かめ直さない。待ちの間に作られた index を保守しない書き込みが通る。 */

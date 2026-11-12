@@ -87,7 +87,7 @@ Categories:
 | m14_red_no_lock | DROP guard checks but does not lock | ignoreTableLock / dropWithoutGuard | rebuild-guard:181 (fixed, guard-only) | A |
 | m14_red_no_check | DROP guard locks but does not check | dropWithoutGuard | rebuild-guard:81 | A |
 | m14_red_check_early | check before the lock version is applied | none | rebuild-guard:74 (fixed) | A |
-| m14_red_no_drain | lock version applied with intents unsettled | ddlIgnoresIntents | none | B |
+| m14_red_no_drain | lock version applied with intents unsettled | ddlIgnoresIntents + unchangedIgnoresIntents (two guards; added 2026-11-12) | rebuild-guard ("the guard settles intents before it checks for changes"); with only the drain removed the pending-write check still stops it | A |
 | m14_red_untied | DROP passes after the lock expires | none | none | C |
 | m14_red_commit_ts | check from the copy's commit ts instead of read ts | none | none | C |
 | m15_red_no_slot | DDL recorded mid-split (not atomic) | none | ddl-vs-split-race:15 (fixed) | A |

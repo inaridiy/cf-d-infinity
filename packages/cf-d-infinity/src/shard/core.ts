@@ -1743,7 +1743,8 @@ export class ShardCore implements ShardApi {
     }
     for (const s of req.spans) {
       if (this.changedSince(s, Math.max(req.from, s.since ?? 0))) return { ok: false, reason: `${s.table} changed after it was read` };
-      const hit = this.overlapping([s], Number.MAX_SAFE_INTEGER)[0];
+      // 版の適用は intent を決着させてから行う (settleAllIntents) が、それに頼らず、決着していない書き込みも変更として数える。
+      const hit = this.faults.unchangedIgnoresIntents ? undefined : this.overlapping([s], Number.MAX_SAFE_INTEGER)[0];
       if (hit) return { ok: false, reason: `${s.table} has a pending write of ${hit.txn}` };
     }
     return { ok: true };
