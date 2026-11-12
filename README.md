@@ -244,6 +244,7 @@ The numbers above are for a workload that partitions cleanly by a shard key. Che
 - **A statement that reads every shard does not get faster with more shards**, and at most 200,000 rows or 32 MB can be gathered for one statement. Each shard stops reading at its share of that limit and the statement fails, so a careless `SELECT *` on a large table gets an error instead of exhausting the Worker's memory.
 - **A snapshot older than a fraction of a second can fail under write load.** A read "as of T" undoes at most 50 changed rows per shard, counted over the whole shard. A long optimistic `BEGIN` on a busy shard gets `ReadTooOld` and has to retry; the 10-minute change log is an upper bound, not what you can rely on.
 - **Reads are not free of billed rows while a shard is active**: each active shard writes one clock row per second.
+- **Contended writes to one shard-key group cost more on a table with an in-shard `UNIQUE`.** Before it commits, a write checks the constraint with the other pending transactions of the same group applied, in a trial that is rolled back, and rolled-back writes are billed. Each pending transaction in the same group adds about 6 billed rows and 10 statements to the write. Measured with 200 pending: 1,206 rows instead of 4. Pending transactions in other groups add nothing.
 
 ## Architecture
 

@@ -377,7 +377,7 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 3. (解決) `test/ddl-vs-split-race.test.ts`、`test/child-behind-parent.test.ts`: 分割と DDL の順序。不変条件 4。保守の操作の枠を入れて通るようになった。
 4. (解決) 主キーに NULL がある行の取り違え (不変条件 6) と、シャードへ送る文の中のメタデータ参照 (不変条件 5)。入口の規則で断る。`test/admission.test.ts`。
 5. (解決) `UPDATE OR IGNORE` と `UPDATE OR REPLACE` が、衝突する行が別のシャードにあるときだけ断られていた。規則 4。基準経路で実行し直すようにした。`test/conflict-clauses.test.ts`、`test/refusals.test.ts`。
-6. `test/open/unique-pending-cost.test.ts`: 未決着の intent が多いとき、UNIQUE のある表への書き込みの費用が増える。いったん通るようになったが、いまは落ちる。理由は調べていない。
+6. (判断、2026-11-12) 未決着の intent が多いとき、UNIQUE のある表への書き込みの費用が増える。原因: prepare が、ほかの取引の intent をすべて試しに適用して巻き戻す (M16 の (b) の状態)。巻き戻した書き込みも課金される。シャードの中の UNIQUE は shard key の列をすべて含むので、衝突し得るのは同じグループの行だけである。試しに適用する intent を、同じ表の同じグループのものに絞った。ほかのグループの intent は、200 個あっても費用を増やさない (文 17、書き込み 4 のまま)。同じグループの intent 1 個につき、書き込み約 6、文約 10 が増える (200 個で書き込み 1,206)。これは README の「When not to use it」に数字で書いた。試験は `test/unique-pending-cost.test.ts`。
 7. (解決) `internal-names.test.ts` と `ddl-endpoint-multistatement.test.ts` は、通るようになっていたので `test/` の直下へ移した。
 8. UNIQUE のある表での競合の頻度を、負荷を掛けて測っていない。衝突を解決する INSERT の費用も測っていない。
 9. `test/autoscale-cron.test.ts` が、CI で 1 回落ちたことがある (`main` の PR #4 のマージ直後)。

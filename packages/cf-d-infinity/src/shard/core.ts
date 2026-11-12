@@ -1599,10 +1599,14 @@ export class ShardCore implements ShardApi {
   private uniquePending(txn: string, writes: Change[]): string | null {
     const constrained = writes.filter((w) => this.hasUniqueBeyondKey(w.table));
     if (!constrained.some((w) => w.after)) return null;
-    const tables = new Set(constrained.map((w) => w.table));
+    // 衝突し得るのは、同じ表の、同じ shard key の値 (グループ) の行だけである。シャードの中の UNIQUE は、shard key の列を
+    // すべて含む (sql/ddl.ts が、含まないものをシャードをまたぐ index にするか断る)。shard key の列の照合順序は BINARY なので、
+    // 同じグループかはキー文字列の一致で決まる。絞らないと、試しに適用する intent が、そのシャードのその表の未確定の取引の数だけ
+    // 増え、巻き戻した書き込みも課金される (未解決の問題 6)。
+    const groups = new Set(constrained.map((w) => `${w.table}\0${w.sk}`));
     const others = (this.b.exec(`SELECT * FROM __intents WHERE txn <> ?`, txn) as unknown as Intent[])
-      .map((i) => decode<Change>(i.change))
-      .filter((o) => tables.has(o.table));
+      .filter((i) => groups.has(`${i.tbl}\0${i.sk}`))
+      .map((i) => decode<Change>(i.change));
     if (others.length === 0) return null;
     // 値を自前で比べない。照合順序、BLOB、部分 index の条件まで SQLite と同じに判定するのは難しく、外すと適用できない取引が残る。
     // ほかの取引の intent をすべて適用した状態を作り、そこへこの取引の変更を入れて、SQLite に判定させる。
