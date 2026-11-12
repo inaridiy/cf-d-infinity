@@ -29,6 +29,12 @@ export const pkValues = (pkJson: string) => decode<Value[]>(pkJson);
 export const selectList = (def: TableDef) => (def.implicitRowid ? "rowid, *" : "*");
 
 /**
+ * Worker が組み立てる走査の列の並び。列を、計画した表定義から名指しする。`*` だと、計画より新しい版を適用したシャードが
+ * 増えた列も返し、シャードによって行の形が違って混ざる (ADD COLUMN の途中。計画書の未解決の問題 11)。
+ */
+export const scanList = (def: TableDef) => [...(def.implicitRowid ? ["rowid"] : []), ...def.columns.map(q)].join(", ");
+
+/**
  * 型のない列 (BLOB の親和性)。INTEGER の 5 と REAL の 5.0 を両方持てるが、DO の SQLite は読み出しで区別しない (src/value.ts)。
  * ほかの列は、入れ直すときに列の型の親和性が同じ型に戻す。
  */

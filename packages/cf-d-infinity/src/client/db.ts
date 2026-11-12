@@ -2,7 +2,7 @@ import type {
   Change, CommitRes, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
 } from "../types";
 import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, utf8Length } from "../types";
-import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, q, selectList, typedValues } from "../shard/rows";
+import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, q, scanList, typedValues } from "../shard/rows";
 import type { Catalog, SplitMove, SplitSlot } from "../meta";
 import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
@@ -884,7 +884,7 @@ export class Txn extends ReadScope {
       const name = q(g.def.name);
       const where = g.conds.map((x) => x.sql).join(" OR ");
       const params = g.conds.flatMap((x) => x.params);
-      const scan: Scan = { table: g.def, sql: `SELECT ${selectList(g.def)} FROM ${name} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, typed: untypedOf(g.def) };
+      const scan: Scan = { table: g.def, sql: `SELECT ${scanList(g.def)} FROM ${name} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, typed: untypedOf(g.def) };
       const { columns, rows } = await this.scan(scan);
       const found: Loaded = { table: g.def, columns, rows: [] };
       keysOf({ table: g.def, columns, rows }).forEach((key, i) => {
