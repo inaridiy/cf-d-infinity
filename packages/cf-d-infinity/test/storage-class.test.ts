@@ -1,7 +1,7 @@
-// 未解決: 値の格納の型 (INTEGER と REAL) が、入口、経路、置き場所で変わる。計画書の不変条件 11、未解決の問題 20。
+// 値の格納の型 (INTEGER と REAL) が、入口、経路、置き場所で変わらないこと。計画書の不変条件 11、未解決の問題 20 (2026-11-12 に直した)。
 //
 // DO の SQLite は、JS の数を、整数でも REAL として束縛する (BigInt は束縛できない)。読むときは、INTEGER の 5 も REAL の 5.0 も
-// JS の 5 になる。D∞ の値 (`Value`) は JS の数なので、INTEGER と REAL の区別を運べない。そのため:
+// JS の 5 になる。直す前は、D∞ の値 (`Value`) が JS の数だけで、INTEGER と REAL の区別を運べなかった。そのため:
 // - Hrana の integer の引数も、D1 の API の整数も、シャードでは REAL として束縛される。TEXT の列には "5.0" が入り、
 //   `v * ? / 2` は整数の割り算にならない。Worker の SQLite (sql.js) は整数を INTEGER として束縛するので、同じ文でも、
 //   表を読まない文 (Worker で答える) と表を読む文 (シャードで答える) で答えが違う。
@@ -11,10 +11,10 @@
 // 束縛する (D1 の型の変換表)。見つけたのは、キー文字列の関数を 1 つにする下調べのとき (2026-11-12)。
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
-import { D1Compatible } from "../../src/client/d1";
-import { Db } from "../../src/client/db";
-import { clientOf } from "../libsql";
-import { SimCluster } from "../sim";
+import { D1Compatible } from "../src/client/d1";
+import { Db } from "../src/client/db";
+import { clientOf } from "./libsql";
+import { SimCluster } from "./sim";
 
 const DDL = "CREATE TABLE kv(k INTEGER PRIMARY KEY, v, s TEXT)";
 

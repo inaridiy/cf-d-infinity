@@ -2,12 +2,13 @@ import type {
   Change, CommitRes, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
 } from "../types";
 import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, utf8Length } from "../types";
-import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, q, selectList } from "../shard/rows";
+import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, q, selectList, typedValues } from "../shard/rows";
 import type { Catalog, SplitMove, SplitSlot } from "../meta";
 import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
-import { ident, normalize, parseStatements, text, type Node, type Params } from "../sql/cst";
-import { SCHEMA_STATEMENTS, findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
+import { ident, parseStatements, text, type Node, type Params } from "../sql/cst";
+import { keyString } from "../keys";
+import { untypedOf, SCHEMA_STATEMENTS, findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
 import { parseDdl } from "../sql/ddl";
 import { openScratch, ScratchDb, type Compiled } from "../sql/scratch";
 import { groupSpan, rowSpan, scanSpans, statementSpans, tableSpan } from "./spans";
@@ -180,7 +181,7 @@ async function runPlanned(
 function keysOf(l: Loaded): string[] {
   const at = l.table.pk.map((c) => l.columns.indexOf(c));
   if (at.some((i) => i < 0)) return [];
-  return l.rows.map((row) => `${l.table.name}\0${encode(at.map((i) => row[i] ?? null))}`);
+  return l.rows.map((row) => `${l.table.name}\0${keyString(at.map((i) => row[i] ?? null))}`);
 }
 
 /** 基準経路で集めた行。Worker の SQLite を作り直すときに読み直さずに済むように、表ごとに持っておく。 */
@@ -309,10 +310,15 @@ class ReadScope {
     // 上限はシャードの側で打ち切らせる。全行が届いてから数えると、数える前に Worker のメモリが尽きる。
     // バイト数は対象のシャードで等分する。偏りがあると早めに拒否するが、合計が予算を超えることはない。
     const maxBytes = Math.max(1_000_000, Math.floor(this.db.byteBudget / targets.length));
+    // 集めた行は Worker の SQLite で計算し直すので、型のない列の INTEGER と REAL を区別して運ぶ (src/value.ts)。
+    const sql = s.typed ? `SELECT *, ${s.typed.map((c, i) => `typeof(${q(c)}) AS ${q(`__dinf_typeof_${i}`)}`).join(", ")} FROM (${s.sql})` : s.sql;
     const parts = await Promise.all(targets.map((t) =>
-      this.call(t.shard, { sql: s.sql, params: s.params, spans: scanSpans(s, t.sks), maxRows: this.db.rowBudget, maxBytes }),
+      this.call(t.shard, { sql, params: s.params, spans: scanSpans(s, t.sks), maxRows: this.db.rowBudget, maxBytes }),
     ));
-    return { columns: parts[0]!.columns, rows: parts.flatMap((r) => r.values) };
+    const columns = parts[0]!.columns;
+    const rows = parts.flatMap((r) => r.values);
+    if (!s.typed) return { columns, rows };
+    return typedValues({ columns: s.typed, affinity: {} }, columns, rows);
   }
 
   /** 走査を実行して、行を集める。sql が実際に開く表は本物のプランナに尋ね、走査にない表は全行を読み足す。 */
@@ -392,7 +398,8 @@ class ReadScope {
         }
       }
       case "partial": {
-        const { rows } = await this.scan(p.scan);
+        // 部分の集約は、型のない __p の表へ入れて計算し直すので、全部の列の型を運ぶ。
+        const { rows } = await this.scan({ ...p.scan, typed: p.columns });
         const w = await openScratch({ ddl: [] });
         try {
           w.exec(`CREATE TABLE "__p" (${p.columns.map(q).join(", ")})`);
@@ -807,7 +814,7 @@ export class Txn extends ReadScope {
     // 行の持ち主のシャードへの問いを、表と shard key の値ごとにまとめる。1 つの行が 2 つの条件に当たっても、1 回だけ返る。
     const wanted = new Map<string, { def: TableDef; sk: string; conds: { sql: string; params: Value[] }[] }>();
     const want = (def: TableDef, sk: string, cols: string[], vals: Value[], op: "=" | "IS") => {
-      const id = `${def.name}\0${sk}\0${cols.join("\0")}\0${encode(vals)}`;
+      const id = `${def.name}\0${sk}\0${cols.join("\0")}\0${keyString(vals)}`;
       if (asked.has(id)) return;
       asked.add(id);
       const key = `${def.name}\0${sk}`;
@@ -824,7 +831,7 @@ export class Txn extends ReadScope {
       for (const cols of def.uniques) {
         const vals = cols.map((col) => c.after![col] ?? null);
         if (vals.some((v) => v === null)) continue;
-        if (c.before && cols.every((col) => encode(c.before![col] ?? null) === encode(c.after![col] ?? null))) continue;
+        if (c.before && cols.every((col) => keyString([c.before![col] ?? null]) === keyString([c.after![col] ?? null]))) continue;
         want(def, c.sk, cols, vals, "=");
       }
       // シャードをまたぐ UNIQUE。index の表を引き、同じ値を持つ行の主キーと場所を知ってから、その行を読む。
@@ -832,16 +839,16 @@ export class Txn extends ReadScope {
         const keyOf = (r: Row | null): string | null => {
           if (!r) return null;
           const vals = ix.columns.map((col) => r[col] ?? null);
-          return vals.some((v) => v === null) ? null : encode(vals);
+          return vals.some((v) => v === null) ? null : keyString(vals);
         };
         const k = keyOf(c.after);
         if (k === null || k === keyOf(c.before) || asked.has(`${ix.table}\0${k}`)) continue;
         asked.add(`${ix.table}\0${k}`);
-        const sk = encode([k]);
+        const sk = keyString([k]);
         // 並べて出さない。取引の最初の読みが 2 つ並ぶと、読む時点が 2 つでき、片方は検証の窓から漏れる。
         const hit = await this.call(ownerOf(this.cat.routing, sk), {
           sql: `SELECT "pk", "sk" FROM ${q(ix.table)} WHERE "k" = ?`, params: [k],
-          spans: [rowSpan(ix.table, encode([k]), sk)],
+          spans: [rowSpan(ix.table, keyString([k]), sk)],
         });
         for (const [pk, at] of hit.values) {
           if (!have.has(`${def.name}\0${pk as string}`)) want(def, at as string, def.pk, decode<Value[]>(pk as string), "IS");
@@ -853,7 +860,7 @@ export class Txn extends ReadScope {
       const name = q(g.def.name);
       const where = g.conds.map((x) => x.sql).join(" OR ");
       const params = g.conds.flatMap((x) => x.params);
-      const scan: Scan = { table: g.def, sql: `SELECT ${selectList(g.def)} FROM ${name} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params } };
+      const scan: Scan = { table: g.def, sql: `SELECT ${selectList(g.def)} FROM ${name} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, typed: untypedOf(g.def) };
       const { columns, rows } = await this.scan(scan);
       const found: Loaded = { table: g.def, columns, rows: [] };
       keysOf({ table: g.def, columns, rows }).forEach((key, i) => {
@@ -910,7 +917,7 @@ export class Txn extends ReadScope {
         const keyOf = (r: Row | null): string | null => {
           if (!r) return null;
           const vals = ix.columns.map((col) => r[col] ?? null);
-          return vals.some((v) => v === null) ? null : encode(vals);
+          return vals.some((v) => v === null) ? null : keyString(vals);
         };
         const oldK = keyOf(c.before);
         const newK = keyOf(c.after);
@@ -929,10 +936,10 @@ export class Txn extends ReadScope {
 
   /** SQLite と同じく文の時点で検査する。commit の検証だけだと、文が成功した後で COMMIT が失敗する。 */
   async assertUnique(def: TableDef, ix: GlobalIndexDef, k: string, pk: string, resolve = false): Promise<void> {
-    const sk = encode([k]);
+    const sk = keyString([k]);
     const res = await this.call(ownerOf(this.cat.routing, sk), {
       sql: `SELECT "pk" FROM ${q(ix.table)} WHERE "k" = ?`, params: [k],
-      spans: [rowSpan(ix.table, encode([k]), sk)],
+      spans: [rowSpan(ix.table, keyString([k]), sk)],
     });
     if (res.values.some((r) => r[0] !== pk)) {
       if (resolve) throw new NeedsReference(`a row on another shard holds the same ${ix.columns.join(", ")}`);
@@ -1525,7 +1532,7 @@ export class Db {
       for (const row of rows) {
         const vals = ix.columns.map((col) => row[col] ?? null);
         if (vals.some((v) => v === null)) continue; // NULL のある値は、どの行とも衝突しない
-        const k = encode(vals);
+        const k = keyString(vals);
         const key = encodeKey(def, row);
         const prior = entries.get(k);
         if (prior !== undefined && prior.pk !== key.pk) throw new SqlError(`UNIQUE constraint failed: ${def.name}.${ix.columns.join(", ")}`);
@@ -1547,8 +1554,8 @@ export class Db {
     let left = [...entries].map(([k, row]) => ({ k, ...row }));
     let cat = await this.stillBuilding(version);
     for (let attempt = 0; left.length > 0; ) {
-      const owner = ownerOf(cat.routing, encode([left[0]!.k]));
-      const batch = left.filter((e) => ownerOf(cat.routing, encode([e.k])) === owner).slice(0, BUILD_BATCH);
+      const owner = ownerOf(cat.routing, keyString([left[0]!.k]));
+      const batch = left.filter((e) => ownerOf(cat.routing, keyString([e.k])) === owner).slice(0, BUILD_BATCH);
       const tx = new Txn(this, cat, this.nextTxnId());
       try {
         const ks = batch.map((e) => e.k);
@@ -1556,7 +1563,7 @@ export class Db {
         const found = await tx.call(owner, {
           sql: `SELECT "k", "pk" FROM ${q(ix.table)} WHERE "k" IN (SELECT value FROM json_each(?))`,
           params: [JSON.stringify(ks)],
-          spans: ks.map((k) => rowSpan(ix.table, encode([k]), encode([k]))),
+          spans: ks.map((k) => rowSpan(ix.table, keyString([k]), keyString([k]))),
         });
         const existing = new Map(found.values as [string, string][]);
         for (const e of batch) {

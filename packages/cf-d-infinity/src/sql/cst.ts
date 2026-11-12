@@ -169,15 +169,6 @@ export function affinityOf(type: string | null): Affinity {
 }
 
 /** 列の型親和性で値を揃える。`id = '1'` と INSERT の 1 を同じシャードへ送るためである。 */
-export function normalize(v: Value, a: Affinity): Value {
-  if (typeof v === "string" && (a === "INTEGER" || a === "REAL" || a === "NUMERIC")) {
-    const t = v.trim();
-    if (t !== "" && Number.isFinite(Number(t))) return Number(t);
-    return v;
-  }
-  if (typeof v === "number" && a === "TEXT") return String(v);
-  return v;
-}
 
 /** 定数として評価できるなら値を返す。 */
 export function constant(n: Node, values: Value[]): { value: Value } | null {

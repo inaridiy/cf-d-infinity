@@ -1,14 +1,14 @@
-// 未解決 (検査): 値の格納の型を、本物の SQLite と比べる生成器。計画書の不変条件 6 と 11、未解決の問題 19 と 20。
+// 値の格納の型を、本物の SQLite と比べる生成器。計画書の不変条件 6 と 11 (未解決の問題 19 と 20 を見つけ、直したことを確かめる)。
 //
 // 型のある引数 (INTEGER は BigInt、REAL は数、TEXT、BLOB、NULL) と、型を揃えると変わる値 ('0x10'、' 12 '、'1e400'、
 // 整数の値の REAL など) を、型の親和性の違う列とキーに入れ、typeof と値を読む文を、@libsql/client (Hrana) から流す。
 // 基準は node:sqlite で、INTEGER を BigInt、REAL を数で束縛する。sqld が Hrana の integer と float を束縛するのと同じである。
 // SQLite との差分テスト (test/diff.ts) は、引数を使わず、結果を JS の値で比べるので、型の違いを見ない。これはそれを見る。
-// 値の型の作り直し (計画書) が入るまでは落ちる。入ったら test/ へ移す。
+// SQLite との比べ方は、基準経路だけの実行 (vitest.config.ts の reference-scans、reference-full) でも流す。
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
-import { clientOf } from "../libsql";
-import { prng, seedsOr, SimCluster } from "../sim";
+import { clientOf } from "./libsql";
+import { prng, seedsOr, SimCluster } from "./sim";
 
 type Arg = null | bigint | number | string | Uint8Array;
 
@@ -74,7 +74,8 @@ function script(seed: number, length: number): Step[] {
 }
 
 const show = (rows: unknown[]) => JSON.stringify(rows, (_k, x) =>
-  x instanceof Uint8Array ? { blob: [...x] } : x instanceof ArrayBuffer ? { blob: [...new Uint8Array(x)] } : typeof x === "bigint" ? Number(x) : x);
+  x instanceof Uint8Array ? { blob: [...x] } : x instanceof ArrayBuffer ? { blob: [...new Uint8Array(x)] } : typeof x === "bigint" ? Number(x)
+    : typeof x === "number" && !Number.isFinite(x) ? `${x}` : x);
 
 async function run(seed: number, shards: number): Promise<string[]> {
   const lite = new DatabaseSync(":memory:");
@@ -89,6 +90,8 @@ async function run(seed: number, shards: number): Promise<string[]> {
     let want: string;
     try {
       const st = lite.prepare(step.sql);
+      // 2^53 を超える INTEGER は、DO と同じく精度を落とした数で比べる (node:sqlite は既定では例外を投げる)。
+      st.setReadBigInts(true);
       want = st.columns().length ? show(st.all(...(step.args as never[])).map((r) => Object.values(r))) : (st.run(...(step.args as never[])), "ok");
     } catch (e) {
       want = "error";
@@ -101,6 +104,8 @@ async function run(seed: number, shards: number): Promise<string[]> {
       got = /unsupported:/.test(String(e)) ? `unsupported ${(e as Error).message.slice(0, 160)}` : `error`;
       if (got === "error" && want !== "error") got = `error ${(e as Error).message.slice(0, 120)}`;
     }
+    // Hrana は値を JSON で運ぶので、REAL の無限大を運べない (sqld も同じ)。クライアントの誤りになるのを、正しいとする。
+    if (/"-?Infinity"/.test(want) && /HRANA_PROTO_ERROR/.test(got)) continue;
     if (got !== want) problems.push(`${step.sql} ${show(step.args)}\n  sqlite: ${want.slice(0, 200)}\n  ours:   ${got.slice(0, 200)}`);
   }
   return problems;

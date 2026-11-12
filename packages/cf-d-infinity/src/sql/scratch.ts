@@ -2,6 +2,7 @@
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js";
 import type { Catalog } from "../meta";
 import { SqlError, type Backend, type Row, type Value } from "../types";
+import { bindTyped, isIntegerValue, isReal, restoreColumns } from "../value";
 
 // Emscripten の glue が self.location を参照する。Workers にはないので補う。
 if (typeof globalThis.location === "undefined") {
@@ -57,9 +58,11 @@ export class ScratchDb implements Backend {
   raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] } {
     let st: ReturnType<Database["prepare"]> | undefined;
     try {
-      st = this.db.prepare(sql);
-      st.bind(params as never);
-      const columns = st.getColumnNames();
+      // sql.js は安全な整数を INTEGER として束縛する。整数の値の REAL は包む (src/value.ts)。
+      const b = bindTyped(sql, params, "integer");
+      st = this.db.prepare(b.sql);
+      st.bind(b.params as never);
+      const columns = restoreColumns(st.getColumnNames(), b.columns);
       const values: Value[][] = [];
       while (st.step()) values.push(st.get() as Value[]);
       return { columns, values };
@@ -133,10 +136,16 @@ export class ScratchDb implements Backend {
   load(table: string, columns: string[], rows: Value[][]): void {
     if (rows.length === 0) return;
     const list = columns.map((c) => `"${c.replaceAll('"', '""')}"`).join(", ");
-    const st = this.db.prepare(`INSERT INTO "${table}" (${list}) VALUES (${columns.map(() => "?").join(", ")})`);
+    const insert = `INSERT INTO "${table}" (${list}) VALUES (${columns.map(() => "?").join(", ")})`;
+    const st = this.db.prepare(insert);
     this.db.run("BEGIN");
     try {
-      for (const r of rows) st.run(r as never);
+      // sql.js の束縛で型が変わる値 (整数の値の REAL と、32 ビットを超える整数) を含む行は、型を保つ束縛 (bindTyped) を通す。
+      // ほかは用意した文で速く入れる。
+      for (const r of rows) {
+        if (r.some((v) => isReal(v) || (isIntegerValue(v) && (v | 0) !== v))) this.raw(insert, ...r);
+        else st.run(r as never);
+      }
       this.db.run("COMMIT");
     } catch (e) {
       // 集めた行が表の制約に反した (同じ UNIQUE の値の行が 2 つあるなど)。文のエラーと同じ型で返す。

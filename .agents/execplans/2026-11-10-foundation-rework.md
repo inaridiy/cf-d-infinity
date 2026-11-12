@@ -65,7 +65,7 @@ npm への公開は、素地ができるまで行わない。
 - ブランチ `wip/gather-missing-rows` (`45e9b57`) は、前の作業者の未完成の変更である。採らなかった (Decision Log の 2026-11-11)。ローカルにだけある。
 - ブランチ `foundation-3` (ローカル) は、PR #8 と `wip/gather-missing-rows` に分ける前の並びで、もう使わない。
 - `packages/cf-d-infinity/DEVELOPMENT.md` は、この一連の変更を反映していない。`AGENTS.md` にそう書いてある。
-- 次にやるのは、「値の型の作り直し」の 1 (検査を先に作る) である。その後で「Early 版の線」の「順番」の 2 へ戻る。
+- 値の型の作り直し (不変条件 6 と 11) は、ブランチ `formats` で済んだ。次にやるのは、「Early 版の線」の「順番」の 2 の残り (形式の一覧と、更新の試験) である。
 
 ### 欠陥の表 (2026-11-12、`f393657`)
 
@@ -132,9 +132,9 @@ PR は、この区切りごとに 1 本にする。長い実行の見張りは�
 
 2 の下調べで、値の型の欠陥 (未解決の問題 19、20、不変条件 6、11) が見つかった。行イメージとキー文字列は、公開した後に変えられない形式なので、形式を固める前に、下の「値の型の作り直し」を入れる。2 はその後に続ける。
 
-### 値の型の作り直し (提案、2026-11-12)
+### 値の型の作り直し (2026-11-12、済)
 
-構造の変更として、次の形にする。並行の仕組みではないので、Quint のモデルは書かない。確かめるのは、SQLite との突き合わせである。
+構造の変更として、次の形にした (手順 1 から 5 は済んだ。決めたことは Decision Log の 2026-11-12)。並行の仕組みではないので、Quint のモデルは書かない。確かめるのは、SQLite との突き合わせである。
 
 1. 検査を先に作る (規則 2)。SQLite との差分テストに、INTEGER と REAL の引数と、`typeof` を入れる。基準の SQLite は `node:sqlite` で、INTEGER を BigInt、REAL を数で束縛する (sqld と同じ)。値と列の型の組を作って、キーの関数と SQLite が入れる値を突き合わせる生成器も作る。
 2. 値の表現。JS の数のうち、整数でない数は REAL、整数の数は INTEGER とする。整数の値を持つ REAL だけを、印のついた値で表す。2^53 を超える INTEGER は、今どおり入口で断る。Hrana の `float` は、整数の値なら印をつける。`integer` は数のまま。D1 の API と Service Binding の数は、そのまま受け取る (整数なら INTEGER。D1 と同じ)。
@@ -195,7 +195,7 @@ SQLite と突き合わせる検査を、通常の実行 (`sim`)、基準経路�
 | 3 | 記録した DDL は、再生する場所すべてで実行できる | Meta | シャードの文は Meta の SQLite の空の表で実行して確かめる。Worker で再生する文は、記録の前に Worker の SQLite で確かめる (`Db.assertReplays`)。行のあるシャードでだけ失敗する文は、取り消す | 済。Worker 側の確認は Meta ではなく Worker にある |
 | 4 | 表定義の版と範囲の移動の順序が、全シャードで一致する | Meta の保守の操作の枠 (`beginSplit`、`startSplit`、`endSplit`、`assertFreeForDdl`) | 分割は、全シャードが最新の版を適用した後で枠を取り、Meta が返す版を使う。枠がある間、Meta は版を記録しない。分割どうしは枠を共有し、DDL (index の作成、DROP の前の禁止を含む) とは排他である。子と親は、枠を Meta に示してからでないと受け取りも fence もしない。子が受け取り始める前の枠は 5 秒で消え、始めた後は Autoscaler が再開して終える | 済 (ブランチ `maintenance-slot`)。モデルは M15 (枠の期限と、止まった進め方を含む)。試験は `test/ddl-vs-split-race.test.ts`、`test/child-behind-parent.test.ts`、`test/split-slot.test.ts` (進め方が各段の前で止まる)、`test/ddl-concurrent.test.ts` の分割の場面 (分割の途中だという理由の拒否を、違反として数える) |
 | 5 | 内部の表は利用者の SQL から触れない | シャードへ送る前の確認 (`Db.tablesOf`) | 内部の名前は作れない。シャードへ送る文は、利用者の表しかない Worker の SQLite でコンパイルし、開く表を確かめる。表定義を読む文 (`sqlite_master`、PRAGMA の関数) は送らない | 済 (`test/admission.test.ts`)。読みは、基準経路へ切り替えて、利用者の表しかない Worker の SQLite で答える。書き込みは断る (書き込みの基準経路は、変更を捕捉する表を Worker の SQLite に作るので、そこも利用者の表定義だけにならない) |
-| 6 | 行と shard key の同一性は 1 通り | キー文字列を作る 1 つのモジュール | 照合順序のあるキーは受け付けない。主キーに NULL のある行は作らせない (`assertKeyed`)。Hrana で届く 2^53 を超える整数は断る | 一部。照合順序、主キーの NULL、Hrana の整数は済。キーを作る関数はまだ複数ある (`encodeKey` と、`planInsert` の中の計算)。Worker が値を列の型に揃える `normalize` が SQLite と違う (未解決の問題 19)。直すには、値が INTEGER と REAL の区別を運ぶこと (不変条件 11) が先に要る |
+| 6 | 行と shard key の同一性は 1 通り | キー文字列を作る 1 つのモジュール | 照合順序のあるキーは受け付けない。主キーに NULL のある行は作らせない (`assertKeyed`)。Hrana で届く 2^53 を超える整数は断る | 済 (ブランチ `formats`)。キー文字列を作る関数は `src/keys.ts` の `keyString` (JS) と `keySql` (trigger の中の SQL) の 2 つだけで、同じ行に同じ文字列を作る。Worker は値を `storedAs` で列の型に揃えてからキーを作る (SQLite の型の親和性を写す)。試験は `test/key-affinity.test.ts` と `test/typed-diff.test.ts` (基準経路だけの実行でも流す) |
 | 7 | グローバル index の項目と行は、取引が見える時点で一致する。出来上がっていない index を、読みも書き込みも使わない | Meta (index を作る操作の記録と、その唯一の終わり方) と、シャード (書き込みの締め出し) | index を記録する版が表を書き込み禁止にし、シャードが `assertWriteSetFits` で断る。index は公開まで計画から見えない。止まった行を読んで項目を埋め、Meta が公開か取り消しの片方だけを通す。禁止は 5 秒の期限つきで、作る側が延ばし続ける (上限 5 分)。公開の版は時刻を運び、シャードは時計をそこまで進める | 済 (ブランチ `schema-change-safety`)。モデルは M12。試験は `test/unique-index-build.test.ts`、`test/ddl-concurrent.test.ts` の `CREATE UNIQUE INDEX` (seed 1 から 500)、文の再生検査の「実行の途中で index を作る」場面 |
 
 | 8 | 範囲を受け取ったシャードが発行する時刻は、その範囲について渡した側が発行したどの時刻よりも大きい | 範囲の移動の手順 (`pull` と `receive`、`finishMove` と `finishIncoming`) | 行のあるグループは、渡す側が時刻 m を発行して運び、受け取る側は m まで時計を進める。行のないグループは運ばれないので、移動を終えるときに、渡す側が時刻をもう 1 つ発行し、受け取る側はそこまで時計を進めてから、届かなかったグループを受け持つ | 済。モデルは M5b の `m5b_green_range` と `m5b_red_range` (`noWriteBelowRead`)。試験は `test/move-timestamp.test.ts` と、history の検査の「欠陥を戻す」試験 |
@@ -204,7 +204,7 @@ SQLite と突き合わせる検査を、通常の実行 (`sim`)、基準経路�
 
 | 10 | 取引が読んで消す表について、読んだ後に確定した別の接続の書き込みは失われない | `Db.guardedDrop` と、Meta の書き込み禁止の枠 (`lockTables`、`finishLock`) と、シャードの確認 (`unchanged`) | 取引が読んだ表を DROP するときは、行を写した区切りを確定した後で、その表を書き込み禁止にする版を記録し、全シャードに適用させる。各シャードは、取引が読んだ範囲に、読んだ時刻より後の変更がないかを確かめる。なければ DROP を禁止の唯一の終わり方として記録し、あれば禁止を取り消して競合で失敗する。読んだ範囲は、区切り、要求 (baton)、batch をまたいで運ぶ | 済 (ブランチ `schema-change-safety`)。モデルは M14。試験は `test/rebuild-guard.test.ts` (本物の Drizzle の作り直しの移行に、途中で書き込む) |
 
-| 11 | 値の格納の型 (NULL、INTEGER、REAL、TEXT、BLOB) は、入口の約束どおりに決まり、経路、置き場所、移動で変わらない | 値の表現 (`Value`) と、その境目 (入口の解読、シャードでの束縛、シャードからの読み出し、行イメージ、Worker の SQLite への束縛) | (未定。下の「値の型の作り直し」) | 未着手 (未解決の問題 20)。DO の SQLite は JS の数を REAL として束縛し、読み出しでは INTEGER と REAL を区別しない。`Value` は JS の数なので区別を運べない。記録は `.agents/execplans/evidence/2026-11-12-value-types.md` |
+| 11 | 値の格納の型 (NULL、INTEGER、REAL、TEXT、BLOB) は、入口の約束どおりに決まり、経路、置き場所、移動で変わらない | 値の表現 (`src/value.ts`) と、束縛の関数 `bindTyped` (DO、シミュレータ、Worker の SQLite の 3 つの Backend が通す) | 整数の JS の数は INTEGER、整数でない数は REAL、整数の値の REAL は印 (`{ real }`) で表す。束縛では、INTEGER の引数を `(CAST(? AS INTEGER)+0)` に包み (DO と node:sqlite は数を REAL で束縛する)、sql.js では印の REAL と 32 ビットを超える整数を包む。型のない列は、行イメージと Worker が集める走査で `typeof` を一緒に読む。エクスポートは REAL に小数点を付けて書く | 済 (ブランチ `formats`)。試験は `test/typed-diff.test.ts` (型のある引数と型のない列を、node:sqlite と Hrana の両方で比べる。基準経路だけの実行でも流す)、`test/storage-class.test.ts`。結果の数の型 (整数の値の REAL を Hrana の `integer` で返す) は sqld と違い、文書に書いた |
 
 不変条件 7 と 8 は、2026-11-11 に検査が見つけた失敗から足した。不変条件 11 は、2026-11-12 にキー文字列の関数の下調べで見つけた。不変条件 9 は、M12 を実装と突き合わせて見つけた欠陥と、持ち主の決定 (取引の中の DDL) から足した。不変条件 10 は、9 の決定が生んだ穴 (表の作り直しの途中の書き込みが消える) を、持ち主の決定で塞いだものである。
 上の 6 つを守っても残る種類が 3 つある (Codex の指摘)。
@@ -333,6 +333,7 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 - [ ] 6 の後半の残り。不変条件 2
 - [ ] 7. UNIQUE の列を引く読みの経路 (モデルを書いてから)
 - [ ] 8. 文書の全面の更新 (`DEVELOPMENT.md` を含む)、実際の移行の道具が出す文での確認、慣らし運転
+- [x] (2026-11-12) 値の型を作り直した (不変条件 6、11。未解決の問題 19、20)。キー文字列の関数を `src/keys.ts` の 1 か所にした
 - [x] (2026-11-12) Early 版の線を引いた。夜間の実行を crontab に入れた。本物の Cloudflare で `test/workerd.test.ts` を流した (公開の条件 4。`.agents/execplans/evidence/2026-11-12-cloudflare-run.md`)
 
 ## 未解決の問題
@@ -408,8 +409,8 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 16. (解決) index を作っている間に分割を始めないこと。保守の操作の枠で排他にした (不変条件 4)。範囲表が変わったときに読み直す処理 (`scanForIndex`) は、届かなくなったので消した。UNIQUE の index と分割を掛け合わせる乱択の場面 (`uniqueIndexAndSplits`) も足した。
 17. 分割を進める側が、親の fence の後、範囲表の切り替えの前に止まると、移る範囲の行を誰も答えない。範囲表はまだ親を指し、親は fence したので「持ち主は子だ」と断る。Worker は範囲表を取り直すが変わっていないので、やり直しを使い切って誤りを返す。Autoscaler が分割を再開するまで (最長で判断の間隔、1 分) 続く。再現は `test/open/fenced-before-switch.test.ts`。候補は、親の断りが運ぶ子の名前に、Worker が従うこと (子は受け取り始めているので、行を取りに行ける)。範囲の持ち主の規則 (不変条件 1 の経路の側、M5b) に関わるので、モデルの確認から始める。
 18. intent を決着させる処理 (`ShardCore.settleIntents`) は、確定した intent を適用した後も intent が残っていると、同じ intent を永久に問い合わせ続ける。anchor が自分自身だと、問い合わせも適用も microtask だけで済むので、イベントループが回らず、試験の制限時間も、シミュレータの止まりの検出も効かない。欠陥のスイッチ `ignoreFence` で、history の検査の seed 27 が 11 時間半止まって見つかった (基準の表を作っているとき)。スイッチが作る「確定したのに、置かれた場所では適用できない intent」は、不変条件 2 の症状である。この処理に進みの確認がないので、誤りではなく止まりとして現れる。不変条件 2 の作業で扱う。記録は `.agents/execplans/evidence/2026-11-12-settle-intents-livelock.md`。
-19. Worker が値を列の型に揃える `normalize` (src/sql/cst.ts) が、SQLite の型の揃え方と違う。16 進などの文字列を数にし、範囲を超える指数の文字列を残し、TEXT の列に入る実数を JavaScript の書き方で文字列にする。Worker のキーとシャードに入った行のキーが食い違い、書き込みは内部の文言の誤りで断られ、読みは行を見落とす (答えが置き場所で変わる。規則 4)。再現は `test/open/key-affinity.test.ts`。不変条件 6。整数と REAL を区別できないと正しく揃えられないので、20 と一緒に直す。直す前に、値と型の組を作って SQLite と突き合わせる生成器を作る (規則 2)。
-20. 値の格納の型が、入口、経路、置き場所で変わる。DO の SQLite は JS の数を整数でも REAL として束縛し (BigInt は束縛できない)、読み出しでは INTEGER と REAL を区別しない。`Value` は JS の数なので区別を運べない。Hrana の integer の引数も D1 の API の整数も、シャードでは REAL になる (TEXT の列に `"5.0"`、`v * ? / 2` が整数の割り算にならない)。Worker の sql.js は整数を INTEGER として束縛するので、同じ文の答えが、Worker で答えるかシャードで答えるかで違う。型のない列の REAL は、Worker の SQLite へ集めると INTEGER になる。再現は `test/open/storage-class.test.ts`、記録は `.agents/execplans/evidence/2026-11-12-value-types.md`。不変条件 11。SQLite との差分テストは、引数を使わず、結果を JS の値で比べるので、これを見ない。
+19. (解決、2026-11-12) Worker が値を列の型に揃える `normalize` (src/sql/cst.ts) が、SQLite の型の揃え方と違う。16 進などの文字列を数にし、範囲を超える指数の文字列を残し、TEXT の列に入る実数を JavaScript の書き方で文字列にする。Worker のキーとシャードに入った行のキーが食い違い、書き込みは内部の文言の誤りで断られ、読みは行を見落とす (答えが置き場所で変わる。規則 4)。再現は `test/open/key-affinity.test.ts`。不変条件 6。整数と REAL を区別できないと正しく揃えられないので、20 と一緒に直す。直す前に、値と型の組を作って SQLite と突き合わせる生成器を作る (規則 2)。
+20. (解決、2026-11-12) 値の格納の型が、入口、経路、置き場所で変わる。DO の SQLite は JS の数を整数でも REAL として束縛し (BigInt は束縛できない)、読み出しでは INTEGER と REAL を区別しない。`Value` は JS の数なので区別を運べない。Hrana の integer の引数も D1 の API の整数も、シャードでは REAL になる (TEXT の列に `"5.0"`、`v * ? / 2` が整数の割り算にならない)。Worker の sql.js は整数を INTEGER として束縛するので、同じ文の答えが、Worker で答えるかシャードで答えるかで違う。型のない列の REAL は、Worker の SQLite へ集めると INTEGER になる。再現は `test/open/storage-class.test.ts`、記録は `.agents/execplans/evidence/2026-11-12-value-types.md`。不変条件 11。SQLite との差分テストは、引数を使わず、結果を JS の値で比べるので、これを見ない。
 
 ## Surprises & Discoveries
 
@@ -645,6 +646,9 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 ### 8. 仕上げ
 
 文書の全面の更新、実際の移行の道具 (drizzle-kit など) が出す文での確認、UNIQUE のある表での競合と費用の計測、慣らし運転。
+
+- (2026-11-12) 値の型。JS の数のうち整数は INTEGER、整数でない数は REAL とし、整数の値の REAL だけを `{ real }` の印で表す (`src/value.ts`)。BigInt で INTEGER を表す案は採らなかった。DO の SQLite が BigInt を束縛できず、整数の値の REAL を表す手段がどちらにしても要るからである。束縛は Backend の 1 か所 (`bindTyped`) で、INTEGER の引数を `(CAST(? AS INTEGER)+0)` に包む。`CAST` だけだと式が列と同じ型の親和性を持ち、`'05' = ...` の比べ方が変わる。`+0` は親和性を消す (node:sqlite で比べ方、typeof、文字列への変換を確かめた)。文を字句で調べる費用は、包んだ文を型の並びごとに覚えて (512 件) 抑える。結果の数の型は運ばない (DO の SQLite が読み出しで区別しないので、利用者の文の結果の列ごとに typeof を足す費用がかかる)。型のない列の行イメージと、Worker が計算し直す読み (集める走査、集約の部分) だけ typeof を読む。並行の仕組みではないので Quint のモデルは書かず、SQLite との突き合わせ (`test/typed-diff.test.ts`) で確かめた。
+- (2026-11-12) trigger が変更を捕まえるときのキー (`keySql`) は、REAL を `quote()` で書く。SQLite の JSON と printf は 15 桁か 16 桁で丸め、Worker のキーとずれる (基準経路だけの実行の `typed-diff` が見つけた)。`quote()` は、node:sqlite、workerd、sql.js のどれでも元の double に戻せる桁数で書く。
 
 ## Validation and Acceptance
 

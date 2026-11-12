@@ -1,17 +1,26 @@
 import type { Backend, Change, Row, TableDef, Value } from "../types";
 import { SqlError } from "../types";
+import { keySql, keyString } from "../keys";
+import { realOf } from "../value";
 
 export const q = (id: string) => `"${id.replaceAll('"', '""')}"`;
 
 const hex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 const unhex = (s: string) => Uint8Array.from(s.match(/../g) ?? [], (h) => parseInt(h, 16));
 
-/** 行イメージを JSON にする。BLOB は JSON で表せないので印を付ける。 */
+/**
+ * 行イメージを JSON にする。BLOB と、JSON で表せない数 (無限大) は印を付ける。整数の値の REAL (src/value.ts) は
+ * `{"real": 5}` のまま入る。
+ */
 export const encode = (v: unknown): string =>
-  JSON.stringify(v, (_k, x) => (x instanceof Uint8Array ? { $b: hex(x) } : x));
+  JSON.stringify(v, (_k, x) =>
+    x instanceof Uint8Array ? { $b: hex(x) } : typeof x === "number" && !Number.isFinite(x) ? { $f: String(x) } : x);
 
 export const decode = <T>(s: string): T =>
-  JSON.parse(s, (_k, x) => (x && typeof x === "object" && typeof x.$b === "string" ? unhex(x.$b) : x)) as T;
+  JSON.parse(s, (_k, x) =>
+    x && typeof x === "object" && typeof x.$b === "string" ? unhex(x.$b)
+      : x && typeof x === "object" && typeof x.$f === "string" ? Number(x.$f)
+        : x) as T;
 
 const pkWhere = (def: TableDef) => def.pk.map((c) => `${q(c)} IS ?`).join(" AND ");
 export const pkValues = (pkJson: string) => decode<Value[]>(pkJson);
@@ -20,14 +29,61 @@ export const pkValues = (pkJson: string) => decode<Value[]>(pkJson);
 export const selectList = (def: TableDef) => (def.implicitRowid ? "rowid, *" : "*");
 
 /**
+ * 型のない列 (BLOB の親和性)。INTEGER の 5 と REAL の 5.0 を両方持てるが、DO の SQLite は読み出しで区別しない (src/value.ts)。
+ * ほかの列は、入れ直すときに列の型の親和性が同じ型に戻す。
+ */
+const untypedColumns = (def: Pick<TableDef, "columns" | "affinity">) => def.columns.filter((c) => (def.affinity[c] ?? "BLOB") === "BLOB");
+const typeTag = (i: number) => `__dinf_typeof_${i}`;
+
+/** 行イメージを読む SELECT の列の並び。型のない列には、型を一緒に読む列を足す (`typedRow` が戻す)。 */
+export const imageList = (def: TableDef) =>
+  [selectList(def), ...untypedColumns(def).map((c, i) => `typeof(${q(c)}) AS ${q(typeTag(i))}`)].join(", ");
+
+/** imageList で読んだ行から、型を読んだ列を除き、整数の値の REAL に印を付ける。 */
+export function typedRow(def: Pick<TableDef, "columns" | "affinity">, row: Row): Row {
+  const cols = untypedColumns(def);
+  if (cols.length === 0) return row;
+  const out: Row = { ...row };
+  cols.forEach((c, i) => {
+    const t = out[typeTag(i)];
+    delete out[typeTag(i)];
+    const v = out[c];
+    if (t === "real" && typeof v === "number" && Number.isInteger(v)) out[c] = realOf(v);
+  });
+  return out;
+}
+
+/** 列名と値の配列で読んだときの typedRow。 */
+export function typedValues(def: Pick<TableDef, "columns" | "affinity">, columns: string[], rows: Value[][]): { columns: string[]; rows: Value[][] } {
+  const cols = untypedColumns(def);
+  if (cols.length === 0) return { columns, rows };
+  const tagAt = cols.map((_c, i) => columns.indexOf(typeTag(i)));
+  const valAt = cols.map((c) => columns.indexOf(c));
+  if (tagAt.some((i) => i < 0)) return { columns, rows };
+  const keep = columns.map((_c, i) => !tagAt.includes(i));
+  return {
+    columns: columns.filter((_c, i) => keep[i]),
+    rows: rows.map((r) => {
+      const v = [...r];
+      tagAt.forEach((t, k) => {
+        const at = valAt[k]!;
+        const x = v[at];
+        if (at >= 0 && r[t] === "real" && typeof x === "number" && Number.isInteger(x)) v[at] = realOf(x);
+      });
+      return v.filter((_x, i) => keep[i]);
+    }),
+  };
+}
+
+/**
  * 行の同一性を表す文字列を作る。主キーと shard key の値を、そのまま並べたものである。
  * 主キー、shard key、シャードをまたぐ UNIQUE の列には、BINARY 以外の照合順序を付けられない (sql/ddl.ts が断る)。
  * だから、値が等しいことと、この文字列が等しいことは同じである。
  */
 export function encodeKey(def: TableDef, row: Row): { pk: string; sk: string } {
   return {
-    pk: encode(def.pk.map((c) => row[c] ?? null)),
-    sk: encode(def.shardKey.map((c) => row[c] ?? null)),
+    pk: keyString(def.pk.map((c) => row[c] ?? null)),
+    sk: keyString(def.shardKey.map((c) => row[c] ?? null)),
   };
 }
 
@@ -55,11 +111,12 @@ export function selectGroup(b: Backend, def: TableDef, g: string): Row[] {
   const vals = decode<Value[]>(g);
   if (vals.length !== def.shardKey.length) return [];
   const where = def.shardKey.map((c) => `${q(c)} IS ?`).join(" AND ");
-  return b.exec(`SELECT ${selectList(def)} FROM ${q(def.name)} WHERE ${where}`, ...vals);
+  return b.exec(`SELECT ${imageList(def)} FROM ${q(def.name)} WHERE ${where}`, ...vals).map((r) => typedRow(def, r));
 }
 
 export function selectRow(b: Backend, def: TableDef, pk: string): Row | null {
-  return b.exec(`SELECT ${selectList(def)} FROM ${q(def.name)} WHERE ${pkWhere(def)}`, ...pkValues(pk))[0] ?? null;
+  const row = b.exec(`SELECT ${imageList(def)} FROM ${q(def.name)} WHERE ${pkWhere(def)}`, ...pkValues(pk))[0];
+  return row ? typedRow(def, row) : null;
 }
 
 export function insertRow(b: Backend, def: TableDef, row: Row): void {
@@ -153,7 +210,7 @@ export function applyChanges(b: Backend, catalog: (t: string) => TableDef, chang
 export function captureDdl(def: Pick<TableDef, "name" | "columns" | "pk" | "implicitRowid">): string[] {
   const t = def.name;
   const all = def.implicitRowid ? ["rowid", ...def.columns] : def.columns;
-  const key = (row: "old" | "new") => `json_array(${def.pk.map((c) => `${row}.${q(c)}`).join(", ")})`;
+  const key = (row: "old" | "new") => keySql(def.pk.map((c) => `${row}.${q(c)}`));
   const mirror = q(`__capv_${t}`);
   const when = `WHEN EXISTS (SELECT 1 FROM __cap_on)`;
   const name = (op: string) => q(`__cap_${t}_${op}`);
@@ -187,11 +244,14 @@ export function capturedChanges(b: Backend, catalog: (t: string) => TableDef): C
   for (const r of b.exec(`SELECT seq, tbl, oldk, newk FROM __cap ORDER BY seq`)) {
     const table = r.tbl as string;
     const def = catalog(table);
-    const norm = (k: Value | undefined) => encode(JSON.parse(k as string));
+    const norm = (k: Value | undefined) => keyString(JSON.parse(k as string) as Value[]);
     const old = (r.oldk ?? null) === null ? null : norm(r.oldk);
     const fresh = (r.newk ?? null) === null ? null : norm(r.newk);
     if (old !== null && !net.has(`${table}\0${old}`)) {
-      const row = b.exec(`SELECT * FROM ${q(`__capv_${table}`)} WHERE __seq = ?`, r.seq as number)[0]!;
+      // 写しの表は型のない列だけなので、型は保たれている。読み出しで失わないよう、元の表の型のない列の型を一緒に読む。
+      const mirror = { columns: def.columns, affinity: def.affinity };
+      const tags = def.columns.filter((c) => (def.affinity[c] ?? "BLOB") === "BLOB").map((c, i) => `, typeof(${q(c)}) AS ${q(typeTag(i))}`).join("");
+      const row = typedRow(mirror, b.exec(`SELECT *${tags} FROM ${q(`__capv_${table}`)} WHERE __seq = ?`, r.seq as number)[0]!);
       const { __seq: _drop, ...before } = row;
       net.set(`${table}\0${old}`, { table, pk: old, before });
     }

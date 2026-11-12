@@ -9,10 +9,11 @@ import {
 } from "../types";
 import type { DdlEntry } from "../meta";
 import { slotOf } from "../routing";
+import { keyString } from "../keys";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import {
   CAPTURE_TABLES, applyChanges, asSqlError, assertKeyed, capturedChanges, decode, deleteRow, encode, encodeKey, insertRow, q,
-  rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore,
+  rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore, imageList, typedRow, typedValues,
 } from "./rows";
 
 export interface ShardDeps {
@@ -644,7 +645,7 @@ export class ShardCore implements ShardApi {
         let read = 0;
         for (const r of rows) {
           read++;
-          add(encode(r));
+          add(keyString(r));
           if (out.length >= req.limit) {
             // NULL を含む shard key は行の比較で絞れないので、読んだ数で続きを表す。
             const next: GroupCursor = r.every((v) => v !== null)
@@ -864,7 +865,7 @@ export class ShardCore implements ShardApi {
     const def = this.defs.get(req.table);
     if (!def) throw new SqlError(`no such table: ${req.table}`);
     const cols = def.pk.map(q).join(", ");
-    const list = selectList(def);
+    const list = imageList(def);
     const keyset = req.after !== null && req.after.every((v) => v !== null);
     const where = keyset ? `WHERE (${cols}) > (${def.pk.map(() => "?").join(", ")})` : "";
     const limit = Math.max(1, Math.min(req.limit, 5000));
@@ -881,7 +882,8 @@ export class ShardCore implements ShardApi {
       // 1 回の応答が大きくなりすぎないよう、行数の上限より先にバイト数で切る。続きは次の呼び出しで読む。
       if (bytes > 4_000_000) break;
     }
-    return { columns, rows: out, pk: def.pk.map((c) => columns.indexOf(c)) };
+    const typed = typedValues(def, columns, out);
+    return { columns: typed.columns, rows: typed.rows, pk: def.pk.map((c) => typed.columns.indexOf(c)) };
   }
 
   async metrics(_req: Record<string, never>): Promise<ShardMetrics> {
@@ -1433,7 +1435,7 @@ export class ShardCore implements ShardApi {
       return this.b.tx(() => {
         const before = span.kind === "pk" && capture === "update" ? selectRow(this.b, def, span.pk) : null;
         const was = before && encodeKey(def, before).pk;
-        const rows = this.b.exec(`${req.sql} RETURNING ${selectList(def)}`, ...req.params);
+        const rows = this.b.exec(`${req.sql} RETURNING ${imageList(def)}`, ...req.params).map((r) => typedRow(def, r));
         if (capture === "update" && (rows.length > 1 || (rows.length === 1 && was !== encodeKey(def, rows[0]!).pk))) {
           throw FALLBACK;
         }

@@ -1,6 +1,9 @@
 // 分散プロトコルの共有型。docs/design.md の用語に対応する。
 export type Ts = number;
-export type Value = string | number | null | Uint8Array;
+import type { Real } from "./value";
+
+/** SQLite の値。整数の JS の数は INTEGER、整数でない JS の数は REAL、整数の値の REAL は Real (src/value.ts)。 */
+export type Value = string | number | null | Uint8Array | Real;
 export type Row = Record<string, Value>;
 
 /** シャードをまたぐ UNIQUE を守る index。一意でない index は、各シャードのローカル index になるので、ここには入らない。 */

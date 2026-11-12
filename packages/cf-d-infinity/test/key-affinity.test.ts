@@ -1,6 +1,6 @@
-// 未解決: Worker が計算するキーと、シャードに入った行のキーが食い違う。計画書の不変条件 6、未解決の問題 19。
+// Worker が計算するキーと、シャードに入った行のキーが一致すること。計画書の不変条件 6、未解決の問題 19 (2026-11-12 に直した)。
 //
-// Worker は、行の置き場所を決める前に、値を列の型に揃える (`normalize`、src/sql/cst.ts)。揃え方が SQLite と違う値がある。
+// Worker は、行の置き場所を決める前に、値を列の型に揃える (src/keys.ts の storedAs)。直す前は、揃え方が SQLite と違う値があった。
 // - 16 進、2 進、8 進の文字列 ('0x10' など): SQLite は文字列のまま入れる。`normalize` は数にする。
 // - 範囲を超える指数の文字列 ('1e400'): SQLite は REAL の無限大にする。`normalize` は文字列のまま。
 // - TEXT の列に入る実数: SQLite は有効数字 15 桁の文字列にする (0.30000000000000004 は "0.3"、1e20 は "1.0e+20")。
@@ -10,8 +10,8 @@
 // 見つけたのは、キー文字列の関数を 1 つにする下調べのとき (2026-11-12)。
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { SimCluster } from "../sim";
+import { Db } from "../src/client/db";
+import { SimCluster } from "./sim";
 
 async function both(ddl: string, statements: string[]) {
   const lite = new DatabaseSync(":memory:");

@@ -2,9 +2,16 @@
 
 const quote = (id) => `"${id.replaceAll('"', '""')}"`;
 
-/** 値を SQL のリテラルにする。BLOB は { $blob: 16 進 } で受ける。 */
+/**
+ * 値を SQL のリテラルにする。BLOB は { $blob: 16 進 } で受ける。整数の値の REAL は { real: 数 } で受け (src/value.ts)、
+ * 小数点を付けて書く。SQLite は小数点か指数のある数のリテラルを REAL として読むので、取り込んでも REAL のままである。
+ */
 export function literal(v) {
   if (v === null || v === undefined) return "NULL";
+  if (typeof v === "object" && typeof v.real === "number") {
+    const s = literal(v.real);
+    return /^-?[0-9]+$/.test(s) ? `${s}.0` : s;
+  }
   if (typeof v === "number") return Number.isFinite(v) ? String(v) : Number.isNaN(v) ? "NULL" : v > 0 ? "9e999" : "-9e999";
   if (typeof v === "object" && typeof v.$blob === "string") return `X'${v.$blob}'`;
   const quoted = `'${String(v).replaceAll("'", "''")}'`;
@@ -86,7 +93,9 @@ export function parseInsert(line) {
         } else {
           const m = /^-?[0-9.eE+-]+/.exec(line.slice(i, i + 40));
           if (!m) return fail();
-          row.push(m[0] === "9e999" ? Infinity : m[0] === "-9e999" ? -Infinity : Number(m[0]));
+          const n = m[0] === "9e999" ? Infinity : m[0] === "-9e999" ? -Infinity : Number(m[0]);
+          // 小数点か指数のある整数の値は REAL である。印を付けて、取り込むときも REAL として束縛する。
+          row.push(Number.isInteger(n) && /[.eE]/.test(m[0]) ? { real: n } : n);
           i += m[0].length;
         }
         if (line.startsWith(", ", i)) i += 2;

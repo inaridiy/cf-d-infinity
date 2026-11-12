@@ -9,6 +9,7 @@ import { planSplit, shardsOf } from "./routing";
 import { ShardCore } from "./shard/core";
 import { batonSealer, handlePipeline, serveHranaSocket, type PipelineReq } from "./client/hrana";
 import { setSqlWasm } from "./sql/scratch";
+import { bindTyped, restoreColumns } from "./value";
 import { checkProtocol, PROTOCOL_VERSION, type Backend, type Row, type ShardApi, type ShardHealth, type Value } from "./types";
 // @ts-expect-error wrangler と esbuild がバンドル時に解決する
 import sqlWasm from "./sql-wasm.wasm";
@@ -62,7 +63,9 @@ class DoBackend implements Backend {
     return values.map((v) => Object.fromEntries(columns.map((c, i) => [c, v[i] ?? null])));
   }
   raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] } {
-    const cur = this.storage.sql.exec(sql, ...(params as never[]));
+    // DO の SQLite は JS の数をすべて REAL として束縛する。INTEGER の引数は包む (src/value.ts)。
+    const b = bindTyped(sql, params, "real");
+    const cur = this.storage.sql.exec(b.sql, ...(b.params as never[]));
     const values = [...cur.raw()].map((r) => r.map((v) => (v instanceof ArrayBuffer ? new Uint8Array(v) : v)) as Value[]);
     if (cur.rowsWritten > 0 || cur.rowsRead > 0) {
       const k = statKey(sql);
@@ -72,10 +75,11 @@ class DoBackend implements Backend {
       e.rowsRead += cur.rowsRead;
       rowStats.set(k, e);
     }
-    return { columns: cur.columnNames, values };
+    return { columns: restoreColumns(cur.columnNames, b.columns), values };
   }
   iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
-    const cur = this.storage.sql.exec(sql, ...(params as never[]));
+    const b = bindTyped(sql, params, "real");
+    const cur = this.storage.sql.exec(b.sql, ...(b.params as never[]));
     const record = () => {
       if (cur.rowsWritten === 0 && cur.rowsRead === 0) return;
       const k = statKey(sql);
@@ -92,7 +96,7 @@ class DoBackend implements Backend {
         record();
       }
     })();
-    return { columns: cur.columnNames, rows };
+    return { columns: restoreColumns(cur.columnNames, b.columns), rows };
   }
   tx<T>(fn: () => T): T {
     return this.storage.transactionSync(fn);

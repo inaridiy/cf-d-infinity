@@ -2,6 +2,7 @@
 // Worker は状態を持たないので、取引の状態は baton に載せて持ち回る。
 import { decode, encode } from "../shard/rows";
 import { SqlError, type Value } from "../types";
+import { isReal, realOf } from "../value";
 import type { Params } from "../sql/cst";
 import type { Db, QueryResult } from "./db";
 import { sleep } from "../runtime";
@@ -63,7 +64,8 @@ function fromH(v: HValue): Value {
       }
       return n;
     }
-    case "float": return v.value;
+    // 整数の値の REAL は、印をつけて REAL のまま運ぶ (src/value.ts)。sqld も float を REAL として束縛する。
+    case "float": return realOf(v.value);
     case "text": return v.value;
     case "blob": return fromBase64(v.base64);
   }
@@ -73,7 +75,9 @@ function toH(v: Value): HValue {
   if (v === null || v === undefined) return { type: "null" };
   if (typeof v === "string") return { type: "text", value: v };
   if (v instanceof Uint8Array) return { type: "blob", base64: toBase64(v) };
-  return Number.isInteger(v) ? { type: "integer", value: String(v) } : { type: "float", value: v };
+  if (isReal(v)) return { type: "float", value: v.real };
+  // 2^53 を超える整数の値は、正確な整数として返せない (JS の数を通るので、もう丸まっている)。float で返す。
+  return Number.isSafeInteger(v) ? { type: "integer", value: String(v) } : { type: "float", value: v };
 }
 
 function args(s: Stmt): Params {
