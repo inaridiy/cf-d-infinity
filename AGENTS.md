@@ -2,7 +2,7 @@
 
 `cf-d-infinity` (D∞) is an experimental horizontally-sharded, SQLite-compatible database on Cloudflare Workers and
 Durable Objects. Design: `docs/overview.md` (English). Development notes: `packages/cf-d-infinity/DEVELOPMENT.md`
-(Japanese; parts are out of date, the code wins).
+(Japanese; where it and the code disagree, the code wins).
 
 ## Read this first
 
