@@ -93,7 +93,7 @@ Categories:
 | m15_red_no_slot | DDL recorded mid-split (not atomic) | none | ddl-vs-split-race:15 (fixed) | A |
 | m15_red_stale_begin | split uses version read before taking the slot | none | split-hazards:79; child-behind-parent:17 | A |
 | m15_red_early_release | slot returned before the child finishes | none | split-slot:62 (fixed) | A |
-| m15_red_no_based_on | slot taken before all shards applied the latest version | splitWithoutSync (in `ClientFaults`, read by autoscaler's reserveSplit; added 2026-11-12) | split-slot ("a split takes its slot only after every shard applied the latest version (m15_red_no_based_on)"; added 2026-11-12); on fixed code the first `split()` fails with `stale schema` before taking a slot and the Autoscaler's retry finishes it | A |
+| m15_red_no_based_on | slot taken before all shards applied the latest version | splitWithoutSync (in `ClientFaults`, read by autoscaler's reserveSplit; added 2026-11-12) | split-slot ("a split takes its slot only after every shard applied the latest version (m15_red_no_based_on)"; added 2026-11-12); on fixed code the first `split()` fails with `stale schema` before taking a slot, so the replay runs it again as the Autoscaler does (open problem 21, `test/open/split-reserve-revoked.test.ts`) | A |
 | m15_red_late_start | child starts after the slot expired | startWithoutSlot + fenceWithoutSlot (Meta side; two guards: startSplit, and checkSplit before the parent fences; added 2026-11-12) | split-slot ("a child that starts receiving after the split slot lapsed (m15_red_late_start)"); with only the start put back the fence check still stops it | A |
 
 ## Switches that match no red module

@@ -114,9 +114,19 @@ describe("a split takes its slot only after every shard applied the latest versi
       reached();
       return held;
     };
-    const splitting = outcome(split(c, "s0", "s2", { range }));
-    const midway = await Promise.race([hit.then(() => true), splitting.then(() => false)]);
-    // s1 が最新の版を適用し、失敗して取り消しを記録する。
+    const midwayOf = (p: Promise<string>) => Promise.race([hit.then(() => true), p.then(() => false)]);
+    let splitting = outcome(split(c, "s0", "s2", { range }));
+    let midway = await midwayOf(splitting);
+    // 直したコードでは、枠を取る前の適用で s1 が失敗して版を取り消し、1 回目の split() は枠を取らずに失敗する。Autoscaler は、保留の
+    // 分割を次の判断でやり直す (worker.ts の runSplit)。ここでも、止めを掛けたまま 1 度だけやり直す。1 回目で終わらないことは、
+    // test/open/split-reserve-revoked.test.ts が再現する。
+    if (!midway) {
+      splitting = outcome(split(c, "s0", "s2", { range }));
+      midway = await midwayOf(splitting);
+    }
+    // 分割の版。取り消しより後の版なら、取り消しは枠より前に入った。
+    const slot = (await c.splits())[0];
+    // s1 が最新の版を適用し、失敗して取り消しを記録する (直したコードでは、もう済んでいる)。
     await outcome(c.shard("s1").syncSchema({ version: before + 1 }));
     const cat = await c.catalog();
     // 取り消しの版で計画した読み。親に残る行と、子へ移る行。
@@ -124,25 +134,18 @@ describe("a split takes its slot only after every shard applied the latest versi
     const reads = { parent: await read(stays), child: await read(moved) };
     c.net.gate = () => undefined;
     release();
-    // 枠を取る前に分割が失敗したら、Autoscaler が保留の分割を次の判断でやり直す (worker.ts の runSplit)。ここでは 1 度だけやり直す。
-    const first = await splitting;
-    const done = first === "ok" ? first : await outcome(split(c, "s0", "s2", { range }));
-    return { midway, revoked: cat.revoked?.version === before + 1, reads, first, split: done };
+    return { midway, slotAfterRevocation: slot !== undefined && slot.version > before + 1, revoked: cat.revoked?.version === before + 1, reads, split: await splitting };
   };
 
   it("applies the failing version on every shard before the slot, so the revocation lands before the split", async () => {
-    // 枠を取る前の適用で、s1 が失敗して版を取り消す。そのため 1 回目の分割は、枠を取らずに失敗する (取り消された版を求めた適用が
-    // stale schema で断られる)。reserveSplit の注釈は、版が進めば適用し直してから取ると言うが、それをするのは Meta が断ったときだけである。
-    expect(await scenario()).toEqual({
-      midway: false, revoked: true, reads: { parent: "ok", child: "ok" }, first: expect.stringMatching(/stale schema/), split: "ok",
-    });
+    expect(await scenario()).toEqual({ midway: true, slotAfterRevocation: true, revoked: true, reads: { parent: "ok", child: "ok" }, split: "ok" });
   });
 
   it("put back: a slot taken before every shard applied the version lets the revocation land mid-split, and the parent and the child refuse it", async () => {
     expect(await scenario({ splitWithoutSync: true })).toEqual({
-      midway: true, revoked: true,
+      midway: true, slotAfterRevocation: false, revoked: true,
       reads: { parent: expect.stringMatching(/waiting for a shard split on s0/), child: expect.stringMatching(/waiting for a shard split on s2/) },
-      first: "ok", split: "ok",
+      split: "ok",
     });
   });
 });
