@@ -1,25 +1,51 @@
 // 同じ ShardCore を本物の workerd と DO の SQLite で動かす結合テスト。
+// 環境変数 DINF_LIVE_URL を与えると、Miniflare を起こさず、同じ試験を Cloudflare に置いた Worker へ向けて流す
+// (scripts/cloudflare-check.sh。トークンは DINF_LIVE_TOKEN と DINF_LIVE_ADMIN_TOKEN)。
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createClient } from "@libsql/client";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/libsql";
+import { migrate } from "drizzle-orm/libsql/migrator";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { drizzleMigrationsTable } from "../src/binding";
+import { ADD, INIT, REBUILD, migrations } from "./drizzle-fixtures";
 
-let mf: Miniflare;
+const LIVE = process.env.DINF_LIVE_URL?.replace(/\/$/, "");
+const TOKEN = LIVE ? (process.env.DINF_LIVE_TOKEN ?? "") : "test";
+const ADMIN = LIVE ? (process.env.DINF_LIVE_ADMIN_TOKEN ?? "") : "admin-test";
+// 本物へ向けるときは、送る要求の数に上限を置く。試験の誤りで要求を送り続け、費用を積むことがないようにする。
+// @libsql/client も、作るときの globalThis.fetch を使うので、ここで数えられる (WebSocket の上の文は数えない)。
+const MAX_REQUESTS = Number(process.env.DINF_LIVE_MAX_REQUESTS ?? 3000);
+let sent = 0;
+if (LIVE) {
+  const real = globalThis.fetch;
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    if (++sent > MAX_REQUESTS) throw new Error(`more than ${MAX_REQUESTS} requests to ${LIVE}; stopped`);
+    return real(input, init);
+  }) as typeof fetch;
+}
 
-async function post(path: string, body: unknown) {
-  const r = await mf.dispatchFetch(`http://x${path}`, {
-    method: "POST", body: JSON.stringify(body), headers: { authorization: "Bearer test" },
-  });
+let mf: Miniflare | undefined;
+/** Worker の URL。末尾の / は付けない。 */
+const base = async () => LIVE ?? (await mf!.ready).toString().replace(/\/$/, "");
+const dispatch = (path: string, init: RequestInit): Promise<Response> =>
+  LIVE ? fetch(`${LIVE}${path}`, init) : (mf!.dispatchFetch(`http://x${path}`, init as never) as unknown as Promise<Response>);
+
+async function post(path: string, body: unknown, token = TOKEN) {
+  const r = await dispatch(path, { method: "POST", body: JSON.stringify(body), headers: { authorization: `Bearer ${token}` } });
   const json = (await r.json()) as Record<string, unknown>;
   return { status: r.status, ...json } as { status: number; rows: Record<string, unknown>[]; error?: string; token: number; results: { rows: unknown[] }[] };
 }
 const sql = (s: string, params: unknown[] = [], extra: object = {}) => post("/sql", { sql: s, params, ...extra });
 
 beforeAll(async () => {
+  if (LIVE) {
+    await post("/ddl", { sql: `CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT UNIQUE, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)` });
+    return;
+  }
   execFileSync("npm", ["run", "-s", "bundle"], { stdio: "inherit" });
   mf = new Miniflare({
     modules: [
@@ -36,26 +62,30 @@ beforeAll(async () => {
   });
   await post("/ddl", { sql: `CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT UNIQUE, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)` });
 }, 60000);
-afterAll(() => mf?.dispose());
+afterAll(async () => {
+  // URL は書かない (アカウントの workers.dev の名前が出る)。
+  if (LIVE) console.log(`sent ${sent} HTTP requests to the live Worker`);
+  await mf?.dispose();
+});
 
 describe("authentication and the production surface", () => {
   const raw = (path: string, token: string, body: unknown = {}) =>
-    mf.dispatchFetch(`http://x${path}`, { method: "POST", body: JSON.stringify(body), headers: { authorization: `Bearer ${token}` } });
+    dispatch(path, { method: "POST", body: JSON.stringify(body), headers: { authorization: `Bearer ${token}` } });
 
   it("separates the data token from the admin token", async () => {
-    expect((await raw("/admin/status", "test")).status).toBe(401);
-    expect((await raw("/admin/status", "admin-test")).status).toBe(200);
-    expect((await raw("/v3/pipeline", "admin-test", { baton: null, requests: [{ type: "close" }] })).status).toBe(401);
-    expect((await raw("/v3/pipeline", "test", { baton: null, requests: [{ type: "close" }] })).status).toBe(200);
+    expect((await raw("/admin/status", TOKEN)).status).toBe(401);
+    expect((await raw("/admin/status", ADMIN)).status).toBe(200);
+    expect((await raw("/v3/pipeline", ADMIN, { baton: null, requests: [{ type: "close" }] })).status).toBe(401);
+    expect((await raw("/v3/pipeline", TOKEN, { baton: null, requests: [{ type: "close" }] })).status).toBe(200);
   });
 
   it("has no benchmark endpoint in the production build", async () => {
-    expect((await raw("/bench", "admin-test", { op: "ping" })).status).not.toBe(200);
+    expect((await raw("/bench", ADMIN, { op: "ping" })).status).not.toBe(200);
   });
 
   it("rejects a tampered baton", async () => {
     const step = async (baton: string | null, sql: string) =>
-      (await (await raw("/v3/pipeline", "test", { baton, requests: [{ type: "execute", stmt: { sql } }] })).json()) as {
+      (await (await raw("/v3/pipeline", TOKEN, { baton, requests: [{ type: "execute", stmt: { sql } }] })).json()) as {
         baton: string | null; results: { type: string; error?: { code: string } }[];
       };
     const first = await step(null, "BEGIN");
@@ -81,7 +111,7 @@ describe("DDL followed at once by another request", () => {
 });
 
 describe("a stock @libsql/client over WebSocket (hrana2)", () => {
-  const connect = async () => createClient({ url: (await mf.ready).toString().replace(/^http/, "ws").replace(/\/$/, ""), authToken: "test" });
+  const connect = async () => createClient({ url: (await base()).replace(/^http/, "ws"), authToken: TOKEN });
 
   it("runs statements, batches and an interactive transaction on one connection", async () => {
     const db = await connect();
@@ -108,14 +138,14 @@ describe("a stock @libsql/client over WebSocket (hrana2)", () => {
   });
 
   it("rejects a connection with the wrong token", async () => {
-    const db = createClient({ url: (await mf.ready).toString().replace(/^http/, "ws").replace(/\/$/, ""), authToken: "wrong" });
+    const db = createClient({ url: (await base()).replace(/^http/, "ws"), authToken: "wrong" });
     await expect(db.execute("SELECT 1")).rejects.toThrow();
     db.close();
   });
 });
 
 describe("a stock @libsql/client against the Worker, changing only the URL", () => {
-  const connect = async () => createClient({ url: (await mf.ready).toString().replace(/\/$/, ""), authToken: "test" });
+  const connect = async () => createClient({ url: await base(), authToken: TOKEN });
 
   it("runs DDL, reads and writes", async () => {
     const db = await connect();
@@ -186,6 +216,38 @@ describe("a stock @libsql/client against the Worker, changing only the URL", () 
   });
 });
 
+// PR #16 以降の仕組みを、本物の workerd と DO で通す。取引の中の DDL (先の確定)、行のある表への UNIQUE の index
+// (書き込み禁止と期限の延長)、DROP の守り (禁止、確認、DROP)。どれもシャードから Meta を呼ぶ。
+describe("Drizzle's libSQL migrator on workerd", () => {
+  const connectHttp = async () => createClient({ url: await base(), authToken: TOKEN });
+
+  it("applies migrations that create a UNIQUE index and rebuild a table, and keeps the rows", async () => {
+    const client = await connectHttp();
+    await client.execute(drizzleMigrationsTable());
+    const folder = (list: typeof INIT[]) => migrations(list);
+    await migrate(drizzle(client), { migrationsFolder: folder([INIT, ADD]) });
+    await client.execute("INSERT INTO users(id, email, name, age) VALUES (1, 'a@x', 'A', 30), (2, 'b@x', NULL, 40)");
+    await migrate(drizzle(client), { migrationsFolder: folder([INIT, ADD, REBUILD]) });
+    const rows = await client.execute("SELECT id, email, name, age FROM users ORDER BY id");
+    expect(rows.rows.map((r) => ({ ...r }))).toEqual([{ id: 1, email: "a@x", name: "A", age: 30 }, { id: 2, email: "b@x", name: "", age: 40 }]);
+    expect((await client.execute("SELECT count(*) AS n FROM __drizzle_migrations")).rows[0]!.n).toBe(3);
+    await expect(client.execute("INSERT INTO users(id, email, name) VALUES (9, 'a@x', 'Z')")).rejects.toThrow(/UNIQUE constraint failed/);
+  });
+
+  it("runs an interactive transaction that changes the schema, across HTTP requests", async () => {
+    const client = await connectHttp();
+    const tx = await client.transaction("write");
+    await tx.execute("CREATE TABLE tx_ddl(id INTEGER PRIMARY KEY, v INTEGER)");
+    await tx.execute("INSERT INTO tx_ddl VALUES (1, 1)");
+    await tx.execute("CREATE TABLE tx_ddl_new(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)");
+    await tx.execute("INSERT INTO tx_ddl_new(id, v) SELECT id, v FROM tx_ddl");
+    await tx.execute("DROP TABLE tx_ddl");
+    await tx.execute("ALTER TABLE tx_ddl_new RENAME TO tx_ddl");
+    await tx.commit();
+    expect((await client.execute("SELECT id, v, w FROM tx_ddl")).rows.map((r) => ({ ...r }))).toEqual([{ id: 1, v: 1, w: null }]);
+  });
+});
+
 describe("on workerd with real Durable Objects", () => {
   it("runs point reads and writes", async () => {
     expect((await sql("INSERT INTO acct(tenant_id,id,email,n) VALUES (?,?,?,?)", [1, 1, "a@x", 100])).error).toBeUndefined();
@@ -228,7 +290,7 @@ describe("on workerd with real Durable Objects", () => {
     expect(r.rows).toEqual([{ n: 777 }]);
   });
   it("refuses requests without the API token", async () => {
-    const r = await mf.dispatchFetch("http://x/sql", { method: "POST", body: "{}" });
+    const r = await dispatch("/sql", { method: "POST", body: "{}" });
     expect(r.status).toBe(401);
   });
   it("runs the Worker side SQLite for what one shard cannot answer", async () => {
@@ -258,5 +320,56 @@ describe("DDL through the HTTP /ddl endpoint", () => {
     expect((await post("/ddl", { sql: "CREATE UNIQUE INDEX people_email ON people(email)" })).status).toBe(200);
     expect((await sql("SELECT id FROM people WHERE email = ?", ["y@example.test"])).rows).toEqual([{ id: 2 }]);
     expect((await sql("INSERT INTO people(id, email) VALUES (3, 'x@example.test')")).status).toBe(400);
+  });
+});
+
+// 書き込み禁止の期限の延長を、本物の DO で通す。期限 (meta.ts の INDEX_LEASE_MS、5 秒) より長くかかる index の作成は、
+// 延長が周期で続かなければ、Meta に取り消されて失敗する。長くかからせるために、作る前に、その表に書いた取引を開いたままにする。
+describe("a UNIQUE index build that outlives one lease", () => {
+  it("keeps its write lock past the lease by renewing it, and ends with the index and the rows agreeing", async () => {
+    const client = createClient({ url: await base(), authToken: TOKEN });
+    await client.execute("CREATE TABLE lease_t(id INTEGER PRIMARY KEY, email TEXT)");
+    await client.execute("INSERT INTO lease_t VALUES (1, 'a@x'), (2, 'b@x')");
+    const tx = await client.transaction("write");
+    await tx.execute("INSERT INTO lease_t VALUES (3, 'c@x')");
+    const t0 = Date.now();
+    const build = post("/ddl", { sql: "CREATE UNIQUE INDEX lease_email ON lease_t(email)" });
+    await new Promise((r) => setTimeout(r, 7000));
+    const committed = await tx.commit().then(() => true, (e: Error) => e.message);
+    const built = await build;
+    const ms = Date.now() - t0;
+    console.log(`build ${ms} ms, status ${built.status}, ${built.error ?? "ok"}; the open transaction: ${committed}`);
+    expect([built.status, built.error]).toEqual([200, undefined]);
+    // 期限より早く終わったなら、この試験は延長を確かめていない。
+    expect(ms).toBeGreaterThan(5000);
+    const rows = await client.execute("SELECT id FROM lease_t ORDER BY id");
+    const viaIndex = await client.execute("SELECT id FROM lease_t WHERE email = 'c@x'");
+    expect(viaIndex.rows.map((r) => r.id)).toEqual(rows.rows.some((r) => r.id === 3) ? [3] : []);
+    await expect(client.execute("INSERT INTO lease_t VALUES (9, 'a@x')")).rejects.toThrow(/UNIQUE constraint failed/);
+  });
+});
+
+// 分割の枠 (M15) を、本物の DO で通す。枠を取り、子の受け入れが Meta の startSplit を、親の fence が checkSplit を呼び、
+// 終わりに枠を返す。返っていなければ、後の表定義の変更が待たされる。
+describe("a split through /admin/split", () => {
+  const admin = (path: string, body: object = {}) => post(path, body, ADMIN) as unknown as Promise<Record<string, unknown> & { status: number }>;
+
+  it("moves part of a shard to a new one, keeps every row, and lets a schema change run after it", async () => {
+    expect((await post("/ddl", { sql: "CREATE TABLE sp(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)" })).status).toBe(200);
+    const values = Array.from({ length: 40 }, (_, i) => `(${i + 1}, ${(i + 1) * 10})`).join(", ");
+    expect((await sql(`INSERT INTO sp(id, v) VALUES ${values}`)).error).toBeUndefined();
+    const before = (await admin("/admin/status")) as unknown as { shards: string[] };
+    const parent = before.shards[0]!;
+    const child = `shard-${Math.max(...before.shards.map((s) => Number(s.slice("shard-".length)))) + 1}`;
+    const r = await admin("/admin/split", { parent, child });
+    expect([r.status, r.error]).toEqual([200, undefined]);
+    const after = (await admin("/admin/status")) as unknown as { shards: string[]; splits: unknown[] };
+    expect(after.shards).toContain(child);
+    expect(after.splits).toEqual([]);
+    // 子へ移った行も含めて、全部の行が読め、書ける。
+    expect((await sql("SELECT count(*) c, sum(v) s FROM sp")).rows).toEqual([{ c: 40, s: 8200 }]);
+    expect((await sql("UPDATE sp SET v = v + 1")).error).toBeUndefined();
+    expect((await post("/ddl", { sql: "CREATE INDEX sp_v ON sp(v)" })).status).toBe(200);
+    expect((await sql("SELECT count(*) c, sum(v) s FROM sp WHERE v > 0")).rows).toEqual([{ c: 40, s: 8240 }]);
   });
 });

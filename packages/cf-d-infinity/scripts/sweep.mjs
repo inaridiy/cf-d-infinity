@@ -20,6 +20,8 @@ const flag = (name) => {
   return i < 0 ? undefined : args.splice(i, 2)[1];
 };
 const pattern = flag("-t");
+// 名前がこれに当たる試験は流さない (欠陥を自分で入れて、決まった seed で見つかることを確かめる試験など)。
+const exclude = flag("--exclude");
 const procs = Number(flag("--procs") ?? Math.max(1, availableParallelism() - 2));
 const [file, fromArg, toArg] = args;
 const from = Number(fromArg);
@@ -46,7 +48,7 @@ const runs = Array.from({ length: chunks }, (_, i) => {
   if (a > b) return null;
   const json = join(out, `${i}.json`);
   // seed ごとの試験だけを流す。名前に「seed 数字」のない試験 (決定性の検査、決まった並びの再現テストなど) は、ここでは要らない。
-  const names = `^(?=.*seed \\d+)${pattern ? `(?=.*${pattern})` : ""}`;
+  const names = `^(?=.*seed \\d+)${pattern ? `(?=.*${pattern})` : ""}${exclude ? `(?!.*${exclude})` : ""}`;
   // vitest を npx を介さずに起動する。介すと、この道具を止めたときに、vitest のプロセスが残る。
   const argv = ["node_modules/vitest/vitest.mjs", "run", file, "--reporter=json", `--outputFile=${json}`, "-t", names];
   return new Promise((done) => {

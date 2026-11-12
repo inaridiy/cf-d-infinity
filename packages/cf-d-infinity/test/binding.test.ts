@@ -103,6 +103,15 @@ describe("the Database binding inside the same Worker", () => {
     });
   });
 
+  it("runs a migration batch that rebuilds a table and re-creates its UNIQUE index", async () => {
+    const r = await call("migrate");
+    expect({ rows: r.rows, journal: r.journal }).toEqual({
+      rows: [{ id: 1, email: "a@x", name: "A" }, { id: 2, email: "b@x", name: "" }, { id: 3, email: "c@x", name: "C" }],
+      journal: 2,
+    });
+    expect(r.duplicate).toMatch(/UNIQUE constraint failed/);
+  });
+
   it("carries the HLC token as a D1 session bookmark", async () => {
     expect(await call("session")).toEqual({ zero: "0", advanced: true, carried: true, read: 70 });
   });
