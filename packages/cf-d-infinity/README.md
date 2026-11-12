@@ -11,11 +11,14 @@ span shards. Not affiliated with Cloudflare.
 
 ## Install
 
-Run this in a Workers project (the directory with your `wrangler.jsonc`):
+> **Not on npm yet.** This package and `create-cf-d-infinity` have not been published, and nobody owns those names on npm yet. Do not run the command below until the first release is announced in the [repository](https://github.com/inaridiy/cf-d-infinity).
+
+After the first release, run this in a Workers project (the directory with your `wrangler.jsonc`):
 
 ```sh
-npx create-cf-d-infinity@alpha init
-npm install
+# after the first npm release:
+# npx create-cf-d-infinity@alpha init
+# npm install
 ```
 
 `init` adds the Durable Object bindings, their migration, a Service Binding named `DINF_DB`, and a one-minute Cron

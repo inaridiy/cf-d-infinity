@@ -1,6 +1,5 @@
 # D∞ (cf-d-infinity)
 
-[![npm version](https://img.shields.io/npm/v/cf-d-infinity/alpha.svg?color=007acc)](https://www.npmjs.com/package/cf-d-infinity)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
 
@@ -55,10 +54,13 @@ Distributed SQL systems such as CockroachDB, TiDB, YugabyteDB and Spanner bring 
 
 ## Quick start
 
-Run `init` in a Workers project, the directory that holds your `wrangler.jsonc`. (For a project that uses the [`cf` CLI](https://developers.cloudflare.com/cf/) and `cloudflare.config.ts`, see [Wrangler and cf](#wrangler-and-cf).) The database becomes part of that Worker: its configuration lives in `wrangler.jsonc`, its version in `package.json`, and one `wrangler dev` runs both. You need Node 20 or later; local development needs no Cloudflare account.
+> **Not on npm yet.** `cf-d-infinity` and `create-cf-d-infinity` have not been published, and nobody owns those names on npm yet. Do not run `npx create-cf-d-infinity` until the first release is announced here. Until then, try D∞ from a clone of this repository (see the demo above and [Develop](#develop)).
+
+After the first release, run `init` in a Workers project, the directory that holds your `wrangler.jsonc`. (For a project that uses the [`cf` CLI](https://developers.cloudflare.com/cf/) and `cloudflare.config.ts`, see [Wrangler and cf](#wrangler-and-cf).) The database becomes part of that Worker: its configuration lives in `wrangler.jsonc`, its version in `package.json`, and one `wrangler dev` runs both. You need Node 20 or later; local development needs no Cloudflare account.
 
 ```sh
-npx create-cf-d-infinity@alpha init    # edits wrangler.jsonc and package.json, writes src/dinf.ts
+# after the first npm release:
+# npx create-cf-d-infinity@alpha init    # edits wrangler.jsonc and package.json, writes src/dinf.ts
 npm install
 npx wrangler dev
 ```
