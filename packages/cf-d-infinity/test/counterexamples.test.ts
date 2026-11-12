@@ -224,6 +224,45 @@ describe("refresh must advance the participant clock", () => {
   });
 });
 
+// specs/m1b_read_refresh.qnt の m1b_red_ra。取引の読みが「moved at m」で断られ、取引の時刻を m へ進める (read-time refresh) とき、
+// 確かめた各シャードの時計も m まで進めなければならない。進めないと、確かめたシャードが、その後の書き込みを m 以下で確定し、
+// 時刻 m の読みが、時刻 m より前に確定した書き込みを見ていないことになる。モデルの反例と同じ順で流す:
+// R が A を読む。B のシャード (時計が進んでいる) が、R の時刻を含む変更ログの世代を消す。R の B の読みが moved at m で断られ、
+// R は A のシャードを確かめて m へ進む。別の接続が A に書く。
+// モデルでは、範囲の移動が moved at を返す。実装の取引は、範囲表が変わると not owner で取引ごと失敗させるので、
+// 取引の中で moved at を返すのは、変更ログを消した後の古い読み (と表定義の変更) である。
+describe("a read-time refresh advances the clock of the shards it validated (m1b_red_ra)", () => {
+  const scenario = async (faults: Faults) => {
+    const { c, db, A, B, drift } = await cluster(faults, { logRetainMs: 100, logGenMs: 20 });
+    const other = await tenantOn(c, "s1", 1);
+    await seed(db, A);
+    await seed(db, B);
+    await seed(db, other);
+    const r = await db.begin();
+    await getN(r, A); // s0 が T を発行する
+    const T0 = r.T!;
+    drift.set("s1", 1000); // B のシャードの時計を進める。消した世代の上限 m は T0 より大きい
+    for (let i = 0; i < 20; i++) {
+      c.time += 50;
+      await new Db(c).query("UPDATE users SET n = ? WHERE tenant_id = ? AND id = 1", [i, other]);
+    }
+    const low = c.backends.get("s1")!.exec("SELECT v FROM __meta WHERE k = 'log_low_water'")[0]?.v as number;
+    expect(low).toBeGreaterThan(T0);
+    await getN(r, B); // s1 は T0 の読みを moved at m で断り、R は s0 を確かめて m へ進む
+    expect(r.T!).toBeGreaterThan(T0);
+    const w = await new Db(c).query("UPDATE users SET n = 5 WHERE tenant_id = ? AND id = 1", [A]);
+    return { T: r.T!, write: w.ts! };
+  };
+  it("put back: without the bump, a later write on the validated shard commits below the refreshed read", async () => {
+    const r = await scenario({ refreshNoBump: true });
+    expect(r.write).toBeLessThan(r.T);
+  });
+  it("orders the later write after the refreshed read", async () => {
+    const r = await scenario({});
+    expect(r.write).toBeGreaterThan(r.T);
+  });
+});
+
 describe("HLC must not fall behind a served read after a restart", () => {
   const scenario = async (faults: Faults) => {
     const { c, db, A, B, drift } = await cluster(faults);

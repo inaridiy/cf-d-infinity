@@ -42,7 +42,7 @@ Categories:
 | m7_red | undo-based restore to W | none | none | D |
 | m1b_green (freshReadPicked) | autocommit read takes T before settling intents | noRealtimeBump (multi-shard path only) | counterexamples:320 (1-shard, fixed); review-regressions:144 | A |
 | m1b_green_bump (freshReadSeq) | claim 3 not promised for a transaction's 2nd statement (scope limit) | none | none | D |
-| m1b_red_ra | read-time refresh does not advance HLC | refreshNoBump | none (:217 is the commit-time case) | B |
+| m1b_red_ra | read-time refresh does not advance HLC | refreshNoBump | counterexamples ("a read-time refresh advances the clock", via log truncation; added 2026-11-12) | A |
 | m1b_red_rc | T advanced after a failed read refresh | none | review2-regressions:18 (fixed, indirect) | A |
 | m8_red_drop | generation DROP does not raise logLowWater | none | none | C |
 | m9_red_ro_skip | read-only transaction with locked reads skips validation | none (nearest: skipReadOnlyPrepare) | none | C |
