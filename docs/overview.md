@@ -216,10 +216,10 @@ the range table. See [scaling.md](./scaling.md) for the timestamp rules that kee
 
 The checks are layered. Each one catches what the layer before it cannot see.
 
-1. **Formal models.** Sixteen Quint models cover the risky protocol parts: commit and snapshot reads, read refresh, 2PC
+1. **Formal models.** Seventeen Quint models cover the risky protocol parts: commit and snapshot reads, read refresh, 2PC
    recovery, HLC across restarts, split fencing and live migration, row locks, garbage collection of transaction
    records, schema changes under concurrent transactions, building a cross-shard `UNIQUE` index, schema changes inside
-   transactions, table rebuilds, and the ordering of schema changes and splits. TLC explores them exhaustively on small
+   transactions, table rebuilds, the ordering of schema changes and splits, and `UNIQUE` across pending writes. TLC explores them exhaustively on small
    instances. Each model has variants with a known bug put back, and the checker must find every one.
 2. **Counterexamples replayed against the code.** A model only checks the design. For each bug variant that the
    implementation guards against, a fault switch puts the same bug back into the code, and a deterministic simulator
