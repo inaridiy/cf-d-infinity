@@ -112,6 +112,8 @@ const PENDING_UNIQUE = Symbol("pending unique");
 const PRED_WINDOW = 2000;
 /** ロックの TTL。Worker の死亡に備える。文を実行するたびに延ばす。 */
 const LOCK_TTL_MS = 5000;
+/** 読みが、1 つの取引の intent を決着させようとする回数の上限。間で待つので、合わせて 1 秒ほど待つ。 */
+const SETTLE_TRIES = 10;
 /** ロックを待つ時間の上限。SQLite の busy_timeout に相当する。 */
 const LOCK_WAIT_MS = 5000;
 /**
@@ -1163,6 +1165,10 @@ export class ShardCore implements ShardApi {
    */
   private async settleIntents(spans: Span[], T: Ts): Promise<Ts> {
     const pushed = new Set<string>();
+    // 取引ごとの、この呼び出しで決着させた回数。決着させた後も intent が残ることはある (運ばれた行の到着を待つ、など)。
+    // その場合は、イベントループへ制御を返して待ってから、もう 1 度問い合わせる。上限を超えて残るなら、ここでは適用できない
+    // (不変条件 2 の症状)。
+    const settled = new Map<string, number>();
     // 適用した取引の commit 時刻の最大値。何も適用していなければ 0。
     let applied: Ts = 0;
     for (;;) {
@@ -1170,6 +1176,14 @@ export class ShardCore implements ShardApi {
       if (pending.length === 0) return applied;
       for (const txn of new Set(pending.map((i) => i.txn))) {
         const intent = pending.find((i) => i.txn === txn)!;
+        const tries = settled.get(txn) ?? 0;
+        if (tries >= SETTLE_TRIES) {
+          // 待たずに問い合わせを繰り返すと止まらない。anchor が自分なら問い合わせも適用も microtask だけで済み、イベントループが回らず、
+          // どの時間の制限も効かない (未解決の問題 18)。読みを、理由を付けて失敗させる。
+          throw new SqlError(`stuck: transaction ${txn} is decided but its write to ${intent.tbl} cannot be applied on ${this.id}`);
+        }
+        if (tries > 0) await sleep(this.rt, Math.min(100, 2 ** tries));
+        settled.set(txn, tries + 1);
         if (this.faults.readerTimeoutPass) {
           pushed.add(txn);
           continue;
@@ -1585,10 +1599,14 @@ export class ShardCore implements ShardApi {
   private uniquePending(txn: string, writes: Change[]): string | null {
     const constrained = writes.filter((w) => this.hasUniqueBeyondKey(w.table));
     if (!constrained.some((w) => w.after)) return null;
-    const tables = new Set(constrained.map((w) => w.table));
+    // 衝突し得るのは、同じ表の、同じ shard key の値 (グループ) の行だけである。シャードの中の UNIQUE は、shard key の列を
+    // すべて含む (sql/ddl.ts が、含まないものをシャードをまたぐ index にするか断る)。shard key の列の照合順序は BINARY なので、
+    // 同じグループかはキー文字列の一致で決まる。絞らないと、試しに適用する intent が、そのシャードのその表の未確定の取引の数だけ
+    // 増え、巻き戻した書き込みも課金される (未解決の問題 6)。
+    const groups = new Set(constrained.map((w) => `${w.table}\0${w.sk}`));
     const others = (this.b.exec(`SELECT * FROM __intents WHERE txn <> ?`, txn) as unknown as Intent[])
-      .map((i) => decode<Change>(i.change))
-      .filter((o) => tables.has(o.table));
+      .filter((i) => groups.has(`${i.tbl}\0${i.sk}`))
+      .map((i) => decode<Change>(i.change));
     if (others.length === 0) return null;
     // 値を自前で比べない。照合順序、BLOB、部分 index の条件まで SQLite と同じに判定するのは難しく、外すと適用できない取引が残る。
     // ほかの取引の intent をすべて適用した状態を作り、そこへこの取引の変更を入れて、SQLite に判定させる。

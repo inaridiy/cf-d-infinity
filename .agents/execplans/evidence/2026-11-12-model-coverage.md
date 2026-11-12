@@ -12,10 +12,10 @@ Survey made read-only by a subagent on `fa1a2cd`; rows `m5b_red_range`, `m5b_red
 counterexample.
 
 Categories:
-- A: the implementation has the guard, and a replay test exists (47 on fa1a2cd; all 68 rows with a guard after 2026-11-12)
+- A: the implementation has the guard, and a replay test exists (47 on fa1a2cd; all 69 rows with a guard after 2026-11-12, M16 included)
 - B: implemented guard, fault switch exists, no deterministic replay (4 on fa1a2cd; none left)
 - C: implemented guard, no fault switch (17 on fa1a2cd; none left)
-- D: a design alternative the implementation never had or no longer has; no switch needed (8)
+- D: a design alternative the implementation never had or no longer has; no switch needed (9 with M16)
 
 | module | flaw modelled | fault switch | deterministic replay | cat |
 |---|---|---|---|---|
@@ -95,6 +95,8 @@ Categories:
 | m15_red_early_release | slot returned before the child finishes | none | split-slot:62 (fixed) | A |
 | m15_red_no_based_on | slot taken before all shards applied the latest version | splitWithoutSync (in `ClientFaults`, read by autoscaler's reserveSplit; added 2026-11-12) | split-slot ("a split takes its slot only after every shard applied the latest version (m15_red_no_based_on)"; added 2026-11-12); on fixed code the first `split()` fails with `stale schema` before taking a slot, so the replay runs it again as the Autoscaler does (open problem 22, `test/open/split-reserve-revoked.test.ts`) | A |
 | m15_red_late_start | child starts after the slot expired | startWithoutSlot + fenceWithoutSlot (Meta side; two guards: startSplit, and checkSplit before the parent fences; added 2026-11-12) | split-slot ("a child that starts receiving after the split slot lapsed (m15_red_late_start)"); with only the start put back the fence check still stops it | A |
+| m16_red_body_only | prepare checks UNIQUE only against the body, not with other intents applied (added 2026-11-12) | autoIgnoresUniqueIntents (the autocommit path; transactions use the same `uniquePending`) | review-regressions:65 | A |
+| m16_red_intents_only | prepare checks UNIQUE only with other intents applied, not against the body (added 2026-11-12) | none: the body check is SQLite's own UNIQUE constraint on the shard's table, which the code cannot run without | none | D |
 
 ## Switches that match no red module
 

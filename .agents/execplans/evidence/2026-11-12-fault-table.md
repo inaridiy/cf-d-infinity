@@ -77,3 +77,15 @@ The replay check now has 3 seeded tests per seed (the third is the first slice: 
 | dropWithoutGuard | 0/120 |
 | noImplicitCommit | 40/120 (1, 2, 3, 4, 5, 6, ...) |
 | ddlAfterFailedCommit | 39/120 (1, 2, 3, 4, 5, 6, ...) |
+
+## ignoreFence after the settle-loop fix (2026-11-12, branch `applies`)
+
+The settle loop now yields and retries a decided transaction at most 10 times, then fails the read with `stuck:`
+(open problem 18). Seeds 1–40, same harnesses:
+
+| fault | replay | history | ddl-concurrent |
+|---|---|---|---|
+| none | 0/120 | 0/240 | 0/440 |
+| ignoreFence | 0/120 | 75/240 (1, 2, 3, 4, 5, 7, ...) | 80/440 (1, 2, 3, 4, 5, 6, ...) |
+
+No run hangs any more.

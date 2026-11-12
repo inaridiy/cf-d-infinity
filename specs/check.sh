@@ -245,6 +245,14 @@ red     $f m15_red_late_start servable       # 期限切れの後に届いた、
 witness $f m15_green witnessRecordedBeforeAndServed
 witness $f m15_green witnessRecordedAfterDeath   # 分割を進める側が枠を取った後で止まっても、DDL は記録できる
 
+echo "== M16 unique pending (不変条件 2 の UNIQUE の部分)"
+f=m16_unique_pending.qnt
+green   $f m16_green committedApplies
+red     $f m16_red_body_only committedApplies      # ほかの取引の intent を適用した状態で確かめない
+red     $f m16_red_intents_only committedApplies   # 本体の行だけの状態で確かめない
+witness $f m16_green witnessBothApplied
+for m in m16_red_body_only m16_red_intents_only; do tests $f $m; done
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect

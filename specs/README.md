@@ -88,6 +88,8 @@ red と green は同じ core モジュールを `const` フラグで切り替え
 | M14 `m14_red_no_lock` / `_no_check` / `_check_early` / `_no_drain` / `_untied` / `_commit_ts` | `noLostWrite` | 決めた設計から条件を 1 つずつ外す | 反例 | 反例は 15 / 11 / 14 / 14 / 17 / 15 手 | 反例 (6 本すべて) |
 | M15 `m15_green` | `servable` | 親、子、分割に関わらないシャード 1 つ (最新の版の適用に失敗して取り消すことがある)、版 0〜3、要求は最新の版で計画、枠の期限切れと、分割を進める側の停止あり | 2,524 | 21 | No violation |
 | M15 `m15_red_no_slot` / `_stale_begin` / `_early_release` / `_no_based_on` / `_late_start` | `servable` | 決めた設計から条件を 1 つずつ外す (`_no_slot` は 2026-11 までの実装) | 反例 | 反例は 12 / 16 / 12 / 13 / 14 手 | 反例 (5 本すべて) |
+| M16 `m16_green` | `committedApplies` | 行 3 つ、値 2 種類と不在、取引 2 つ (1 行か 2 行を書く)、決着と適用は別の段 | 7,197 | | No violation |
+| M16 `m16_red_body_only` / `_intents_only` | `committedApplies` | prepare の 2 つの状態の確かめ方から 1 つずつ外す | 反例 | 手で書いた run は 6 / 5 手 | 反例 (2 本とも) |
 
 witness (vacuous でないことの確認。`not(到達したい状態)` を invariant にして違反 = 到達可能):
 
@@ -118,6 +120,7 @@ witness (vacuous でないことの確認。`not(到達したい状態)` を inv
 | M13 | `witnessRetriedAndDone` / `witnessOtherDdlThenDone` | 確定を断られた区切りをやり直して最後まで進む / 別の接続の DDL の後で最後まで進む |
 | M14 | `witnessDroppedAfterWrites` / `witnessRefusedByCheck` | 別の接続の書き込みの後で DROP まで進む / copy の後の書き込みを見つけて禁止を取り消す |
 | M15 | `witnessRecordedBeforeAndServed` / `witnessRecordedAfterDeath` | 分割の前に記録された版で分割が始まり、子へ移った行がグループの到着で読める / 分割を進める側が枠を取った後で止まっても、期限で枠が消え、DDL が記録される |
+| M16 | `witnessBothApplied` | 2 つの取引がどちらも確定して、本体へ適用される |
 
 ## 新しく見つかった設計バグ (M1、green が破れた)
 
@@ -483,6 +486,19 @@ invariant は 4 つである。
 
 枠の終わり方。子が受け取り始める前の枠は、期限 (5 秒) で消える。分割を進める側が止まっても枠が残らないことは、`witnessRecordedAfterDeath` が示す。子が受け取り始めると期限を外す。分割は取り消せないので、子が受け取り終えたときにだけ枠を返し、止まった分割は Autoscaler が Meta の枠の一覧から再開する。
 モデルにないもの。受け取り始めた後に止まった分割の再開 (実装の試験 `test/split-slot.test.ts` が、止まる位置ごとに確かめる)。終わらない分割 (16 MB を超えるグループ) が枠を持ち続けると、DDL がいつまでも待つ。
+
+### M16 `m16_unique_pending.qnt` — 未確定の書き込みがあっても、確定した取引は UNIQUE を守って適用できる (不変条件 2)
+
+2026-11-12 に書いた。実装 (`uniquePending` と prepare の試適用) が前から持つ論法を、後から確かめた。prepare は、取引の書き込みが、本体の行だけの状態と、ほかの取引の intent をすべて適用した状態の、どちらでも UNIQUE を破らないことを確かめる。ほかの行の最後の値は、本体の版か、その行の intent の版のどちらかなので、両方で通れば、どの組み合わせで確定しても衝突しない。
+
+`committedApplies`: 確定した取引の適用が、UNIQUE を破らない。
+
+| 外した条件 | インスタンス | 反例 |
+|---|---|---|
+| ほかの取引の intent を適用した状態で確かめる | `m16_red_body_only` | 取引 1 が行 1 に値 1 を書く intent を置き、取引 2 が本体だけを見て行 2 に値 1 を書く。両方が確定する |
+| 本体の行だけの状態で確かめる | `m16_red_intents_only` | 本体の行 1 が値 1 を持ち、取引 1 がそれを消す intent を置く。取引 2 は取引 1 が確定した状態だけを見て行 2 に値 1 を書く。取引 1 が中止され、取引 2 が確定する |
+
+モデルにないもの。シャードをまたぐ UNIQUE (index の表の行も、同じ規則の intent になる)、照合順序と部分 index (実装は値を自前で比べず、SQLite に判定させる)、autocommit の書き込み (prepare と確定と適用が続けて起きる場合なので、このモデルの部分である)。
 
 ### M5b `m5b_live_migration.qnt` — pull 型ライブ再構成 (S2 + S3)
 

@@ -2,7 +2,7 @@
 // 1 シャードに収まる文はそのシャードの SQLite へ、それ以外は行を集めて Worker の SQLite へ渡す。
 import type { Catalog } from "../meta";
 import { ownerOf } from "../routing";
-import { encode, q, selectList } from "../shard/rows";
+import { encode, q, scanList } from "../shard/rows";
 import type { GlobalIndexDef, TableDef, Value, WritePlan } from "../types";
 import { SqlError } from "../types";
 import { bindParams, constant, ident, render, text, walk, type Node, type Params } from "./cst";
@@ -116,7 +116,7 @@ const PURE = new Set(["abs", "lower", "upper", "length", "coalesce", "ifnull", "
 
 /** 表の全行を読む走査。プランナが見落とした表を読み足すのに使う。 */
 export function fullScan(def: TableDef): Scan {
-  return { table: def, sql: `SELECT ${selectList(def)} FROM ${q(def.name)}`, params: [], sks: null, typed: untypedOf(def) };
+  return { table: def, sql: `SELECT ${scanList(def)} FROM ${q(def.name)}`, params: [], sks: null, typed: untypedOf(def) };
 }
 
 /** 利用者の文が名指しした表を探す。内部の表 (グローバル index の表) は、利用者の文からは存在しないものとして扱う。 */
@@ -508,7 +508,7 @@ function fullyPushed(s: Scope, ref: Ref, values: Value[]): boolean {
 function scanOf(s: Scope | null, ref: Ref | null, def: TableDef, values: Value[]): Scan {
   const name = ref?.alias ?? def.name;
   const conj = s && ref ? pushable(s, ref, values) : [];
-  const from = `SELECT ${selectList(def)} FROM ${q(def.name)} AS ${q(name)}`;
+  const from = `SELECT ${scanList(def)} FROM ${q(def.name)} AS ${q(name)}`;
   if (conj.length === 0) return { table: def, sql: from, params: [], sks: null, typed: untypedOf(def) };
   const parts = conj.map((c) => render(c, values));
   const where = parts.map((p) => `(${p.sql})`).join(" AND ");
