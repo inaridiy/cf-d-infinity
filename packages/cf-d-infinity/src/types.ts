@@ -406,6 +406,12 @@ export interface Faults {
   validateFromT?: boolean;
   /** 検証の代わりにロックの保持だけを信じる。ロックを失っても検出できない。 */
   trustLocks?: boolean;
+  /** 変更ログの世代を DROP しても logLowWater を上げない。消した commit は、再起動の後の検証から見えなくなる (モデル m8_red_drop)。 */
+  dropNoLowWater?: boolean;
+  /** anchor の取引記録の GC が、全参加者への phase 2 を終えていない committed の記録も消す (モデル m10_red_gc_undone)。 */
+  gcUndone?: boolean;
+  /** 分析への flush が、未解決の intent の prepare_ts で flush 時刻を抑えない (resolved ts を使わない。モデル m6_red_resolved)。 */
+  flushPastIntents?: boolean;
 }
 
 export class ConflictError extends Error {

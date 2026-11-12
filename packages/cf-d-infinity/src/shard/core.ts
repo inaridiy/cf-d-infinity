@@ -309,17 +309,22 @@ export class ShardCore implements ShardApi {
       low = Math.max(low, max);
     }
     if (drop.length > 0) {
-      this.logLowWater = low;
+      // dropNoLowWater は、消した範囲を窓の外として扱わない欠陥を戻す。索引の掃除もこの low-water に頼るので、一緒に外す。
+      const raise = !this.faults.dropNoLowWater;
+      if (raise) this.logLowWater = low;
       this.maxCommit = Math.max(this.maxCommit, low);
-      this.metaSet("log_low_water", low);
+      if (raise) this.metaSet("log_low_water", low);
       const keep = gens.filter((g) => !drop.includes(g));
       this.metaSet("log_gens", JSON.stringify(keep));
       for (const g of drop) this.b.exec(`DROP TABLE __log_g${g}`);
       // logLowWater 以下の索引は、検証が先に窓の外として abort するので要らない。
-      for (const [k, ts] of this.recent) if (ts <= low) this.recent.delete(k);
+      if (raise) for (const [k, ts] of this.recent) if (ts <= low) this.recent.delete(k);
     }
     const cutoff = now - (this.deps.txnRetainMs ?? TXN_RETAIN_MS);
-    this.b.exec(`DELETE FROM __txn WHERE done = 1 AND at < ?`, cutoff);
+    // 消すのは、全参加者へ決着を届け終えた (done = 1) 記録だけである。届け終えていない committed の記録を消すと、
+    // intent を持つ参加者が「記録なし」から tombstone を書き、確定した取引の書き込みを捨てる (specs/m10_txn_record_gc.qnt)。
+    if (this.faults.gcUndone) this.b.exec(`DELETE FROM __txn WHERE at < ?`, cutoff);
+    else this.b.exec(`DELETE FROM __txn WHERE done = 1 AND at < ?`, cutoff);
   }
 
   private metaGet(k: string): Value {
@@ -1972,7 +1977,10 @@ export class ShardCore implements ShardApi {
   async flush(req: { upTo?: Ts }): Promise<FlushRes> {
     const minPrepare = this.b.exec(`SELECT min(prepare_ts) v FROM __intents`)[0]?.v as number | null;
     const now = this.issue();
-    const limit = Math.min(req.upTo ?? now, minPrepare === null ? now : minPrepare - 1);
+    // 未解決の intent は、prepare_ts 以上のどこか (この flush の時刻以下のこともある) で確定する。flush 時刻をそれより前に抑えないと、
+    // 後で届いた phase 2 の commit が flush 済みの範囲に入り、分析へ送られない (specs/m6_watermark.qnt の m6_red_resolved)。
+    const resolved = minPrepare === null || this.faults.flushPastIntents ? now : minPrepare - 1;
+    const limit = Math.min(req.upTo ?? now, resolved);
     const rows = this.logScan(`WHERE commit_ts > ? AND commit_ts <= ?`, [this.flushedTs, limit]);
     const entries = rows.map((r) => ({
       commitTs: r.commit_ts as Ts, txn: r.txn as string, changes: decode<Change[]>(r.blob as string),
