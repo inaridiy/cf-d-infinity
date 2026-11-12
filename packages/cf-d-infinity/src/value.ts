@@ -126,7 +126,9 @@ function wrapOf(v: Value, binding: NumberBinding): "i" | "r" | null {
   return isIntegerValue(v) && (v | 0) !== v ? "i" : null;
 }
 
-const cache = new Map<string, { sql: string; columns: Map<string, string> | null }>();
+/** 包んだ文。文ごとに、包む引数の並び (mask) ごとに覚える。キーに文の全体をつなげた文字列を作ると、呼び出しのたびに費用がかかる。 */
+const cache = { real: new Map<string, Map<string, Rewritten>>(), integer: new Map<string, Map<string, Rewritten>>() };
+interface Rewritten { sql: string; columns: Map<string, string> }
 const CACHE_MAX = 512;
 
 /**
@@ -135,12 +137,28 @@ const CACHE_MAX = 512;
  * 列名にする。呼び出し側は、結果の列名をこれで戻す (`SELECT ?` の列名は `?` のまま)。
  */
 export function bindTyped(sql: string, params: Value[], binding: NumberBinding): { sql: string; params: Value[]; columns: Map<string, string> | null } {
-  const bound = params.map((v) => (isReal(v) ? v.real : v));
-  let mask = "";
-  for (const v of params) mask += wrapOf(v, binding) ?? "-";
-  if (!mask.includes("i") && !mask.includes("r")) return { sql, params: bound, columns: null };
-  const key = `${binding}\0${mask}\0${sql}`;
-  let hit = cache.get(key);
+  if (params.length === 0) return { sql, params, columns: null };
+  let mask: string | null = null;
+  let hasReal = false;
+  for (let i = 0; i < params.length; i++) {
+    const v = params[i]!;
+    if (isReal(v)) hasReal = true;
+    const w = wrapOf(v, binding);
+    if (w !== null) {
+      mask ??= "-".repeat(i);
+      mask += w;
+    } else if (mask !== null) mask += "-";
+  }
+  const bound = hasReal ? params.map((v) => (isReal(v) ? v.real : v)) : params;
+  if (mask === null) return { sql, params: bound, columns: null };
+  const bySql = cache[binding];
+  let byMask = bySql.get(sql);
+  if (!byMask) {
+    if (bySql.size >= CACHE_MAX) bySql.delete(bySql.keys().next().value!);
+    byMask = new Map();
+    bySql.set(sql, byMask);
+  }
+  let hit = byMask.get(mask);
   if (!hit) {
     let out = "";
     let at = 0;
@@ -156,8 +174,8 @@ export function bindTyped(sql: string, params: Value[], binding: NumberBinding):
     }
     out += sql.slice(at);
     hit = { sql: out, columns };
-    if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value!);
-    cache.set(key, hit);
+    if (byMask.size >= 16) byMask.delete(byMask.keys().next().value!);
+    byMask.set(mask, hit);
   }
   return { sql: hit.sql, params: bound, columns: hit.columns };
 }

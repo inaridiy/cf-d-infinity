@@ -77,28 +77,6 @@ describe("change log retention", () => {
     expect(attempt).toBeGreaterThan(1);
     expect((await db.query("SELECT n FROM users WHERE tenant_id = 1 AND id = 2")).rows[0]!.n).toBe(1000);
   });
-
-  it("migrates a shard that still has the old single __log table", async () => {
-    const { c, db } = await setup();
-    await db.query("INSERT INTO users(tenant_id,id,n) VALUES (1,1,0)");
-    const owner = c.shardIds.find((id) => logRows(c, id) > 0)!;
-    const b = c.backends.get(owner)!;
-    // 旧形式へ戻す。
-    const old = rowsOf(b);
-    for (const t of b.exec(`SELECT name FROM sqlite_master WHERE type = 'table' AND name GLOB '__log_g*'`)) b.exec(`DROP TABLE ${t.name as string}`);
-    b.exec(`CREATE TABLE __log(commit_ts INTEGER NOT NULL, txn TEXT NOT NULL, blob TEXT NOT NULL, PRIMARY KEY(commit_ts, txn))`);
-    for (const r of old) b.exec(`INSERT INTO __log VALUES (?, ?, ?)`, r.commit_ts!, r.txn!, r.blob!);
-    b.exec(`DELETE FROM __meta WHERE k IN ('log_gens', 'txn_legacy_at')`);
-    c.restart(owner);
-    expect(logRows(c, owner)).toBe(old.length);
-    expect(count(c, owner, `SELECT count(*) n FROM sqlite_master WHERE name = '__log_g0'`)).toBe(1);
-    for (let i = 0; i < 40; i++) {
-      c.time += 50;
-      await db.query("UPDATE users SET n = n + 1 WHERE tenant_id = 1 AND id = 1");
-    }
-    expect(count(c, owner, `SELECT count(*) n FROM sqlite_master WHERE name = '__log_g0'`)).toBe(0);
-    expect((await db.query("SELECT n FROM users WHERE tenant_id = 1 AND id = 1")).rows[0]!.n).toBe(40);
-  });
 });
 
 describe("transaction record retention", () => {

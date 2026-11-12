@@ -261,6 +261,11 @@ export function injectedFault(): { name: string; side: "shard" | "client" | "spa
 }
 
 export interface SimOptions {
+  /**
+   * 保存データから起動する (test/upgrade.test.ts)。Meta とシャードの SQLite をそのまま使う。シャードの一覧は shards の鍵である。
+   * 指定したときは、shards (数) は無視する。
+   */
+  stored?: { meta: DatabaseSync; shards: Map<string, DatabaseSync> };
   shards?: number;
   faults?: Faults;
   skewMs?: (id: string) => number;
@@ -310,6 +315,8 @@ export class SimCluster implements Cluster {
   /** 宣言した範囲の外の行に依存していた文。空でなければ、取引の検証が成り立っていない。 */
   spanEscapes: SpanEscape[] = [];
   backends = new Map<string, SqliteBackend>();
+  /** Meta の SQLite。 */
+  metaBackend: SqliteBackend;
   meta: MetaCore;
   background = new Set<Promise<unknown>>();
   /** 送ったが、まだ応答も失敗も返っていない RPC。終わらない実行で、どの要求が返らないのかを知るのに使う。 */
@@ -323,8 +330,9 @@ export class SimCluster implements Cluster {
     this.clientFaults = injected?.side === "client" ? { [injected.name]: true } : undefined;
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
     this.runtime = this.virtual ?? systemRuntime;
-    this.shardIds = Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
-    this.meta = new MetaCore(new SqliteBackend(), this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs });
+    this.shardIds = o.stored ? [...o.stored.shards.keys()] : Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
+    this.metaBackend = new SqliteBackend(o.stored?.meta);
+    this.meta = new MetaCore(this.metaBackend, this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs });
     for (const id of this.shardIds) this.core(id);
   }
 
@@ -383,7 +391,7 @@ export class SimCluster implements Cluster {
   /** DO と同じく、触った時に存在し始める。 */
   private core(id: string): ShardCore {
     if (!this.cores.has(id)) {
-      const b = new SqliteBackend();
+      const b = new SqliteBackend(this.o.stored?.shards.get(id));
       b.rt = this.runtime;
       this.backends.set(id, b);
       this.boot(id);
