@@ -22,6 +22,25 @@ Sharding usually leaks into the application. It has to know the shard key, stay 
   - Values are compared together with their SQLite storage class (INTEGER and REAL included).
   - The counterexamples that the formal models find are replayed step by step against the real code in a deterministic simulator.
 
+See it on your machine (no Cloudflare account; real workerd and Durable Objects through Miniflare):
+
+```sh
+git clone https://github.com/inaridiy/cf-d-infinity.git && cd cf-d-infinity/packages/cf-d-infinity
+npm install && npm run demo
+```
+
+The demo starts with one shard. Six writers keep moving money between 200 accounts in interactive transactions, while the shards are split from 1 to 2, 4 and 8. A watcher keeps checking two things. Every snapshot must total the same amount, and an account owner, a `UNIQUE` column that the shard key does not contain, must never be reused across shards. It prints what it checked, and the transfer rate per second after the last split (a short stall there is a known open item):
+
+```
+shards:              1 → 8, split under load
+transfers committed: 3478 transactions, most of them across shards after the first split (11 conflicts retried)
+snapshots checked:   264, every one totalling 20000 (0 retried during a split)
+duplicates refused:  264 attempts to reuse an owner across shards
+final:               total 20000, 200 accounts, 200 distinct owners
+
+no answer changed while the data moved.
+```
+
 Distributed SQL systems such as CockroachDB, TiDB, YugabyteDB and Spanner bring transactions and SQL across many machines, for Postgres or MySQL dialects, on clusters of nodes that you or a vendor run. D∞ brings that shape to SQLite with no nodes at all. Each shard is a Durable Object holding ordinary SQLite, the query layer is your Worker, and the whole database lives in your own Cloudflare account.
 
 ## Key features
