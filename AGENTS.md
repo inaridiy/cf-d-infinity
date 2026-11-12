@@ -56,5 +56,7 @@ in the same commit as the change. How plans are written here: `.agents/PLANS.md`
   repository root (about ten minutes; `--quick` for typecheck and tests only). When `specs/` differs from `main` it
   also runs the formal models (about an hour). GitHub Actions does not run by itself: it is slow and loads GitHub
   for nothing. It runs only when started by hand.
+- `scripts/cloudflare-check.sh` deploys a throwaway Worker, runs `test/workerd.test.ts` against it and deletes it. It
+  deploys to Cloudflare, so run it only when the owner asks (rule 6).
 - Changes go to `main` through a pull request and a squash merge once `scripts/check.sh` has passed locally. Finish
   and verify before pushing, and push once.

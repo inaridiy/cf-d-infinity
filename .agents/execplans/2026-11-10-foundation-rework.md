@@ -60,12 +60,12 @@ npm への公開は、素地ができるまで行わない。
 - ブランチ `maintenance-slot` (PR #17) は `main` に入った。
 - ブランチ `oracle-crossing` (PR #18) は `main` に入った。
 - ブランチ `early-line` が、Early 版の線と、その順番の 1 である。
-- 夜間の実行は、持ち主の了承 (2026-11-12) を得て、この計算機の crontab に入れた。毎晩 2 時に `scripts/nightly.sh --hours 4 --procs 6 --seeds 300` が `origin/main` を流し、結果を `~/.dinf-nightly/<日付>/summary.txt` に残す。完了の条件 8 の 2 週間は、2026-11-13 の晩から数える。
-- 本物の Cloudflare での確認は、持ち主の了承 (2026-11-12) を得た。条件は「無料枠は考慮せず、1 ドルは超えない」。一時的に置いて確かめ、確かめた後に消す。まだ流していない。
+- 夜間の実行は、持ち主の了承 (2026-11-12) を得て、この計算機の crontab に入れた。毎晩、日本時間の 2 時に (この計算機の時計は UTC なので、crontab では 17 時) `scripts/nightly.sh --hours 4 --procs 6 --seeds 300` が `origin/main` を流し、結果を `~/.dinf-nightly/<UTC の日付>/summary.txt` に残す。完了の条件 8 の 2 週間は、2026-11-12 17:00 UTC (日本時間 11-13 の 2 時) の回から数える。
+- 本物の Cloudflare での確認は、持ち主の了承 (2026-11-12) を得て、2 回流した (`scripts/cloudflare-check.sh`)。条件は「無料枠は考慮せず、1 ドルは超えない」と「CPU は少なめ」。2 回目 (`634832d`) は、`test/workerd.test.ts` の 25 件がすべて通った。期限より長い index の作成と、`/admin/split` の分割の枠を含む。置いた Worker は消し、残っていないことを API で確かめた。記録は `.agents/execplans/evidence/2026-11-12-cloudflare-run.md` にある。公開の条件 4 は、そこに書いた「確かめていないこと」を残して満たした。
 - ブランチ `wip/gather-missing-rows` (`45e9b57`) は、前の作業者の未完成の変更である。採らなかった (Decision Log の 2026-11-11)。ローカルにだけある。
 - ブランチ `foundation-3` (ローカル) は、PR #8 と `wip/gather-missing-rows` に分ける前の並びで、もう使わない。
 - `packages/cf-d-infinity/DEVELOPMENT.md` は、この一連の変更を反映していない。`AGENTS.md` にそう書いてある。
-- 次にやるのは、本物の Cloudflare での確認 (公開の条件 4) と、「Early 版の線」の「順番」の 2 である。
+- 次にやるのは、「Early 版の線」の「順番」の 2 である。
 
 ### 欠陥の表 (2026-11-12、`f393657`)
 
@@ -113,7 +113,7 @@ UNIQUE の列を引く読みの経路 (Plan of Work 7)、表の作り直しで�
 1. 完了の条件 (下の Validation and Acceptance) の 1、2、3、6、7、8 を満たす。1 の「重大」は、安全性 (直列化可能性、原子性、データの消失、index と行の不一致) を壊す欠陥とする。重大な欠陥のスイッチは、乱択の検査のどれかが seed 1 から 40 で 1 回以上見つけるか、決定的な試験だけで確かめる理由を表に書く。
 2. 公開した後に変えられない形式を固める。行のキー文字列、変更ログ、intent、`__ddl` の項目、範囲表、`__meta`、Hrana の baton、`PROTOCOL_VERSION` を並べ、Early 版で固定するか、作り直せるか (index の表など) を書く。キー文字列を作る関数を 1 つにする (完了の条件 6)。公開する版が書いた保存データを試験の材料に残し、以後のコードがそれを開けることを確かめる。
 3. 利用者に見える既知の欠陥を、直すか、数字と一緒に文書に書く: 未解決の問題 18 と不変条件 2 (検査を先に作る)、6 (費用)、11 (広い seed で掃引する)。
-4. 本物の Cloudflare で 1 度流し、PR #16 以降の仕組み (書き込み禁止と期限の延長、DROP の守り、分割の枠、シャードから Meta への呼び出し) が動くことを確かめる。持ち主の了承の後である。
+4. 本物の Cloudflare で 1 度流し、PR #16 以降の仕組み (書き込み禁止と期限の延長、DROP の守り、分割の枠、シャードから Meta への呼び出し) が動くことを確かめる。持ち主の了承の後である。(2026-11-12 に済んだ。`scripts/cloudflare-check.sh`。確かめていないことは記録に書いた。形式や仕組みを変えたら、公開の前にもう 1 度流す)
 5. 文書を直す (`DEVELOPMENT.md`、`docs/roadmap.md`、README)。HTTP と管理の入口の安全を確かめる。drizzle-kit の本物の出力で確かめる (未解決の問題 10)。履歴の中の秘密と個人の情報、ライセンス、npm の名前を確かめる。
 6. 持ち主に公開の了承を求める。
 
@@ -318,6 +318,7 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 - [ ] 6 の後半の残り。不変条件 2
 - [ ] 7. UNIQUE の列を引く読みの経路 (モデルを書いてから)
 - [ ] 8. 文書の全面の更新 (`DEVELOPMENT.md` を含む)、実際の移行の道具が出す文での確認、慣らし運転
+- [x] (2026-11-12) Early 版の線を引いた。夜間の実行を crontab に入れた。本物の Cloudflare で `test/workerd.test.ts` を流した (公開の条件 4。`.agents/execplans/evidence/2026-11-12-cloudflare-run.md`)
 
 ## 未解決の問題
 
@@ -661,7 +662,7 @@ main へ入れる前には、リポジトリの直下で `scripts/check.sh` を�
 - `main` へは、手元で `scripts/check.sh` を流して通ってから、PR を作って squash merge する。`specs/` を変えたときは `scripts/check.sh --models` も流す。GitHub の CI は、push や PR では走らない。
 - 前の作業者の未完成の変更は `wip/gather-missing-rows` (`45e9b57`) にある。ローカルにだけあり、push していない。
 - `foundation-3` (ローカル) は、PR #8 と `wip/gather-missing-rows` に分ける前の並びである。`wip/gather-missing-rows` が残っていれば消してよい。
-- Cloudflare 上に、この作業のためのリソースは残していない。
+- Cloudflare 上に、この作業のためのリソースは残していない。`scripts/cloudflare-check.sh` は、置いた Worker (`dinf-check-<乱数>`) を終わりに消す。途中で止めたときは、`npx wrangler delete --name <名前> --force` で消す。
 - 証拠 (Codex の報告、試験の出力) は `.agents/execplans/evidence/` に置く。
 
 ## Outcomes & Retrospective (途中)
