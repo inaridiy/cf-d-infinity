@@ -2,7 +2,7 @@
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { integer, sqliteTable } from "drizzle-orm/sqlite-core";
-import { connect, type Connection } from "../../src/binding";
+import { connect, drizzleMigrationsTable, type Connection } from "../../src/binding";
 
 export { DinfAutoscaler, DinfDatabase, DinfMeta, DinfShard } from "../../src/cloudflare";
 
@@ -84,6 +84,36 @@ const scenarios: Record<string, (db: Connection) => Promise<unknown>> = {
       orm.select().from(acc).orderBy(acc.id),
     ]);
     return { before, after: batch[1] };
+  },
+  // Drizzle の D1 のドライバの移行が送るのと同じ形の batch。移行のファイルは node:fs で読むので、workerd の中では
+  // Drizzle の migrate を呼べない。文の並びを、そのまま batch で送る (DDL の位置で区切られる)。
+  async migrate(db) {
+    await db.prepare(drizzleMigrationsTable()).run();
+    const run = (sql: string[], tag: string) => db.batch([
+      ...sql.map((s) => db.prepare(s)),
+      db.prepare(`INSERT INTO "__drizzle_migrations" ("hash", "created_at") VALUES ('${tag}', ${tag.length})`),
+    ]);
+    await run([
+      "CREATE TABLE `m_users` (`id` integer PRIMARY KEY NOT NULL, `email` text NOT NULL, `name` text)",
+      "CREATE UNIQUE INDEX `m_users_email_unique` ON `m_users` (`email`)",
+    ], "0000");
+    await db.prepare("INSERT INTO m_users(id, email, name) VALUES (1, 'a@x', 'A'), (2, 'b@x', NULL), (3, 'c@x', 'C')").run();
+    // 表の作り直し。DROP は、取引が読んだ表を消すので、書き込みを止めて確かめてから消す。index は、行のある表に作り直す。
+    await run([
+      "PRAGMA foreign_keys=OFF",
+      "CREATE TABLE `__new_m_users` (`id` integer PRIMARY KEY NOT NULL, `email` text NOT NULL, `name` text DEFAULT '' NOT NULL)",
+      "INSERT INTO `__new_m_users`(\"id\", \"email\", \"name\") SELECT \"id\", \"email\", coalesce(\"name\", '') FROM `m_users`",
+      "DROP TABLE `m_users`",
+      "ALTER TABLE `__new_m_users` RENAME TO `m_users`",
+      "PRAGMA foreign_keys=ON",
+      "CREATE UNIQUE INDEX `m_users_email_unique` ON `m_users` (`email`)",
+    ], "0001");
+    const duplicate = await db.prepare("INSERT INTO m_users(id, email, name) VALUES (9, 'a@x', 'Z')").run().then(() => "ok", (e: Error) => e.message);
+    return {
+      rows: (await db.prepare("SELECT id, email, name FROM m_users ORDER BY id").all()).results,
+      journal: await db.prepare('SELECT count(*) AS n FROM "__drizzle_migrations"').first("n"),
+      duplicate,
+    };
   },
   async session(db) {
     const s = db.withSession();

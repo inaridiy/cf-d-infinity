@@ -4,9 +4,12 @@ import { readFileSync } from "node:fs";
 import { createClient } from "@libsql/client";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/libsql";
+import { migrate } from "drizzle-orm/libsql/migrator";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { drizzleMigrationsTable } from "../src/binding";
+import { ADD, INIT, REBUILD, migrations } from "./drizzle-fixtures";
 
 let mf: Miniflare;
 
@@ -183,6 +186,38 @@ describe("a stock @libsql/client against the Worker, changing only the URL", () 
       await tx.delete(t).where(eq(t.name, "x"));
     });
     expect((await orm.select().from(t).orderBy(t.name)).map((r) => r.name)).toEqual(["y", "z"]);
+  });
+});
+
+// PR #16 以降の仕組みを、本物の workerd と DO で通す。取引の中の DDL (先の確定)、行のある表への UNIQUE の index
+// (書き込み禁止と期限の延長)、DROP の守り (禁止、確認、DROP)。どれもシャードから Meta を呼ぶ。
+describe("Drizzle's libSQL migrator on workerd", () => {
+  const connectHttp = async () => createClient({ url: (await mf.ready).toString().replace(/\/$/, ""), authToken: "test" });
+
+  it("applies migrations that create a UNIQUE index and rebuild a table, and keeps the rows", async () => {
+    const client = await connectHttp();
+    await client.execute(drizzleMigrationsTable());
+    const folder = (list: typeof INIT[]) => migrations(list);
+    await migrate(drizzle(client), { migrationsFolder: folder([INIT, ADD]) });
+    await client.execute("INSERT INTO users(id, email, name, age) VALUES (1, 'a@x', 'A', 30), (2, 'b@x', NULL, 40)");
+    await migrate(drizzle(client), { migrationsFolder: folder([INIT, ADD, REBUILD]) });
+    const rows = await client.execute("SELECT id, email, name, age FROM users ORDER BY id");
+    expect(rows.rows.map((r) => ({ ...r }))).toEqual([{ id: 1, email: "a@x", name: "A", age: 30 }, { id: 2, email: "b@x", name: "", age: 40 }]);
+    expect((await client.execute("SELECT count(*) AS n FROM __drizzle_migrations")).rows[0]!.n).toBe(3);
+    await expect(client.execute("INSERT INTO users(id, email, name) VALUES (9, 'a@x', 'Z')")).rejects.toThrow(/UNIQUE constraint failed/);
+  });
+
+  it("runs an interactive transaction that changes the schema, across HTTP requests", async () => {
+    const client = await connectHttp();
+    const tx = await client.transaction("write");
+    await tx.execute("CREATE TABLE tx_ddl(id INTEGER PRIMARY KEY, v INTEGER)");
+    await tx.execute("INSERT INTO tx_ddl VALUES (1, 1)");
+    await tx.execute("CREATE TABLE tx_ddl_new(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)");
+    await tx.execute("INSERT INTO tx_ddl_new(id, v) SELECT id, v FROM tx_ddl");
+    await tx.execute("DROP TABLE tx_ddl");
+    await tx.execute("ALTER TABLE tx_ddl_new RENAME TO tx_ddl");
+    await tx.commit();
+    expect((await client.execute("SELECT id, v, w FROM tx_ddl")).rows.map((r) => ({ ...r }))).toEqual([{ id: 1, v: 1, w: null }]);
   });
 });
 
