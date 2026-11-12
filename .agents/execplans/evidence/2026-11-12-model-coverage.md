@@ -12,8 +12,8 @@ Survey made read-only by a subagent on `fa1a2cd`; rows `m5b_red_range`, `m5b_red
 counterexample.
 
 Categories:
-- A: the implementation has the guard, and a replay test exists (47)
-- B: implemented guard, fault switch exists, no deterministic replay (4)
+- A: the implementation has the guard, and a replay test exists (47 on fa1a2cd; 51 after the B rows were replayed on 2026-11-12)
+- B: implemented guard, fault switch exists, no deterministic replay (4 on fa1a2cd; 0 after 2026-11-12)
 - C: implemented guard, no fault switch (17)
 - D: a design alternative the implementation never had or no longer has; no switch needed (8)
 
@@ -31,8 +31,8 @@ Categories:
 | m5_red_switch | old push handoff: route switch before fence gives two owners | none (nearest: ignoreFence) | none (nearest: migration:223, symptom only) | D |
 | m5_red_intents | handoff does not carry intents | dropIntentsOnMove | migration:182 | A |
 | m5b_red_s3 | move as a transaction; child answers T<m by undo | servePastMove | migration:202 | A |
-| m5b_red_s3_parent | parent answers T<m read of a moved group | ignoreFence (broader) | none (migration:223 is a write) | B |
-| m5b_red_p2 | phase 2 applied at parent, not forwarded | applyAfterMoved | none (:170 drives the window variant) | B |
+| m5b_red_s3_parent | parent answers T<m read of a moved group | ignoreFence (broader) | migration ("m5b_red_s3_parent: a parent that ignores the fence answers a read ..."; added 2026-11-12) | A |
+| m5b_red_p2 | phase 2 applied at parent, not forwarded | applyAfterMoved | migration ("m5b_red_p2: applying at the parent after the group arrived ..."; added 2026-11-12) | A |
 | m5b_red_p2_window | phase 2 applied at parent while the pull reply is in flight | applyAfterMoved | migration:170 | A |
 | m5b_red_intents | pull does not carry intents | dropIntentsOnMove | migration:182 | A |
 | m5b_red_range | finishing a move does not pass the parent clock to the child | finishWithoutClock | move-timestamp:54 | A |
