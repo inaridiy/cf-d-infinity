@@ -1,5 +1,7 @@
 // drizzle-kit が書き出す形の移行。本物の Drizzle の移行 (drizzle-orm の migrate) に流す。
-// 作り直しの移行の形は、drizzle-kit の出力を記憶で書いたもので、drizzle-kit 自体は動かしていない (計画書の未解決の問題 10)。
+// 作り直しの移行の形は、drizzle-kit の出力を記憶で書いたものである。本物の drizzle-kit 0.31 の出力は test/drizzle-kit.test.ts で
+// 流している (計画書の未解決の問題 10)。本物との違いは 1 つ: 本物の INSERT ... SELECT は列をそのまま写し、`coalesce` を付けない。
+// ここでは NULL の行も写す場合を試すために付けてある。
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
