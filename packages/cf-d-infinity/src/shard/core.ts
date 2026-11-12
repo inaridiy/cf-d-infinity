@@ -1828,7 +1828,9 @@ export class ShardCore implements ShardApi {
       `INSERT INTO __txn(txn, status, c, participants, at) VALUES (?, 'committed', ?, ?, ?)`,
       req.txn, c, JSON.stringify(req.participants.map((p) => p.shard)), this.deps.clock.now(),
     );
-    await this.b.sync(); // record の確定を待ってから phase 2 を送る。
+    // record の確定を待ってから phase 2 と応答を送る。先に送ると、確定の前に再起動したとき、記録が消えて
+    // 照会した参加者が tombstone を書き、phase 2 を受けた参加者とで決着が割れる (specs/m3_anchor_recovery.qnt の m3_red)。
+    if (!this.faults.phase2BeforeSync) await this.b.sync();
     this.deps.scheduleRedrive?.();
     this.spawn(this.phase2(req.txn, c, req.participants));
     return { ok: true, c };

@@ -37,7 +37,7 @@ const SHARD = [
   "anchorNoAbsorb", "skipReadOnlyPrepare", "refreshNoBump", "predicateProtected", "ignoreIntentsInValidation", "readerTimeoutPass",
   "hlcNoCeiling", "rowwiseUndo", "pushAfterDecide", "applyAfterMoved", "triggerCapture", "dropIntentsOnMove", "servePastMove",
   "ignoreFence", "staleWideRead", "finishWithoutClock", "ignoreTableLock", "publishWithoutClock", "validateFromT", "trustLocks",
-  "dropNoLowWater", "gcUndone", "flushPastIntents",
+  "phase2BeforeSync", "dropNoLowWater", "gcUndone", "flushPastIntents",
 ];
 const OTHER = ["rowSpanDespiteUnique", "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit"];
 const FAULTS = ["none", ...(only ?? [...SHARD, ...OTHER])];

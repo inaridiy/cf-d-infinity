@@ -26,7 +26,7 @@ Categories:
 | m1_red_e | validation ignores others' intents (cross-shard write skew) | ignoreIntentsInValidation | counterexamples:94 | A |
 | m1_red_g | push accepted after c is decided (refresh window) | pushAfterDecide | counterexamples:307 | A |
 | m2_red | reader passes an in-flight intent on timeout | readerTimeoutPass | counterexamples:66 | A |
-| m3_red | phase 2 and reply sent before anchor record is synced | none (guard at core.ts:1825) | none (sim's sync never loses writes) | C |
+| m3_red | phase 2 and reply sent before anchor record is synced | phase2BeforeSync | counterexamples ("the anchor syncs its commit record before phase 2 (m3_red)"; uses `c.loseUnsynced(id)`, note 3; added 2026-11-12) | A |
 | m4_red | only commit ts persisted, so HLC falls behind served read | hlcNoCeiling | counterexamples:242 | A |
 | m5_red_switch | old push handoff: route switch before fence gives two owners | none (nearest: ignoreFence) | none (nearest: migration:223, symptom only) | D |
 | m5_red_intents | handoff does not carry intents | dropIntentsOnMove | migration:182 | A |
@@ -37,14 +37,14 @@ Categories:
 | m5b_red_intents | pull does not carry intents | dropIntentsOnMove | migration:182 | A |
 | m5b_red_range | finishing a move does not pass the parent clock to the child | finishWithoutClock | move-timestamp:54 | A |
 | m6_red_dirty | dirty reported only on intent write | none | none | D |
-| m6_red_resolved | flush at HLC instead of resolved ts | none (guard at core.ts:1972-1974) | none | C |
+| m6_red_resolved | flush at HLC instead of resolved ts | flushPastIntents | analytics ("the analytics flush stops below unresolved intents (m6_red_resolved)"; added 2026-11-12). The analytics path is not wired into the deployed Worker | A |
 | m6_red_skew | clock skew plus report delay exceeds MARGIN | none | none | D |
 | m7_red | undo-based restore to W | none | none | D |
 | m1b_green (freshReadPicked) | autocommit read takes T before settling intents | noRealtimeBump (multi-shard path only) | counterexamples:320 (1-shard, fixed); review-regressions:144 | A |
 | m1b_green_bump (freshReadSeq) | claim 3 not promised for a transaction's 2nd statement (scope limit) | none | none | D |
 | m1b_red_ra | read-time refresh does not advance HLC | refreshNoBump | counterexamples ("a read-time refresh advances the clock", via log truncation; added 2026-11-12) | A |
 | m1b_red_rc | T advanced after a failed read refresh | none | review2-regressions:18 (fixed, indirect) | A |
-| m8_red_drop | generation DROP does not raise logLowWater | none | none | C |
+| m8_red_drop | generation DROP does not raise logLowWater | dropNoLowWater | gc ("dropping a log generation raises the conflict window (m8_red_drop)"; added 2026-11-12) | A |
 | m9_red_ro_skip | read-only transaction with locked reads skips validation | none (nearest: skipReadOnlyPrepare) | none | C |
 | m9_red_second_f | 2nd DML on a row resets since to the new F | none | none | C |
 | m9_red_imm_read_t | IMMEDIATE key read at T, validated from F | none | none | C |
@@ -57,7 +57,7 @@ Categories:
 | m9_impl_wake | lock-TTL expiry never wakes the waiter | none | counterexamples:498 (fixed) | A |
 | m9_red_leave_silent | woken waiter leaves without waking the next one | none | counterexamples:510 (fixed) | A |
 | m10_red_no_guard | no COMMIT age check; commit after tombstone GC | none | gc:102 (fixed, guard-only) | A |
-| m10_red_gc_undone | committed record GC'd before all participants applied | none | none | C |
+| m10_red_gc_undone | committed record GC'd before all participants applied | gcUndone | gc ("the anchor keeps a committed record until every participant applied it (m10_red_gc_undone)"; added 2026-11-12) | A |
 | m10_red_guard_too_long | accepted COMMIT age G ≥ retention R | none | gc:102 (pins G=R/2) | A |
 | m11_impl | all five M11 fixes removed | noSchemaRecheck+ddlIgnoresIntents+ignoreTableLock (BUG-1 none) | ddl-concurrent:334–509, one test per BUG | A |
 | m11_impl_wait | BUG-3: no version recheck after lock wait | noSchemaRecheck | ddl-concurrent:416 | A |
@@ -112,7 +112,7 @@ Categories:
 1. A also covers rows with no switch when a test replays the scenario on fixed code ("fixed"). Such a replay shows the
    guard works on that ordering but cannot show that the check would notice the guard missing.
 2. `m11_impl_inflight` needs both switches on; the specs README says either fix alone closes it.
-3. `m3_red` cannot be replayed: the simulator's `sync()` never loses unsynced writes on restart. Replaying it needs a
-   backend that drops writes not yet synced when the shard restarts.
+3. `m3_red` is replayed with `SimCluster.loseUnsynced(id)` (added 2026-11-12): on that shard, writes that `sync()` has not
+   confirmed are rolled back by `c.restart(id)`. By default the simulator never loses writes on restart.
 4. `noImplicitCommit` and `ddlAfterFailedCommit` have no "put back" test; the `FAULT=` sweep and fixed-code tests use them.
 5. `test/open/*` covers open availability and cost problems and replays no red module.

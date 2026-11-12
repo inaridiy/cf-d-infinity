@@ -638,3 +638,66 @@ describe("anchor crash", () => {
     for (const b of c.backends.values()) expect(b.exec("SELECT count(*) c FROM __intents")[0]!.c).toBe(0);
   });
 });
+
+// specs/m3_anchor_recovery.qnt の m3_red。anchor は、committed の記録の確定 (sync) を待ってから phase 2 と応答を送る。
+// モデルの反例 (counterexampleTest) と同じ順で流す: 全参加者の ack を受けて、anchor が committed の記録を書く (未確定)。
+// 参加者 1 へ phase 2 が届いて適用される。anchor が再起動し、確定していない記録を失う。参加者 2 の intent を見た読み手が照会する。
+// 記録がなく in-flight でもないので tombstone が書かれ、参加者 2 は intent を捨てる。参加者 1 にだけ書き込みが残る。
+// シミュレータの SQLite は既定では書き込みを失わないので、anchor のシャードで、確定していない書き込みを再起動で失わせる (loseUnsynced)。
+// anchor (s0) は読むだけの参加者にして、モデルと同じく書き込みを持たせない。参加者 1 は s1、参加者 2 は s2 である。
+describe("the anchor syncs its commit record before phase 2 (m3_red)", () => {
+  const scenario = async (faults: Faults) => {
+    const { c, db, A, B, C } = await cluster(faults);
+    await seed(db, A);
+    await seed(db, B);
+    await seed(db, C);
+    c.loseUnsynced("s0"); // ここまでの書き込みは確定済みとする
+    const w = await db.begin();
+    await getN(w, A); // 書き込みで守られていない読みなので、anchor は s0 になる
+    await setN(w, B, 1);
+    await setN(w, C, 1);
+    // 参加者 2 への phase 2 は届かない。参加者 1 が phase 2 を適用した直後に anchor が再起動する。
+    let restarted = false;
+    let onRestart!: () => void;
+    const restartDone = new Promise<void>((r) => (onRestart = r));
+    c.net.drop = (m) => m.method === "finalize" && m.to === "s2";
+    c.net.reply = (m) => {
+      if (m.method === "finalize" && m.to === "s1" && !restarted) {
+        restarted = true;
+        c.restart("s0");
+        onRestart();
+      }
+    };
+    const out = await w.commit().then(() => "committed", (e: Error) => e.message);
+    // s2 への phase 2 が落ちた時点で phase 2 の処理は終わるので、settle だけでは s1 の適用を待てない。
+    await restartDone;
+    await c.settle();
+    c.net.drop = () => false;
+    c.net.reply = () => {};
+    const commit = c.net.log.find((m) => m.method === "commit" && m.from === "client")!;
+    const txn = (commit.req as { txn: string }).txn;
+    // 読み手が s2 の行を読み、intent を見つけて anchor に照会する。
+    const n = { s1: await getN(new Db(c), B), s2: await getN(new Db(c), C) };
+    const record = c.backends.get("s0")!.exec("SELECT status FROM __txn WHERE txn = ?", txn);
+    return { anchor: commit.to, restarted, out, n, record };
+  };
+
+  it("put back: phase 2 before the sync splits the outcome when the anchor restarts", async () => {
+    const s = await scenario({ phase2BeforeSync: true });
+    expect(s.anchor).toBe("s0");
+    expect(s.restarted).toBe(true);
+    // 参加者 1 は適用済み、参加者 2 は intent を捨てた。記録は tombstone で、Worker は確定したと聞いている。
+    expect(s.n).toEqual({ s1: 1, s2: 0 });
+    expect(s.record).toEqual([{ status: "aborted" }]);
+    expect(s.out).toBe("committed");
+  });
+
+  it("keeps the record across the restart, so the reader applies the write on the other participant", async () => {
+    const s = await scenario({});
+    expect(s.anchor).toBe("s0");
+    expect(s.restarted).toBe(true);
+    expect(s.n).toEqual({ s1: 1, s2: 1 });
+    expect(s.record).toEqual([{ status: "committed" }]);
+    expect(s.out).toBe("committed");
+  });
+});

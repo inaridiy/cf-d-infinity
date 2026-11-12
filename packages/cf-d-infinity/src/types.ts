@@ -406,6 +406,8 @@ export interface Faults {
   validateFromT?: boolean;
   /** 検証の代わりにロックの保持だけを信じる。ロックを失っても検出できない。 */
   trustLocks?: boolean;
+  /** anchor が、committed の記録の確定 (sync) を待たずに phase 2 と応答を送る (モデル m3_red)。 */
+  phase2BeforeSync?: boolean;
   /** 変更ログの世代を DROP しても logLowWater を上げない。消した commit は、再起動の後の検証から見えなくなる (モデル m8_red_drop)。 */
   dropNoLowWater?: boolean;
   /** anchor の取引記録の GC が、全参加者への phase 2 を終えていない committed の記録も消す (モデル m10_red_gc_undone)。 */
