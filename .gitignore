@@ -10,3 +10,4 @@ specs/_apalache-out/
 specs/tmp/
 packages/cf-d-infinity/bench/results/*.history.json.gz
 .DS_Store
+.claude/worktrees/
