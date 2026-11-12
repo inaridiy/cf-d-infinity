@@ -323,6 +323,32 @@ describe("DDL through the HTTP /ddl endpoint", () => {
   });
 });
 
+// 書き込み禁止の期限の延長を、本物の DO で通す。期限 (meta.ts の INDEX_LEASE_MS、5 秒) より長くかかる index の作成は、
+// 延長が周期で続かなければ、Meta に取り消されて失敗する。長くかからせるために、作る前に、その表に書いた取引を開いたままにする。
+describe("a UNIQUE index build that outlives one lease", () => {
+  it("keeps its write lock past the lease by renewing it, and ends with the index and the rows agreeing", async () => {
+    const client = createClient({ url: await base(), authToken: TOKEN });
+    await client.execute("CREATE TABLE lease_t(id INTEGER PRIMARY KEY, email TEXT)");
+    await client.execute("INSERT INTO lease_t VALUES (1, 'a@x'), (2, 'b@x')");
+    const tx = await client.transaction("write");
+    await tx.execute("INSERT INTO lease_t VALUES (3, 'c@x')");
+    const t0 = Date.now();
+    const build = post("/ddl", { sql: "CREATE UNIQUE INDEX lease_email ON lease_t(email)" });
+    await new Promise((r) => setTimeout(r, 7000));
+    const committed = await tx.commit().then(() => true, (e: Error) => e.message);
+    const built = await build;
+    const ms = Date.now() - t0;
+    console.log(`build ${ms} ms, status ${built.status}, ${built.error ?? "ok"}; the open transaction: ${committed}`);
+    expect([built.status, built.error]).toEqual([200, undefined]);
+    // 期限より早く終わったなら、この試験は延長を確かめていない。
+    expect(ms).toBeGreaterThan(5000);
+    const rows = await client.execute("SELECT id FROM lease_t ORDER BY id");
+    const viaIndex = await client.execute("SELECT id FROM lease_t WHERE email = 'c@x'");
+    expect(viaIndex.rows.map((r) => r.id)).toEqual(rows.rows.some((r) => r.id === 3) ? [3] : []);
+    await expect(client.execute("INSERT INTO lease_t VALUES (9, 'a@x')")).rejects.toThrow(/UNIQUE constraint failed/);
+  });
+});
+
 // 分割の枠 (M15) を、本物の DO で通す。枠を取り、子の受け入れが Meta の startSplit を、親の fence が checkSplit を呼び、
 // 終わりに枠を返す。返っていなければ、後の表定義の変更が待たされる。
 describe("a split through /admin/split", () => {
