@@ -162,7 +162,8 @@ async function runRequest(db: Db, r: Request, stored: Map<number, string>): Prom
         const busy = stepErrors.some((e) => (e as { code?: string } | null)?.code === "SQLITE_BUSY");
         const settled = db.boundaries !== boundaries && !db.faults.replayAcrossSchemaChange;
         if (!replayable || !busy || settled || attempt >= 12) break;
-        db.abandon();
+        // 前の試行の行ロックを手放してからやり直す。手放さないと、やり直した取引が、自分の前の試行のロックを期限まで待つ。
+        await db.abandon();
         await sleep(db.rt, db.rt.random() * Math.min(50, 2 ** attempt));
       }
       return { type: "batch", result: { step_results: stepResults, step_errors: stepErrors } };
@@ -181,6 +182,8 @@ async function runRequest(db: Db, r: Request, stored: Map<number, string>): Prom
     case "get_autocommit":
       return { type: "get_autocommit", is_autocommit: !db.inTransaction };
     case "close":
+      // 開いている取引は巻き戻す (sqld と同じ)。行ロックを残すと、ほかの接続の書き込みが期限まで待たされる。
+      if (db.inTransaction) await db.abandon();
       return { type: "close" };
   }
 }
@@ -295,7 +298,7 @@ export function serveHranaSocket(
           break;
         case "close_stream": {
           const db = streams.get(r.stream_id);
-          if (db?.inTransaction) db.abandon();
+          if (db?.inTransaction) await db.abandon();
           streams.delete(r.stream_id);
           response = { type: "close_stream" };
           break;
@@ -326,7 +329,8 @@ export function serveHranaSocket(
     chain = chain.then(() => handle(m));
   });
   ws.addEventListener("close", () => {
-    for (const db of streams.values()) if (db.inTransaction) db.abandon();
+    // 接続が切れた。閉じる要求は来ないので、ここで取引を捨ててロックを手放す (待たない)。
+    for (const db of streams.values()) if (db.inTransaction) void db.abandon();
     streams.clear();
     o.onClose?.();
   });

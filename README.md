@@ -29,13 +29,14 @@ git clone https://github.com/inaridiy/cf-d-infinity.git && cd cf-d-infinity/pack
 npm install && npm run demo
 ```
 
-The demo starts with one shard. Six writers keep moving money between 200 accounts in interactive transactions, while the shards are split from 1 to 2, 4 and 8. A watcher keeps checking two things. Every snapshot must total the same amount, and an account owner, a `UNIQUE` column that the shard key does not contain, must never be reused across shards. It prints what it checked, and the transfer rate per second after the last split (a short stall there is a known open item):
+The demo starts with one shard. Six writers keep moving money between 200 accounts in interactive transactions, while the shards are split from 1 to 2, 4 and 8. A watcher keeps checking two things. Every snapshot must total the same amount, and an account owner, a `UNIQUE` column that the shard key does not contain, must never be reused across shards. It prints what it checked, and the transfer rate per second after the last split:
 
 ```
 shards:              1 → 8, split under load
-transfers committed: 3478 transactions, most of them across shards after the first split (11 conflicts retried)
-snapshots checked:   264, every one totalling 20000 (0 retried during a split)
-duplicates refused:  264 attempts to reuse an owner across shards
+transfers committed: 3115 transactions, most of them across shards after the first split (8 conflicts retried)
+after the last split: 104, 110, 102, 107, 114, 110 transfers per second; 8, 8, 7, 8, 8, 8 snapshot reads per second
+snapshots checked:   192, every one totalling 20000 (0 retried during a split)
+duplicates refused:  192 attempts to reuse an owner across shards
 final:               total 20000, 200 accounts, 200 distinct owners
 
 no answer changed while the data moved.

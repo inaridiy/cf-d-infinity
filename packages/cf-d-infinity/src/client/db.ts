@@ -1730,9 +1730,15 @@ export class Db {
     return this.current !== null;
   }
 
-  /** 実行中の取引を捨てる。サーバには何も残っていないので、呼び出すだけでよい。 */
-  abandon(): void {
+  /**
+   * 実行中の取引を捨てる。取引が取った行ロックを、ここで手放す (sqld も、ストリームを閉じると取引を巻き戻す)。
+   * 手放さないと、ほかの接続の書き込みが、ロックの期限 (5 秒) まで待たされる (test/closed-stream-locks.test.ts)。
+   * 呼び出し側が消えて、閉じる要求も届かない取引のロックは、期限で切れる。
+   */
+  abandon(): Promise<void> {
+    const tx = this.current;
     this.current = null;
+    return tx ? tx.unlockAll().catch(() => undefined) : Promise.resolve();
   }
 
   /** 接続の状態を書き出す。 */
