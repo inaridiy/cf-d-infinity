@@ -12,9 +12,9 @@ Survey made read-only by a subagent on `fa1a2cd`; rows `m5b_red_range`, `m5b_red
 counterexample.
 
 Categories:
-- A: the implementation has the guard, and a replay test exists (45)
-- B: implemented guard, fault switch exists, no deterministic replay (5)
-- C: implemented guard, no fault switch (18)
+- A: the implementation has the guard, and a replay test exists (47)
+- B: implemented guard, fault switch exists, no deterministic replay (4)
+- C: implemented guard, no fault switch (17)
 - D: a design alternative the implementation never had or no longer has; no switch needed (8)
 
 | module | flaw modelled | fault switch | deterministic replay | cat |
