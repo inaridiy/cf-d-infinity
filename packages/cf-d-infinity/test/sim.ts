@@ -7,6 +7,7 @@ import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
 import { ShardCore, type SpanEscape } from "../src/shard/core";
 import type { Backend, Faults, Row, ShardApi, Ts, Value } from "../src/types";
+import { bindTyped, restoreColumns } from "../src/value";
 
 /**
  * DO の SQLite の実測の制限 (公式の表にないもの)。node:sqlite は上限を変えられないので、文を見て模す。
@@ -139,6 +140,12 @@ export class VirtualRuntime implements Runtime {
   }
 }
 
+/**
+ * DO の SQLite は、2^53 を超える INTEGER を、精度を落とした JS の数で返す。node:sqlite は既定では例外を投げるので、BigInt で読んで、
+ * DO と同じように数にする。
+ */
+const lossy = (v: unknown): Value => (typeof v === "bigint" ? Number(v) : (v as Value));
+
 /** node:sqlite の Backend。fence() 後の操作は失敗する (DO 基盤が旧 instance を止めるのと同じ)。 */
 export class SqliteBackend implements Backend {
   fenced = false;
@@ -149,32 +156,46 @@ export class SqliteBackend implements Backend {
   exec(sql: string, ...params: Value[]): Row[] {
     if (this.fenced) throw new Error("fenced instance");
     checkDoLimits(sql, params);
-    const st = this.db.prepare(sql);
-    return st.columns().length > 0 ? (st.all(...params) as Row[]).map((r) => ({ ...r })) : (st.run(...params), []);
+    // node:sqlite も DO の SQLite と同じく、JS の数を REAL として束縛する。束縛の仕方は DO と同じにする (src/value.ts)。
+    const b = bindTyped(sql, params, "real");
+    const st = this.db.prepare(b.sql);
+    const p = b.params as never[];
+    if (st.columns().length === 0) return (st.run(...p), []);
+    const names = restoreColumns(st.columns().map((c) => c.name), b.columns);
+    st.setReturnArrays(true);
+    st.setReadBigInts(true);
+    return (st.all(...p) as unknown as Value[][]).map((r) => Object.fromEntries(names.map((c, i) => [c, lossy(r[i] ?? null)])));
   }
   iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
     if (this.fenced) throw new Error("fenced instance");
     checkDoLimits(sql, params);
-    const st = this.db.prepare(sql);
-    const columns = st.columns().map((c) => c.name);
+    const b = bindTyped(sql, params, "real");
+    const st = this.db.prepare(b.sql);
+    const p = b.params as never[];
+    const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
     if (columns.length === 0) {
-      st.run(...params);
+      st.run(...p);
       return { columns, rows: [] };
     }
     st.setReturnArrays(true);
-    return { columns, rows: st.iterate(...params) as unknown as Iterable<Value[]> };
+    st.setReadBigInts(true);
+    const it = st.iterate(...p) as unknown as Iterable<Value[]>;
+    return { columns, rows: (function* () { for (const r of it) yield r.map(lossy); })() };
   }
   raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] } {
     if (this.fenced) throw new Error("fenced instance");
     checkDoLimits(sql, params);
-    const st = this.db.prepare(sql);
-    const columns = st.columns().map((c) => c.name);
+    const b = bindTyped(sql, params, "real");
+    const st = this.db.prepare(b.sql);
+    const p = b.params as never[];
+    const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
     if (columns.length === 0) {
-      st.run(...params);
+      st.run(...p);
       return { columns, values: [] };
     }
     st.setReturnArrays(true);
-    return { columns, values: st.all(...params) as unknown as Value[][] };
+    st.setReadBigInts(true);
+    return { columns, values: (st.all(...p) as unknown as Value[][]).map((r) => r.map(lossy)) };
   }
   tx<T>(fn: () => T): T {
     const name = `sp${this.depth++}`;
@@ -240,6 +261,11 @@ export function injectedFault(): { name: string; side: "shard" | "client" | "spa
 }
 
 export interface SimOptions {
+  /**
+   * 保存データから起動する (test/upgrade.test.ts)。Meta とシャードの SQLite をそのまま使う。シャードの一覧は shards の鍵である。
+   * 指定したときは、shards (数) は無視する。
+   */
+  stored?: { meta: DatabaseSync; shards: Map<string, DatabaseSync> };
   shards?: number;
   faults?: Faults;
   skewMs?: (id: string) => number;
@@ -289,6 +315,8 @@ export class SimCluster implements Cluster {
   /** 宣言した範囲の外の行に依存していた文。空でなければ、取引の検証が成り立っていない。 */
   spanEscapes: SpanEscape[] = [];
   backends = new Map<string, SqliteBackend>();
+  /** Meta の SQLite。 */
+  metaBackend: SqliteBackend;
   meta: MetaCore;
   background = new Set<Promise<unknown>>();
   /** 送ったが、まだ応答も失敗も返っていない RPC。終わらない実行で、どの要求が返らないのかを知るのに使う。 */
@@ -302,8 +330,9 @@ export class SimCluster implements Cluster {
     this.clientFaults = injected?.side === "client" ? { [injected.name]: true } : undefined;
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
     this.runtime = this.virtual ?? systemRuntime;
-    this.shardIds = Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
-    this.meta = new MetaCore(new SqliteBackend(), this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs });
+    this.shardIds = o.stored ? [...o.stored.shards.keys()] : Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
+    this.metaBackend = new SqliteBackend(o.stored?.meta);
+    this.meta = new MetaCore(this.metaBackend, this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs });
     for (const id of this.shardIds) this.core(id);
   }
 
@@ -362,7 +391,7 @@ export class SimCluster implements Cluster {
   /** DO と同じく、触った時に存在し始める。 */
   private core(id: string): ShardCore {
     if (!this.cores.has(id)) {
-      const b = new SqliteBackend();
+      const b = new SqliteBackend(this.o.stored?.shards.get(id));
       b.rt = this.runtime;
       this.backends.set(id, b);
       this.boot(id);

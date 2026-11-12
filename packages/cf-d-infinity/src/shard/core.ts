@@ -9,10 +9,11 @@ import {
 } from "../types";
 import type { DdlEntry } from "../meta";
 import { slotOf } from "../routing";
+import { keyString } from "../keys";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import {
   CAPTURE_TABLES, applyChanges, asSqlError, assertKeyed, capturedChanges, decode, deleteRow, encode, encodeKey, insertRow, q,
-  rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore,
+  rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore, imageList, typedRow, typedValues,
 } from "./rows";
 
 export interface ShardDeps {
@@ -192,7 +193,7 @@ export class ShardCore implements ShardApi {
     b.exec(`CREATE TABLE IF NOT EXISTS __arrived(g TEXT PRIMARY KEY, m INTEGER NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __txn(
       txn TEXT PRIMARY KEY, status TEXT NOT NULL, c INTEGER, participants TEXT, done INTEGER NOT NULL DEFAULT 0, at INTEGER)`);
-    this.migrateStorage();
+    this.initStorage();
 
     for (const r of b.exec(`SELECT entry FROM __ddl ORDER BY version`)) {
       const e = JSON.parse(r.entry as string) as DdlEntry & { skipped?: boolean };
@@ -232,24 +233,9 @@ export class ShardCore implements ShardApi {
     this.hlc = new Hlc(resume);
   }
 
-  /**
-   * 旧形式の DO を新しい形へ揃える。
-   * 変更ログは世代の表に分けたので、旧来の __log 表は最古の世代として残す。
-   * 世代を束ねていた view は消す。DO の SQLite は UNION の項を 5 個までしか受け付けないからである。
-   */
-  private migrateStorage(): void {
-    const b = this.b;
-    if (b.exec(`SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = '__log'`).length > 0) b.exec(`DROP VIEW __log`);
-    if (this.metaGet("log_gens") === null) {
-      let gens: number[] = [];
-      if (b.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__log'`).length > 0) {
-        b.exec(`ALTER TABLE __log RENAME TO __log_g0`);
-        gens = [0];
-      }
-      this.metaSet("log_gens", JSON.stringify(gens));
-      this.metaSet("txn_legacy_at", this.deps.clock.now());
-    }
-    if (!b.exec(`PRAGMA table_info(__txn)`).some((c) => c.name === "at")) b.exec(`ALTER TABLE __txn ADD COLUMN at INTEGER`);
+  /** 初めて開く DO に、変更ログの世代の一覧を作る。保存の形式を変えたときの移行は checkStorageFormat (src/types.ts) に置く。 */
+  private initStorage(): void {
+    if (this.metaGet("log_gens") === null) this.metaSet("log_gens", JSON.stringify([]));
   }
 
   private logGens(): number[] {
@@ -333,11 +319,7 @@ export class ShardCore implements ShardApi {
       for (const [k, ts] of this.recent) if (ts <= low) this.recent.delete(k);
     }
     const cutoff = now - (this.deps.txnRetainMs ?? TXN_RETAIN_MS);
-    const legacyAt = (this.metaGet("txn_legacy_at") as number | null) ?? 0;
-    this.b.exec(
-      `DELETE FROM __txn WHERE done = 1 AND (at < ? OR (at IS NULL AND ? < ?))`,
-      cutoff, legacyAt, cutoff,
-    );
+    this.b.exec(`DELETE FROM __txn WHERE done = 1 AND at < ?`, cutoff);
   }
 
   private metaGet(k: string): Value {
@@ -644,7 +626,7 @@ export class ShardCore implements ShardApi {
         let read = 0;
         for (const r of rows) {
           read++;
-          add(encode(r));
+          add(keyString(r));
           if (out.length >= req.limit) {
             // NULL を含む shard key は行の比較で絞れないので、読んだ数で続きを表す。
             const next: GroupCursor = r.every((v) => v !== null)
@@ -864,7 +846,7 @@ export class ShardCore implements ShardApi {
     const def = this.defs.get(req.table);
     if (!def) throw new SqlError(`no such table: ${req.table}`);
     const cols = def.pk.map(q).join(", ");
-    const list = selectList(def);
+    const list = imageList(def);
     const keyset = req.after !== null && req.after.every((v) => v !== null);
     const where = keyset ? `WHERE (${cols}) > (${def.pk.map(() => "?").join(", ")})` : "";
     const limit = Math.max(1, Math.min(req.limit, 5000));
@@ -881,7 +863,8 @@ export class ShardCore implements ShardApi {
       // 1 回の応答が大きくなりすぎないよう、行数の上限より先にバイト数で切る。続きは次の呼び出しで読む。
       if (bytes > 4_000_000) break;
     }
-    return { columns, rows: out, pk: def.pk.map((c) => columns.indexOf(c)) };
+    const typed = typedValues(def, columns, out);
+    return { columns: typed.columns, rows: typed.rows, pk: def.pk.map((c) => typed.columns.indexOf(c)) };
   }
 
   async metrics(_req: Record<string, never>): Promise<ShardMetrics> {
@@ -1433,7 +1416,7 @@ export class ShardCore implements ShardApi {
       return this.b.tx(() => {
         const before = span.kind === "pk" && capture === "update" ? selectRow(this.b, def, span.pk) : null;
         const was = before && encodeKey(def, before).pk;
-        const rows = this.b.exec(`${req.sql} RETURNING ${selectList(def)}`, ...req.params);
+        const rows = this.b.exec(`${req.sql} RETURNING ${imageList(def)}`, ...req.params).map((r) => typedRow(def, r));
         if (capture === "update" && (rows.length > 1 || (rows.length === 1 && was !== encodeKey(def, rows[0]!).pk))) {
           throw FALLBACK;
         }

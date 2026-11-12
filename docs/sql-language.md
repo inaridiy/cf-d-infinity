@@ -81,7 +81,9 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 
 | 項目 | 差分 |
 |---|---|
-| 2^53 を超える整数 | Hrana で引数として渡すと断る (`unsupported:`)。JavaScript の数値を通るので、受け付けると黙って隣の値になる。SQL の中で計算して 2^53 を超えた値は、結果として返るときに精度が落ちる |
+| 2^53 を超える整数 | Hrana で引数として渡すと断る (`unsupported:`)。JavaScript の数値を通るので、受け付けると黙って隣の値になる。SQL の中で計算して 2^53 を超えた値は、結果として返るときに精度が落ちる。Hrana では `float` として返す |
+| 引数の型 | 差分はない。Hrana は要求に書いた型のまま束縛する (`integer` は INTEGER、`float` は REAL。sqld と同じ。@libsql/client は JS の数を `float`、BigInt と真偽値を `integer` で送る)。D1 互換の API と Service Binding は、整数の JS の数を INTEGER、ほかの数を REAL として束縛する (D1 と同じ)。DO の SQLite は JS の数を REAL として束縛するので、D∞ が文の中の引数を `(CAST(? AS INTEGER)+0)` に包んで、型を保つ。値は、どの経路で答えても、分割で運んでも、型を変えない |
+| 結果の数の型 | 整数の値の REAL (5.0 など) は、Hrana の `integer` で返す。DO の SQLite は、読み出しで INTEGER と REAL を区別しないからである。sqld は `float` で返す。`typeof()` は SQLite と同じ値を返す。REAL の無限大は、Hrana が JSON で運べないので、クライアントの誤りになる (sqld も同じ) |
 | 暗黙の rowid と `INTEGER PRIMARY KEY` の採番 | 一意で増えるが連続しない。削除された番号は再利用しない。接続を跨ぐと順序も保証しない |
 | 列名 | `x IN ()` は書き換えるので、別名のない列名が変わる |
 

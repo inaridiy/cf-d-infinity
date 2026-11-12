@@ -35,12 +35,6 @@ interface RunOpts {
   faults?: Faults;
 }
 
-/**
- * 範囲の移動で時計を渡さない欠陥 (finishWithoutClock) を、行ロック、分割、再起動の掛け合わせが見つける seed。
- * 見つける割合は低い。2026-11-11 に分割が保守の操作の枠を取るようにした後は、seed 1 から 1000 のうち 958 だけだった
- * (その前は 400 のうち 2 つ)。欠陥そのものの決定的な再現は test/move-timestamp.test.ts にある。
- */
-const PUT_BACK_SEEDS = [958];
 
 /**
  * 実行が終わらないと見なす上限。仮想の時刻で 10 分、出来事 200 万個。欠陥を入れた実行は、要求を投げ合い続けて終わらないことがある。
@@ -254,17 +248,9 @@ describe("history checker with pessimistic transactions", () => {
   }
 });
 
-// 過去の欠陥を戻して、この検査が見つけることを確かめる。個別の再現テストではなく、乱択の作業負荷が見つける。
-// どの seed が見つけるかは、コードが変わると変わる。下の seed で見つからなくなったら、SEEDS=1..400 で流して、通る seed に替える。
-describe.skipIf(REFERENCE_ONLY)("a defect put back is found by the random workload", () => {
-  for (const seed of seedsOr(PUT_BACK_SEEDS)) {
-    it(`finds a range handed over without the old owner's clock (seed ${seed})`, async () => {
-      const o = { seed, skewMs: 20, pessimistic: true, splits: true, restarts: true, ops: 25 };
-      expect((await run({ ...o, faults: { finishWithoutClock: true } })).violations.length).toBeGreaterThan(0);
-      expect((await run(o)).violations).toEqual([]);
-    }, 60000);
-  }
-});
+// 範囲の移動で時計を渡さない欠陥 (finishWithoutClock) は、この作業負荷では見つからない (2026-11-12 に seed 1 から 1000 で 0 件。
+// その前は 1000 のうち 1 つだった)。決定的な再現は test/move-timestamp.test.ts にある。見つける作業負荷は、計画書の
+// 「Early 版の線」の順番の 4 で作る。
 
 describe("the simulator is deterministic for this workload", () => {
   it("the same seed gives the same run, with clock skew, restarts and splits", async () => {

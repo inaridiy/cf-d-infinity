@@ -5,7 +5,8 @@ import { ownerOf } from "../routing";
 import { encode, q, selectList } from "../shard/rows";
 import type { GlobalIndexDef, TableDef, Value, WritePlan } from "../types";
 import { SqlError } from "../types";
-import { bindParams, constant, ident, normalize, render, text, walk, type Node, type Params } from "./cst";
+import { bindParams, constant, ident, render, text, walk, type Node, type Params } from "./cst";
+import { keyString, storedAs } from "../keys";
 import { isInternalName } from "./ddl";
 
 export type Route =
@@ -21,7 +22,15 @@ export interface Scan {
   sks: string[] | null;
   /** 押し下げた条件。取引の検証は、この条件に関わる変更だけを競合にする。 */
   where?: { alias: string; sql: string; params: Value[] };
+  /** 型を一緒に読む列。INTEGER と REAL を区別して運ぶ (src/value.ts)。表を読む走査では、型のない列である。 */
+  typed?: string[];
 }
+
+/** 型のない列 (BLOB の親和性)。Worker の SQLite へ入れ直すとき、ほかの列は列の型の親和性が型を戻す。 */
+export const untypedOf = (def: TableDef): string[] | undefined => {
+  const cols = def.columns.filter((c) => (def.affinity[c] ?? "BLOB") === "BLOB");
+  return cols.length ? cols : undefined;
+};
 
 export interface WriteTarget {
   route: Route;
@@ -107,7 +116,7 @@ const PURE = new Set(["abs", "lower", "upper", "length", "coalesce", "ifnull", "
 
 /** 表の全行を読む走査。プランナが見落とした表を読み足すのに使う。 */
 export function fullScan(def: TableDef): Scan {
-  return { table: def, sql: `SELECT ${selectList(def)} FROM ${q(def.name)}`, params: [], sks: null };
+  return { table: def, sql: `SELECT ${selectList(def)} FROM ${q(def.name)}`, params: [], sks: null, typed: untypedOf(def) };
 }
 
 /** 利用者の文が名指しした表を探す。内部の表 (グローバル index の表) は、利用者の文からは存在しないものとして扱う。 */
@@ -327,10 +336,11 @@ function pinsOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string[] | n
     const vs = equalities(conj, ref, col, s, values);
     if (!vs) return null;
     if (vs.some((v) => v === null)) return null; // NULL との等値は常に偽だが、経路にはしない
-    const norm = vs.map((v) => normalize(v, def.skAffinity[i]!));
+    // 列に入るときと同じく、列の型の親和性で揃える。SQLite の等値の比べ方も、定数の側に列の親和性を掛ける。
+    const norm = vs.map((v) => storedAs(v, def.skAffinity[i]!));
     keys = keys.flatMap((k) => norm.map((v) => [...k, v]));
   }
-  return keys.map((k) => encode(k));
+  return keys.map((k) => keyString(k));
 }
 
 function pkOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string | null {
@@ -340,9 +350,9 @@ function pkOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string | null 
     const vs = equalities(conj, ref, col, s, values);
     if (vs?.length !== 1) return null;
     // 行の同一性はシャードと同じ規則で作る (rows.ts の encodeKey)。照合順序のある列は値を揃える。
-    vals.push(normalize(vs[0]!, def.affinity[col] ?? "INTEGER"));
+    vals.push(storedAs(vs[0]!, def.affinity[col] ?? "INTEGER"));
   }
-  return encode(vals);
+  return keyString(vals);
 }
 
 function joined(conj: Node[], a: Ref, b: Ref, i: number, s: Scope): boolean {
@@ -499,7 +509,7 @@ function scanOf(s: Scope | null, ref: Ref | null, def: TableDef, values: Value[]
   const name = ref?.alias ?? def.name;
   const conj = s && ref ? pushable(s, ref, values) : [];
   const from = `SELECT ${selectList(def)} FROM ${q(def.name)} AS ${q(name)}`;
-  if (conj.length === 0) return { table: def, sql: from, params: [], sks: null };
+  if (conj.length === 0) return { table: def, sql: from, params: [], sks: null, typed: untypedOf(def) };
   const parts = conj.map((c) => render(c, values));
   const where = parts.map((p) => `(${p.sql})`).join(" AND ");
   const params = parts.flatMap((p) => p.params);
@@ -509,6 +519,7 @@ function scanOf(s: Scope | null, ref: Ref | null, def: TableDef, values: Value[]
     params,
     sks: pinsOf(conj, ref!, s!, values),
     where: { alias: name, sql: where, params },
+    typed: untypedOf(def),
   };
 }
 
@@ -827,12 +838,12 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
     const skVals: Value[] = [];
     for (const [k, at] of skAt.entries()) {
       const v = at < 0 ? null : await parts[at]!.value();
-      skVals.push(normalize(v, def.skAffinity[k]!));
+      skVals.push(storedAs(v, def.skAffinity[k]!));
     }
     const pkVals: Value[] = [];
     for (const c of def.pk) {
       const at = outCols.findIndex((n2) => same(n2, c) || (c === "rowid" && ROWID_NAMES.has(lower(n2))));
-      pkVals.push(at < 0 ? null : normalize(await parts[at]!.value(), def.affinity[c] ?? "INTEGER"));
+      pkVals.push(at < 0 ? null : storedAs(await parts[at]!.value(), def.affinity[c] ?? "INTEGER"));
     }
     if (auto) {
       const v = id ?? given[i];
@@ -842,7 +853,7 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
       }
     }
     built.push({
-      sk: encode(skVals), pk: encode(pkVals), uniq,
+      sk: keyString(skVals), pk: keyString(pkVals), uniq,
       sql: `(${parts.map((p) => p.sql).join(", ")})`, params: parts.flatMap((p) => p.params),
     });
   }

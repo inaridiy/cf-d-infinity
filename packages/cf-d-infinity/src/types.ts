@@ -1,6 +1,9 @@
 // 分散プロトコルの共有型。docs/design.md の用語に対応する。
 export type Ts = number;
-export type Value = string | number | null | Uint8Array;
+import type { Real } from "./value";
+
+/** SQLite の値。整数の JS の数は INTEGER、整数でない JS の数は REAL、整数の値の REAL は Real (src/value.ts)。 */
+export type Value = string | number | null | Uint8Array | Real;
 export type Row = Record<string, Value>;
 
 /** シャードをまたぐ UNIQUE を守る index。一意でない index は、各シャードのローカル index になるので、ここには入らない。 */
@@ -423,7 +426,7 @@ export class ReadTooOld extends Error {
  * 互換でない変更をするときだけ上げる。シャードは [MIN_PROTOCOL_VERSION, PROTOCOL_VERSION] を受け付け、
  * 新しすぎる要求は「更新中」として再試行させる。版を上げるデプロイでは、先に両方の版を読めるコードを出し、
  * 全 DO が入れ替わってから新しい版で送り始める (2 段階のデプロイ)。
- * 永続データの形式の変更は版では扱わず、起動時の移行 (ShardCore.migrateStorage) で吸収する。
+ * 永続データの形式の変更は、この版ではなく保存の形式の版 (STORAGE_FORMAT) で扱う (docs/storage-format.md)。
  */
 export const PROTOCOL_VERSION = 1;
 export const MIN_PROTOCOL_VERSION = 1;
@@ -493,12 +496,16 @@ export function utf8Length(s: string): number {
 }
 
 /**
- * Durable Object に保存しているデータの形式の版。内部の表の形や意味を、互換でない形で変えるときに上げる。
+ * Durable Object に保存しているデータの形式の版 (docs/storage-format.md)。内部の表の形や意味を、互換でない形で変えるときに上げる。
  * 新しいコードが書いた DO を古いコードが開くと、黙って壊すおそれがある。版が新しすぎれば起動を拒否する。
+ * 上げるときは、古い版から 1 つずつ進める移行を STORAGE_MIGRATIONS に足し、古い版の材料を test/fixtures/storage/ に残す。
  */
 export const STORAGE_FORMAT = 1;
 
-/** 保存形式の版を確かめる。初めて開く DO と、版の印がまだない DO には現在の版を書く。 */
+/** 版 n の保存データを版 n + 1 にする移行。鍵は n である。Early 版 (1) の前の形式は持たない (公開前は後方互換を持たない)。 */
+const STORAGE_MIGRATIONS: Record<number, (b: Backend) => void> = {};
+
+/** 保存形式の版を確かめる。初めて開く DO には現在の版を書く。古い版なら、移行を順に流す。 */
 export function checkStorageFormat(b: Backend, table: string, what: string): void {
   const have = b.exec(`SELECT v FROM ${table} WHERE k = 'format'`)[0]?.v as number | undefined;
   if (have !== undefined && have > STORAGE_FORMAT) {
@@ -507,9 +514,16 @@ export function checkStorageFormat(b: Backend, table: string, what: string): voi
       `Deploy the newer version again; an older release must not open this data.`,
     );
   }
-  if (have !== STORAGE_FORMAT) {
+  if (have === STORAGE_FORMAT) return;
+  b.tx(() => {
+    // 版の印がないのは、初めて開く DO である。
+    for (let v = have ?? STORAGE_FORMAT; v < STORAGE_FORMAT; v++) {
+      const step = STORAGE_MIGRATIONS[v];
+      if (!step) throw new Error(`storage format ${v} of this ${what} has no migration to format ${v + 1}`);
+      step(b);
+    }
     b.exec(`INSERT INTO ${table}(k, v) VALUES ('format', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, STORAGE_FORMAT);
-  }
+  });
 }
 
 export class SqlError extends Error {
