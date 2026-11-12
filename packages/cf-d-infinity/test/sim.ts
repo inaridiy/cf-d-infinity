@@ -269,7 +269,10 @@ export class SimNet {
 }
 
 /** Worker の側の欠陥のスイッチの名前 (src/client/db.ts の ClientFaults)。 */
-const CLIENT_FAULTS = new Set(["repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit"]);
+const CLIENT_FAULTS = new Set([
+  "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
+  "publishBeforeBackfill", "scanBeforeLock", "scanSkipsEmpty", "guardFromCommitTs", "splitWithoutSync",
+]);
 /** 範囲の作り方の欠陥のスイッチの名前 (src/client/spans.ts の spanFaults)。test/setup.ts が入れる。 */
 export const SPAN_FAULTS = new Set(["rowSpanDespiteUnique"]);
 
@@ -290,7 +293,10 @@ export interface SimOptions {
    */
   stored?: { meta: DatabaseSync; shards: Map<string, DatabaseSync> };
   shards?: number;
+  /** シャードと Meta の側の欠陥のスイッチ。 */
   faults?: Faults;
+  /** このクラスタへつなぐ Db と、分割を進める側 (autoscaler.ts の split) の欠陥のスイッチの既定。 */
+  clientFaults?: ClientFaults;
   skewMs?: (id: string) => number;
   K?: number;
   now?: () => number;
@@ -350,12 +356,12 @@ export class SimCluster implements Cluster {
   constructor(private o: SimOptions = {}) {
     const injected = injectedFault();
     if (injected?.side === "shard") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
-    this.clientFaults = injected?.side === "client" ? { [injected.name]: true } : undefined;
+    this.clientFaults = injected?.side === "client" ? { ...o.clientFaults, [injected.name]: true } : o.clientFaults;
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
     this.runtime = this.virtual ?? systemRuntime;
     this.shardIds = o.stored ? [...o.stored.shards.keys()] : Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
     this.metaBackend = new SqliteBackend(o.stored?.meta);
-    this.meta = new MetaCore(this.metaBackend, this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs });
+    this.meta = new MetaCore(this.metaBackend, this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs, faults: o.faults });
     for (const id of this.shardIds) this.core(id);
   }
 

@@ -56,6 +56,16 @@ export interface ClientFaults {
   noImplicitCommit?: boolean;
   /** 取引の中の DDL が、先の確定に失敗しても実行される (モデル m13_red_ddl_anyway)。 */
   ddlAfterFailedCommit?: boolean;
+  /** 既存の行から作る index を、行を読んで項目を書く前に公開する (モデル m11_red_early_public)。 */
+  publishBeforeBackfill?: boolean;
+  /** 既存の行から index を作るとき、書き込み禁止の版を全シャードへ適用させず、その前の版を名乗って行を読む (モデル m12_red_scan_early)。 */
+  scanBeforeLock?: boolean;
+  /** 既存の行から index を作るとき、行のないシャードの時計を公開の時刻に入れない (モデル m12_clock_red_skip_empty)。 */
+  scanSkipsEmpty?: boolean;
+  /** 取引が読んだ表を DROP する前の確認を、どのシャードでも、読んだ時刻ではなく確定の時刻から行う (モデル m14_red_commit_ts)。 */
+  guardFromCommitTs?: boolean;
+  /** 分割の枠を、全シャードに最新の版を適用させずに取る (モデル m15_red_no_based_on。autoscaler.ts の reserveSplit が読む)。 */
+  splitWithoutSync?: boolean;
 }
 
 /**
@@ -557,9 +567,11 @@ export class Txn extends ReadScope {
   /** この取引が読んだ範囲。確定した後に呼ぶ。 */
   readRecord(): ReadRecord[] {
     const T = this.T ?? 0;
+    // 欠陥のスイッチ guardFromCommitTs: 書いていないシャードでも確定の時刻を使う。確定の時刻を見ていないシャードの書き込みを見落とす。
+    const wrote = (shard: string) => this.db.faults.guardFromCommitTs || (this.writes.get(shard)?.size ?? 0) > 0;
     return [...this.spans].map(([shard, spans]) => ({
       shard, spans,
-      from: this.commitTs !== undefined && (this.writes.get(shard)?.size ?? 0) > 0 ? Math.max(T, this.commitTs) : T,
+      from: this.commitTs !== undefined && wrote(shard) ? Math.max(T, this.commitTs) : T,
     }));
   }
 
@@ -1435,11 +1447,16 @@ export class Db {
     const lease = this.keepLease(version);
     try {
       // 行を読む要求は、作り始めた版を名乗る。シャードはその版を適用してから答えるので、読んだ時点で、そのシャードの行は止まっている。
-      const failed = await this.syncRecorded(started);
+      const failed = this.faults.scanBeforeLock ? null : await this.syncRecorded(started);
       if (failed) throw failed;
-      const { entries, at } = await this.scanForIndex(def, ix, version);
-      const written = await this.writeIndex(ix, entries, version);
-      published = await this.cluster.publishIndex(def.name, ix.name, version, Math.max(at, written));
+      if (this.faults.publishBeforeBackfill) {
+        // 欠陥のスイッチ: 既存の行の項目を書く前に公開する。公開の後は、作り始めた版が最新でないので、項目はもう書けない。
+        published = await this.cluster.publishIndex(def.name, ix.name, version, 0);
+      } else {
+        const { entries, at } = await this.scanForIndex(def, ix, version);
+        const written = await this.writeIndex(ix, entries, version);
+        published = await this.cluster.publishIndex(def.name, ix.name, version, Math.max(at, written));
+      }
     } catch (e) {
       // 取り消す。期限切れで先に取り消されていれば、その理由を返す。Worker の 1 回の呼び出しで使える要求の数を使い切ったときは、
       // 取り消しの要求も通らない。その場合は、期限が来れば Meta が取り消す。
@@ -1521,13 +1538,16 @@ export class Db {
     const pkCols = def.pk.map(q).join(", ");
     let after: Value[] | null = null;
     let at: Ts = 0;
+    // 欠陥のスイッチ scanBeforeLock: 書き込み禁止の版の前の版を名乗る。シャードは禁止を適用せずに答え、読んだ後の書き込みを受ける。
+    const schema = this.faults.scanBeforeLock ? cat.version - 1 : cat.version;
     for (;;) {
       const res = await this.shardOf(shard).exec({
         sql: `SELECT ${cols} FROM ${q(def.name)} ${after ? `WHERE (${pkCols}) > (${def.pk.map(() => "?").join(", ")})` : ""} ORDER BY ${pkCols} LIMIT ${BUILD_PAGE}`,
-        params: after ?? [], spans: withSlots(cat.routing, shard, [tableSpan(def.name)]), schema: cat.version,
+        params: after ?? [], spans: withSlots(cat.routing, shard, [tableSpan(def.name)]), schema,
       });
       if (res.error !== undefined) throw new SqlError(res.error);
-      at = Math.max(at, res.T, res.hlc);
+      // 欠陥のスイッチ scanSkipsEmpty: 行のないシャードは、読まなかったのと同じく、その時計を公開の時刻に入れない。
+      if (!(this.faults.scanSkipsEmpty && after === null && res.values.length === 0)) at = Math.max(at, res.T, res.hlc);
       const rows = new QueryResult(res.columns, res.values).rows;
       for (const row of rows) {
         const vals = ix.columns.map((col) => row[col] ?? null);

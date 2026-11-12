@@ -66,7 +66,7 @@ Categories:
 | m11_impl_chunk | BUG-1: same-shard duplicate overwritten in backfill | none | ddl-concurrent:334 (fixed) | A |
 | m11_impl_drop | BUG-5: committed intent applied to recreated table | ddlIgnoresIntents | review-regressions:181; ddl-concurrent:495 | A |
 | m11_red_no_reject | shard accepts stale-version requests | none (check at core.ts:347) | migration:234 (fixed, guard-only) | A |
-| m11_red_early_public | index public before backfill finishes | none | none | C |
+| m11_red_early_public | index public before backfill finishes | publishBeforeBackfill (added 2026-11-12; publishes before any entry is written, as in the model's trace) | unique-index-build ("a UNIQUE index that spans shards is published after the existing rows are indexed (m11_red_early_public)"; added 2026-11-12) | A |
 | m11_red_no_write_only | writes skip a write-only index | none | none | D |
 | m11_red_no_sync | DDL returns before all shards applied it | none (stub at ddl-concurrent:687, seed sweep) | migration:247 (fixed) | A |
 | m12_red_online | index used and maintained while being built (old design) | none | ddl-concurrent:368; unique-index-build:51 (fixed design) | D |
@@ -76,9 +76,9 @@ Categories:
 | m12_red_stale | shard accepts stale-version plans | none | migration:234 (fixed, guard-only) | A |
 | m12_red_two_exits | late publish after expiry withdrawal | none | unique-index-build:63 (fixed) | A |
 | m12_red_repin | transaction takes new version without replanning | repinOnRestore | txn-across-schema-change:53 | A |
-| m12_red_scan_early | scan before the shard applied the lock version | none | none | C |
+| m12_red_scan_early | scan before the shard applied the lock version | scanBeforeLock (added 2026-11-12; removes both the sync before the scan and the lock version the scan names) | unique-index-build ("the rows are read for the index only after their shard applied the write lock (m12_red_scan_early)"; added 2026-11-12) | A |
 | m12_clock_red_no_clock | publish version carries no timestamp | publishWithoutClock | unique-index-build:140 | A |
-| m12_clock_red_skip_empty | build skips empty shards' clocks | none | none | C |
+| m12_clock_red_skip_empty | build skips empty shards' clocks | scanSkipsEmpty (added 2026-11-12; the build still reads the empty shard, the switch drops its clock) | unique-index-build ("the publication timestamp of a UNIQUE index includes the clocks of shards with no rows (m12_clock_red_skip_empty)"; added 2026-11-12) | A |
 | m13_red_main | DDL takes effect before buffered writes, plus repin | noImplicitCommit (+repinOnRestore) | migration-tools:122 (fixed) | A |
 | m13_red_pin_only | DDL does not commit first; own new table unwritable | noImplicitCommit | migration-tools:161 (fixed) | A |
 | m13_red_repin | transaction takes new version without replanning | repinOnRestore | txn-across-schema-change:53 | A |
@@ -88,13 +88,13 @@ Categories:
 | m14_red_no_check | DROP guard locks but does not check | dropWithoutGuard | rebuild-guard:81 | A |
 | m14_red_check_early | check before the lock version is applied | none | rebuild-guard:74 (fixed) | A |
 | m14_red_no_drain | lock version applied with intents unsettled | ddlIgnoresIntents + unchangedIgnoresIntents (two guards; added 2026-11-12) | rebuild-guard ("the guard settles intents before it checks for changes"); with only the drain removed the pending-write check still stops it | A |
-| m14_red_untied | DROP passes after the lock expires | none | none | C |
-| m14_red_commit_ts | check from the copy's commit ts instead of read ts | none | none | C |
+| m14_red_untied | DROP passes after the lock expires | dropAfterExpiry (Meta side, in `Faults`; added 2026-11-12) | rebuild-guard ("the DROP after a rebuild is recorded only while the lock still holds (m14_red_untied)"; added 2026-11-12) | A |
+| m14_red_commit_ts | check from the copy's commit ts instead of read ts | guardFromCommitTs + refreshNoBump (two guards: the commit-time refresh carries the commit ts to every shard the copy read; added 2026-11-12) | rebuild-guard ("the guard checks for changes from the time the copy read the table (m14_red_commit_ts)"); with only the commit ts put back the refresh still stops it | A |
 | m15_red_no_slot | DDL recorded mid-split (not atomic) | none | ddl-vs-split-race:15 (fixed) | A |
 | m15_red_stale_begin | split uses version read before taking the slot | none | split-hazards:79; child-behind-parent:17 | A |
 | m15_red_early_release | slot returned before the child finishes | none | split-slot:62 (fixed) | A |
-| m15_red_no_based_on | slot taken before all shards applied the latest version | none | none | C |
-| m15_red_late_start | child starts after the slot expired | none | none | C |
+| m15_red_no_based_on | slot taken before all shards applied the latest version | splitWithoutSync (in `ClientFaults`, read by autoscaler's reserveSplit; added 2026-11-12) | split-slot ("a split takes its slot only after every shard applied the latest version (m15_red_no_based_on)"; added 2026-11-12); on fixed code the first `split()` fails with `stale schema` before taking a slot and the Autoscaler's retry finishes it | A |
+| m15_red_late_start | child starts after the slot expired | startWithoutSlot + fenceWithoutSlot (Meta side; two guards: startSplit, and checkSplit before the parent fences; added 2026-11-12) | split-slot ("a child that starts receiving after the split slot lapsed (m15_red_late_start)"); with only the start put back the fence check still stops it | A |
 
 ## Switches that match no red module
 

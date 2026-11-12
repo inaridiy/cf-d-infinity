@@ -359,8 +359,14 @@ export interface Backend {
   size(): number;
 }
 
-/** 検証済みの欠陥を再導入するスイッチ。反例の再現テスト専用で、既定はすべて false。 */
+/** 検証済みの欠陥を再導入するスイッチ。反例の再現テスト専用で、既定はすべて false。シャードと Meta (meta.ts) が読む。 */
 export interface Faults {
+  /** Meta が、書き込み禁止の版が期限切れで取り消された後でも、DROP を記録する (モデル m14_red_untied)。 */
+  dropAfterExpiry?: boolean;
+  /** Meta が、期限切れで消えた分割の枠を示す子の受け取りの始まりを断らない (モデル m15_red_late_start の 1 つ目の守り)。 */
+  startWithoutSlot?: boolean;
+  /** Meta が、親の fence の前に、分割の枠が生きていることを確かめない (モデル m15_red_late_start の 2 つ目の守り)。 */
+  fenceWithoutSlot?: boolean;
   /** autocommit の書き込みが、他の取引の intent との UNIQUE を照合しない (2026-11 のレビューで見つかった欠陥)。 */
   autoIgnoresUniqueIntents?: boolean;
   /** DDL を、持っている intent を決着させずに適用する。表や列が消えた後では、確定済みの取引の intent を適用できない。 */

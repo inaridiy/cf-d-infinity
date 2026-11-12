@@ -215,7 +215,8 @@ async function reserveSplit(cluster: Cluster, move: { parent: string; child: str
   // 最新の版は Meta が知っている。手元の表定義が古ければ、Meta が断るときに教える版まで、全シャードを進める。
   let version = cat.version;
   for (let attempt = 0; ; attempt++) {
-    await Promise.all(shardsOf(cat.routing).map((id) => cluster.shard(id).syncSchema({ version })));
+    // 欠陥のスイッチ splitWithoutSync: 適用させずに取る。適用に失敗するシャードが、分割の途中で取り消しの版を記録する。
+    if (!cluster.clientFaults?.splitWithoutSync) await Promise.all(shardsOf(cat.routing).map((id) => cluster.shard(id).syncSchema({ version })));
     try {
       return await cluster.beginSplit(move, version);
     } catch (e) {

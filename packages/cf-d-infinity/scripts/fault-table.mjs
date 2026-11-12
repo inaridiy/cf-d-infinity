@@ -37,9 +37,14 @@ const SHARD = [
   "anchorNoAbsorb", "skipReadOnlyPrepare", "refreshNoBump", "predicateProtected", "ignoreIntentsInValidation", "readerTimeoutPass",
   "hlcNoCeiling", "rowwiseUndo", "pushAfterDecide", "applyAfterMoved", "triggerCapture", "dropIntentsOnMove", "servePastMove",
   "ignoreFence", "staleWideRead", "finishWithoutClock", "ignoreTableLock", "publishWithoutClock", "validateFromT", "trustLocks",
-  "phase2BeforeSync", "dropNoLowWater", "gcUndone", "flushPastIntents",
+  "phase2BeforeSync", "dropNoLowWater", "gcUndone", "flushPastIntents", "unchangedIgnoresIntents",
+  // Meta が読むスイッチ (同じ Faults にある)
+  "dropAfterExpiry", "startWithoutSlot", "fenceWithoutSlot",
 ];
-const OTHER = ["rowSpanDespiteUnique", "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit"];
+const OTHER = [
+  "rowSpanDespiteUnique", "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
+  "publishBeforeBackfill", "scanBeforeLock", "scanSkipsEmpty", "guardFromCommitTs", "splitWithoutSync",
+];
 const FAULTS = ["none", ...(only ?? [...SHARD, ...OTHER])];
 const ALL_HARNESSES = ["test/replay.test.ts", "test/history.test.ts", "test/ddl-concurrent.test.ts"];
 // --harness replay,history で、流す検査を選ぶ。

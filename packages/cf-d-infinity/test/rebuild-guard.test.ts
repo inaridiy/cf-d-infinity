@@ -177,6 +177,148 @@ describe("the guard settles intents before it checks for changes (m14_red_no_dra
   });
 });
 
+// specs/m14_rebuild_guard.qnt の m14_red_untied。DROP は、書き込み禁止の唯一の終わり方として記録する。禁止が期限で取り消された後の
+// DROP は通さない (TIED)。モデルの反例と同じ順で流す: 作り直す取引が表を読んで写し、確定する。書き込み禁止の版を記録し、全シャードが
+// 適用し、読んだ後に変更がないことを確かめる。ここで DROP を進める側が止まり、禁止が期限で取り消される (expire)。別の接続が表へ書いて
+// 確定する。遅れて届いた DROP を記録する。
+describe("the DROP after a rebuild is recorded only while the lock still holds (m14_red_untied)", () => {
+  const scenario = async (faults: Faults = {}) => {
+    const c = new SimCluster({ shards: 2, faults });
+    await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)");
+    await new Db(c).query("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)");
+    // DROP を進める側は、確かめた後で止まる。期限を延ばさず、DROP の記録は、通すまで Meta に届かない。
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let reached!: () => void;
+    const hit = new Promise<void>((r) => (reached = r));
+    const stalled = Object.assign(Object.create(c) as SimCluster, {
+      renewLock: () => new Promise<{ leaseMs: number }>(() => {}),
+      finishLock: async (version: number, sql: string) => {
+        reached();
+        await held;
+        return c.finishLock(version, sql);
+      },
+    });
+    const db = new Db(stalled);
+    await db.query("BEGIN");
+    await db.query("CREATE TABLE __new_t(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)");
+    await db.query("INSERT INTO __new_t(id, v) SELECT id, v FROM t");
+    const dropping = outcome(db.query("DROP TABLE t"));
+    await hit;
+    // 別の接続の書き込みは、禁止に断られ、期限で取り消されるのを待ってから通る。
+    const written = await outcome(new Db(c).query("INSERT INTO t VALUES (4, 4)"));
+    const revoked = (await c.catalog()).revoked?.reason ?? null;
+    release();
+    const drop = await dropping;
+    const rename = drop === "ok" ? await outcome(db.query("ALTER TABLE __new_t RENAME TO t")) : "skipped";
+    await outcome(db.query(drop === "ok" ? "COMMIT" : "ROLLBACK"));
+    await c.settle();
+    return { written, revoked, drop, rename, rows: await RESULT(c, "SELECT id FROM t ORDER BY id") };
+  };
+
+  it("refuses the late DROP, and keeps the row written after the lock lapsed", async () => {
+    const r = await scenario();
+    expect(r.written).toBe("ok");
+    expect(r.revoked).toMatch(/the lock on t before DROP TABLE stopped before it finished and was withdrawn/);
+    expect(r.drop).toMatch(/the lock on t before DROP TABLE stopped before it finished and was withdrawn/);
+    expect(r.rows).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }]);
+  });
+
+  it("put back: a DROP not tied to the lock goes through after it lapsed, and the row is lost", async () => {
+    const r = await scenario({ dropAfterExpiry: true });
+    expect(r.written).toBe("ok");
+    expect(r.revoked).toMatch(/stopped before it finished and was withdrawn/);
+    expect({ drop: r.drop, rename: r.rename }).toEqual({ drop: "ok", rename: "ok" });
+    expect(r.rows).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+  });
+});
+
+// specs/m14_rebuild_guard.qnt の m14_red_commit_ts。DROP の前の確認は、取引が読んだ範囲に、読んだ時刻より後の変更がないかを見る
+// (CHECK_FROM_READ)。copy が読んだシャードは、どれも読んだ時刻を見ている。確定の時刻は、見ていないシャードがあり、そこでの後の書き込みは、
+// 確定の時刻より小さい時刻を持ち得る。モデルの反例と同じ順で流す: copy が全シャードで表を読む。時計の進んだシャード (anchor) で確定する。
+// 別の接続が、確定の時刻を見ていないシャードの古い表へ書いて確定する。書き込み禁止の版を記録し、全シャードが適用し、確かめ、DROP する。
+// 実装では、確定の時刻は、読んだシャードの全部に、確定の前の refresh で届く (specs/m1_serializable_commit.qnt の m1_red_c の守り)。
+// だから、確定の時刻と比べても、それだけでは見落とさない。モデルの「確定の時刻を見ていないシャード」は、refresh が時計を進めないときに現れる。
+describe("the guard checks for changes from the time the copy read the table (m14_red_commit_ts)", () => {
+  const scenario = async (o: { faults?: Faults; clientFaults?: ClientFaults } = {}) => {
+    // s0 の時計は 5 秒進んでいる。copy の確定の時刻は s0 の時計で決まる。
+    const c = new SimCluster({ shards: 2, skewMs: (id) => (id === "s0" ? 5000 : 0), ...o });
+    await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)");
+    await new Db(c).ddl("CREATE TABLE u(id INTEGER PRIMARY KEY, v INTEGER)");
+    const { routing } = await c.catalog();
+    const on = (shard: string, from: number) => { for (let i = from; ; i++) if (ownerOf(routing, keyString([i])) === shard) return i; };
+    // 古い表の行は s0 にだけある。copy は s1 では読むだけで、書かない (copy が書いたシャードでは、実装も確定の時刻から確かめる。
+    // 確定の phase 2 が、そのシャードへ確定の時刻を運ぶからである)。
+    const [t1, t2, u1, t4] = [on("s0", 1), on("s0", on("s0", 1) + 1), on("s0", 1), on("s1", 100)];
+    await new Db(c).query("INSERT INTO t VALUES (?, 1), (?, 2)", [t1, t2]);
+    await new Db(c).query("INSERT INTO u VALUES (?, 1)", [u1]);
+    const commits: (number | undefined)[] = [];
+    const db = new Db(c, { onCommit: (x) => commits.push(x.at) });
+    await db.query("BEGIN");
+    await db.query("CREATE TABLE __new_t(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)");
+    await db.query("INSERT INTO __new_t(id, v) SELECT id, v FROM t");
+    // s0 に守られていない読みを足して、anchor を s0 にする。
+    await db.query("SELECT v FROM u WHERE id = ?", [u1]);
+    // 別の接続は、DROP の前の、いまの表定義を持っている。
+    const other = new Db(c);
+    await other.query("SELECT count(*) FROM t");
+    // anchor の時計が進む (モデルの tick)。s1 の時計は 5 秒遅れていて、読みの要求が運んだ時刻のまま進まない。
+    await c.sleep(100);
+    // copy の確定の phase 2 が s1 に届くのを止める。書き込み禁止の版の適用を止めている間に、別の接続が s1 へ書く。
+    const lock = (await c.catalog()).version + 1;
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let releaseLock!: () => void;
+    const lockHeld = new Promise<void>((r) => (releaseLock = r));
+    let reached!: () => void;
+    const hit = new Promise<void>((r) => (reached = r));
+    let anchor: string | undefined;
+    c.net.gate = (m) => {
+      if (m.method === "commit") anchor ??= m.to;
+      if (m.method === "finalize" && m.to === "s1") return held;
+      if (m.method === "syncSchema" && (m.req as { version: number }).version === lock) {
+        reached();
+        return lockHeld;
+      }
+      return undefined;
+    };
+    const dropping = outcome(db.query("DROP TABLE t"));
+    await hit;
+    const copied = commits.at(-1)!;
+    const written = await other.query("INSERT INTO t VALUES (?, 4)", [t4]);
+    releaseLock();
+    const drop = await dropping;
+    const rename = drop === "ok" ? await outcome(db.query("ALTER TABLE __new_t RENAME TO t")) : "skipped";
+    await outcome(db.query(drop === "ok" ? "COMMIT" : "ROLLBACK"));
+    c.net.gate = () => undefined;
+    release();
+    await c.settle();
+    // below: 別の接続の書き込みの時刻が、copy の確定の時刻より小さい。
+    const ids = (list: number[]) => list.sort((a, b) => a - b).map((id) => ({ id }));
+    return { anchor, below: written.ts! < copied, drop, rename, rows: await RESULT(c, "SELECT id FROM t ORDER BY id"), copied: ids([t1, t2]), all: ids([t1, t2, t4]) };
+  };
+
+  it("fails the rebuild with a conflict and keeps the row written on the shard where the copy only read", async () => {
+    const r = await scenario();
+    expect({ anchor: r.anchor, below: r.below }).toEqual({ anchor: "s0", below: false });
+    expect(r.drop).toMatch(/^conflict: another connection wrote to t after this transaction read it/);
+    expect(r.rows).toEqual(r.all);
+  });
+
+  it("put back the commit timestamp alone: the refresh moved that shard's clock past it, so the write is still found", async () => {
+    const r = await scenario({ clientFaults: { guardFromCommitTs: true } });
+    expect({ anchor: r.anchor, below: r.below }).toEqual({ anchor: "s0", below: false });
+    expect(r.drop).toMatch(/^conflict: another connection wrote to t after this transaction read it/);
+  });
+
+  it("put back both guards: the write below the commit timestamp is missed and lost, as in the model's counterexample", async () => {
+    const r = await scenario({ faults: { refreshNoBump: true }, clientFaults: { guardFromCommitTs: true } });
+    expect({ anchor: r.anchor, below: r.below }).toEqual({ anchor: "s0", below: true });
+    expect({ drop: r.drop, rename: r.rename }).toEqual({ drop: "ok", rename: "ok" });
+    expect(r.rows).toEqual(r.copied);
+  });
+});
+
 describe("the guard, through other ways of running the same statements", () => {
   const setup = async () => {
     const c = new SimCluster({ shards: 2 });
