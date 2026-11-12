@@ -10,6 +10,20 @@ Read the name as "D-infinity": the D1 API your Worker already speaks, without th
 
 > **Status: experimental.** A research prototype. Do not put data you cannot afford to lose in it; read [Limitations](#limitations) first.
 
+## The idea
+
+Sharding usually leaks into the application. It has to know the shard key, stay away from cross-shard joins and constraints, and live with statements that behave differently once rows are spread out. D∞ is built on the opposite rule: **where a row lives never changes what a statement does.**
+
+- **Any statement SQLite accepts runs, wherever the rows are.** A statement that one shard can answer goes to that shard. Anything else gathers the rows it needs into a WebAssembly SQLite inside the Worker and runs the original SQL there. The fast paths are optimizations of that reference path, never a different meaning.
+- **The guarantees do not stop at a shard boundary.** Transactions are serializable across shards, and `UNIQUE` holds across shards. Schema changes work inside transactions and while other connections write, and they take turns with shard splits instead of racing them.
+- **Refusals are decided by the statement, not by luck.** A statement is refused only for its shape, its values or the schema, with an `unsupported:` error the first time it runs. Where the rows happen to be is never the reason.
+- **The rule is checked by machine, not only stated.**
+  - The differential suites run again with every statement forced through the reference path, so a fast path that changes an answer fails. They cover random statements, compatibility scripts, typed values and concurrent statement replay.
+  - Values are compared together with their SQLite storage class (INTEGER and REAL included).
+  - The counterexamples that the formal models find are replayed step by step against the real code in a deterministic simulator.
+
+Distributed SQL systems such as CockroachDB, TiDB, YugabyteDB and Spanner bring transactions and SQL across many machines, for Postgres or MySQL dialects, on clusters of nodes that you or a vendor run. D∞ brings that shape to SQLite with no nodes at all. Each shard is a Durable Object holding ordinary SQLite, the query layer is your Worker, and the whole database lives in your own Cloudflare account.
+
 ## Key features
 
 - **Interactive transactions, across shards.** `BEGIN`, read, decide, write, `COMMIT`, serializable by default, with no central timestamp oracle. D1 offers `batch()` only.
@@ -17,7 +31,7 @@ Read the name as "D-infinity": the D1 API your Worker already speaks, without th
 - **Scales past one database.** Tables are spread over up to 4,096 hash slots, and a shard can be split online. The autoscaler watches every shard and, once you opt in with `DINF_AUTOSCALE = "split"`, splits hot or large ones itself. One shard takes ~950 single-shard writes/s; 64 shards reached 18,784 writes/s. Transactions that span shards are far slower: about 44–60 per second per shard (see [When not to use it](#when-not-to-use-it)).
 - **SQLite semantics, not a reimplementation.** Each shard is SQLite, and cross-shard statements re-run the original SQL in a WebAssembly SQLite inside the Worker. All 8,884 queries of sqllogictest `select1`–`select5` match.
 - **Pay per row, no instance to size.** Durable Object pricing: 2 billed rows per single-row `UPDATE`, $0.20 per GB-month. When nothing is happening, the only activity is the autoscaler waking each shard once a minute.
-- **Checked, not only claimed.** Twelve formal models, a fault-injecting simulator, and Elle-style black-box checks against production Cloudflare while Durable Objects crash and shards split.
+- **Checked, not only claimed.** Sixteen formal models whose counterexamples are replayed against the code, a deterministic fault-injecting simulator, differential tests against real SQLite on every execution path, and Elle-style black-box checks against production Cloudflare while Durable Objects crash and shards split.
 
 ## Quick start
 
@@ -238,6 +252,8 @@ Rows are placed by `hash(shard key)`; the shard key defaults to the first primar
 |---|---|
 | Single-shard transaction | Strict serializable (not verified during a Durable Object failover) |
 | Multi-shard transaction | Serializable |
+| Placement | The same answer as SQLite whatever the placement of rows, and whichever execution path a statement takes. Checked by running the differential suites with every statement forced through the reference path |
+| Value types | INTEGER and REAL keep their storage class through every path, a split included. Hrana arguments are bound as their declared type (as in sqld), D1-API numbers as in D1 |
 | Real-time order across sessions | Autocommit reads and the first read of a transaction see every write committed before they start. Later statements of a transaction may miss a newer commit on another shard. (Until 0.1.0-alpha.0 this did not hold for an autocommit read of several shards that excluded the transaction's anchor; fixed, with a regression test) |
 
 `BEGIN IMMEDIATE` (`transaction("write")`) takes row locks and rarely fails at `COMMIT`. Plain `BEGIN` is optimistic and can fail at `COMMIT` with `SQLITE_BUSY`; retrying it is the application's job.
@@ -245,9 +261,10 @@ Rows are placed by `hash(shard key)`; the shard key defaults to the first primar
 None of the following is a proof of the implementation:
 
 - **Formal models** ([specs/](specs/README.md)): sixteen Quint models of the risky protocol parts (the newest cover building a cross-shard `UNIQUE` index, schema changes inside transactions, table rebuilds, and the ordering of schema changes and shard splits), exhaustively checked with TLC on small instances. Each has variants with a known bug re-introduced, and TLC finds every one.
+- **Model counterexamples replayed against the code**: for each re-introduced bug that the implementation guards against, a fault switch puts the bug back into the code, and a deterministic simulator test drives the model's counterexample step by step. It checks that the switch produces the violation and the real code does not ([the table](.agents/execplans/evidence/2026-11-12-model-coverage.md)).
 - **Simulator**: the real shard code runs on `node:sqlite` under simulated delays, clock skew, restarts and splits, with a serializability checker over the history.
 - **Black-box checks** (Elle-style list-append): run in the simulator and against production Cloudflare while Durable Objects are crashed, shards split and code redeployed. The latest production run (10 minutes, 38 crashes, 22,798 commits) found no anomaly; earlier runs found three real bugs, including an undocumented Durable Object limit of 5 terms per compound `SELECT`.
-- **Compatibility**: sqllogictest (`select1`–`select5` in full, ~174,000 further queries) and differential fuzzing against real SQLite (200 seeds).
+- **Compatibility**: sqllogictest (`select1`–`select5` in full, ~174,000 further queries), differential fuzzing against real SQLite (200 seeds), and a generator that sends typed arguments through a stock `@libsql/client` and compares values and `typeof` with SQLite. The differential suites (not the large sqllogictest set) run three times: as planned, with every scan gathered, and with every statement on the reference path.
 
 ## Limitations
 
@@ -255,7 +272,7 @@ None of the following is a proof of the implementation:
 - **One database, two static tokens.** No multi-tenancy, no per-user permissions.
 - **Thin observability.** There is a slow-statement log (see [Command line](#command-line)), but no abort-rate or scatter-rate metrics and no tracing.
 - **Unverified platform behavior.** Whether an old Durable Object instance can serve reads during failover is not documented by Cloudflare and was not tested. Clock skew between Durable Objects has no published bound.
-- **SQLite differences.** Foreign keys are not enforced; `TEMP` tables, `ATTACH` and FTS5 are unavailable; an integer argument beyond 2^53 is refused over Hrana, and one computed inside SQL loses precision when it is returned; implicit rowids are unique but not contiguous. Durable Object SQLite limits also apply (for example 100 bound parameters). See [docs/sql-language.md](docs/sql-language.md).
+- **SQLite differences.** Foreign keys are not enforced; `TEMP` tables, `ATTACH` and FTS5 are unavailable; an integer argument beyond 2^53 is refused over Hrana, and one computed inside SQL loses precision when it is returned; a REAL result with an integral value (`5.0`) is returned over Hrana as an `integer`, because Durable Object SQLite does not tell the two apart when reading (`typeof()` is still exact); implicit rowids are unique but not contiguous. Durable Object SQLite limits also apply (for example 100 bound parameters). See [docs/sql-language.md](docs/sql-language.md).
 - **Refused features.** Triggers, generated columns, `CREATE TABLE ... AS SELECT`, `ALTER TABLE ... RENAME COLUMN` and `DROP COLUMN`, a collation other than `BINARY` on a primary key, a shard key or a `UNIQUE` column that does not contain the shard key, a row with `NULL` in a primary key column (Drizzle's migration journal is such a table; create it first with `drizzleMigrationsTable()` from `cf-d-infinity/client`), and `sqlite_master` or a PRAGMA function inside a statement that writes are refused with an error that starts with `unsupported:`. The refusal depends only on the statement, its values and the schema, never on where rows are, so it shows up the first time the statement runs.
 - **Transaction size.** What one transaction changes on one shard, old and new row images together, must fit in 1 MB of UTF-8 (a BLOB counts twice its size). A larger transaction is refused before it commits; split it.
 - **Schema changes inside a transaction.** A schema change inside a transaction first commits the transaction, and the statements after it form a new one, as in MySQL. `ROLLBACK` reaches back only to the last schema change, and a `batch` that contains one is split there and is no longer all or nothing. A migration that rebuilds a table (create a new table, copy the rows, drop the old one) does not lose rows that other connections write to the old table meanwhile: the drop checks for them and fails as a conflict instead, leaving the half-built new table behind, so run such a migration when the table is quiet.
@@ -264,7 +281,7 @@ None of the following is a proof of the implementation:
 - **Open items from the November 2026 design review.** There is no operator command to discard a committed transaction that can never be applied (the review's known causes are fixed, and `status` reports the state). A shard keeps one bookkeeping row per shard-key group it ever handed to another shard. The HTTP and admin entry points have not had an independent security review.
 - **Scale limits.** At most 200,000 rows gathered into the Worker per statement; no hierarchical fan-out beyond 8 shards; a single hot row tops out around 650 writes/s; shards are never merged; the autoscaler notices new load within about a minute, then follows it every 5 seconds.
 - **No region control.** A shard is created near the Worker that first reaches it and never moves, so latency grows with distance from there.
-- **No stability promise.** Storage format, wire protocol and admin API may change between commits. The stored data carries a format version: a release that does not understand the format refuses to open it and says so, instead of rewriting it. No release has changed the format yet, so this has only been exercised in tests.
+- **Stability.** The storage formats are listed in [docs/storage-format.md](docs/storage-format.md) and will be frozen with the first release. Data written by format 1 is kept as a test fixture that every later version must open, read, write, split and migrate. A release that does not understand a newer format refuses to open it and says so. The admin API may still change.
 - **Splitting a shard cannot be undone or cancelled, so automatic splitting is opt-in.** By default the autoscaler only records that a shard should be split (`npx cf-d-infinity status` shows `would-split`); set the var `DINF_AUTOSCALE` to `"split"` to let it act. Splitting has been measured with 128 shard-key groups per shard, not with millions. A shard-key group larger than 16 MB cannot be moved, and a split that meets one stops with an error naming it. Such a split also keeps holding the maintenance slot, so every schema change waits (and after 60 seconds asks to be retried) until the group is made smaller; `status` lists the splits in progress under `splits`. A statement that reads a whole table is retried for under a second and then fails while a split is still moving data.
 - **The schema is fetched from one Durable Object.** Each Worker isolate caches it for 2 seconds and refetches on the request path, so that object is a dependency of every request.
 
