@@ -64,6 +64,18 @@ npm への公開は、素地ができるまで行わない。
 - `packages/cf-d-infinity/DEVELOPMENT.md` は、この一連の変更を反映していない。`AGENTS.md` にそう書いてある。
 - 次にやるのは、Plan of Work の 5 である。不変条件 2 (確定した取引は必ず適用できる) には、まだ再現も、破れを見つける検査もない。規則 2 により、先に検査を作る。最初の切り口は、SQL の `BEGIN` と DDL を並行に流す、文の再生検査である (不変条件 9 を乱択で確かめていない)。
 
+### 欠陥の表 (2026-11-12、`f393657`)
+
+欠陥のスイッチを 1 つずつ入れ、乱択の検査 3 つの seed ごとの試験を、seed 1 から 40 で流した (`scripts/fault-table.mjs`)。表そのものは `.agents/execplans/evidence/2026-11-12-fault-table.md` にある。欠陥を入れない行は、3 つとも 0 件の失敗だった。
+
+- どの検査も見つけない (3 つとも 0): `autoIgnoresUniqueIntents`、`childKeepsOldSchema`、`noSchemaRecheck`、`noWriteSetLimit`、`noRealtimeBump`、`servePastMove`、`finishWithoutClock`、`publishWithoutClock`、`validateFromT`、`repinOnRestore`、`dropWithoutGuard`。`replayAcrossSchemaChange` もこの版では 0 (取引の中の DDL を流す接続がまだない)。`triggerCapture` は欠陥ではない (遅い経路を使わせるだけ) ので、0 が正しい。
+- 見つけるが、少ない (いちばん見つける検査で 1 割未満): `applyAfterMoved` (DDL と並行する取引で 440 回中 2)、`dropIntentsOnMove` (history で 240 回中 4)、`hlcNoCeiling` (同 5)、`staleWideRead` (DDL と並行する取引で 440 回中 22)、`predicateProtected` と `trustLocks` (history で 240 回中 17)、`ddlIgnoresIntents` (DDL と並行する取引で 440 回中 43)。
+- よく見つける: `readerTimeoutPass`、`ignoreIntentsInValidation`、`skipReadOnlyPrepare`、`anchorNoAbsorb`、`refreshNoBump`、`pushAfterDecide`、`ignoreTableLock`。
+- 止まる: `ignoreFence` (未解決の問題 18)。
+- `rowSpanDespiteUnique` は、文の再生検査で 80 回中 44 回落ちた。どの試験にも掛かる範囲の検査 (`test/setup.ts`) が見つけている可能性が高い。文の再生そのものが見つけているかは、分けて数えていない。
+
+見つけない欠陥の多くは、検査の作業負荷にない場面に住んでいる。時計とずれ (`noRealtimeBump`、`servePastMove`、`finishWithoutClock`、`publishWithoutClock`)、悲観的な取引のロック待ちと検証の窓 (`validateFromT`、`noSchemaRecheck`)、UNIQUE と 2PC の途中の intent の重なり (`autoIgnoresUniqueIntents`)、大きな取引 (`noWriteSetLimit`)、分割と DDL の重なり (`childKeepsOldSchema`)、接続をまたぐ取引と UNIQUE の index の重なり (`repinOnRestore`)、共有の表の作り直し (`dropWithoutGuard`。直列の順序に置けないので、文の再生では作れない)。次の切り口は、この一覧から選ぶ。
+
 ### 検査の結果 (`main` の `628b20a`、2026-11-11)
 
 - `scripts/check.sh` は、全部の段が通る (型検査、全テスト 735 件、課金行数、sqllogictest、パッケージの作成確認、CLI の試験)。11 分かかった。うち 9 分は sqllogictest である。
