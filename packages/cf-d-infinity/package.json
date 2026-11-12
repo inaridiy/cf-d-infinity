@@ -48,6 +48,7 @@
     "build": "node scripts/build.mjs",
     "prepack": "npm run build",
     "test": "vitest run",
+    "demo": "node examples/split-under-load.mjs",
     "typecheck": "tsc --noEmit",
     "bundle": "esbuild src/worker.ts --bundle --format=esm --platform=browser --external:cloudflare:workers --external:*.wasm --alias:fs=./src/empty.js --alias:path=./src/empty.js --alias:crypto=./src/empty.js --define:process.versions.node=undefined --outfile=dist/worker.js",
     "bundle:bench": "esbuild src/bench.ts --bundle --format=esm --platform=browser --external:cloudflare:workers --external:*.wasm --alias:fs=./src/empty.js --alias:path=./src/empty.js --alias:crypto=./src/empty.js --define:process.versions.node=undefined --outfile=dist/bench.js",

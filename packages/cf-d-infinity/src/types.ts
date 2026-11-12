@@ -359,12 +359,20 @@ export interface Backend {
   size(): number;
 }
 
-/** 検証済みの欠陥を再導入するスイッチ。反例の再現テスト専用で、既定はすべて false。 */
+/** 検証済みの欠陥を再導入するスイッチ。反例の再現テスト専用で、既定はすべて false。シャードと Meta (meta.ts) が読む。 */
 export interface Faults {
+  /** Meta が、書き込み禁止の版が期限切れで取り消された後でも、DROP を記録する (モデル m14_red_untied)。 */
+  dropAfterExpiry?: boolean;
+  /** Meta が、期限切れで消えた分割の枠を示す子の受け取りの始まりを断らない (モデル m15_red_late_start の 1 つ目の守り)。 */
+  startWithoutSlot?: boolean;
+  /** Meta が、親の fence の前に、分割の枠が生きていることを確かめない (モデル m15_red_late_start の 2 つ目の守り)。 */
+  fenceWithoutSlot?: boolean;
   /** autocommit の書き込みが、他の取引の intent との UNIQUE を照合しない (2026-11 のレビューで見つかった欠陥)。 */
   autoIgnoresUniqueIntents?: boolean;
   /** DDL を、持っている intent を決着させずに適用する。表や列が消えた後では、確定済みの取引の intent を適用できない。 */
   ddlIgnoresIntents?: boolean;
+  /** DROP の守りの確認 (unchanged) が、決着していない intent を変更として数えない (specs/m14_rebuild_guard.qnt の m14_red_no_drain の 2 つ目の守り)。 */
+  unchangedIgnoresIntents?: boolean;
   /** 増設の子が、親からグループを受け取るときに表定義を追いつかせない。 */
   childKeepsOldSchema?: boolean;
   /** 行ロックや intent を待った後で、表定義を確かめ直さない。待ちの間に作られた index を保守しない書き込みが通る。 */
@@ -404,6 +412,24 @@ export interface Faults {
   validateFromT?: boolean;
   /** 検証の代わりにロックの保持だけを信じる。ロックを失っても検出できない。 */
   trustLocks?: boolean;
+  /** anchor が、committed の記録の確定 (sync) を待たずに phase 2 と応答を送る (モデル m3_red)。 */
+  phase2BeforeSync?: boolean;
+  /** 変更ログの世代を DROP しても logLowWater を上げない。消した commit は、再起動の後の検証から見えなくなる (モデル m8_red_drop)。 */
+  dropNoLowWater?: boolean;
+  /** anchor の取引記録の GC が、全参加者への phase 2 を終えていない committed の記録も消す (モデル m10_red_gc_undone)。 */
+  gcUndone?: boolean;
+  /** 分析への flush が、未解決の intent の prepare_ts で flush 時刻を抑えない (resolved ts を使わない。モデル m6_red_resolved)。 */
+  flushPastIntents?: boolean;
+  /** BEGIN IMMEDIATE のロック読みを、F ではなく T の snapshot で読む。範囲の since は F のまま (モデル m9_red_imm_read_t)。 */
+  lockedReadAtT?: boolean;
+  /** 悲観の DML とロック読みを、F を発行せずに取引の T で実行し、since も T にする (モデル m9_red_f_is_t。守りの 1 つ目)。 */
+  dmlAtT?: boolean;
+  /** 悲観の DML とロック読みが、要求の T と因果トークンまで時計を進めない (モデル m9_red_f_is_t。守りの 2 つ目)。 */
+  dmlSkipsClock?: boolean;
+  /** wound が、prepare 済みの取引の intent も奪って捨てる (モデル m9_red_wound_prepared)。 */
+  woundPrepared?: boolean;
+  /** prepare が、書く行の他の取引のロックを待つ (モデル m9_red_prepare_waits)。 */
+  prepareWaits?: boolean;
 }
 
 export class ConflictError extends Error {

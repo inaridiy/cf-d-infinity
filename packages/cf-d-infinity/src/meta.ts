@@ -1,4 +1,4 @@
-import { SqlError, checkStorageFormat, type Backend, type TableDef, type Ts } from "./types";
+import { SqlError, checkStorageFormat, type Backend, type Faults, type TableDef, type Ts } from "./types";
 import { parseDdl, publishBuild, type IndexInfo, type ParsedDdl, type SchemaView } from "./sql/ddl";
 import { systemRuntime, type Runtime } from "./runtime";
 import { CAPTURE_TABLES } from "./shard/rows";
@@ -85,13 +85,16 @@ export class MetaCore {
   private rt: Runtime;
   private leaseMs: number;
   private buildMaxMs: number;
+  /** 欠陥を再導入するスイッチ。検査が欠陥を見つけることを確かめる試験だけが渡す。 */
+  private faults: Faults;
   constructor(
     private b: Backend, private initialShards: string[] = [],
-    opts: { runtime?: Runtime; leaseMs?: number; buildMaxMs?: number } = {},
+    opts: { runtime?: Runtime; leaseMs?: number; buildMaxMs?: number; faults?: Faults } = {},
   ) {
     this.rt = opts.runtime ?? systemRuntime;
     this.leaseMs = opts.leaseMs ?? INDEX_LEASE_MS;
     this.buildMaxMs = opts.buildMaxMs ?? INDEX_BUILD_MAX_MS;
+    this.faults = opts.faults ?? {};
     b.exec(`CREATE TABLE IF NOT EXISTS __ddl(version INTEGER PRIMARY KEY, entry TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __routing(version INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __seq(name TEXT PRIMARY KEY, next INTEGER NOT NULL)`);
@@ -216,6 +219,8 @@ export class MetaCore {
     this.expire();
     const list = this.splitSlots();
     const slot = list.find((x) => x.id === id);
+    // 欠陥のスイッチ: 枠が期限で消えていても断らず、いまの版で受け取り始めさせる。枠のないまま分割が進み、DDL が記録される。
+    if (!slot && this.faults.startWithoutSlot) return { version: this.current().version };
     if (!slot || slot.parent !== move.parent || slot.child !== move.child || slot.start !== move.start || slot.end !== move.end) {
       throw new SqlError(`split ${id}: no such split slot (it expired before the child started, or it is for another range)`);
     }
@@ -225,6 +230,7 @@ export class MetaCore {
 
   /** 親が fence する前に、枠が生きていて、子が受け取り始めていることを確かめる。 */
   async checkSplit(id: string, move: SplitMove): Promise<void> {
+    if (this.faults.fenceWithoutSlot) return;
     const slot = this.splitSlots().find((x) => x.id === id);
     if (!slot?.started || slot.parent !== move.parent || slot.child !== move.child || slot.start !== move.start || slot.end !== move.end) {
       throw new SqlError(`split ${id}: the split slot is not held, or the child has not started receiving`);
@@ -423,6 +429,12 @@ export class MetaCore {
   async finishLock(version: number, sql: string): Promise<Catalog> {
     this.expire();
     const b = this.building();
+    if (this.faults.dropAfterExpiry && !(b?.guard && b.version === version)) {
+      // 欠陥のスイッチ: DROP が禁止と結び付いていない。期限切れで禁止が解けた後でも、最新の版の次に DROP を記録する。
+      const cat = this.current();
+      this.append(parseDdl(sql, cat), cat.version + 1);
+      return this.current();
+    }
     if (!b?.guard || b.version !== version) throw new SqlError(`DROP TABLE: the lock on the table was withdrawn before the table was dropped`);
     const parsed = parseDdl(sql, this.current());
     if (!b.guard.tables.every((t) => parsed.drops.includes(t))) throw new SqlError(`DROP TABLE: the statement does not drop ${b.guard.tables.join(", ")}`);

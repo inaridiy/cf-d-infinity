@@ -309,17 +309,22 @@ export class ShardCore implements ShardApi {
       low = Math.max(low, max);
     }
     if (drop.length > 0) {
-      this.logLowWater = low;
+      // dropNoLowWater は、消した範囲を窓の外として扱わない欠陥を戻す。索引の掃除もこの low-water に頼るので、一緒に外す。
+      const raise = !this.faults.dropNoLowWater;
+      if (raise) this.logLowWater = low;
       this.maxCommit = Math.max(this.maxCommit, low);
-      this.metaSet("log_low_water", low);
+      if (raise) this.metaSet("log_low_water", low);
       const keep = gens.filter((g) => !drop.includes(g));
       this.metaSet("log_gens", JSON.stringify(keep));
       for (const g of drop) this.b.exec(`DROP TABLE __log_g${g}`);
       // logLowWater 以下の索引は、検証が先に窓の外として abort するので要らない。
-      for (const [k, ts] of this.recent) if (ts <= low) this.recent.delete(k);
+      if (raise) for (const [k, ts] of this.recent) if (ts <= low) this.recent.delete(k);
     }
     const cutoff = now - (this.deps.txnRetainMs ?? TXN_RETAIN_MS);
-    this.b.exec(`DELETE FROM __txn WHERE done = 1 AND at < ?`, cutoff);
+    // 消すのは、全参加者へ決着を届け終えた (done = 1) 記録だけである。届け終えていない committed の記録を消すと、
+    // intent を持つ参加者が「記録なし」から tombstone を書き、確定した取引の書き込みを捨てる (specs/m10_txn_record_gc.qnt)。
+    if (this.faults.gcUndone) this.b.exec(`DELETE FROM __txn WHERE at < ?`, cutoff);
+    else this.b.exec(`DELETE FROM __txn WHERE done = 1 AND at < ?`, cutoff);
   }
 
   private metaGet(k: string): Value {
@@ -951,7 +956,12 @@ export class ShardCore implements ShardApi {
    * prepare 自身はこの待ちに入らない。入ると閉路ができる。
    */
   private waitForRow(key: string, me: LockOwner, deadline: number): Promise<void> {
-    const held = this.liveLock(key);
+    const lock = this.liveLock(key);
+    // 欠陥 woundPrepared は、ロックのない行の intent の持ち主 (prepare 済みの取引) も奪う相手にする。
+    // intent に開始時刻はないので、prepare_ts の物理時刻で代える。
+    const cut = key.indexOf("\0");
+    const intent = !lock && this.faults.woundPrepared ? this.intentAt(key.slice(0, cut), key.slice(cut + 1)) : undefined;
+    const held: LockOwner | undefined = lock ?? (intent && { txn: intent.txn, start: tsToPhysical(intent.prepare_ts) });
     return new Promise((resolve, reject) => {
       const list = this.waiters.get(key) ?? [];
       const leave = () => {
@@ -967,8 +977,13 @@ export class ShardCore implements ShardApi {
       });
       const wound = held && this.older(me, held)
         ? this.rt.after(WOUND_DELAY_MS, () => {
-            if (this.locks.get(key)?.txn !== held.txn) return;
-            this.locks.delete(key);
+            if (intent) {
+              if (this.intentAt(intent.tbl, intent.pk)?.txn !== intent.txn) return;
+              this.b.exec(`DELETE FROM __intents WHERE tbl = ? AND pk = ?`, intent.tbl, intent.pk);
+            } else {
+              if (this.locks.get(key)?.txn !== held.txn) return;
+              this.locks.delete(key);
+            }
             leave();
             resolve();
           })
@@ -979,13 +994,29 @@ export class ShardCore implements ShardApi {
         const l = this.liveLock(key); // 切れていれば wakeNext が先頭を起こす
         if (l) expiry = this.rt.after(Math.max(1, l.expires - this.deps.clock.now() + 1), watch);
       };
-      if (held) expiry = this.rt.after(Math.max(1, held.expires - this.deps.clock.now() + 1), watch);
+      if (lock) expiry = this.rt.after(Math.max(1, lock.expires - this.deps.clock.now() + 1), watch);
       const w: Waiter = { ...me, wake: () => { leave(); resolve(); } };
       // 古い取引を先に起こす。同じ開始時刻の間は到着順である。
       const at = list.findIndex((x) => this.older(me, x));
       list.splice(at < 0 ? list.length : at, 0, w);
       this.waiters.set(key, list);
     });
+  }
+
+  /**
+   * 欠陥 prepareWaits だけが使う。prepare が、書く行の他の取引のロックが空くのを待つ。prepare の要求に開始時刻はないので、
+   * 最も若い待ち手として待ち、wound はしない。期限を過ぎたら待つのをやめ、検証に任せる (ロックが残っていれば abort)。
+   */
+  private async waitForForeignLocks(txn: string, writes: Pick<Change, "table" | "pk">[]): Promise<void> {
+    const deadline = this.deps.clock.now() + LOCK_WAIT_MS;
+    const me: LockOwner = { txn, start: Number.MAX_SAFE_INTEGER };
+    for (const w of writes) {
+      const key = this.lockKey(w.table, w.pk);
+      for (let l = this.liveLock(key); l && l.txn !== txn; l = this.liveLock(key)) {
+        if (this.deps.clock.now() >= deadline) return;
+        await this.waitForRow(key, me, deadline).catch(() => undefined);
+      }
+    }
   }
 
   private blockedBy(changes: Pick<Change, "table" | "pk">[], me: LockOwner): string | null {
@@ -1010,13 +1041,19 @@ export class ShardCore implements ShardApi {
     try {
       for (;;) {
         await this.ensureArrived(this.sksOf(req.spans));
-        this.observe(req.minTs);
-        this.observe(req.T);
-        let F = this.issue();
+        // F はこのシャードが発行する時刻である。取引の T と因果トークンまで時計を進めてから発行するので、F より後の確定は F より大きい
+        // (specs/m9_protocol.qnt の m9_red_f_is_t)。
+        if (!this.faults.dmlSkipsClock) {
+          this.observe(req.minTs);
+          this.observe(req.T);
+        }
+        // 欠陥 dmlAtT は、F を発行せず、取引の T を F として使う。T は別のシャードの時計から来ることがある。
+        const atT = this.faults.dmlAtT && req.T !== undefined;
+        let F = atT ? req.T! : this.issue();
         this.assertOwned(req.spans, [], null);
         let applied = await this.settleIntents(req.spans, F);
         while (applied) {
-          F = this.issue();
+          if (!atT) F = this.issue();
           applied = await this.settleIntents(req.spans, F);
         }
         // ここから先は await を挟まない。
@@ -1025,8 +1062,11 @@ export class ShardCore implements ShardApi {
         this.renew(me.txn);
         const overlay = (req.overlay ?? []).map((c) => ({ table: c.table, pk: c.pk, image: c.after }));
         let out: { columns: string[]; values: Value[][]; changes: Change[]; count?: number };
+        // 欠陥 lockedReadAtT は、ロック読みを T の snapshot で読む (返す F は変えない)。dmlAtT は、F = T の状態で実行する。
+        const readAt = atT ? F : this.faults.lockedReadAtT && !req.write ? req.T : undefined;
         try {
           out = this.rollback(() => {
+            if (readAt !== undefined) this.restore(this.deltaAfter(readAt));
             if (overlay.length) setBasedRestore(this.b, (t) => this.def(t), overlay);
             return this.run(req);
           });
@@ -1639,6 +1679,7 @@ export class ShardCore implements ShardApi {
   async commitLocal(req: Omit<PrepareReq, "anchor">): Promise<CommitRes> {
     await this.ensureSchema(req.schema);
     await this.ensureArrived(this.sksOf(req.spans, req.writes));
+    if (this.faults.prepareWaits) await this.waitForForeignLocks(req.txn, req.writes);
     // グループの到着を待っている間に DDL が適用されることがある。古い計画のまま書かない。
     this.requireSchema(req.schema);
     this.observe(req.T);
@@ -1664,6 +1705,7 @@ export class ShardCore implements ShardApi {
   async prepare(req: PrepareReq): Promise<PrepareRes> {
     await this.ensureSchema(req.schema);
     await this.ensureArrived(this.sksOf(req.spans, req.writes));
+    if (this.faults.prepareWaits) await this.waitForForeignLocks(req.txn, req.writes);
     this.requireSchema(req.schema);
     return this.prepareSync(req);
   }
@@ -1743,7 +1785,8 @@ export class ShardCore implements ShardApi {
     }
     for (const s of req.spans) {
       if (this.changedSince(s, Math.max(req.from, s.since ?? 0))) return { ok: false, reason: `${s.table} changed after it was read` };
-      const hit = this.overlapping([s], Number.MAX_SAFE_INTEGER)[0];
+      // 版の適用は intent を決着させてから行う (settleAllIntents) が、それに頼らず、決着していない書き込みも変更として数える。
+      const hit = this.faults.unchangedIgnoresIntents ? undefined : this.overlapping([s], Number.MAX_SAFE_INTEGER)[0];
       if (hit) return { ok: false, reason: `${s.table} has a pending write of ${hit.txn}` };
     }
     return { ok: true };
@@ -1790,6 +1833,7 @@ export class ShardCore implements ShardApi {
     const failed = acks.find((a) => !a.ok);
     if (failed && !failed.ok) return this.decideAbort(req, failed.reason);
     const stamps = acks.map((a) => (a as { prepareTs: Ts }).prepareTs);
+    if (this.faults.prepareWaits) await this.waitForForeignLocks(req.txn, self.writes);
 
     // ここから c の確定までは await を挟まない。
     // 参加者の応答を待っている間に、この anchor に DDL が適用されていれば、取引は古い表定義で計画されている。
@@ -1822,7 +1866,9 @@ export class ShardCore implements ShardApi {
       `INSERT INTO __txn(txn, status, c, participants, at) VALUES (?, 'committed', ?, ?, ?)`,
       req.txn, c, JSON.stringify(req.participants.map((p) => p.shard)), this.deps.clock.now(),
     );
-    await this.b.sync(); // record の確定を待ってから phase 2 を送る。
+    // record の確定を待ってから phase 2 と応答を送る。先に送ると、確定の前に再起動したとき、記録が消えて
+    // 照会した参加者が tombstone を書き、phase 2 を受けた参加者とで決着が割れる (specs/m3_anchor_recovery.qnt の m3_red)。
+    if (!this.faults.phase2BeforeSync) await this.b.sync();
     this.deps.scheduleRedrive?.();
     this.spawn(this.phase2(req.txn, c, req.participants));
     return { ok: true, c };
@@ -1971,7 +2017,10 @@ export class ShardCore implements ShardApi {
   async flush(req: { upTo?: Ts }): Promise<FlushRes> {
     const minPrepare = this.b.exec(`SELECT min(prepare_ts) v FROM __intents`)[0]?.v as number | null;
     const now = this.issue();
-    const limit = Math.min(req.upTo ?? now, minPrepare === null ? now : minPrepare - 1);
+    // 未解決の intent は、prepare_ts 以上のどこか (この flush の時刻以下のこともある) で確定する。flush 時刻をそれより前に抑えないと、
+    // 後で届いた phase 2 の commit が flush 済みの範囲に入り、分析へ送られない (specs/m6_watermark.qnt の m6_red_resolved)。
+    const resolved = minPrepare === null || this.faults.flushPastIntents ? now : minPrepare - 1;
+    const limit = Math.min(req.upTo ?? now, resolved);
     const rows = this.logScan(`WHERE commit_ts > ? AND commit_ts <= ?`, [this.flushedTs, limit]);
     const entries = rows.map((r) => ({
       commitTs: r.commit_ts as Ts, txn: r.txn as string, changes: decode<Change[]>(r.blob as string),

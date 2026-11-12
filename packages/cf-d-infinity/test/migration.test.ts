@@ -1,7 +1,7 @@
 // pull 型のライブ移動。specs/m5b_live_migration.qnt の反例を実コードで再現する。
 import { describe, expect, it } from "vitest";
 import { decide, DEFAULTS, needsFollowUp, nextShardNumber, split, type AutoscalerState } from "../src/autoscaler";
-import { Db } from "../src/client/db";
+import { Db, type Txn } from "../src/client/db";
 import { ownerOf, planSplit, shardsOf, slotOf } from "../src/routing";
 import type { Faults, ShardMetrics } from "../src/types";
 import { SimCluster, USERS } from "./sim";
@@ -136,7 +136,8 @@ describe("live split", () => {
 
 describe("counterexamples from m5b_live_migration", () => {
   // 取引の intent が親にある状態で移動し、その後に phase 2 が親へ届く。
-  const pendingIntent = async (faults: Faults) => {
+  const pendingIntent = async (faults: Faults, arrivedFirst = false) => {
+    let reader: Txn | undefined;
     const c = await setup(faults);
     const { t, range } = await movingTenant(c);
     let other = 1;
@@ -152,19 +153,25 @@ describe("counterexamples from m5b_live_migration", () => {
     await w.query("UPDATE users SET n = 1 WHERE tenant_id = ? AND id = 1", row(t));
     await w.query("UPDATE users SET n = 1 WHERE tenant_id = ? AND id = 1", row(other));
     await w.commit(); // commit 済みで phase 2 が親に未達
+    // 移す前に時点を取る読み手。時点は w の確定の後、移す時刻 m の前にある。範囲表は移す前のものを持ち続ける。
+    reader = await new Db(c).begin();
+    await getN(reader, other);
     const slot = await c.reserveSplit("s0", "s2", range);
     await c.shard("s2").beginIncoming({ ...range, from: "s0", slot: slot.id });
     await c.shard("s0").fence({ ...range, to: "s2", slot: slot.id });
     await c.switchRange({ ...range, to: "s2" });
     // 親は応答を返したが子の処理はまだで、グループは飛行中である。
     const inFlight = await c.shard("s0").pull({ groups: [JSON.stringify([t])], to: "s2", maxBytes: 1_000_000 });
+    const receive = () => (c.cores.get("s2") as unknown as { receive(p: unknown): Promise<void> }).receive(inFlight);
+    // arrivedFirst: グループが子に着き終わってから、親に phase 2 が届く (m5b_red_p2)。そうでなければ、飛行中に届く (m5b_red_p2_window)。
+    if (arrivedFirst) await receive();
     c.net.gate = () => {};
     release();
     await c.settle();
     await c.sleep(5);
     // 飛行中だった応答がここで子へ届く。
-    await (c.cores.get("s2") as unknown as { receive(p: unknown): Promise<void> }).receive(inFlight);
-    return { c, t, range };
+    if (!arrivedFirst) await receive();
+    return { c, t, range, reader: reader! };
   };
 
   it("m5b_red_p2_window: applying at the parent loses the write in the flying snapshot", async () => {
@@ -172,6 +179,18 @@ describe("counterexamples from m5b_live_migration", () => {
     await c.shard("s2").drain(range);
     await c.settle();
     expect(c.backends.get("s2")!.exec("SELECT n FROM users WHERE tenant_id = ?", t)).toEqual([{ n: 0 }]);
+  });
+  it("m5b_red_p2: applying at the parent after the group arrived at the child loses the write", async () => {
+    const { c, t, range } = await pendingIntent({ applyAfterMoved: true }, true);
+    await c.shard("s2").drain(range);
+    await c.settle();
+    expect(c.backends.get("s2")!.exec("SELECT n FROM users WHERE tenant_id = ?", t)).toEqual([{ n: 0 }]);
+  });
+  it("forwards phase 2 to the child after the group arrived", async () => {
+    const { c, t, range } = await pendingIntent({}, true);
+    await c.shard("s2").drain(range);
+    await c.settle();
+    expect(await getN(new Db(c), t)).toBe(1);
   });
   it("forwards phase 2 through the moved table instead", async () => {
     const { c, t, range } = await pendingIntent({});
@@ -208,6 +227,22 @@ describe("counterexamples from m5b_live_migration", () => {
     const { r, t } = await staleRead({});
     (r as unknown as { cat: unknown }).cat = await (r as unknown as { db: Db }).db.cluster.catalog();
     await expect(getN(r, t)).rejects.toThrow(/moved at/);
+  });
+
+  // specs/m5b_live_migration.qnt の m5b_red_s3_parent。親は、移ったグループの読みに、移す時刻 m より前の時点でも答えてはならない。
+  // 取引 w の intent が親に置かれたまま確定し (c < m)、intent はグループと一緒に子へ運ばれ、子で適用される。親は w を知らない。
+  // 時点 T (c <= T < m) の読みに親が答えると、w の書き込みを見落とす。モデルの反例と同じ順で流す。
+  it("m5b_red_s3_parent: a parent that ignores the fence answers a read of a moved group without the moved write", async () => {
+    const { c, t, range, reader } = await pendingIntent({ ignoreFence: true }, true);
+    await c.shard("s2").drain(range);
+    await c.settle();
+    expect(await getN(reader, t).catch((e: Error) => e.message)).not.toBe(1); // T の時点の真の値は w が書いた 1 である
+  });
+  it("a fenced parent refuses the read of a moved group", async () => {
+    const { c, t, range, reader } = await pendingIntent({}, true);
+    await c.shard("s2").drain(range);
+    await c.settle();
+    await expect(getN(reader, t)).rejects.toThrow(/not owner|moved at/);
   });
 
   const fencedWrite = async (faults: Faults) => {

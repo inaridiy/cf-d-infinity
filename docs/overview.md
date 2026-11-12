@@ -214,15 +214,37 @@ the range table. See [scaling.md](./scaling.md) for the timestamp rules that kee
 
 ## How it is checked
 
-1. **Formal models.** Twelve Quint models cover the risky parts (schema changes under concurrent transactions, commit and snapshot reads, read refresh, 2PC
-   recovery, HLC across restarts, split fencing, live migration, garbage collection of transaction records, and the
-   integrated protocol). TLC explores them exhaustively on small instances. Each model has variants with a known bug
-   put back, and the checker must find every one.
-2. **Simulator.** The same shard code runs on `node:sqlite` under simulated delays, clock skew, restarts and splits,
-   and a checker verifies that each history is serializable.
-3. **Black-box checks.** An Elle-style list-append workload runs in the simulator and against production Cloudflare
-   while Durable Objects are crashed, shards split, and code redeployed with mixed versions.
-4. **Compatibility.** sqllogictest and differential fuzzing against real SQLite.
+The checks are layered. Each one catches what the layer before it cannot see.
+
+1. **Formal models.** Sixteen Quint models cover the risky protocol parts: commit and snapshot reads, read refresh, 2PC
+   recovery, HLC across restarts, split fencing and live migration, row locks, garbage collection of transaction
+   records, schema changes under concurrent transactions, building a cross-shard `UNIQUE` index, schema changes inside
+   transactions, table rebuilds, and the ordering of schema changes and splits. TLC explores them exhaustively on small
+   instances. Each model has variants with a known bug put back, and the checker must find every one.
+2. **Counterexamples replayed against the code.** A model only checks the design. For each bug variant that the
+   implementation guards against, a fault switch puts the same bug back into the code, and a deterministic simulator
+   test drives the model's counterexample step by step. The test checks that the switch produces the violation and the
+   real code does not. Without it, a rare ordering is left to a random seed that may never produce it. The
+   [coverage table](../.agents/execplans/evidence/2026-11-12-model-coverage.md) maps every variant to its switch and replay.
+3. **A deterministic simulator.** The real shard code runs on `node:sqlite` under simulated delays, clock skew,
+   restarts and splits. Time, timers, randomness and transaction IDs come from the seed, so the same seed gives the
+   same run, down to every RPC, and every failure is reproduced from its seed. Every statement a shard runs is checked
+   against the spans it declared. Two randomized checkers run on top:
+   - a serializability checker over the transaction history;
+   - a statement replay that re-runs every committed statement, in commit order, on one SQLite and compares each answer.
+4. **The reference path as an oracle.** The differential suites run three times: as planned, with every scan gathered
+   into the Worker, and with every statement on the reference path. A fast path that changes an answer, or an answer
+   that depends on where rows are, fails there.
+5. **SQLite itself as the oracle.** sqllogictest, differential fuzzing, and a generator that sends typed arguments
+   through a stock `@libsql/client` and compares values and `typeof` with SQLite (INTEGER bound as BigInt, as sqld does).
+6. **A fault table.** Every fault switch is run against the randomized checks over the same seeds, and the table records
+   which check finds which bug, so a check that finds nothing is visible.
+7. **Every night.** The randomized checks run on fresh seeds each night.
+8. **Upgrades.** Data written by storage format 1 is kept as a fixture, and every later version must open it, give the
+   same answers, and keep writing, splitting and changing the schema on it.
+9. **Production.** The workerd integration tests also run against a Worker deployed to Cloudflare. An Elle-style
+   list-append workload runs in the simulator and against production while Durable Objects are crashed, shards split,
+   and code is redeployed with mixed versions.
 
 None of this is a proof of the implementation.
 

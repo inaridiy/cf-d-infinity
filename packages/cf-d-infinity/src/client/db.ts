@@ -56,6 +56,22 @@ export interface ClientFaults {
   noImplicitCommit?: boolean;
   /** 取引の中の DDL が、先の確定に失敗しても実行される (モデル m13_red_ddl_anyway)。 */
   ddlAfterFailedCommit?: boolean;
+  /** 既存の行から作る index を、行を読んで項目を書く前に公開する (モデル m11_red_early_public)。 */
+  publishBeforeBackfill?: boolean;
+  /** 既存の行から index を作るとき、書き込み禁止の版を全シャードへ適用させず、その前の版を名乗って行を読む (モデル m12_red_scan_early)。 */
+  scanBeforeLock?: boolean;
+  /** 既存の行から index を作るとき、行のないシャードの時計を公開の時刻に入れない (モデル m12_clock_red_skip_empty)。 */
+  scanSkipsEmpty?: boolean;
+  /** 取引が読んだ表を DROP する前の確認を、どのシャードでも、読んだ時刻ではなく確定の時刻から行う (モデル m14_red_commit_ts)。 */
+  guardFromCommitTs?: boolean;
+  /** 分割の枠を、全シャードに最新の版を適用させずに取る (モデル m15_red_no_based_on。autoscaler.ts の reserveSplit が読む)。 */
+  splitWithoutSync?: boolean;
+  /** 読みだけの取引は、ロックを取って最新を読んだ範囲があっても、COMMIT で検証せずにロックを手放して終える (モデル m9_red_ro_skip)。 */
+  lockedReadsSkipValidation?: boolean;
+  /** 同じ行への 2 回目の DML で、書き込みの since を 2 回目の F にする (モデル m9_red_second_f。守りの 1 つ目、Txn.buffer の min)。 */
+  secondDmlNewSince?: boolean;
+  /** 後の DML が同じ範囲を記録すると、前の DML が F で記録した範囲を捨てる (モデル m9_red_second_f。守りの 2 つ目、最初の F の範囲)。 */
+  secondDmlNewSpanSince?: boolean;
 }
 
 /**
@@ -464,7 +480,13 @@ export class Txn extends ReadScope {
     return [...(this.writes.get(shard)?.values() ?? [])];
   }
   protected override record(shard: string, spans: Span[]): void {
-    this.spans.set(shard, [...(this.spans.get(shard) ?? []), ...spans]);
+    let prior = this.spans.get(shard) ?? [];
+    if (this.db.faults.secondDmlNewSpanSince) {
+      const bare = (s: Span) => JSON.stringify({ ...s, since: undefined });
+      const again = new Set(spans.filter((s) => s.since !== undefined).map(bare));
+      prior = prior.filter((p) => p.since === undefined || !again.has(bare(p)));
+    }
+    this.spans.set(shard, [...prior, ...spans]);
   }
 
   /**
@@ -557,9 +579,11 @@ export class Txn extends ReadScope {
   /** この取引が読んだ範囲。確定した後に呼ぶ。 */
   readRecord(): ReadRecord[] {
     const T = this.T ?? 0;
+    // 欠陥のスイッチ guardFromCommitTs: 書いていないシャードでも確定の時刻を使う。確定の時刻を見ていないシャードの書き込みを見落とす。
+    const wrote = (shard: string) => this.db.faults.guardFromCommitTs || (this.writes.get(shard)?.size ?? 0) > 0;
     return [...this.spans].map(([shard, spans]) => ({
       shard, spans,
-      from: this.commitTs !== undefined && (this.writes.get(shard)?.size ?? 0) > 0 ? Math.max(T, this.commitTs) : T,
+      from: this.commitTs !== undefined && wrote(shard) ? Math.max(T, this.commitTs) : T,
     }));
   }
 
@@ -898,7 +922,8 @@ export class Txn extends ReadScope {
     const key = `${c.table}\0${c.pk}`;
     const prior = m.get(key);
     // 検証の窓は最初の F から取る。2 回目の DML は自分の overlay を読むだけで、他者の変更を見ていない。
-    const since = prior?.since !== undefined && c.since !== undefined ? Math.min(prior.since, c.since) : (prior?.since ?? c.since);
+    const first = prior?.since !== undefined && c.since !== undefined ? Math.min(prior.since, c.since) : (prior?.since ?? c.since);
+    const since = this.db.faults.secondDmlNewSince && c.since !== undefined ? c.since : first;
     m.set(key, prior ? { ...c, before: prior.before, since } : c);
   }
 
@@ -971,6 +996,7 @@ export class Txn extends ReadScope {
     // 読みの時刻が揃っていないので検証が要る。検証でロックも手放す。
     const latest = [...this.spans.values()].some((list) => list.some((s) => s.since !== undefined));
     if (shards.size === 0 && !latest) return;
+    if (shards.size === 0 && this.db.faults.lockedReadsSkipValidation) return this.unlockAll();
     for (const s of this.spans.keys()) shards.add(s);
 
     const parts = [...shards].map((shard) => ({
@@ -1435,11 +1461,16 @@ export class Db {
     const lease = this.keepLease(version);
     try {
       // 行を読む要求は、作り始めた版を名乗る。シャードはその版を適用してから答えるので、読んだ時点で、そのシャードの行は止まっている。
-      const failed = await this.syncRecorded(started);
+      const failed = this.faults.scanBeforeLock ? null : await this.syncRecorded(started);
       if (failed) throw failed;
-      const { entries, at } = await this.scanForIndex(def, ix, version);
-      const written = await this.writeIndex(ix, entries, version);
-      published = await this.cluster.publishIndex(def.name, ix.name, version, Math.max(at, written));
+      if (this.faults.publishBeforeBackfill) {
+        // 欠陥のスイッチ: 既存の行の項目を書く前に公開する。公開の後は、作り始めた版が最新でないので、項目はもう書けない。
+        published = await this.cluster.publishIndex(def.name, ix.name, version, 0);
+      } else {
+        const { entries, at } = await this.scanForIndex(def, ix, version);
+        const written = await this.writeIndex(ix, entries, version);
+        published = await this.cluster.publishIndex(def.name, ix.name, version, Math.max(at, written));
+      }
     } catch (e) {
       // 取り消す。期限切れで先に取り消されていれば、その理由を返す。Worker の 1 回の呼び出しで使える要求の数を使い切ったときは、
       // 取り消しの要求も通らない。その場合は、期限が来れば Meta が取り消す。
@@ -1521,13 +1552,16 @@ export class Db {
     const pkCols = def.pk.map(q).join(", ");
     let after: Value[] | null = null;
     let at: Ts = 0;
+    // 欠陥のスイッチ scanBeforeLock: 書き込み禁止の版の前の版を名乗る。シャードは禁止を適用せずに答え、読んだ後の書き込みを受ける。
+    const schema = this.faults.scanBeforeLock ? cat.version - 1 : cat.version;
     for (;;) {
       const res = await this.shardOf(shard).exec({
         sql: `SELECT ${cols} FROM ${q(def.name)} ${after ? `WHERE (${pkCols}) > (${def.pk.map(() => "?").join(", ")})` : ""} ORDER BY ${pkCols} LIMIT ${BUILD_PAGE}`,
-        params: after ?? [], spans: withSlots(cat.routing, shard, [tableSpan(def.name)]), schema: cat.version,
+        params: after ?? [], spans: withSlots(cat.routing, shard, [tableSpan(def.name)]), schema,
       });
       if (res.error !== undefined) throw new SqlError(res.error);
-      at = Math.max(at, res.T, res.hlc);
+      // 欠陥のスイッチ scanSkipsEmpty: 行のないシャードは、読まなかったのと同じく、その時計を公開の時刻に入れない。
+      if (!(this.faults.scanSkipsEmpty && after === null && res.values.length === 0)) at = Math.max(at, res.T, res.hlc);
       const rows = new QueryResult(res.columns, res.values).rows;
       for (const row of rows) {
         const vals = ix.columns.map((col) => row[col] ?? null);
@@ -1730,9 +1764,15 @@ export class Db {
     return this.current !== null;
   }
 
-  /** 実行中の取引を捨てる。サーバには何も残っていないので、呼び出すだけでよい。 */
-  abandon(): void {
+  /**
+   * 実行中の取引を捨てる。取引が取った行ロックを、ここで手放す (sqld も、ストリームを閉じると取引を巻き戻す)。
+   * 手放さないと、ほかの接続の書き込みが、ロックの期限 (5 秒) まで待たされる (test/closed-stream-locks.test.ts)。
+   * 呼び出し側が消えて、閉じる要求も届かない取引のロックは、期限で切れる。
+   */
+  abandon(): Promise<void> {
+    const tx = this.current;
     this.current = null;
+    return tx ? tx.unlockAll().catch(() => undefined) : Promise.resolve();
   }
 
   /** 接続の状態を書き出す。 */

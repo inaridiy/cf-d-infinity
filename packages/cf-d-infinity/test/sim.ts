@@ -212,9 +212,32 @@ export class SqliteBackend implements Backend {
       this.depth--;
     }
   }
+  /**
+   * 確定していない書き込みを、再起動で失う模擬 (SimCluster.loseUnsynced)。有効にした後の書き込みは SQLite の取引に溜まり、
+   * sync() が終わると確定する (COMMIT)。再起動 (SimCluster.restart) は、確定していない分を捨てる (ROLLBACK)。
+   * 既定では無効で、書き込みはすぐ確定し、再起動でも失われない。本番の DO は、sync() を呼ばなくても数 ms で書き込みを確定させる。
+   * これは、その確定の前に再起動した場合を表す。
+   */
+  private holding: "off" | "open" | "lost" = "off";
+  holdUnsynced(): void {
+    if (this.holding === "open") return;
+    this.db.exec("BEGIN");
+    this.holding = "open";
+  }
+  /** 確定していない書き込みを捨てる。再起動の模擬が、旧 instance に対して呼ぶ。無効なら何もしない。 */
+  dropUnsynced(): void {
+    if (this.holding !== "open") return;
+    this.db.exec("ROLLBACK");
+    this.holding = "lost";
+  }
   /** quorum の確定には本番で約 10 ms かかる。ここで処理が譲られないと、待ちの間のレースを再現できない。 */
   async sync(): Promise<void> {
     await sleep(this.rt, this.rt.random() * 2);
+    if (this.holding === "off") return;
+    // 再起動した旧 instance の確定は成功しない。COMMIT すると、同じ SQLite を使う新しい instance の書き込みを確定させてしまう。
+    if (this.holding === "lost" || this.fenced) throw new Error("fenced instance: the shard restarted before its writes were confirmed");
+    this.db.exec("COMMIT");
+    this.db.exec("BEGIN");
   }
   size(): number {
     const r = this.db.prepare(`SELECT page_count * page_size s FROM pragma_page_count(), pragma_page_size()`).get() as { s: number };
@@ -246,7 +269,11 @@ export class SimNet {
 }
 
 /** Worker の側の欠陥のスイッチの名前 (src/client/db.ts の ClientFaults)。 */
-const CLIENT_FAULTS = new Set(["repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit"]);
+const CLIENT_FAULTS = new Set([
+  "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
+  "publishBeforeBackfill", "scanBeforeLock", "scanSkipsEmpty", "guardFromCommitTs", "splitWithoutSync",
+  "lockedReadsSkipValidation", "secondDmlNewSince", "secondDmlNewSpanSince",
+]);
 /** 範囲の作り方の欠陥のスイッチの名前 (src/client/spans.ts の spanFaults)。test/setup.ts が入れる。 */
 export const SPAN_FAULTS = new Set(["rowSpanDespiteUnique"]);
 
@@ -267,7 +294,10 @@ export interface SimOptions {
    */
   stored?: { meta: DatabaseSync; shards: Map<string, DatabaseSync> };
   shards?: number;
+  /** シャードと Meta の側の欠陥のスイッチ。 */
   faults?: Faults;
+  /** このクラスタへつなぐ Db と、分割を進める側 (autoscaler.ts の split) の欠陥のスイッチの既定。 */
+  clientFaults?: ClientFaults;
   skewMs?: (id: string) => number;
   K?: number;
   now?: () => number;
@@ -327,12 +357,12 @@ export class SimCluster implements Cluster {
   constructor(private o: SimOptions = {}) {
     const injected = injectedFault();
     if (injected?.side === "shard") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
-    this.clientFaults = injected?.side === "client" ? { [injected.name]: true } : undefined;
+    this.clientFaults = injected?.side === "client" ? { ...o.clientFaults, [injected.name]: true } : o.clientFaults;
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
     this.runtime = this.virtual ?? systemRuntime;
     this.shardIds = o.stored ? [...o.stored.shards.keys()] : Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
     this.metaBackend = new SqliteBackend(o.stored?.meta);
-    this.meta = new MetaCore(this.metaBackend, this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs });
+    this.meta = new MetaCore(this.metaBackend, this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs, faults: o.faults });
     for (const id of this.shardIds) this.core(id);
   }
 
@@ -436,12 +466,26 @@ export class SimCluster implements Cluster {
     for (const id of due) if (await this.core(id).redrive()) this.alarms.add(id);
   }
 
+  /** 確定していない書き込みを、再起動で失うシャード (loseUnsynced)。 */
+  private unsyncedLost = new Set<string>();
+  /**
+   * このシャードでは、これより後の書き込みのうち sync() で確定していないものを、再起動で失う (SqliteBackend.holdUnsynced)。
+   * 再起動した後の instance にも掛かる。既定では、どのシャードの書き込みも再起動で失われない。
+   */
+  loseUnsynced(id: string): void {
+    this.core(id);
+    this.unsyncedLost.add(id);
+    this.backends.get(id)!.holdUnsynced();
+  }
+
   /** 再起動。メモリは失われ、SQLite だけが残る。旧 instance は fence される。 */
   restart(id: string): void {
     const old = this.backends.get(id)!;
     old.fenced = true;
+    old.dropUnsynced();
     const fresh = new SqliteBackend(old.db);
     fresh.rt = this.runtime;
+    if (this.unsyncedLost.has(id)) fresh.holdUnsynced();
     this.backends.set(id, fresh);
     this.boot(id);
   }
