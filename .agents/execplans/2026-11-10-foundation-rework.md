@@ -53,15 +53,30 @@ npm への公開は、素地ができるまで行わない。
 
 ## いまの状態 (2026-11-11)
 
-- `main` は `8d02190`。PR #8 から #16 が入っている。#8 は前の作業者の検査済みの変更と引き継ぎの文書、#9 は決定的なシミュレータ、#10 は seed を大量に流す道具と検査の誤りの修正、#11 は入口の受け入れの規則、#12 は基準経路と切り替えの一本化、#13 は切った機能の残りのコードの削除、#14 は範囲の移動で時計を渡す修正と、検査を手元で流すための `scripts/check.sh`、#15 は index の作り方の決定と CI の週 1 回の実行の削除、#16 は表定義の変更の安全の一式 (不変条件 7、9、10。モデル M12、M13、M14) である。
+- `main` は `5f9fa15`。PR #8 から #17 が入っている。#8 は前の作業者の検査済みの変更と引き継ぎの文書、#9 は決定的なシミュレータ、#10 は seed を大量に流す道具と検査の誤りの修正、#11 は入口の受け入れの規則、#12 は基準経路と切り替えの一本化、#13 は切った機能の残りのコードの削除、#14 は範囲の移動で時計を渡す修正と、検査を手元で流すための `scripts/check.sh`、#15 は index の作り方の決定と CI の週 1 回の実行の削除、#16 は表定義の変更の安全の一式 (不変条件 7、9、10。モデル M12、M13、M14)、#17 は表定義の変更と分割の順序 (不変条件 4、モデル M15) である。
 - 行の配置で断る経路は、`main` にない。
 - 検査は手元で流す。GitHub の CI は、push や PR では走らない (Decision Log の 2026-11-11)。
 - ブランチ `schema-change-safety` (PR #16) は `main` に入った。`txn-schema-boundary` と `unique-index-under-lock` はその途中のブランチで、もう使わない。
-- ブランチ `maintenance-slot` が、Plan of Work の 6 の後半 (不変条件 4、DDL と分割の順序) である。
+- ブランチ `maintenance-slot` (PR #17) は `main` に入った。
+- ブランチ `oracle-crossing` が、Plan of Work の 5 (生成器と、障害の掛け合わせ) である。
 - ブランチ `wip/gather-missing-rows` (`45e9b57`) は、前の作業者の未完成の変更である。採らなかった (Decision Log の 2026-11-11)。ローカルにだけある。
 - ブランチ `foundation-3` (ローカル) は、PR #8 と `wip/gather-missing-rows` に分ける前の並びで、もう使わない。
 - `packages/cf-d-infinity/DEVELOPMENT.md` は、この一連の変更を反映していない。`AGENTS.md` にそう書いてある。
-- 次にやるのは、Plan of Work の 6 の後半である。先に不変条件 4 (DDL と分割の順序。未解決の問題 3 と 16) をモデルから進め、その後に不変条件 2 (確定した取引は必ず適用できる) へ移る。
+- 次にやるのは、Plan of Work の 5 である。不変条件 2 (確定した取引は必ず適用できる) には、まだ再現も、破れを見つける検査もない。規則 2 により、先に検査を作る。最初の切り口は、SQL の `BEGIN` と DDL を並行に流す、文の再生検査である (不変条件 9 を乱択で確かめていない)。
+
+### 欠陥の表 (2026-11-12、`f393657`)
+
+欠陥のスイッチを 1 つずつ入れ、乱択の検査 3 つの seed ごとの試験を、seed 1 から 40 で流した (`scripts/fault-table.mjs`)。表そのものは `.agents/execplans/evidence/2026-11-12-fault-table.md` にある。欠陥を入れない行は、3 つとも 0 件の失敗だった。
+
+- どの検査も見つけない (3 つとも 0): `autoIgnoresUniqueIntents`、`childKeepsOldSchema`、`noSchemaRecheck`、`noWriteSetLimit`、`noRealtimeBump`、`servePastMove`、`finishWithoutClock`、`publishWithoutClock`、`validateFromT`、`repinOnRestore`、`dropWithoutGuard`。`replayAcrossSchemaChange` もこの版では 0 (取引の中の DDL を流す接続がまだない)。`triggerCapture` は欠陥ではない (遅い経路を使わせるだけ) ので、0 が正しい。
+- 見つけるが、少ない (いちばん見つける検査で 1 割未満): `applyAfterMoved` (DDL と並行する取引で 440 回中 2)、`dropIntentsOnMove` (history で 240 回中 4)、`hlcNoCeiling` (同 5)、`staleWideRead` (DDL と並行する取引で 440 回中 22)、`predicateProtected` と `trustLocks` (history で 240 回中 17)、`ddlIgnoresIntents` (DDL と並行する取引で 440 回中 43)。
+- よく見つける: `readerTimeoutPass`、`ignoreIntentsInValidation`、`skipReadOnlyPrepare`、`anchorNoAbsorb`、`refreshNoBump`、`pushAfterDecide`、`ignoreTableLock`。
+- 止まる: `ignoreFence` (未解決の問題 18)。
+- `rowSpanDespiteUnique` は、文の再生検査で 80 回中 44 回落ちた。どの試験にも掛かる範囲の検査 (`test/setup.ts`) が見つけている可能性が高い。文の再生そのものが見つけているかは、分けて数えていない。
+
+切り口 1 (取引の中の DDL を流す接続。`3b0a303`) を入れた後、文の再生検査の列を流し直した (`ac92184`、seed 1 から 40、試験は 1 seed に 3 つ)。新しく見つかるようになったのは、`noImplicitCommit` (120 回中 40)、`ddlAfterFailedCommit` (39)、`replayAcrossSchemaChange` (0 から 7)、`ddlIgnoresIntents` (0 から 27。狙っていなかった) である。ほかの行は変わらない。欠陥を入れない行は 0 だった。
+
+見つけない欠陥の多くは、検査の作業負荷にない場面に住んでいる。時計とずれ (`noRealtimeBump`、`servePastMove`、`finishWithoutClock`、`publishWithoutClock`)、悲観的な取引のロック待ちと検証の窓 (`validateFromT`、`noSchemaRecheck`)、UNIQUE と 2PC の途中の intent の重なり (`autoIgnoresUniqueIntents`)、大きな取引 (`noWriteSetLimit`)、分割と DDL の重なり (`childKeepsOldSchema`)、接続をまたぐ取引と UNIQUE の index の重なり (`repinOnRestore`)、共有の表の作り直し (`dropWithoutGuard`。直列の順序に置けないので、文の再生では作れない)。次の切り口は、この一覧から選ぶ。
 
 ### 検査の結果 (`main` の `628b20a`、2026-11-11)
 
@@ -332,6 +347,7 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 15. 表を作り直す移行の途中で、別の接続が古い表へ書くと、行は失われないが、移行が競合で失敗する。作りかけの新しい表 (`__new_<表名>`) が残り、drizzle-kit の移行をそのまま流し直すと「表がもうある」で失敗する。書き込みを待たせて移行を通す形にするには、禁止を行を写す前に掛ける必要がある。そうすると、写す区切りが名乗る版が古くなり、シャードが断る (不変条件 9)。書き込み禁止だけの版を「計画を変えない版」として、その前の版の計画も通す形が候補である。モデル M13 と M12 の版の確認を、その形で検査し直してから入れる。
 16. (解決) index を作っている間に分割を始めないこと。保守の操作の枠で排他にした (不変条件 4)。範囲表が変わったときに読み直す処理 (`scanForIndex`) は、届かなくなったので消した。UNIQUE の index と分割を掛け合わせる乱択の場面 (`uniqueIndexAndSplits`) も足した。
 17. 分割を進める側が、親の fence の後、範囲表の切り替えの前に止まると、移る範囲の行を誰も答えない。範囲表はまだ親を指し、親は fence したので「持ち主は子だ」と断る。Worker は範囲表を取り直すが変わっていないので、やり直しを使い切って誤りを返す。Autoscaler が分割を再開するまで (最長で判断の間隔、1 分) 続く。再現は `test/open/fenced-before-switch.test.ts`。候補は、親の断りが運ぶ子の名前に、Worker が従うこと (子は受け取り始めているので、行を取りに行ける)。範囲の持ち主の規則 (不変条件 1 の経路の側、M5b) に関わるので、モデルの確認から始める。
+18. intent を決着させる処理 (`ShardCore.settleIntents`) は、確定した intent を適用した後も intent が残っていると、同じ intent を永久に問い合わせ続ける。anchor が自分自身だと、問い合わせも適用も microtask だけで済むので、イベントループが回らず、試験の制限時間も、シミュレータの止まりの検出も効かない。欠陥のスイッチ `ignoreFence` で、history の検査の seed 27 が 11 時間半止まって見つかった (基準の表を作っているとき)。スイッチが作る「確定したのに、置かれた場所では適用できない intent」は、不変条件 2 の症状である。この処理に進みの確認がないので、誤りではなく止まりとして現れる。不変条件 2 の作業で扱う。記録は `.agents/execplans/evidence/2026-11-12-settle-intents-livelock.md`。
 
 ## Surprises & Discoveries
 
@@ -498,7 +514,28 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 - 文を再生する検査は、`db.begin()` の取引オブジェクトで文を流すので、取引の中の DDL (不変条件 9) を乱択で試していない (そこでは DDL を断る)。SQL の `BEGIN` と Hrana の batch で流す接続を混ぜ、DDL の位置を区切りとして再生する。いま不変条件 9 を確かめているのは、モデル M13 と、1 つの接続の決定的な試験 (`test/migration-tools.test.ts`、`test/txn-across-schema-change.test.ts`) だけである。
 - Drizzle の D1 のドライバの移行は、`D1Compatible` を同じプロセスで通して確かめた。利用者が使う `connect(env.DINF_DB)` (Service Binding) を通しては流していない。workerd の試験 (`test/binding.test.ts`) に足す。
 - `Faults` と `spanFaults` を 1 つずつ入れ、個別の回帰テストを使わずに、生成器と検査が見つけるかを表にする。見つからない欠陥は、生成器が薄い場所を示す。
-- 夜間の実行を CI に足し、実行した数、seed、掛け合わせ、省いた数を記録する。
+- 長い乱択の実行は、手元の計算機で流す (検査は手元。Decision Log の 2026-11-11)。`scripts/fault-table.mjs` の表と、`scripts/sweep.mjs` の掃引を、実行した数、seed、掛け合わせ、省いた数と一緒に、この文書の「検査の結果」に記録する。
+
+#### 5 の進め方 (2026-11-11)
+
+区切りは 2 つにする。PR も、この 2 つで 1 本ずつにする。
+
+1. 基準の表。欠陥のスイッチ (`Faults`、`spanFaults`、`ClientFaults`) を環境変数 `FAULT` で 1 つずつ入れ (`test/sim.ts` の `injectedFault`)、文の再生検査、history の検査、DDL と並行する取引の検査の seed ごとの試験を、同じ seed の範囲で流す (`scripts/fault-table.mjs`)。どの検査がどの欠陥を見つけるかと、その割合が、5 全体の物差しで、次に何を足すかを決める。
+2. 最初の切り口: SQL の `BEGIN` と Hrana の batch で、取引の中に DDL を含めて流す接続を、文の再生検査に足す。文の形は、モデルの壊した変種から逆に作る。
+
+| 壊した変種 | 食い違いになる文の形 | 戻すスイッチ |
+|---|---|---|
+| `m13_red_main` / `m13_red_pin_only` (DDL の前に確定しない) | 接続専用の表を作り、行を写し、古い表を消す。書く、DDL、作った表へ書く | なし。`noImplicitCommit` を足す |
+| `m13_red_repin` (計画し直さずに新しい版を名乗る) | 接続をまたぐ取引が書いた表に、別の接続が UNIQUE の index を作る | `repinOnRestore` (index の再生検査で 900 回に 1 回。形でなく頻度が足りない) |
+| `m13_red_retry_whole` (batch を頭からやり直す) | BEGIN から始まる batch の中の DDL の後で、別の接続と競合する | `replayAcrossSchemaChange` |
+| `m13_red_ddl_anyway` (確定に失敗しても DDL を流す) | 読んだ行を別の接続が書き換えた後の DDL | なし。`ddlAfterFailedCommit` を足す |
+| `m14_red_no_lock` / `_no_check` | 共有の表を作り直す取引と、その表への別の接続の書き込み | `ignoreTableLock`、`dropWithoutGuard` |
+| `m14_red_no_drain` | 同上で、書き込みが 2PC の途中 | `ddlIgnoresIntents` |
+| `m14_red_check_early` / `_untied` / `_commit_ts` | 同上 | なし (足すかどうかは、表を見て決める) |
+| M15 の 5 本 (分割と DDL の順序) | 分割と並行する DDL。DDL と並行する取引の検査の分割の場面が、拒否を数える | なし (Meta の側にスイッチがない) |
+
+直列の順序に置けるのは、位置が決まる DDL だけである。接続専用の表への DDL (自分の区切りとの前後だけが効く)、index の公開 (`DdlEntry.at`)、守られた DROP (行を写した区切りの確定の直後) である。共有の表へのそれ以外の DDL には時刻がないので、生成しない (「まだ見ていない」として残す)。
+記録は区切りごとに 1 つにする。先の確定に失敗した DDL の後、接続は取引の外にいる。続く文は 1 文ずつ確定し、COMMIT は誤りになる。だから、区切りは台本からではなく、文ごとの `db.inTransaction` から決める。
 
 ### 6. モデルを先に書く仕事
 

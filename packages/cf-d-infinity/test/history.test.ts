@@ -42,6 +42,13 @@ interface RunOpts {
  */
 const PUT_BACK_SEEDS = [958];
 
+/**
+ * 実行が終わらないと見なす上限。仮想の時刻で 10 分、出来事 200 万個。欠陥を入れた実行は、要求を投げ合い続けて終わらないことがある。
+ * 上限で、原因の分かる失敗にする (試験の制限時間は、出来事が途切れずに続くと効かないことがある)。
+ */
+const STALL_MS = 10 * 60_000;
+const STALL_STEPS = 2_000_000;
+
 async function run(o: RunOpts) {
   const rnd = prng(o.seed);
   const skew = new Map<string, number>();
@@ -55,6 +62,10 @@ async function run(o: RunOpts) {
     },
   });
   c.net.jitter = () => (rnd() < 0.5 ? 0 : rnd() * 3);
+  return Promise.race([body(o, c, rnd), c.stalled(STALL_MS, STALL_STEPS)]);
+}
+
+async function body(o: RunOpts, c: SimCluster, rnd: () => number) {
   const admin = c.client();
   await admin.ddl(USERS);
 
