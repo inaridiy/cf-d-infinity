@@ -66,6 +66,12 @@ export interface ClientFaults {
   guardFromCommitTs?: boolean;
   /** 分割の枠を、全シャードに最新の版を適用させずに取る (モデル m15_red_no_based_on。autoscaler.ts の reserveSplit が読む)。 */
   splitWithoutSync?: boolean;
+  /** 読みだけの取引は、ロックを取って最新を読んだ範囲があっても、COMMIT で検証せずにロックを手放して終える (モデル m9_red_ro_skip)。 */
+  lockedReadsSkipValidation?: boolean;
+  /** 同じ行への 2 回目の DML で、書き込みの since を 2 回目の F にする (モデル m9_red_second_f。守りの 1 つ目、Txn.buffer の min)。 */
+  secondDmlNewSince?: boolean;
+  /** 後の DML が同じ範囲を記録すると、前の DML が F で記録した範囲を捨てる (モデル m9_red_second_f。守りの 2 つ目、最初の F の範囲)。 */
+  secondDmlNewSpanSince?: boolean;
 }
 
 /**
@@ -474,7 +480,13 @@ export class Txn extends ReadScope {
     return [...(this.writes.get(shard)?.values() ?? [])];
   }
   protected override record(shard: string, spans: Span[]): void {
-    this.spans.set(shard, [...(this.spans.get(shard) ?? []), ...spans]);
+    let prior = this.spans.get(shard) ?? [];
+    if (this.db.faults.secondDmlNewSpanSince) {
+      const bare = (s: Span) => JSON.stringify({ ...s, since: undefined });
+      const again = new Set(spans.filter((s) => s.since !== undefined).map(bare));
+      prior = prior.filter((p) => p.since === undefined || !again.has(bare(p)));
+    }
+    this.spans.set(shard, [...prior, ...spans]);
   }
 
   /**
@@ -910,7 +922,8 @@ export class Txn extends ReadScope {
     const key = `${c.table}\0${c.pk}`;
     const prior = m.get(key);
     // 検証の窓は最初の F から取る。2 回目の DML は自分の overlay を読むだけで、他者の変更を見ていない。
-    const since = prior?.since !== undefined && c.since !== undefined ? Math.min(prior.since, c.since) : (prior?.since ?? c.since);
+    const first = prior?.since !== undefined && c.since !== undefined ? Math.min(prior.since, c.since) : (prior?.since ?? c.since);
+    const since = this.db.faults.secondDmlNewSince && c.since !== undefined ? c.since : first;
     m.set(key, prior ? { ...c, before: prior.before, since } : c);
   }
 
@@ -983,6 +996,7 @@ export class Txn extends ReadScope {
     // 読みの時刻が揃っていないので検証が要る。検証でロックも手放す。
     const latest = [...this.spans.values()].some((list) => list.some((s) => s.since !== undefined));
     if (shards.size === 0 && !latest) return;
+    if (shards.size === 0 && this.db.faults.lockedReadsSkipValidation) return this.unlockAll();
     for (const s of this.spans.keys()) shards.add(s);
 
     const parts = [...shards].map((shard) => ({

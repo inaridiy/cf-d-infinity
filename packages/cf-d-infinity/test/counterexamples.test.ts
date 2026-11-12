@@ -1,10 +1,10 @@
 // 設計レビューと形式モデルで見つけた反例を、本物のシャードコードで再現する。
 // 各テストは「欠陥スイッチを入れると壊れ、外すと直る」の両方を確かめる。
 import { describe, expect, it } from "vitest";
-import { ORDERS, SimCluster, USERS, type SimOptions } from "./sim";
-import { Db } from "../src/client/db";
+import { ORDERS, SimCluster, USERS, logRows, type SimOptions } from "./sim";
+import { Db, type ClientFaults } from "../src/client/db";
 import { ownerOf } from "../src/routing";
-import type { Faults } from "../src/types";
+import type { ExecReq, Faults } from "../src/types";
 
 /** 指定シャードに載る tenant を返す。 */
 async function tenantOn(c: SimCluster, shard: string, skip = 0): Promise<number> {
@@ -587,6 +587,277 @@ describe("pessimistic transactions", () => {
     expect(c.time - t0).toBeGreaterThanOrEqual(150);
     await old.query("COMMIT");
     await expect(stuck.query("COMMIT")).rejects.toThrow(/conflict/);
+  });
+});
+
+// 以下は specs/m9_protocol.qnt の red の反例を、悲観の取引 (BEGIN、BEGIN IMMEDIATE) で流す。
+/** 開始時刻を 0 にした接続。wound-wait で、ほかのどの取引よりも古い。 */
+function oldest(c: SimCluster): Db {
+  const d = new Db(c);
+  (d as unknown as { startStamp(): number }).startStamp = () => 0;
+  return d;
+}
+/** Promise が決着したかを、待たずに見る。 */
+function watch(p: Promise<unknown>): { done: boolean } {
+  const s = { done: false };
+  void p.then(() => (s.done = true), () => (s.done = true));
+  return s;
+}
+const lockedReads = (c: SimCluster) => c.net.log.filter((m) => m.method === "exec" && (m.req as ExecReq).lockRows).length;
+
+// m9_red_ro_skip。BEGIN IMMEDIATE の主キーの読みは、ロックを取って最新の状態 (F) を読む。読みごとに時刻が違うので、書き込みのない
+// 取引でも COMMIT で検証する (Txn.commit の latest)。モデルの反例と同じ順で流す:
+// 1 が x を F でロック読みする (0)。x のロックが TTL で切れる。2 (悲観の取引) が x と y に書いて確定する。
+// 1 が y を F でロック読みする (2 の値)。検証せずに終えると、1 は x を 2 の前の値、y を 2 の後の値で読んだまま確定する。
+describe("m9_red_ro_skip: a read-only transaction that read under locks is validated at COMMIT", () => {
+  const scenario = async (clientFaults: ClientFaults) => {
+    const { c, db, A, B } = await cluster({}, { lockTtlMs: 150 });
+    await seed(db, A);
+    await seed(db, B);
+    const r = new Db(c, { faults: clientFaults });
+    await r.query("BEGIN IMMEDIATE");
+    const x = await getN(r, A);
+    c.time += 200; // x のロックが TTL で切れる
+    const w = new Db(c);
+    await w.query("BEGIN");
+    await setN(w, A, 1);
+    await setN(w, B, 1);
+    await w.query("COMMIT");
+    await c.settle();
+    const y = await getN(r, B);
+    const out = await r.query("COMMIT").then(() => "committed", (e: Error) => e.message);
+    return { seen: [x, y], locked: lockedReads(c), out };
+  };
+  it("put back: without the validation, it commits x from before the writer and y from after it", async () => {
+    expect(await scenario({ lockedReadsSkipValidation: true })).toEqual({ seen: [0, 1], locked: 2, out: "committed" });
+  });
+  it("aborts because x changed after the locked read", async () => {
+    const r = await scenario({});
+    expect(r.seen).toEqual([0, 1]);
+    expect(r.locked).toBe(2);
+    expect(r.out).toMatch(/conflict/);
+  });
+});
+
+// m9_red_second_f。同じ行への 2 回目の DML は、自分の overlay を読むだけで、他者の変更を見ていない。だから検証の窓は最初の DML の F
+// から取る。実装では窓の下限が 2 か所にある。書き込みの since (Txn.buffer の min) と、最初の DML が F で記録した範囲である。
+// モデルの反例と同じ順で流す: 1 の DML1 が x を F1 で読んで書く。x のロックが TTL で切れる。2 (autocommit) が x に書いて確定する。
+// 1 の DML2 が F2 でロックを取り直す。窓を F2 から取ると 2 の確定が窓に入らず、1 は 2 を見ずに上書きする (失われた更新)。
+describe("m9_red_second_f: a second DML on a row keeps the window from the first F", () => {
+  const scenario = async (clientFaults: ClientFaults) => {
+    const c = new SimCluster({ shards: 1, lockTtlMs: 150 });
+    const db = new Db(c);
+    await db.query("CREATE TABLE h(id INTEGER PRIMARY KEY, n INTEGER)");
+    await db.query("INSERT INTO h VALUES (1, 0)");
+    const a = new Db(c, { faults: clientFaults });
+    await a.query("BEGIN");
+    await a.query("UPDATE h SET n = n + 1 WHERE id = 1"); // F1 で 0 を読む
+    c.time += 200; // x のロックが TTL で切れる
+    await new Db(c).query("UPDATE h SET n = n + 100 WHERE id = 1");
+    await a.query("UPDATE h SET n = n + 1 WHERE id = 1"); // F2 でロックを取り直し、自分の overlay (1) を読む
+    const out = await a.query("COMMIT").then(() => "committed", (e: Error) => e.message);
+    return { out, n: (await db.query("SELECT n FROM h")).rows[0]!.n };
+  };
+  it("put back: with both bounds moved to the second F, the transaction overwrites the other commit", async () => {
+    expect(await scenario({ secondDmlNewSince: true, secondDmlNewSpanSince: true })).toEqual({ out: "committed", n: 2 });
+  });
+  it("still aborts with only the write's since moved: the first DML's span is validated from the first F", async () => {
+    const r = await scenario({ secondDmlNewSince: true });
+    expect(r.n).toBe(100);
+    expect(r.out).toMatch(/conflict: span changed/);
+  });
+  it("still aborts with only the first span dropped: the write keeps the first F", async () => {
+    const r = await scenario({ secondDmlNewSpanSince: true });
+    expect(r.n).toBe(100);
+    expect(r.out).toMatch(/conflict: write after T/);
+  });
+  it("aborts because the other commit is after the first F", async () => {
+    const r = await scenario({});
+    expect(r.n).toBe(100);
+    expect(r.out).toMatch(/conflict/);
+  });
+});
+
+// m9_red_imm_read_t。BEGIN IMMEDIATE の主キーの読みはロックを取って F で読み、その範囲を F から検証する。T の snapshot で読んで
+// F から検証すると、(T, F] の確定を読み落とし、検証もそれを見ない。モデルの反例と同じ順で流す:
+// 1 が T を持つ (モデルでは開始時に決まる。実装の T は最初の文で決まるので、2 が触らない行 2 をロック読みして決める)。
+// 2 (autocommit) が x に書いて確定する。1 が x をロック読みし、読んだ値から x を書いて確定する。
+describe("m9_red_imm_read_t: a locked read in BEGIN IMMEDIATE reads at F, where its window starts", () => {
+  const scenario = async (faults: Faults) => {
+    const c = new SimCluster({ shards: 1, faults });
+    const db = new Db(c);
+    await db.query("CREATE TABLE h(id INTEGER PRIMARY KEY, n INTEGER)");
+    await db.query("INSERT INTO h VALUES (1, 0), (2, 0)");
+    const a = new Db(c);
+    await a.query("BEGIN IMMEDIATE");
+    await a.query("SELECT n FROM h WHERE id = 2"); // T が決まる
+    c.time += 1;
+    await new Db(c).query("UPDATE h SET n = 100 WHERE id = 1");
+    const read = (await a.query("SELECT n FROM h WHERE id = 1")).rows[0]!.n as number;
+    await a.query("UPDATE h SET n = ? WHERE id = 1", [read + 1]);
+    const out = await a.query("COMMIT").then(() => "committed", () => "aborted");
+    return { read, out, n: (await db.query("SELECT n FROM h WHERE id = 1")).rows[0]!.n, locked: lockedReads(c) };
+  };
+  it("put back: reading at T misses the commit before F, and the transaction overwrites it", async () => {
+    expect(await scenario({ lockedReadAtT: true })).toEqual({ read: 0, out: "committed", n: 1, locked: 2 });
+  });
+  it("reads the commit and builds on it", async () => {
+    expect(await scenario({})).toEqual({ read: 100, out: "committed", n: 101, locked: 2 });
+  });
+});
+
+// m9_red_f_is_t。悲観の DML とロック読みは、このシャードが発行した F の状態で実行し、F から検証する。F は、要求の T と因果トークン
+// まで時計を進めてから発行するので、その後このシャードで確定する書き込みは F より大きい。取引の T で実行して since = T にすると、
+// T は別のシャードの時計から来ることがあり、このシャードの時計は T に届いていない。後から確定した書き込みが T 以下の時刻を持ち、
+// T からの検証の窓に入らない。TLC の反例の順で流す:
+// 1 (古い) と 2 (BEGIN IMMEDIATE) が始まる。2 の T は時計の進んだ y のシャードで決まる。2 が x を T でロック読みする (0)。
+// 1 が x を待ち、wound で奪って書き、確定する (c ≤ T)。2 の検証の窓 (T, c] に 1 の確定は入らない。
+// モデルの 2 は読むだけで、確定の順と読んだ値の食い違いが反例になる。ここでは読んだ x から x を書かせ、失われた更新として見る
+// (書き込みを足したこの順も m9_red_f_is_t で反例になることを、モデルで確かめた)。
+// 実装の守りは 2 つある。F を T にしないこと (dmlAtT) と、時計を T と因果トークンまで進めること (dmlSkipsClock) である。
+// 時計を T まで進めていれば、T で読んで T から検証するのは楽観の読みと同じで正しい。validateFromT (F で読み T から検証する) は
+// 窓を広げるだけで abort が増えるだけなので、この欠陥の代わりにはならない。
+describe("m9_red_f_is_t: a pessimistic statement runs at F, a time this shard issued", () => {
+  const scenario = async (faults: Faults) => {
+    const { c, db, A, B, drift } = await cluster(faults);
+    await seed(db, A);
+    await seed(db, B);
+    drift.set("s1", 1000); // y のシャードの時計が進んでいる
+    const l = new Db(c);
+    await l.query("BEGIN IMMEDIATE");
+    await getN(l, B); // T は s1 の時計で決まる
+    const x = (await getN(l, A)) as number; // x をロック読みする
+    const T = (c.net.log.find((m) => m.method === "exec" && m.to === "s0" && (m.req as ExecReq).lockRows)!.req as ExecReq).T!;
+    const d = oldest(c);
+    await d.query("BEGIN");
+    const t0 = c.time;
+    await setN(d, A, 5); // 2 のロックを待ち、wound で奪う
+    expect(c.time - t0).toBeGreaterThanOrEqual(200);
+    await d.query("COMMIT");
+    // 1 の確定は s0 だけの commitLocal である。その確定の時刻を s0 の変更ログから読む。
+    const dTxn = (c.net.log.find((m) => m.method === "commitLocal" && m.to === "s0")!.req as { txn: string }).txn;
+    const other = logRows(c.backends.get("s0")!).find((r) => r.txn === dTxn)!.commit_ts as number;
+    await setN(l, A, x + 1);
+    const out = await l.query("COMMIT").then(() => "committed", (e: Error) => e.message);
+    await c.settle();
+    return { x, out, n: await getN(db, A), otherAtOrBelowT: other <= T };
+  };
+  it("put back: running at T with the clock left behind lets the other commit land inside T and be overwritten", async () => {
+    expect(await scenario({ dmlAtT: true, dmlSkipsClock: true })).toEqual({ x: 0, out: "committed", n: 1, otherAtOrBelowT: true });
+  });
+  it("still aborts with only F = T: the clock was moved to T, so the other commit is after T", async () => {
+    const r = await scenario({ dmlAtT: true });
+    expect(r).toMatchObject({ x: 0, n: 5, otherAtOrBelowT: false });
+    expect(r.out).toMatch(/conflict: write after T/);
+  });
+  it("still aborts with only the clock left behind: F is still a time this shard issued", async () => {
+    const r = await scenario({ dmlSkipsClock: true });
+    expect(r).toMatchObject({ x: 0, n: 5 });
+    expect(r.out).toMatch(/conflict: span changed/);
+  });
+  it("aborts because the other commit is after F", async () => {
+    const r = await scenario({});
+    expect(r).toMatchObject({ x: 0, n: 5, otherAtOrBelowT: false });
+    expect(r.out).toMatch(/conflict/);
+  });
+});
+
+// m9_red_wound_prepared。wound-wait で古い取引が若い保持者から奪ってよいのは、ロックだけである。prepare 済みの取引は行を intent で
+// 守る (prepare がロックを intent に置き換える)。待ち手は intent を奪わず、決着を待つ。
+// TLC の反例: 若い 2 が x をロックし、確定を始める。古い 1 が x を待つ。2 の prepare が x を intent にし、c が決まる (1 シャード)。
+// 1 が wound で 2 の intent を捨てて x を取る。2 は確定したのに、x への書き込みが消える (atomicWrites)。
+// 実装では、1 シャードの取引は intent を置かずに確定し (commitLocal)、確定済みの intent は待ち手が待つ前に適用する (settleIntents)。
+// そこで 2 を 2 シャードの取引にし、x のシャードの prepare の応答を止めて、c が決まる前の intent を 1 に待たせる
+// (prepare 済みで c が未定の相手も、モデルでは奪えない。この順もモデルで反例になることを確かめた)。
+describe("m9_red_wound_prepared: a wound never takes a prepared transaction's intent", () => {
+  const scenario = async (faults: Faults) => {
+    const { c, db, A, B } = await cluster(faults);
+    await seed(db, A);
+    await seed(db, B);
+    const young = new Db(c);
+    await young.query("BEGIN");
+    await young.query("SELECT count(*) FROM users WHERE tenant_id = ?", [B]); // y のシャード (s1) を anchor にする
+    await setN(young, A, 1);
+    await setN(young, B, 1);
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let prepared = false;
+    c.net.reply = (m) => {
+      if (m.method !== "prepare" || m.to !== "s0") return;
+      prepared = true; // x の intent は置かれた。anchor はまだ c を決めていない
+      return held;
+    };
+    const commit = young.query("COMMIT").then(() => "committed", (e: Error) => e.message);
+    while (!prepared) await new Promise((r) => setImmediate(r));
+    const old = oldest(c);
+    await old.query("BEGIN");
+    const update = old.query("UPDATE users SET n = n + 10 WHERE tenant_id = ? AND id = 1", [A]);
+    const done = watch(update);
+    await c.sleep(300); // wound の遅延 (200 ms) を過ぎる
+    const waited = !done.done;
+    c.net.reply = () => {};
+    release();
+    const out = await commit;
+    await update;
+    await old.query("COMMIT");
+    await c.settle();
+    return { waited, out, x: await getN(db, A), y: await getN(db, B) };
+  };
+  it("put back: taking the intent drops the write of a transaction that then commits", async () => {
+    // 2 は確定し、y の書き込みは残るが x の書き込みは消える。1 は 2 の前の x (0) から書いた。どちらの順に並べても x = 10 にはならない。
+    expect(await scenario({ woundPrepared: true })).toEqual({ waited: false, out: "committed", x: 10, y: 1 });
+  });
+  it("waits for the outcome and builds on the write", async () => {
+    expect(await scenario({})).toEqual({ waited: true, out: "committed", x: 11, y: 1 });
+  });
+});
+
+// m9_red_prepare_waits。prepare は他の取引のロックを待たず、当たれば abort する (validate の row locked by)。待つと、prepare 済みの
+// 取引を待つ DML との間に閉路ができる。specs/README.md の説明の順で流す (古い / 若いは入れ替えてある):
+// 若い X が x と y をロックする。x のロックが TTL で切れる。古い Y が x をロックする。X の確定で、y のシャードの prepare が y を
+// intent にし、anchor (x のシャード) の prepare が Y のロックに当たる。Y は y を書こうとして、X の intent (奪えない) を待つ。
+// TLC の反例は、古い側が、確定を始めた若い側のロックを待つ順である。実装の wound は、相手が確定を始めたかを知らずにロックを奪うので、
+// その順は閉路にならない。intent は誰も奪えないので、上の順は実装でも閉路になる (この順もモデルで反例になることを確かめた)。
+// 実装の閉路は永久には続かず、Y のロックの TTL か待ちの期限 (どちらも 5 秒) で解ける。
+describe("m9_red_prepare_waits: prepare aborts on another transaction's lock instead of waiting", () => {
+  const scenario = async (faults: Faults) => {
+    const { c, db, A, B } = await cluster(faults);
+    await seed(db, A);
+    await seed(db, B);
+    const x = new Db(c);
+    await x.query("BEGIN");
+    await x.query("SELECT count(*) FROM users WHERE tenant_id = ?", [A]); // x のシャード (s0) を anchor にする
+    await setN(x, A, 1);
+    c.time += 6000; // x のロックが TTL (5 秒) で切れる
+    await setN(x, B, 1); // y のロックは切れていない
+    const y = oldest(c);
+    await y.query("BEGIN");
+    await setN(y, A, 2);
+    const t0 = c.time;
+    const commit = x.query("COMMIT").then(() => "committed", (e: Error) => e.message);
+    while (!c.net.log.some((m) => m.method === "prepare" && m.to === "s1")) await new Promise((r) => setImmediate(r));
+    await c.sleep(5); // y の intent が置かれる
+    const update = setN(y, B, 2);
+    const pending = [watch(commit), watch(update)];
+    await c.sleep(1000);
+    const stuck = pending.map((s) => !s.done);
+    const intents = c.backends.get("s1")!.exec("SELECT count(*) c FROM __intents")[0]!.c; // X の y の intent
+    const out = await commit;
+    await update.catch(() => {});
+    const elapsed = c.time - t0;
+    await y.query("COMMIT").catch(() => {});
+    await c.settle();
+    return { stuck, intents, out, elapsed };
+  };
+  it("put back: a waiting prepare and a statement waiting for its intent wait for each other until a 5 s timeout", async () => {
+    const r = await scenario({ prepareWaits: true });
+    expect(r).toMatchObject({ stuck: [true, true], intents: 1 });
+    expect(r.elapsed).toBeGreaterThanOrEqual(4000);
+  });
+  it("aborts the prepare at once, and the statement proceeds", async () => {
+    const r = await scenario({});
+    expect(r).toMatchObject({ stuck: [false, false], intents: 0 });
+    expect(r.out).toMatch(/conflict: row locked/);
   });
 });
 

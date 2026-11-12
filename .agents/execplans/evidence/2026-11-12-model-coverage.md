@@ -12,9 +12,9 @@ Survey made read-only by a subagent on `fa1a2cd`; rows `m5b_red_range`, `m5b_red
 counterexample.
 
 Categories:
-- A: the implementation has the guard, and a replay test exists (47 on fa1a2cd; 51 after the B rows were replayed on 2026-11-12)
-- B: implemented guard, fault switch exists, no deterministic replay (4 on fa1a2cd; 0 after 2026-11-12)
-- C: implemented guard, no fault switch (17)
+- A: the implementation has the guard, and a replay test exists (47 on fa1a2cd; all 68 rows with a guard after 2026-11-12)
+- B: implemented guard, fault switch exists, no deterministic replay (4 on fa1a2cd; none left)
+- C: implemented guard, no fault switch (17 on fa1a2cd; none left)
 - D: a design alternative the implementation never had or no longer has; no switch needed (8)
 
 | module | flaw modelled | fault switch | deterministic replay | cat |
@@ -45,14 +45,14 @@ Categories:
 | m1b_red_ra | read-time refresh does not advance HLC | refreshNoBump | counterexamples ("a read-time refresh advances the clock", via log truncation; added 2026-11-12) | A |
 | m1b_red_rc | T advanced after a failed read refresh | none | review2-regressions:18 (fixed, indirect) | A |
 | m8_red_drop | generation DROP does not raise logLowWater | dropNoLowWater | gc ("dropping a log generation raises the conflict window (m8_red_drop)"; added 2026-11-12) | A |
-| m9_red_ro_skip | read-only transaction with locked reads skips validation | none (nearest: skipReadOnlyPrepare) | none | C |
-| m9_red_second_f | 2nd DML on a row resets since to the new F | none | none | C |
-| m9_red_imm_read_t | IMMEDIATE key read at T, validated from F | none | none | C |
+| m9_red_ro_skip | read-only transaction with locked reads skips validation | lockedReadsSkipValidation (client; added 2026-11-12) | counterexamples ("m9_red_ro_skip: a read-only transaction that read under locks is validated at COMMIT") | A |
+| m9_red_second_f | 2nd DML on a row resets since to the new F | secondDmlNewSince + secondDmlNewSpanSince (client, two guards: the write's since and the first DML's span; added 2026-11-12) | counterexamples ("m9_red_second_f: a second DML on a row keeps the window from the first F"); either guard alone still aborts | A |
+| m9_red_imm_read_t | IMMEDIATE key read at T, validated from F | lockedReadAtT (added 2026-11-12) | counterexamples ("m9_red_imm_read_t: a locked read in BEGIN IMMEDIATE reads at F, where its window starts") | A |
 | m9_red_skip_lost | trusts a held lock and skips validation | trustLocks | counterexamples:492 | A |
-| m9_red_f_is_t | DML dry-run at T instead of F | none (nearest: validateFromT) | none | C |
-| m9_red_wound_prepared | wound steals a prepared transaction's lock and intent | none | none | C |
+| m9_red_f_is_t | DML dry-run at T instead of F | dmlAtT + dmlSkipsClock (two guards: F = T, and the clock moved to T and the causal token; added 2026-11-12; validateFromT is not this flaw) | counterexamples ("m9_red_f_is_t: a pessimistic statement runs at F, a time this shard issued"); TLC's trace, with the reader also writing x so the anomaly is a lost update; either guard alone still aborts | A |
+| m9_red_wound_prepared | wound steals a prepared transaction's lock and intent | woundPrepared (added 2026-11-12; the intent has no start, prepare_ts stands in) | counterexamples ("m9_red_wound_prepared: a wound never takes a prepared transaction's intent"); the victim is a 2-shard transaction prepared at the row's shard with c not yet decided, because a 1-shard commit places no intent and a decided intent is applied before the waiter waits | A |
 | m9_red_no_pred | DML predicate / referenced-table spans not validated | none | counterexamples:419 (fixed) | A |
-| m9_red_prepare_waits | prepare waits on others' locks (deadlock) | none | none | C |
+| m9_red_prepare_waits | prepare waits on others' locks (deadlock) | prepareWaits (added 2026-11-12) | counterexamples ("m9_red_prepare_waits: prepare aborts on another transaction's lock instead of waiting"); the README's order with the ages swapped (TLC's order is broken in the code by a wound on the anchor's lock); the cycle ends at the 5 s lock TTL | A |
 | m9_red_wait_die | wait-die instead of wound-wait | none | none | D |
 | m9_impl_wake | lock-TTL expiry never wakes the waiter | none | counterexamples:498 (fixed) | A |
 | m9_red_leave_silent | woken waiter leaves without waking the next one | none | counterexamples:510 (fixed) | A |
@@ -104,7 +104,7 @@ Categories:
 - `rowwiseUndo`: undo row by row, so a UNIQUE swap breaks the snapshot. Used in counterexamples:269.
 - `staleWideRead`: parent answers whole-table reads after a move (BUG-8, which no model covers). Used in ddl-concurrent:614 and :645.
 - `childKeepsOldSchema`: split child does not catch up its schema when groups arrive. Only the `FAULT=` sweep uses it.
-- `validateFromT`: validates from T instead of F, which widens the window. Not the same as M9's `RED_F_IS_T`. No test uses it.
+- `validateFromT`: validates from T instead of F, which widens the window. Not the same as M9's `RED_F_IS_T` (that is `dmlAtT` + `dmlSkipsClock`). No test uses it.
 - `triggerCapture`: not a defect; it only forces the slower capture path. No test uses it.
 
 ## Notes

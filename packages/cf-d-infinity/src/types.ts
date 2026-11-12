@@ -420,6 +420,16 @@ export interface Faults {
   gcUndone?: boolean;
   /** 分析への flush が、未解決の intent の prepare_ts で flush 時刻を抑えない (resolved ts を使わない。モデル m6_red_resolved)。 */
   flushPastIntents?: boolean;
+  /** BEGIN IMMEDIATE のロック読みを、F ではなく T の snapshot で読む。範囲の since は F のまま (モデル m9_red_imm_read_t)。 */
+  lockedReadAtT?: boolean;
+  /** 悲観の DML とロック読みを、F を発行せずに取引の T で実行し、since も T にする (モデル m9_red_f_is_t。守りの 1 つ目)。 */
+  dmlAtT?: boolean;
+  /** 悲観の DML とロック読みが、要求の T と因果トークンまで時計を進めない (モデル m9_red_f_is_t。守りの 2 つ目)。 */
+  dmlSkipsClock?: boolean;
+  /** wound が、prepare 済みの取引の intent も奪って捨てる (モデル m9_red_wound_prepared)。 */
+  woundPrepared?: boolean;
+  /** prepare が、書く行の他の取引のロックを待つ (モデル m9_red_prepare_waits)。 */
+  prepareWaits?: boolean;
 }
 
 export class ConflictError extends Error {

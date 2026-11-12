@@ -272,6 +272,7 @@ export class SimNet {
 const CLIENT_FAULTS = new Set([
   "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
   "publishBeforeBackfill", "scanBeforeLock", "scanSkipsEmpty", "guardFromCommitTs", "splitWithoutSync",
+  "lockedReadsSkipValidation", "secondDmlNewSince", "secondDmlNewSpanSince",
 ]);
 /** 範囲の作り方の欠陥のスイッチの名前 (src/client/spans.ts の spanFaults)。test/setup.ts が入れる。 */
 export const SPAN_FAULTS = new Set(["rowSpanDespiteUnique"]);

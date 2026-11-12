@@ -31,19 +31,25 @@ const only = flag("--only", null)?.split(",");
 const limitMs = Number(flag("--limit", "900")) * 1000;
 const resume = args.includes("--resume");
 
-/** 欠陥のスイッチ。triggerCapture は欠陥ではなく、遅い経路を使わせるだけである (見つからないのが正しい)。 */
+/**
+ * 欠陥のスイッチ。triggerCapture は欠陥ではなく、遅い経路を使わせるだけである (見つからないのが正しい)。
+ * dmlAtT と dmlSkipsClock、secondDmlNewSince と secondDmlNewSpanSince は、2 つの守りの片方ずつを外す。1 つだけ入れても
+ * もう片方の守りが止めるので、欠陥にならない (見つからないのが正しい。2 つ揃えた試験は test/counterexamples.test.ts にある)。
+ */
 const SHARD = [
   "autoIgnoresUniqueIntents", "ddlIgnoresIntents", "childKeepsOldSchema", "noSchemaRecheck", "noWriteSetLimit", "noRealtimeBump",
   "anchorNoAbsorb", "skipReadOnlyPrepare", "refreshNoBump", "predicateProtected", "ignoreIntentsInValidation", "readerTimeoutPass",
   "hlcNoCeiling", "rowwiseUndo", "pushAfterDecide", "applyAfterMoved", "triggerCapture", "dropIntentsOnMove", "servePastMove",
   "ignoreFence", "staleWideRead", "finishWithoutClock", "ignoreTableLock", "publishWithoutClock", "validateFromT", "trustLocks",
   "phase2BeforeSync", "dropNoLowWater", "gcUndone", "flushPastIntents", "unchangedIgnoresIntents",
+  "lockedReadAtT", "dmlAtT", "dmlSkipsClock", "woundPrepared", "prepareWaits",
   // Meta が読むスイッチ (同じ Faults にある)
   "dropAfterExpiry", "startWithoutSlot", "fenceWithoutSlot",
 ];
 const OTHER = [
   "rowSpanDespiteUnique", "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
   "publishBeforeBackfill", "scanBeforeLock", "scanSkipsEmpty", "guardFromCommitTs", "splitWithoutSync",
+  "lockedReadsSkipValidation", "secondDmlNewSince", "secondDmlNewSpanSince",
 ];
 const FAULTS = ["none", ...(only ?? [...SHARD, ...OTHER])];
 const ALL_HARNESSES = ["test/replay.test.ts", "test/history.test.ts", "test/ddl-concurrent.test.ts"];
