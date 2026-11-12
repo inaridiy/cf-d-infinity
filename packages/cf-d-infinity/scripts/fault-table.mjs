@@ -40,7 +40,9 @@ const SHARD = [
 ];
 const OTHER = ["rowSpanDespiteUnique", "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit"];
 const FAULTS = ["none", ...(only ?? [...SHARD, ...OTHER])];
-const HARNESSES = ["test/replay.test.ts", "test/history.test.ts", "test/ddl-concurrent.test.ts"];
+const ALL_HARNESSES = ["test/replay.test.ts", "test/history.test.ts", "test/ddl-concurrent.test.ts"];
+// --harness replay,history で、流す検査を選ぶ。
+const HARNESSES = flag("--harness", null)?.split(",").map((h) => `test/${h}.test.ts`) ?? ALL_HARNESSES;
 
 const children = [];
 for (const signal of ["SIGINT", "SIGTERM"]) {
