@@ -59,11 +59,13 @@ npm への公開は、素地ができるまで行わない。
 - ブランチ `schema-change-safety` (PR #16) は `main` に入った。`txn-schema-boundary` と `unique-index-under-lock` はその途中のブランチで、もう使わない。
 - ブランチ `maintenance-slot` (PR #17) は `main` に入った。
 - ブランチ `oracle-crossing` (PR #18) は `main` に入った。
-- ブランチ `early-line` が、Early 版の線と、その順番の 1 と 2 である。
+- ブランチ `early-line` が、Early 版の線と、その順番の 1 である。
+- 夜間の実行は、持ち主の了承 (2026-11-12) を得て、この計算機の crontab に入れた。毎晩 2 時に `scripts/nightly.sh --hours 4 --procs 6 --seeds 300` が `origin/main` を流し、結果を `~/.dinf-nightly/<日付>/summary.txt` に残す。完了の条件 8 の 2 週間は、2026-11-13 の晩から数える。
+- 本物の Cloudflare での確認は、持ち主の了承 (2026-11-12) を得た。条件は「無料枠は考慮せず、1 ドルは超えない」。一時的に置いて確かめ、確かめた後に消す。まだ流していない。
 - ブランチ `wip/gather-missing-rows` (`45e9b57`) は、前の作業者の未完成の変更である。採らなかった (Decision Log の 2026-11-11)。ローカルにだけある。
 - ブランチ `foundation-3` (ローカル) は、PR #8 と `wip/gather-missing-rows` に分ける前の並びで、もう使わない。
 - `packages/cf-d-infinity/DEVELOPMENT.md` は、この一連の変更を反映していない。`AGENTS.md` にそう書いてある。
-- 次にやるのは、「Early 版の線」の「順番」の 1 と 2 である。
+- 次にやるのは、本物の Cloudflare での確認 (公開の条件 4) と、「Early 版の線」の「順番」の 2 である。
 
 ### 欠陥の表 (2026-11-12、`f393657`)
 
@@ -274,7 +276,7 @@ SQLite と結果が違ってよいのは、行の物理的な並び順で結果�
 | DDL と並行する取引 | `test/ddl-harness.ts`、`test/ddl-concurrent.test.ts` | DDL、分割、取引を並行に流した後の、index と行の一致、読みの正しさ | 流す seed は場面ごとに 5、6 個。未解決の問題 2 と 11 は、決定的にする前に、ここでまれに出た |
 | 基準経路だけの実行 | `vitest.config.ts` の `reference-scans` と `reference-full`、環境変数 `REFERENCE` | SQLite と突き合わせる検査 14 本を、全部の文を基準経路で実行して流す。通常の実行と答えが違えば、行の配置で答えが変わる経路がある | sqllogictest の大きい組 (`test/slt.test.ts`) は入れていない。計画の種類や行ロックを確かめる試験は対象外 |
 | 断る文の一覧 | `test/refusals.test.ts` | `unsupported:` を返す箇所が一覧のとおりであること。一覧の文が、シャードが 1 つでも 3 つでも同じに断られること。以前は断っていた文が、どちらでも SQLite と同じ結果になること | 一覧は手で書く |
-| seed を大量に流す | `scripts/sweep.mjs`、環境変数 `SEEDS` | 乱択の検査を、指定した範囲の seed で流し、落ちた seed を試験の名前ごとにまとめる。落ちた seed は `SEEDS=<seed>` で同じように落ちる | 夜間の実行には、まだ組み込んでいない |
+| seed を大量に流す | `scripts/sweep.mjs`、環境変数 `SEEDS` | 乱択の検査を、指定した範囲の seed で流し、落ちた seed を試験の名前ごとにまとめる。落ちた seed は `SEEDS=<seed>` で同じように落ちる。夜間の実行 (`scripts/nightly.sh`) は、文の再生、history、DDL と並行する取引の 3 つを、日付で決まる新しい seed で流す | 夜間の実行は、欠陥を入れて決まった seed で見つかることを確かめる試験を流さない |
 | 終わらない実行の検出 | `SimCluster.stalled` (`test/sim.ts`) | 仮想の時刻か出来事の数が上限を超えたら、返らなかった RPC と、最後の RPC の内訳を付けて失敗する | いまは DDL と並行する取引の検査だけが使う |
 | 決定性の検査 | `test/determinism.test.ts` と、乱択の検査のそれぞれ | ソースが、時計、タイマー、乱数を直に呼んでいないこと。同じ seed の実行が、単独でも、別のクラスタと同時でも、同じ RPC の記録になること | workerd を動かす試験は対象外 (本物の時間で動く) |
 | 終了時の不変条件 | `test/invariants.ts` | intent の残り、適用されない確定済みの取引、index と行の一致 | |
