@@ -74,6 +74,8 @@ npm への公開は、素地ができるまで行わない。
 - 止まる: `ignoreFence` (未解決の問題 18)。
 - `rowSpanDespiteUnique` は、文の再生検査で 80 回中 44 回落ちた。どの試験にも掛かる範囲の検査 (`test/setup.ts`) が見つけている可能性が高い。文の再生そのものが見つけているかは、分けて数えていない。
 
+切り口 1 (取引の中の DDL を流す接続。`3b0a303`) を入れた後、文の再生検査の列を流し直した (`ac92184`、seed 1 から 40、試験は 1 seed に 3 つ)。新しく見つかるようになったのは、`noImplicitCommit` (120 回中 40)、`ddlAfterFailedCommit` (39)、`replayAcrossSchemaChange` (0 から 7)、`ddlIgnoresIntents` (0 から 27。狙っていなかった) である。ほかの行は変わらない。欠陥を入れない行は 0 だった。
+
 見つけない欠陥の多くは、検査の作業負荷にない場面に住んでいる。時計とずれ (`noRealtimeBump`、`servePastMove`、`finishWithoutClock`、`publishWithoutClock`)、悲観的な取引のロック待ちと検証の窓 (`validateFromT`、`noSchemaRecheck`)、UNIQUE と 2PC の途中の intent の重なり (`autoIgnoresUniqueIntents`)、大きな取引 (`noWriteSetLimit`)、分割と DDL の重なり (`childKeepsOldSchema`)、接続をまたぐ取引と UNIQUE の index の重なり (`repinOnRestore`)、共有の表の作り直し (`dropWithoutGuard`。直列の順序に置けないので、文の再生では作れない)。次の切り口は、この一覧から選ぶ。
 
 ### 検査の結果 (`main` の `628b20a`、2026-11-11)
