@@ -8,6 +8,8 @@
 Read the name as "D-infinity": the D1 API your Worker already speaks, without the single-database ceiling. Add it to a Worker with one command; the Worker plans each statement, the shards are Durable Objects holding ordinary SQLite, and there is no server to run.
 
 > **Status: experimental.** A research prototype. Do not put data you cannot afford to lose in it; read [Limitations](#limitations) first.
+>
+> **License note.** The code in this repository is MIT, but it uses the GPL-2.0-or-later SQL parser [`sql-parser-cst`](https://github.com/nene/sql-parser-cst) at runtime, so a Worker bundle built with D∞ is a combined work covered by the GPL (see [license](#contributing-disclaimer-and-license)). Replacing the parser is planned.
 
 ## The idea
 
