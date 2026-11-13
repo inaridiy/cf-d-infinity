@@ -40,7 +40,7 @@ const REFUSALS = [
   "client/db.ts: the table ${def.name} is too wide for a shard to scan",
   // 値で決まる
   "shard/rows.ts: NULL in the primary key column",
-  "shard/rows.ts: an INTEGER beyond",
+  "value.ts: an INTEGER beyond",
   "client/hrana.ts: the integer ${v.value} cannot be stored exactly",
 ].sort();
 
