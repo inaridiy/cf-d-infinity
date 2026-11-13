@@ -3,7 +3,7 @@
 Sets up [cf-d-infinity](https://github.com/inaridiy/cf-d-infinity) (D∞), an unofficial, experimental sharded SQLite
 database for Cloudflare Workers. Not affiliated with Cloudflare.
 
-> **Not on npm yet.** This package and `create-cf-d-infinity` have not been published, and nobody owns those names on npm yet. Do not run the command below until the first release is announced in the [repository](https://github.com/inaridiy/cf-d-infinity).
+> **Not on npm yet.** This package and `cf-d-infinity` are reserved on npm with an empty 0.0.0 placeholder. The command below works after the first real release, which will be announced in the [repository](https://github.com/inaridiy/cf-d-infinity).
 
 ```sh
 # after the first npm release:
