@@ -8,7 +8,7 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 
 形式は 3 つに分ける。
 
-- **固定**：Early 版から変えない。変えるときは、保存の形式の版 (`STORAGE_FORMAT`、`src/types.ts`) を上げ、1 つ前の版から進める移行を `STORAGE_MIGRATIONS` に足し、更新の試験 (`test/upgrade.test.ts`) に古い版のデータを残す (`test/fixtures/storage/format-<版>.json`。一度書いた版の材料は書き換えない)。DO は起動するときに、古い版のデータへ移行を順に流す。古い版のコードは、新しい版のデータを開くと起動を拒否する (`checkStorageFormat`)。
+- **固定**：Early 版から変えない。変えるときは、保存の形式の版 (`STORAGE_FORMAT`、`src/types.ts`) を上げ、1 つ前の版から進める移行を `STORAGE_MIGRATIONS` に足し、更新の試験 (`test/upgrade.test.ts`) に古い版のデータを残す (`test/fixtures/storage/format-<版>.json`。公開した版の材料は書き換えない。最初の公開の前は、版 1 の形式も変えてよく、材料を作り直す)。DO は起動するときに、古い版のデータへ移行を順に流す。古い版のコードは、新しい版のデータを開くと起動を拒否する (`checkStorageFormat`)。
 - **版で守る**：互換でない変更は、通信の版 (`PROTOCOL_VERSION`、`MIN_PROTOCOL_VERSION`) を上げて行う。シャードは受け付ける範囲の版だけを処理する。
 - **作り直せる**：失っても、作り直すか、利用者がやり直せば済む。版を上げずに変えてよい。
 

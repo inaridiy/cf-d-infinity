@@ -120,7 +120,7 @@ sql.js は `process.versions.node` があると Node で動いているとみな
 保存形式の版は `STORAGE_FORMAT` (`src/types.ts`) で、シャードと Meta の `__meta` の `format` に書く。
 固める形式と作り直せる形式の一覧は [docs/storage-format.md](../../docs/storage-format.md) にある。
 内部の表の形や意味を互換でない形で変えるときは、版を上げ、1 つ前の版から進める移行を `STORAGE_MIGRATIONS` に足し、古い版の材料を `test/fixtures/storage/` に残す。
-材料は、決まった作業負荷を流した Meta と全シャードの SQLite を `quote()` で SQL に写したもので、`test/upgrade.test.ts` が今のコードでそこから起動して確かめる。一度書いた版の材料は書き換えない。
+材料は、決まった作業負荷を流した Meta と全シャードの SQLite を `quote()` で SQL に写したもので、`test/upgrade.test.ts` が今のコードでそこから起動して確かめる。公開した版の材料は書き換えない。最初の公開 (npm への本物のリリース) の前は、版 1 の形式も自由に変えてよく、変えたら `REWRITE_STORAGE_FIXTURE=1 WRITE_STORAGE_FIXTURE=1 npx vitest run test/upgrade.test.ts --project sim` で材料を作り直す。
 DO は起動するときに、古い版のデータへ移行を順に流す。移行のない古い版と、新しすぎる版 (`storage format too new`) は、起動を拒否する。
 
 `export` は利用者が実行した DDL (`schemaSql`) と、各表の行 (`exportRows`) を SQL にする。
