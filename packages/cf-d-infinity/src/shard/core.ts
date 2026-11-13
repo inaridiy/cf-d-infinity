@@ -133,6 +133,23 @@ interface Waiter extends LockOwner {
 }
 
 /** シャード 1 個のプロトコル本体。DO に依存せず、Node の SQLite でも同じコードが動く。 */
+/**
+ * 確定の記録の指紋。参加者と、参加者ごとの書き込みの 64 ビットの hash (FNV-1a を 2 通り) と長さである。同じ取引の ID で
+ * 中身の違う COMMIT を見分けるのに使う (specs/m17_txn_id_reuse.qnt)。安全の境目ではない。わざと衝突させても、損をするのは
+ * 衝突させた側の取引だけである。crypto.subtle の hash は本物の非同期で、シミュレータの出来事の順序を変えるので使わない。
+ */
+function commitDigest(req: CommitReq): string {
+  const text = encode(req.participants.map((p) => [p.shard, p.writes]));
+  let h1 = 0x811c9dc5;
+  let h2 = 0x050c5d1f;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ c, 0x01000193) ^ (h2 >>> 15);
+  }
+  return `${(h1 >>> 0).toString(16)}${(h2 >>> 0).toString(16)}:${text.length}`;
+}
+
 export class ShardCore implements ShardApi {
   readonly id: string;
   epoch = 0;
@@ -194,7 +211,7 @@ export class ShardCore implements ShardApi {
     b.exec(`CREATE TABLE IF NOT EXISTS __moved_txn(txn TEXT NOT NULL, g TEXT NOT NULL, dest TEXT NOT NULL, PRIMARY KEY(txn, g))`);
     b.exec(`CREATE TABLE IF NOT EXISTS __arrived(g TEXT PRIMARY KEY, m INTEGER NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __txn(
-      txn TEXT PRIMARY KEY, status TEXT NOT NULL, c INTEGER, participants TEXT, done INTEGER NOT NULL DEFAULT 0, at INTEGER)`);
+      txn TEXT PRIMARY KEY, status TEXT NOT NULL, c INTEGER, participants TEXT, done INTEGER NOT NULL DEFAULT 0, at INTEGER, digest TEXT)`);
     this.initStorage();
 
     for (const r of b.exec(`SELECT entry FROM __ddl ORDER BY version`)) {
@@ -1730,7 +1747,18 @@ export class ShardCore implements ShardApi {
 
   private prepareSync(req: PrepareReq): PrepareRes {
     const dup = this.b.exec(`SELECT prepare_ts FROM __intents WHERE txn = ? LIMIT 1`, req.txn)[0];
-    if (dup) return { ok: true, prepareTs: dup.prepare_ts as Ts };
+    if (dup) {
+      // 同じ取引の ID の intent がもうある。同じ書き込みなら再送なので、同じ答えを返す。違う書き込みなら、baton の使い回しで
+      // できた別の続きである。前の intent を残して ok と答えると、後の続きの書き込みは捨てられ、前の続きの確定がそれを適用する
+      // (specs/m17_txn_id_reuse.qnt の m17_red_commit_only、不変条件 12)。
+      const have = (this.b.exec(`SELECT tbl, pk, change FROM __intents WHERE txn = ?`, req.txn) as { tbl: string; pk: string; change: string }[])
+        .map((r) => `${r.tbl}\0${r.pk}\0${r.change}`).sort();
+      const want = req.writes.map((w) => `${w.table}\0${w.pk}\0${encode(w)}`).sort();
+      if (!this.faults.prepareKeepsFirst && (have.length !== want.length || have.some((x, i) => x !== want[i]))) {
+        return { ok: false, reason: `conflict: transaction ${req.txn} was prepared here with other writes` };
+      }
+      return { ok: true, prepareTs: dup.prepare_ts as Ts };
+    }
     // phase 2 で初めて上限に当たると、確定した取引が適用できなくなる。intent を置く前に拒否する。
     try {
       this.assertWriteSetFits(req.writes);
@@ -1812,8 +1840,16 @@ export class ShardCore implements ShardApi {
 
   async commit(req: CommitReq): Promise<CommitRes> {
     await this.ensureSchema(req.schema);
-    const done = this.b.exec(`SELECT status, c FROM __txn WHERE txn = ?`, req.txn)[0];
-    if (done) return done.status === "committed" ? { ok: true, c: done.c as Ts } : { ok: false, reason: "aborted" };
+    const done = this.b.exec(`SELECT status, c, digest FROM __txn WHERE txn = ?`, req.txn)[0];
+    const digest = commitDigest(req);
+    if (done) {
+      // 同じ取引の ID で、中身の違う COMMIT が来た。baton の使い回し (再送を含む) で、1 つの取引から 2 つの続きができた。
+      // 前の結果を返すと、後の続きは確定したと聞くのに、その書き込みは入らない (specs/m17_txn_id_reuse.qnt、不変条件 12)。
+      if (!this.faults.commitIgnoresDigest && done.digest !== null && done.digest !== undefined && done.digest !== digest) {
+        return { ok: false, reason: `conflict: transaction ${req.txn} was already decided with other writes` };
+      }
+      return done.status === "committed" ? { ok: true, c: done.c as Ts } : { ok: false, reason: "aborted" };
+    }
     // 決着の記録は保持時間の後に消す。消した tombstone の後に同じ取引の COMMIT が届いて確定すると、
     // 中止と判断して intent を無視した読み手と矛盾する (specs/m10_txn_record_gc.qnt の反例)。
     // 保持時間の半分より古い取引の COMMIT を受け付けなければ、消した後に確定することはない。
@@ -1836,6 +1872,7 @@ export class ShardCore implements ShardApi {
   }
 
   private async drive(req: CommitReq, flight: InFlight): Promise<CommitRes> {
+    const digest = commitDigest(req);
     const self = req.participants.find((p) => p.shard === this.id);
     if (!self) throw new SqlError("anchor must be a participant");
     let others = req.participants.filter((p) => p.shard !== this.id);
@@ -1881,8 +1918,8 @@ export class ShardCore implements ShardApi {
     if (bad) return this.decideAbort(req, bad.reason ?? "refresh failed");
 
     this.b.exec(
-      `INSERT INTO __txn(txn, status, c, participants, at) VALUES (?, 'committed', ?, ?, ?)`,
-      req.txn, c, JSON.stringify(req.participants.map((p) => p.shard)), this.deps.clock.now(),
+      `INSERT INTO __txn(txn, status, c, participants, at, digest) VALUES (?, 'committed', ?, ?, ?, ?)`,
+      req.txn, c, JSON.stringify(req.participants.map((p) => p.shard)), this.deps.clock.now(), digest,
     );
     // record の確定を待ってから phase 2 と応答を送る。先に送ると、確定の前に再起動したとき、記録が消えて
     // 照会した参加者が tombstone を書き、phase 2 を受けた参加者とで決着が割れる (specs/m3_anchor_recovery.qnt の m3_red)。

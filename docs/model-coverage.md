@@ -10,7 +10,7 @@ Test references are `packages/cf-d-infinity/test/<file>.test.ts:<line>` or a tes
 counterexample.
 
 Categories:
-- A: the implementation has the guard, and a replay test exists (47 on fa1a2cd; all 69 rows with a guard after 2026-11-12, M16 included)
+- A: the implementation has the guard, and a replay test exists (47 on fa1a2cd; all 72 rows with a guard, M16 and M17 included)
 - B: implemented guard, fault switch exists, no deterministic replay (4 on fa1a2cd; none left)
 - C: implemented guard, no fault switch (17 on fa1a2cd; none left)
 - D: a design alternative the implementation never had or no longer has; no switch needed (9 with M16)
@@ -95,6 +95,9 @@ Categories:
 | m15_red_late_start | child starts after the slot expired | startWithoutSlot + fenceWithoutSlot (Meta side; two guards: startSplit, and checkSplit before the parent fences; added 2026-11-12) | split-slot ("a child that starts receiving after the split slot lapsed (m15_red_late_start)"); with only the start put back the fence check still stops it | A |
 | m16_red_body_only | prepare checks UNIQUE only against the body, not with other intents applied (added 2026-11-12) | autoIgnoresUniqueIntents (the autocommit path; transactions use the same `uniquePending`) | review-regressions:65 | A |
 | m16_red_intents_only | prepare checks UNIQUE only with other intents applied, not against the body (added 2026-11-12) | none: the body check is SQLite's own UNIQUE constraint on the shard's table, which the code cannot run without | none | D |
+| m17_red_impl | neither the anchor nor the participants tell two continuations of one transaction id apart (added 2026-11-13) | commitIgnoresDigest + prepareKeepsFirst | baton-reuse ("put back m17_red_prepare_only ...", which already loses the write) | A |
+| m17_red_prepare_only | the anchor returns the earlier outcome to a COMMIT with other writes | commitIgnoresDigest | baton-reuse ("put back m17_red_prepare_only: an anchor that returns the earlier outcome ...") | A |
+| m17_red_commit_only | a participant answers ok to a second prepare of the same id with other writes | prepareKeepsFirst | baton-reuse ("refuses a second prepare of the same transaction id with other writes ...") | A |
 
 ## Switches that match no red module
 
