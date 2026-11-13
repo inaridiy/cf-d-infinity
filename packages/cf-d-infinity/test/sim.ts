@@ -155,9 +155,10 @@ export class SqliteBackend implements Backend {
   constructor(readonly db = new DatabaseSync(":memory:")) {}
   exec(sql: string, ...params: Value[]): Row[] {
     if (this.fenced) throw new Error("fenced instance");
-    checkDoLimits(sql, params);
     // node:sqlite も DO の SQLite と同じく、JS の数を REAL として束縛する。束縛の仕方は DO と同じにする (src/value.ts)。
+    // DO の上限は、束縛のために書き換えた後の文に掛かる (書き換えで文が長くなる)。
     const b = bindTyped(sql, params, "real");
+    checkDoLimits(b.sql, b.params);
     const st = this.db.prepare(b.sql);
     const p = b.params as never[];
     if (st.columns().length === 0) return (st.run(...p), []);
@@ -168,8 +169,8 @@ export class SqliteBackend implements Backend {
   }
   iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
     if (this.fenced) throw new Error("fenced instance");
-    checkDoLimits(sql, params);
     const b = bindTyped(sql, params, "real");
+    checkDoLimits(b.sql, b.params);
     const st = this.db.prepare(b.sql);
     const p = b.params as never[];
     const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
@@ -184,8 +185,8 @@ export class SqliteBackend implements Backend {
   }
   raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] } {
     if (this.fenced) throw new Error("fenced instance");
-    checkDoLimits(sql, params);
     const b = bindTyped(sql, params, "real");
+    checkDoLimits(b.sql, b.params);
     const st = this.db.prepare(b.sql);
     const p = b.params as never[];
     const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);

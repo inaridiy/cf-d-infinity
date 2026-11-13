@@ -255,11 +255,14 @@ for m in m16_red_body_only m16_red_intents_only; do tests $f $m; done
 
 echo "== M17 txn id reuse (不変条件 12)"
 f=m17_txn_id_reuse.qnt
-green   $f m17_green safe
-red     $f m17_red_impl safe            # 2026-11 までの実装: 参加者も anchor も、同じ ID の別の続きを確かめない
-red     $f m17_red_prepare_only safe    # anchor が、同じ ID の決着があると、中身を見ずに結果を返す
-red     $f m17_red_commit_only safe     # 参加者が、同じ ID の intent があると、後の書き込みを捨てて ok と答える
+green   $f m17_green safe                # 2PC の ID は続きごと (取引の ID と中身の指紋)
+red     $f m17_red_abort safe            # 2026-11-12 の修正: 指紋を両方で確かめるが、ID は取引の ID。断られた続きの中止が、確定した続きの intent を消す
+red     $f m17_red_impl safe             # 2026-11-12 より前の実装: 参加者も anchor も、同じ ID の別の続きを確かめない
+red     $f m17_red_prepare_only safe     # anchor が、同じ ID の決着があると、中身を見ずに結果を返す
+red     $f m17_red_commit_only safe      # 参加者が、同じ ID の intent があると、後の書き込みを捨てて ok と答える
 witness $f m17_green witnessOneCommittedOneRefused
+witness $f m17_green witnessConcurrent
+tests   $f m17_red_abort
 tests   $f m17_red_impl
 
 echo "== M7 restore (S6 の全シャード同時点復元)"

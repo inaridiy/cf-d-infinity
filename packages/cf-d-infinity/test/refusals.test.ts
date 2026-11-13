@@ -30,6 +30,8 @@ const REFUSALS = [
   "sql/ddl.ts: CREATE TRIGGER",
   "sql/ddl.ts: ALTER TABLE ... RENAME COLUMN",
   "sql/ddl.ts: ALTER TABLE ... DROP COLUMN",
+  "sql/ddl.ts: a UNIQUE partial or expression index that does not include the shard key",
+  "sql/ddl.ts: column name ${name} is reserved for internal use",
   // 文の形で決まる
   "sql/plan.ts: CREATE TABLE ... AS SELECT",
   "client/db.ts: a statement that writes cannot read sqlite_master or a PRAGMA function",
@@ -37,6 +39,7 @@ const REFUSALS = [
   "client/db.ts: a schema change inside a transaction",
   // 値で決まる
   "shard/rows.ts: NULL in the primary key column",
+  "shard/rows.ts: an INTEGER beyond",
   "client/hrana.ts: the integer ${v.value} cannot be stored exactly",
 ].sort();
 

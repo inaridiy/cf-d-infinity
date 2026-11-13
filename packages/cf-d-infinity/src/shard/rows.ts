@@ -41,12 +41,52 @@ export const scanList = (def: TableDef) => [...(def.implicitRowid ? ["rowid"] : 
 const untypedColumns = (def: Pick<TableDef, "columns" | "affinity">) => def.columns.filter((c) => (def.affinity[c] ?? "BLOB") === "BLOB");
 const typeTag = (i: number) => `__dinf_typeof_${i}`;
 
+/**
+ * 2^53 を超える INTEGER を持つ列があるかを、SQL の中で確かめる列 (`typedRow` と `typedValues` が見て、外す)。
+ * D∞ の値は JS の数なので、2^53 を超える整数を正確に持てない。DO の SQLite も読み出しで JS の数にする。そういう値の行を行イメージ
+ * にすると、隣の値と同じ数になり、主キーが重なり、取引は丸めた値を書く (計画書の K1)。行イメージは書き込みのたびに作るので
+ * (捕捉した変更、RETURNING、分割で運ぶ行)、ここで見れば、どの経路の書き込みも同じように断れる。断るのは値で決まる。
+ */
+const WIDE = "__dinf_wide";
+const MAX_EXACT = Number.MAX_SAFE_INTEGER;
+const wideCheck = (def: Pick<TableDef, "columns" | "implicitRowid">) =>
+  `(${[...(def.implicitRowid ? ["rowid"] : []), ...def.columns].map((c) => `(typeof(${q(c)}) = 'integer' AND (${q(c)} > ${MAX_EXACT} OR ${q(c)} < -${MAX_EXACT}))`).join(" OR ")}) AS ${q(WIDE)}`;
+const wideError = (table: string) =>
+  new SqlError(`unsupported: an INTEGER beyond ±${MAX_EXACT} (2^53 - 1) in ${table} cannot be stored exactly; store such values (for example 64-bit ids) as TEXT`);
+
+/**
+ * キーの JSON (keySql が SQL の中で作る) に、2^53 を超える整数があるか。JSON.parse すると桁が落ちるので、文字のまま見る。
+ * REAL は quote() で書くので小数点か指数を持ち、文字列は引用符の中にあるので、どちらも当たらない。
+ */
+function hasWideInteger(json: string): boolean {
+  for (let i = 0; i < json.length; i++) {
+    const c = json[i]!;
+    if (c === '"') {
+      for (i++; i < json.length && json[i] !== '"'; i++) if (json[i] === "\\") i++;
+      continue;
+    }
+    if (c === "-" || (c >= "0" && c <= "9")) {
+      let j = i + 1;
+      while (j < json.length && /[0-9.eE+-]/.test(json[j]!)) j++;
+      const token = json.slice(i, j);
+      if (/^-?\d{16,}$/.test(token) && (BigInt(token) > BigInt(MAX_EXACT) || BigInt(token) < -BigInt(MAX_EXACT))) return true;
+      i = j - 1;
+    }
+  }
+  return false;
+}
+
 /** 行イメージを読む SELECT の列の並び。型のない列には、型を一緒に読む列を足す (`typedRow` が戻す)。 */
 export const imageList = (def: TableDef) =>
-  [selectList(def), ...untypedColumns(def).map((c, i) => `typeof(${q(c)}) AS ${q(typeTag(i))}`)].join(", ");
+  [selectList(def), ...untypedColumns(def).map((c, i) => `typeof(${q(c)}) AS ${q(typeTag(i))}`), wideCheck(def)].join(", ");
 
-/** imageList で読んだ行から、型を読んだ列を除き、整数の値の REAL に印を付ける。 */
-export function typedRow(def: Pick<TableDef, "columns" | "affinity">, row: Row): Row {
+/** imageList で読んだ行から、型を読んだ列を除き、整数の値の REAL に印を付ける。2^53 を超える整数があれば断る。 */
+export function typedRow(def: Pick<TableDef, "columns" | "affinity"> & { name?: string }, row: Row): Row {
+  if (WIDE in row) {
+    if (row[WIDE]) throw wideError(def.name ?? "the table");
+    row = { ...row };
+    delete row[WIDE];
+  }
   const cols = untypedColumns(def);
   if (cols.length === 0) return row;
   const out: Row = { ...row };
@@ -60,7 +100,13 @@ export function typedRow(def: Pick<TableDef, "columns" | "affinity">, row: Row):
 }
 
 /** 列名と値の配列で読んだときの typedRow。 */
-export function typedValues(def: Pick<TableDef, "columns" | "affinity">, columns: string[], rows: Value[][]): { columns: string[]; rows: Value[][] } {
+export function typedValues(def: Pick<TableDef, "columns" | "affinity"> & { name?: string }, columns: string[], rows: Value[][]): { columns: string[]; rows: Value[][] } {
+  const wideAt = columns.indexOf(WIDE);
+  if (wideAt >= 0) {
+    if (rows.some((r) => r[wideAt])) throw wideError(def.name ?? "the table");
+    columns = columns.filter((_c, i) => i !== wideAt);
+    rows = rows.map((r) => r.filter((_v, i) => i !== wideAt));
+  }
   const cols = untypedColumns(def);
   if (cols.length === 0) return { columns, rows };
   const tagAt = cols.map((_c, i) => columns.indexOf(typeTag(i)));
@@ -250,6 +296,9 @@ export function capturedChanges(b: Backend, catalog: (t: string) => TableDef): C
   for (const r of b.exec(`SELECT seq, tbl, oldk, newk FROM __cap ORDER BY seq`)) {
     const table = r.tbl as string;
     const def = catalog(table);
+    // 2^53 を超える整数の主キーは、JSON.parse で桁が落ち、行を引けなくなる。引けない行は「同じ文の中で挿入して消した行」と
+    // 区別できず、書き込みが黙って消えた (2026-11-13、test/wide-integers.test.ts の基準経路だけの実行)。キーの文字で見て断る。
+    for (const k of [r.oldk, r.newk]) if (typeof k === "string" && hasWideInteger(k)) throw wideError(table);
     const norm = (k: Value | undefined) => keyString(JSON.parse(k as string) as Value[]);
     const old = (r.oldk ?? null) === null ? null : norm(r.oldk);
     const fresh = (r.newk ?? null) === null ? null : norm(r.newk);

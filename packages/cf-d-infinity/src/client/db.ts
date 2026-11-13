@@ -8,7 +8,10 @@ import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import { ident, parseStatements, text, type Node, type Params } from "../sql/cst";
 import { keyString } from "../keys";
-import { untypedOf, SCHEMA_STATEMENTS, findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
+import { realOf } from "../value";
+import { sha256Text } from "../sha256";
+import { SHARD_LIMITS, isShardLimit, withinShardLimits } from "../shard-limits";
+import { scanSql, untypedOf, SCHEMA_STATEMENTS, findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
 import { parseDdl } from "../sql/ddl";
 import { openScratch, ScratchDb, type Compiled } from "../sql/scratch";
 import { groupSpan, rowSpan, scanSpans, statementSpans, tableSpan } from "./spans";
@@ -46,6 +49,11 @@ export interface Cluster {
 
 /** Worker の側の欠陥を再導入するスイッチ (シャードの側は types.ts の Faults)。検査が欠陥を見つけることを確かめる試験だけが使う。 */
 export interface ClientFaults {
+  /**
+   * 2PC の ID に、続きの中身の指紋を付けず、取引の ID をそのまま使う (specs/m17_txn_id_reuse.qnt の m17_red_impl)。同じ baton の
+   * 2 つの続きが 1 つの 2PC に混ざり、確定と答えた書き込みが消える。
+   */
+  commitIdIsTxn?: boolean;
   /** 書き出した取引を組み立て直すとき、表定義が変わっていても、新しい版を名乗らせる (モデル m13_red_repin)。 */
   repinOnRestore?: boolean;
   /** DDL を実行した batch も、競合したら頭からやり直す (モデル m13_red_retry_whole)。 */
@@ -170,6 +178,23 @@ const resolvesConflicts = (sql: string): boolean => /^\s*(INSERT|UPDATE)\s+OR\s+
  */
 export class NeedsReference extends Error {}
 
+/**
+ * シャードが DO の SQLite の上限で断った文 (src/shard-limits.ts) は、基準経路で実行し直す。上限に当たるかは、行がシャードに
+ * どう分かれているかで変わるので、断ると成否が置き場所で決まる (計画書の不変条件 13)。シャードは何も読まず書かずに断るので、
+ * 読んだ範囲も取引の変更も残らない。それ以外の誤りはそのまま投げる。
+ */
+/** 行の変更の大きさ (取引の大きさの上限で数える単位)。同じ変更を何度も数えないように覚えておく。 */
+const changeSizes = new WeakMap<Change, number>();
+const changeBytes = (c: Change): number => {
+  let n = changeSizes.get(c);
+  if (n === undefined) changeSizes.set(c, (n = utf8Length(encode(c))));
+  return n;
+};
+
+const rerouted = (e: unknown): never => {
+  throw isShardLimit(e) ? new NeedsReference((e as Error).message) : e;
+};
+
 /** 書き込みの文が表定義を読むときの拒否。文の形だけで決まる。 */
 const METADATA_IN_WRITE =
   "unsupported: a statement that writes cannot read sqlite_master or a PRAGMA function inside it; read the schema in a statement of its own and pass the value as a parameter";
@@ -189,7 +214,13 @@ async function runPlanned(
     if (!(e instanceof NeedsReference)) throw e;
     const p = await planStatement(parseStatements(source)[0], params, cat, { ...ctx, reference: "scans" });
     seen?.(p);
-    return run(p);
+    try {
+      return await run(p);
+    } catch (again) {
+      // 基準経路の走査は、作りとして上限に収まる (Scan を作るプランナが確かめる)。ここに来れば、それが崩れている。
+      if (again instanceof NeedsReference) throw new SqlError(`the reference path sent a shard a statement over its limits (${again.message}); please report this`);
+      throw again;
+    }
   }
 }
 
@@ -260,8 +291,12 @@ function withSlots(routing: Routing, shard: string, spans: Span[]): Span[] {
 
 /** 1 回の読み取りで Worker へ集める行の上限。メモリからの推定で、本番で調整する。 */
 export const ROW_BUDGET = 200_000;
-/** 1 文で Worker へ集めてよいバイト数。isolate のメモリは 128 MB で、集めた行は wasm の SQLite にも入る。 */
-export const BYTE_BUDGET = 32_000_000;
+/**
+ * 1 文で Worker へ集めてよいバイト数の合計。isolate のメモリは 128 MB で、集めた行は wasm の SQLite にも入る。
+ * 1 つのシャードが 1 回で返せる大きさ (SHARD_LIMITS.resultBytes) を超えない。超えると、行が 1 つのシャードに偏ったときだけ、
+ * 予算の内側の結果を集められない (計画書の不変条件 13)。
+ */
+export const BYTE_BUDGET = SHARD_LIMITS.resultBytes;
 
 /** 読み取りのコンテキスト。autocommit と Txn で実行経路を共有する。 */
 class ReadScope {
@@ -282,7 +317,7 @@ class ReadScope {
     const full: ExecReq = {
       ...req, spans, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), fresh: this.wantsFresh, realtime: this.realtime,
     };
-    const res = await this.db.shardOf(shard).exec(full);
+    const res = await this.db.shardOf(shard).exec(full).catch(rerouted);
     this.T ??= res.T;
     this.db.observe(res.hlc);
     this.record(shard, spans);
@@ -302,9 +337,48 @@ class ReadScope {
     }
   }
 
-  protected async shardRead(p: Extract<Plan, { kind: "shard" }>, t: Target): Promise<ExecRes> {
+  protected async shardRead(p: Extract<Plan, { kind: "shard" }>, t: Target, maxBytes?: number): Promise<ExecRes> {
     const tables = await this.db.tablesOf(p.sql, this.cat, p.tables, false);
-    return this.call(t.shard, { sql: p.sql, params: p.params, spans: statementSpans({ tables, sks: t.sks, pk: p.pk, write: false }) });
+    return this.call(t.shard, {
+      sql: p.sql, params: p.params, spans: statementSpans({ tables, sks: t.sks, pk: p.pk, write: false }),
+      ...(maxBytes === undefined ? {} : { maxBytes, budgeted: true }),
+    });
+  }
+
+  /** 文 1 つが集めてよいバイト数の合計。 */
+  protected byteBudget(): number {
+    return Math.min(this.db.byteBudget, SHARD_LIMITS.resultBytes);
+  }
+
+  /**
+   * 複数のシャードから、合わせて budget バイトまでの結果を読む。
+   *
+   * 予算は、まず対象のシャードで等分する。溢れたシャードにだけ、ほかのシャードが使わなかった分を配り直して読み直す。
+   * 1 回ごとに、少なくとも 1 つのシャードが読み終わるか (溢れたシャードの合計が残りの予算以下なら、平均以下のシャードがある)、
+   * 溢れたシャード全部が取り分を超えて合計が予算を超えたと分かる。だから成否は結果の合計の大きさだけで決まり、行がどの
+   * シャードに偏っているかでは変わらない (計画書の不変条件 13)。等分だけでは、同じ結果が偏った置き場所でだけ断られた
+   * (2026-11-13 の README の確認の指摘 2)。読み直しは同じ時点 T で読むので、答えは 1 回で読んだときと同じである。
+   * 届いている途中の行は、合計で予算と、シャードごとの 1 行の超過を超えない。
+   */
+  protected async budgeted(targets: Target[], budget: number, read: (t: Target, maxBytes: number) => Promise<ExecRes>): Promise<{ parts: ExecRes[]; bytes: number }> {
+    const done = new Map<Target, ExecRes>();
+    let pending = targets;
+    let left = budget;
+    while (pending.length > 0) {
+      const share = Math.floor(left / pending.length);
+      const res = await Promise.all(pending.map((t) => read(t, share)));
+      const over = pending.filter((_t, i) => res[i]!.over);
+      res.forEach((r, i) => {
+        if (r.over) return;
+        done.set(pending[i]!, r);
+        left -= r.bytes ?? 0;
+      });
+      if (over.length === pending.length) {
+        throw new SqlError(`result too large: the statement reads more than ${budget} bytes; narrow the query or select fewer columns`);
+      }
+      pending = over;
+    }
+    return { parts: targets.map((t) => done.get(t)!), bytes: budget - left };
   }
 
   /**
@@ -318,23 +392,21 @@ class ReadScope {
     this.T = Math.max(this.db.token, ...clocks);
   }
 
-  /** 走査を実行して行を返す。 */
-  protected async scan(s: Scan): Promise<{ columns: string[]; rows: Value[][] }> {
+  /** 走査を実行して行を返す。集める行は、合わせて budget バイトまでである (budgeted)。 */
+  protected async scan(s: Scan, budget = this.byteBudget()): Promise<{ columns: string[]; rows: Value[][]; bytes: number }> {
     const targets = await this.resolve(s.sks ? { by: "sk", sks: s.sks } : { by: "all" });
-    if (targets.length === 0) return { columns: [], rows: [] };
+    if (targets.length === 0) return { columns: [], rows: [], bytes: 0 };
     await this.pickT(targets.map((t) => t.shard));
     // 上限はシャードの側で打ち切らせる。全行が届いてから数えると、数える前に Worker のメモリが尽きる。
-    // バイト数は対象のシャードで等分する。偏りがあると早めに拒否するが、合計が予算を超えることはない。
-    const maxBytes = Math.max(1_000_000, Math.floor(this.db.byteBudget / targets.length));
     // 集めた行は Worker の SQLite で計算し直すので、型のない列の INTEGER と REAL を区別して運ぶ (src/value.ts)。
-    const sql = s.typed ? `SELECT *, ${s.typed.map((c, i) => `typeof(${q(c)}) AS ${q(`__dinf_typeof_${i}`)}`).join(", ")} FROM (${s.sql})` : s.sql;
-    const parts = await Promise.all(targets.map((t) =>
-      this.call(t.shard, { sql, params: s.params, spans: scanSpans(s, t.sks), maxRows: this.db.rowBudget, maxBytes }),
-    ));
+    const sql = scanSql(s);
+    const { parts, bytes } = await this.budgeted(targets, budget, (t, maxBytes) =>
+      this.call(t.shard, { sql, params: s.params, spans: scanSpans(s, t.sks), maxRows: this.db.rowBudget, maxBytes, budgeted: true }),
+    );
     const columns = parts[0]!.columns;
     const rows = parts.flatMap((r) => r.values);
-    if (!s.typed) return { columns, rows };
-    return typedValues({ columns: s.typed, affinity: {} }, columns, rows);
+    if (!s.typed) return { columns, rows, bytes };
+    return { ...typedValues({ columns: s.typed, affinity: {} }, columns, rows), bytes };
   }
 
   /** 走査を実行して、行を集める。sql が実際に開く表は本物のプランナに尋ね、走査にない表は全行を読み足す。 */
@@ -350,8 +422,11 @@ class ReadScope {
     await this.pickT([...new Set(all.flat().map((t) => t.shard))]);
     const out: Loaded[] = [];
     let total = 0;
+    // バイト数の予算は文全体で 1 つである。走査ごとに、残りを渡す。
+    let bytesLeft = this.byteBudget();
     for (const s of scans) {
-      const { columns, rows } = await this.scan(s);
+      const { columns, rows, bytes } = await this.scan(s, bytesLeft);
+      bytesLeft -= bytes;
       total += rows.length;
       this.withinRowBudget(total);
       out.push({ table: s.table, columns, rows });
@@ -394,15 +469,10 @@ class ReadScope {
       case "shard": {
         const targets = await this.resolve(p.route);
         await this.pickT(targets.map((t) => t.shard));
-        try {
-          const parts = await Promise.all(targets.map((t) => this.shardRead(p, t)));
-          return new QueryResult(parts[0]!.columns, parts.flatMap((r) => r.values), 0, null, this.T);
-        } catch (e) {
-          // DO の SQLite は UNION などの複合 SELECT を 5 項までしか受け付けない (公式の制限表にない実測値)。
-          // 上限 500 の Worker の SQLite で実行するために、基準経路へ切り替える。
-          if (/too many terms in compound SELECT/.test((e as Error)?.message ?? "")) throw new NeedsReference("compound SELECT with more terms than a shard accepts");
-          throw e;
-        }
+        // DO の SQLite の上限に当たる文は、シャードが断り、call が基準経路への切り替えにする (src/shard-limits.ts)。
+        // 結果の大きさは、集める読みと同じ予算の合計で決める (budgeted)。
+        const { parts } = await this.budgeted(targets, this.byteBudget(), (t, maxBytes) => this.shardRead(p, t, maxBytes));
+        return new QueryResult(parts[0]!.columns, parts.flatMap((r) => r.values), 0, null, this.T);
       }
       case "gather": {
         const w = await this.gather(p.scans, p.sql);
@@ -633,7 +703,7 @@ export class Txn extends ReadScope {
     tx.pessimistic = d.pessimistic;
     tx.lockReads = d.lockReads;
     tx.lockOwner = d.lockOwner;
-    tx.writes = m(d.writes);
+    tx.replaceWrites(m(d.writes));
     tx.spans = new Map(d.spans);
     tx.saves = new Map(d.saves.map(([k, v]) => [k, { writes: m(v.writes), spans: new Map(v.spans) }]));
     return tx;
@@ -648,7 +718,7 @@ export class Txn extends ReadScope {
   rollbackTo(name: string): void {
     const s = this.saves.get(name.toLowerCase());
     if (!s) throw new SqlError(`no such savepoint: ${name}`);
-    this.writes = new Map([...s.writes].map(([k, v]) => [k, new Map(v)]));
+    this.replaceWrites(new Map([...s.writes].map(([k, v]) => [k, new Map(v)])));
   }
   release(name: string): void {
     if (!this.saves.delete(name.toLowerCase())) throw new SqlError(`no such savepoint: ${name}`);
@@ -694,7 +764,7 @@ export class Txn extends ReadScope {
     const spans = withSlots(this.cat.routing, shard, req.spans);
     const res = await this.db.shardOf(shard).exec({
       ...req, spans, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), lock: this.lockOwner,
-    });
+    }).catch(rerouted);
     this.T ??= res.T;
     this.db.observe(res.hlc);
     this.record(shard, spans.map((s) => ({ ...s, since: res.F })));
@@ -711,10 +781,15 @@ export class Txn extends ReadScope {
   /** 文の途中で失敗したら、その文の変更だけを取り消す。SQLite の文の原子性と同じである。 */
   private async atomically(fn: () => Promise<QueryResult>): Promise<QueryResult> {
     const saved = new Map([...this.writes].map(([k, v]) => [k, new Map(v)]));
+    const savedBytes = this.writeBytes;
     try {
-      return await fn();
+      const out = await fn();
+      // 大きすぎる取引は、上限を超えさせた文で断る。COMMIT まで待つと、どの文が原因か分からない。
+      this.assertWriteSetBudget();
+      return out;
     } catch (e) {
       this.writes = saved;
+      this.writeBytes = savedBytes;
       throw e;
     }
   }
@@ -880,11 +955,30 @@ export class Txn extends ReadScope {
       }
     }
     const out: Loaded[] = [];
+    // 問いが多いと、1 つの走査が DO の SQLite の上限 (変数 100 個、文 100 KB) を超える。上限に収まる数ずつに分けて読む
+    // (src/shard-limits.ts。基準経路の走査は、作りとして上限に収める)。
+    const batches: { def: TableDef; sk: string; conds: { sql: string; params: Value[] }[] }[] = [];
     for (const g of wanted.values()) {
-      const name = q(g.def.name);
+      let batch: typeof g.conds = [];
+      const scanOf = (conds: typeof g.conds): Scan => {
+        const where = conds.map((x) => x.sql).join(" OR ");
+        const params = conds.flatMap((x) => x.params);
+        return { table: g.def, sql: `SELECT ${scanList(g.def)} FROM ${q(g.def.name)} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, typed: untypedOf(g.def) };
+      };
+      for (const c of g.conds) {
+        const next = [...batch, c];
+        const s = scanOf(next);
+        if (batch.length > 0 && !withinShardLimits(scanSql(s), s.params)) {
+          batches.push({ def: g.def, sk: g.sk, conds: batch });
+          batch = [c];
+        } else batch = next;
+      }
+      if (batch.length > 0) batches.push({ def: g.def, sk: g.sk, conds: batch });
+    }
+    for (const g of batches) {
       const where = g.conds.map((x) => x.sql).join(" OR ");
       const params = g.conds.flatMap((x) => x.params);
-      const scan: Scan = { table: g.def, sql: `SELECT ${scanList(g.def)} FROM ${name} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, typed: untypedOf(g.def) };
+      const scan: Scan = { table: g.def, sql: `SELECT ${scanList(g.def)} FROM ${q(g.def.name)} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, typed: untypedOf(g.def) };
       const { columns, rows } = await this.scan(scan);
       const found: Loaded = { table: g.def, columns, rows: [] };
       keysOf({ table: g.def, columns, rows }).forEach((key, i) => {
@@ -898,8 +992,25 @@ export class Txn extends ReadScope {
   }
 
   private async insertSelect(p: Extract<Plan, { kind: "insertSelect" }>): Promise<QueryResult> {
-    const src = await this.read(p.select);
+    let src = await this.read(p.select);
     if (src.values.length === 0) return new QueryResult([], []);
+    // 読んだ結果では、整数の値の REAL (5.0) が整数の 5 になる (DO の SQLite は読み出しで区別しない。src/value.ts)。INTEGER と
+    // REAL と NUMERIC の列は、入るときに SQLite が型を揃えるので変わらないが、TEXT の列は "5" と "5.0"、型のない列は格納の型が違う。
+    // そこに入る整数があれば、同じ取引の時点で、typeof を一緒に読み直す (2026-11-13 の Codex の指摘 C6、test/typed-diff.test.ts)。
+    const into = p.columns ?? p.def.columns;
+    const loose = into.map((c) => ["TEXT", "BLOB"].includes(p.def.affinity[c] ?? "BLOB"));
+    if (src.values.some((row) => row.some((v, i) => loose[i] !== false && typeof v === "number" && Number.isInteger(v)))) {
+      const n = src.columns.length;
+      const names = Array.from({ length: n }, (_v, i) => q(`__dinf_c${i}`));
+      const typed = await this.query(
+        `WITH ${q("__dinf_s")}(${names.join(", ")}) AS (${p.selectSql}) SELECT ${names.map((c) => `${c}, typeof(${c})`).join(", ")} FROM ${q("__dinf_s")}`,
+        p.selectParams,
+      );
+      src = new QueryResult(src.columns, typed.values.map((row) => Array.from({ length: n }, (_v, i) => {
+        const v = row[2 * i] ?? null;
+        return row[2 * i + 1] === "real" && typeof v === "number" ? realOf(v) : v;
+      })));
+    }
     const cols = p.columns ? `(${p.columns.map(q).join(", ")}) ` : "";
     let changes = 0;
     let last: number | null = null;
@@ -924,7 +1035,27 @@ export class Txn extends ReadScope {
     // 検証の窓は最初の F から取る。2 回目の DML は自分の overlay を読むだけで、他者の変更を見ていない。
     const first = prior?.since !== undefined && c.since !== undefined ? Math.min(prior.since, c.since) : (prior?.since ?? c.since);
     const since = this.db.faults.secondDmlNewSince && c.since !== undefined ? c.since : first;
-    m.set(key, prior ? { ...c, before: prior.before, since } : c);
+    const next = prior ? { ...c, before: prior.before, since } : c;
+    this.writeBytes += changeBytes(next) - (prior ? changeBytes(prior) : 0);
+    m.set(key, next);
+  }
+
+  /**
+   * 取引が変える行の大きさの合計 (行イメージの UTF-8 のバイト数)。上限は取引全体で数える。シャードごとに数えると、同じ取引が、
+   * 行が分かれていれば通り、1 つのシャードに集まれば断られる (計画書の不変条件 13、test/shard-limits.test.ts)。
+   * 合計が上限以下なら、シャードごとの変更ログの 1 行にも必ず収まる (ShardCore.assertWriteSetFits)。
+   */
+  private writeBytes = 0;
+  /** 書き込みの集まりを丸ごと入れ替える (baton からの組み立て直し、SAVEPOINT への巻き戻し)。合計を数え直す。 */
+  private replaceWrites(writes: Map<string, Map<string, Change>>): void {
+    this.writes = writes;
+    this.writeBytes = 0;
+    for (const m of writes.values()) for (const c of m.values()) this.writeBytes += changeBytes(c);
+  }
+  private assertWriteSetBudget(): void {
+    if (this.writeBytes > this.db.writeSetBudget) {
+      throw new SqlError(`transaction too large: it changes more than ${this.db.writeSetBudget} bytes of rows; split it into smaller transactions`);
+    }
   }
 
   /**
@@ -983,13 +1114,12 @@ export class Txn extends ReadScope {
   async commit(): Promise<void> {
     if (this.doomed) throw this.doomed;
     // 大きすぎる取引は、シャードへ送る前にここで断る。シャードも同じ検査をするが、そちらの拒否は競合と同じ扱いで再試行される。
-    for (const changes of this.writes.values()) {
-      let bytes = 0;
-      for (const c of changes.values()) bytes += utf8Length(encode(c));
-      if (bytes > this.db.writeSetBudget) {
-        await this.unlockAll().catch(() => undefined);
-        throw new SqlError(`transaction too large: it changes more than ${this.db.writeSetBudget} bytes of rows on one shard; split it into smaller transactions`);
-      }
+    // 文ごとにも確かめているが (atomically)、取引を組み立て直した後 (baton) にも効くように、ここでも確かめる。
+    try {
+      this.assertWriteSetBudget();
+    } catch (e) {
+      await this.unlockAll().catch(() => undefined);
+      throw e;
     }
     const shards = new Set([...this.writes.keys()].filter((s) => this.writes.get(s)!.size > 0));
     // 読み取りだけなら T の snapshot で完結する。ただしロックを取って最新を読んだ取引は、
@@ -1016,10 +1146,18 @@ export class Txn extends ReadScope {
         p.spans.filter((s) => !(s.kind === "pk" && p.writes.some((w) => w.table === s.table && w.pk === s.pk))).length;
       const sorted = [...parts].sort((a, b) => score(b) - score(a) || hashKey(this.id + a.shard) - hashKey(this.id + b.shard));
       const anchor = this.db.shardOf(sorted[0]!.shard);
+      // 2PC の ID は、取引の ID と、この続きの中身 (時点、表定義の版、参加者ごとの書き込みと読んだ範囲) の指紋である。
+      // baton は使い捨てではないので、同じ取引の ID の続きが 2 つできる。ID が取引の ID だけだと、2 つの COMMIT が 1 つの 2PC に
+      // 混ざる。断られた続きの中止が、確定した続きの intent を消し、確定と答えた書き込みが消えた (2026-11-13 の Codex の指摘 C1、
+      // specs/m17_txn_id_reuse.qnt の m17_red_abort)。中身ごとに ID を分けると、2 つの続きは別の 2PC になり、同じ行を書けば普通の
+      // 競合で片方が断られる。同じ中身の再送は同じ ID なので、anchor の記録から同じ答えを返す。指紋は SHA-256 で、利用者が
+      // 中身を選んでも衝突を作れない。行ロックは取引の ID のままで、シャードは ID の # の前で自分のロックを見分ける (lockIdOf)。
+      const txn = this.db.faults.commitIdIsTxn ? this.id
+        : `${this.id}#${sha256Text(encode([T, schema, parts.map((p) => [p.shard, p.writes, p.spans])])).slice(0, 32)}`;
       try {
-        res = await anchor.commit({ txn: this.id, T, participants: parts, schema });
+        res = await anchor.commit({ txn, T, participants: parts, schema });
       } catch (e) {
-        const st = await anchor.status({ txn: this.id }); // 応答不明は status で決着を知る。
+        const st = await anchor.status({ txn }); // 応答不明は status で決着を知る。
         if (st.status === "committed") res = { ok: true, c: st.c };
         else if (st.status === "aborted") throw new ConflictError(`commit outcome: ${e instanceof Error ? e.message : e}`);
         else throw e;
@@ -1977,7 +2115,7 @@ export class Db {
     const spans = statementSpans({ tables: await this.tablesOf(t.sql, cat, p.tables ?? [p.def], true), sks: [sk], pk: t.pk, write: true, uniqueReads: t.uniqueReads });
     const res = await this.shardOf(ownerOf(cat.routing, sk)).execAuto({
       sql: t.sql, params: t.params, spans, write: t.write, schema: cat.version, minTs: this.token,
-    });
+    }).catch(rerouted);
     this.observe(res.hlc);
     return new QueryResult(res.columns, res.values, res.count ?? res.changes.length, p.lastRowid, res.T);
   }

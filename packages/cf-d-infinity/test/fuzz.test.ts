@@ -18,6 +18,7 @@ CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);
 CREATE TABLE t2(k TEXT PRIMARY KEY, a INTEGER, c REAL);
 CREATE TABLE t3(x INTEGER, y INTEGER, v TEXT, PRIMARY KEY (x, y));
 CREATE TABLE t4(id INTEGER PRIMARY KEY, u TEXT UNIQUE, n INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE t5(id INTEGER PRIMARY KEY, x);
 CREATE INDEX i1 ON t1(a);
 CREATE INDEX i3 ON t3(x, v);
 `;
@@ -57,6 +58,12 @@ function script(seed: number, length: number): string {
     () => `DELETE FROM t2 WHERE a ${cmp()} ${n(12)}`,
     () => `DELETE FROM t3 WHERE x = ${n(4)} AND y = ${n(4)}`,
     () => `DELETE FROM t4 WHERE id = ${n(10)}`,
+    // 型のない列。INTEGER と REAL と TEXT が、どの経路でも型を変えずに入ること (比べ方は test/diff.ts の quote())。
+    () => `INSERT OR REPLACE INTO t5 VALUES (${n(12)}, ${pick(["2.0", "2", "'2'", "x'02'", "NULL", "0.5", "-0.0", "1e14"])})`,
+    () => `INSERT OR REPLACE INTO t5(id, x) SELECT id + ${n(5)}, ${pick(["c", "a", "a * 1.0", "c + 0.5", "k"])} FROM t2 WHERE k = ${key()}`,
+    () => `INSERT OR IGNORE INTO t5(id, x) SELECT id, a FROM t1 WHERE id ${cmp()} ${n(12)}`,
+    () => `UPDATE t5 SET x = ${pick(["x * 1.0", "x + 1", "x || ''", "CAST(x AS INTEGER)", "round(x)"])} WHERE id ${cmp()} ${n(12)}`,
+    () => `SELECT id, x, typeof(x) FROM t5 ORDER BY id`,
     () => `SELECT * FROM t1 WHERE ${cond1()} ORDER BY id`,
     () => `SELECT * FROM t1 ORDER BY id`,
     () => `SELECT * FROM t2 ORDER BY k`,
@@ -91,7 +98,7 @@ describe("random statements against real SQLite", () => {
   for (let seed = 1; seed <= SEEDS; seed++) {
     it(`seed ${seed}`, async () => {
       const problems = await diff(script(seed, LENGTH), 1 + (seed % 6), [
-        "SELECT * FROM t1 ORDER BY id", "SELECT * FROM t2 ORDER BY k", "SELECT * FROM t3 ORDER BY x, y", "SELECT id, u, n FROM t4 ORDER BY id",
+        "SELECT * FROM t1 ORDER BY id", "SELECT * FROM t2 ORDER BY k", "SELECT * FROM t3 ORDER BY x, y", "SELECT id, u, n FROM t4 ORDER BY id", "SELECT * FROM t5 ORDER BY id",
       ]);
       expect(problems.slice(0, 3).join("\n\n")).toBe("");
     }, 120000);

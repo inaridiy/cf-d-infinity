@@ -52,13 +52,31 @@ const INTERNAL_NAMES = new Set([
 export const isInternalName = (name: string): boolean =>
   INTERNAL_NAMES.has(name.toLowerCase()) || /^(sqlite_|__gidx_|__cap_|__capv_|__log_g)/i.test(name);
 
+/**
+ * 列の名前のうち、内部で使う接頭辞。行イメージの JSON の印 (`{"$b": 16 進}`、`{"$f": "Infinity"}`。src/shard/rows.ts の encode)
+ * と、Worker やシャードが文に足す列の別名 (`__dinf_typeof_<i>` など) である。利用者の列がこの名前だと、行イメージを読むときに
+ * 行そのものを印と取り違えたり (確定した INSERT が消える)、足した列が利用者の列を上書きしたりする (2026-11-13 の Codex の
+ * 指摘 C2、C3)。新しい印や別名は、この接頭辞で作る (test/internal-names.test.ts が、印と別名がここに当たることを確かめる)。
+ */
+export const INTERNAL_COLUMN_PREFIXES = ["$", "__dinf_"];
+export const isInternalColumn = (name: string): boolean =>
+  INTERNAL_COLUMN_PREFIXES.some((p) => name.toLowerCase().startsWith(p));
+
+function userColumn(name: string): string {
+  if (isInternalColumn(name)) {
+    throw new SqlError(`unsupported: column name ${name} is reserved for internal use (names starting with ${INTERNAL_COLUMN_PREFIXES.map((p) => `'${p}'`).join(" or ")})`);
+  }
+  return name;
+}
+
 /** 対応していない機能は、黙って通さずに断る。エラーは必ず `unsupported:` で始める。 */
 const unsupported = (what: string): never => {
   throw new SqlError(`unsupported: ${what}`);
 };
 
 function userName(name: string, what: string): string {
-  if (isInternalName(name)) throw new SqlError(`${what} name ${name} is reserved for internal use`);
+  // `__dinf_` は、Worker が文に足す別名と CTE の名前に使う (Txn.insertSelect)。CTE には付けられるので、表の名前だけを断る。
+  if (isInternalName(name) || /^__dinf_/i.test(name)) throw new SqlError(`${what} name ${name} is reserved for internal use`);
   return name;
 }
 
@@ -133,7 +151,7 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
       if (c.type === "constraint_unique") uniqueSets.push(specCols(c));
       continue;
     }
-    const col = ident(item.name);
+    const col = userColumn(ident(item.name));
     columns.push(col);
     types.set(col, item.dataType ? text(item.dataType) : null);
     for (const raw of item.constraints ?? []) {
@@ -234,7 +252,7 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
   const local = (plain && def.shardKey.every((c) => cols.includes(c))) || !plain || partial || !unique;
   if (local) {
     if (unique && !(plain && def.shardKey.every((c) => cols.includes(c)))) {
-      throw new SqlError("UNIQUE partial or expression indexes must include the shard key");
+      throw new SqlError("unsupported: a UNIQUE partial or expression index that does not include the shard key");
     }
     // 部分 index も記録する。記録しないと、書き込みの UNIQUE の検査がこの表を飛ばし、確定した後の適用で初めて違反になる。
     if (unique) def.uniques.push(cols);
@@ -323,7 +341,7 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       const col = action.column;
       col.constraints = (col.constraints ?? []).filter((c: Node) => !isFk(inner(c)));
       sql.push(`ALTER TABLE ${q(name)} ADD COLUMN ${text(col)}`);
-      const added = ident(col.name);
+      const added = userColumn(ident(col.name));
       def.columns.push(added);
       // 型親和性と照合順序も記録する。無いと、この列の index を引くときに値を正規化できず、行を見つけられない。
       def.affinity[added] = affinityOf(col.dataType ? text(col.dataType) : null);

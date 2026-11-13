@@ -4,9 +4,11 @@ import type { Catalog } from "../meta";
 import { ownerOf } from "../routing";
 import { encode, q, scanList } from "../shard/rows";
 import type { GlobalIndexDef, TableDef, Value, WritePlan } from "../types";
-import { SqlError } from "../types";
+import { SqlError, utf8Length } from "../types";
 import { bindParams, constant, ident, render, text, walk, type Node, type Params } from "./cst";
 import { keyString, storedAs } from "../keys";
+import { isReal } from "../value";
+import { SHARD_LIMITS, withinShardLimits } from "../shard-limits";
 import { isInternalName } from "./ddl";
 
 export type Route =
@@ -24,7 +26,16 @@ export interface Scan {
   where?: { alias: string; sql: string; params: Value[] };
   /** 型を一緒に読む列。INTEGER と REAL を区別して運ぶ (src/value.ts)。表を読む走査では、型のない列である。 */
   typed?: string[];
+  /**
+   * 押し下げられる条件があったのに、押し下げると DO の SQLite の上限を超えるので、押し下げなかった (scanOf)。
+   * 部分集約と Top-N は、条件を全部シャードで評価する前提なので、この走査を使えない。
+   */
+  unpushed?: true;
 }
+
+/** 走査としてシャードへ送る文。型を一緒に読む列があれば、typeof の列を足して包む (src/shard/rows.ts の typedValues が外す)。 */
+export const scanSql = (s: Pick<Scan, "sql" | "typed">): string =>
+  s.typed ? `SELECT *, ${s.typed.map((c, i) => `typeof(${q(c)}) AS ${q(`__dinf_typeof_${i}`)}`).join(", ")} FROM (${s.sql})` : s.sql;
 
 /** 型のない列 (BLOB の親和性)。Worker の SQLite へ入れ直すとき、ほかの列は列の型の親和性が型を戻す。 */
 export const untypedOf = (def: TableDef): string[] | undefined => {
@@ -71,7 +82,11 @@ export type Plan =
    * lastRowid は、プランナが rowid を採番したときの、最後の値である。
    */
   | { kind: "wasmWrite"; scans: Scan[]; sql: string; params: Value[]; tables: TableDef[]; lastRowid?: number | null }
-  | { kind: "insertSelect"; def: TableDef; select: Plan; head: string; columns: string[] | null; tail: string; tailParams: Value[] }
+  | {
+      kind: "insertSelect"; def: TableDef; select: Plan; head: string; columns: string[] | null; tail: string; tailParams: Value[];
+      /** SELECT の文面と引数。結果の格納の型を読み直すときに、typeof の列を足して包む (Txn.insertSelect)。 */
+      selectSql: string; selectParams: Value[];
+    }
   | { kind: "ddl"; sql: string }
   | { kind: "noop" }
   /** 文を 1 つの取引の中で計画し直す。計画の途中で表を読む必要があるときに返す。 */
@@ -338,7 +353,9 @@ function pinsOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string[] | n
     if (vs.some((v) => v === null)) return null; // NULL との等値は常に偽だが、経路にはしない
     // 列に入るときと同じく、列の型の親和性で揃える。SQLite の等値の比べ方も、定数の側に列の親和性を掛ける。
     const norm = vs.map((v) => storedAs(v, def.skAffinity[i]!));
-    keys = keys.flatMap((k) => norm.map((v) => [...k, v]));
+    // SQLite と同じに揃えられない値 (TEXT の列に入る REAL) では絞らない。シャードの SQLite が比べる。
+    if (norm.some((v) => v === undefined)) return null;
+    keys = keys.flatMap((k) => norm.map((v) => [...k, v as Value]));
   }
   return keys.map((k) => keyString(k));
 }
@@ -350,7 +367,9 @@ function pkOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string | null 
     const vs = equalities(conj, ref, col, s, values);
     if (vs?.length !== 1) return null;
     // 行の同一性はシャードと同じ規則で作る (rows.ts の encodeKey)。照合順序のある列は値を揃える。
-    vals.push(storedAs(vs[0]!, def.affinity[col] ?? "INTEGER"));
+    const v = storedAs(vs[0]!, def.affinity[col] ?? "INTEGER");
+    if (v === undefined) return null;
+    vals.push(v);
   }
   return keyString(vals);
 }
@@ -513,7 +532,7 @@ function scanOf(s: Scope | null, ref: Ref | null, def: TableDef, values: Value[]
   const parts = conj.map((c) => render(c, values));
   const where = parts.map((p) => `(${p.sql})`).join(" AND ");
   const params = parts.flatMap((p) => p.params);
-  return {
+  const scan: Scan = {
     table: def,
     sql: `${from} WHERE ${where}`,
     params,
@@ -521,6 +540,10 @@ function scanOf(s: Scope | null, ref: Ref | null, def: TableDef, values: Value[]
     where: { alias: name, sql: where, params },
     typed: untypedOf(def),
   };
+  // 押し下げた条件で走査が DO の SQLite の上限を超えるなら、条件を押し下げずに表を読む。基準経路の走査は、作りとして上限に
+  // 収まらなければならない (src/shard-limits.ts、計画書の不変条件 13)。条件は Worker の SQLite が元の文で評価する。
+  if (!withinShardLimits(scanSql(scan), params)) return { table: def, sql: from, params: [], sks: null, typed: untypedOf(def), unpushed: true };
+  return scan;
 }
 
 function viewTables(cat: Catalog, name: string, n: Names, seen = new Set<string>()): TableDef[] {
@@ -655,6 +678,7 @@ function partialAggregate(stmt: Node, s: Scope, values: Value[]): Plan | null {
     if (bad) return null;
   }
   const scan = scanOf(s, ref, def, values);
+  if (scan.unpushed) return null;
   const whereAt = scan.sql.indexOf(" WHERE ");
   const whereSql = whereAt < 0 ? "" : scan.sql.slice(whereAt);
   const groupSql = groups.length ? ` GROUP BY ${groups.map((g) => q(g!.col)).join(", ")}` : "";
@@ -663,6 +687,8 @@ function partialAggregate(stmt: Node, s: Scope, values: Value[]): Plan | null {
   const groupTail = groups.length ? ` GROUP BY ${groupIdx.map((i) => `"__g${i}"`).join(", ")}` : "";
   const orderR = order ? render(order, values) : null;
   const limitR = limit ? render(limit, values) : null;
+  // 集約の列を足した文も、DO の SQLite の上限に収まらなければ使わない (src/shard-limits.ts)。
+  if (!withinShardLimits(sql, [...shardParams, ...scan.params])) return null;
   return {
     kind: "partial",
     scan: { ...scan, sql, params: [...shardParams, ...scan.params] },
@@ -675,7 +701,7 @@ function partialAggregate(stmt: Node, s: Scope, values: Value[]): Plan | null {
 /** ORDER BY と LIMIT をシャードへ押す。各シャードの上位 n 件に全体の上位 n 件が必ず含まれる。 */
 function topN(stmt: Node, s: Scope, scan: Scan, values: Value[]): Scan {
   if (stmt.type !== "select_stmt" || s.refs.length !== 1 || s.derived) return scan;
-  if (!fullyPushed(s, s.refs[0]!, values)) return scan;
+  if (!fullyPushed(s, s.refs[0]!, values) || scan.unpushed) return scan;
   const order = clause(stmt, "order_by_clause");
   const limit = clause(stmt, "limit_clause");
   const sel = clause(stmt, "select_clause");
@@ -758,6 +784,7 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   if (body.type !== "values_clause" && body.type !== "default_values") {
     return {
       kind: "insertSelect", def, select: planRead(body, values, cat, ctx.reference), head: prefix, columns: cols, tail: tailSql, tailParams,
+      ...(({ sql, params }) => ({ selectSql: sql, selectParams: params }))(render(body, values)),
     };
   }
 
@@ -785,7 +812,9 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
       missing.push(i);
       return undefined;
     }
-    const v = constant(r[idAt], values);
+    const c = constant(r[idAt], values);
+    // INTEGER PRIMARY KEY は、整数の値の REAL (`5.0`) を整数として入れる。
+    const v = c && isReal(c.value) ? { value: c.value.real } : c;
     if (v && v.value === null) {
       missing.push(i);
       return undefined;
@@ -801,7 +830,7 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   // SQLite だけでは解決できない。最初から基準経路で実行する。基準経路だけで実行する指定のときも、そうする。
   const resolves = /^(REPLACE|INSERT OR (IGNORE|REPLACE))$/.test(keyword) || tailClauses.some((c) => c.type === "upsert_clause");
   // ON CONFLICT や RETURNING の中のサブクエリは、表を読む。挿入先のシャードだけでは答えられないので、これも基準経路で実行する。
-  const viaWorker = ctx.reference !== undefined || (resolves && def.globalIndexes.length > 0) || tailClauses.some(hasSubquery);
+  let viaWorker = ctx.reference !== undefined || (resolves && def.globalIndexes.length > 0) || tailClauses.some(hasSubquery);
   const skAt = def.shardKey.map((c) => outCols.findIndex((n2) => same(n2, c) || (c === "rowid" && ROWID_NAMES.has(lower(n2)))));
   type Built = { sk: string; pk: string | null; sql: string; params: Value[]; uniq: UniqueRead[] | null };
   const built: Built[] = [];
@@ -835,16 +864,18 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
       }
       return out;
     })();
-    const skVals: Value[] = [];
+    const skVals: (Value | undefined)[] = [];
     for (const [k, at] of skAt.entries()) {
       const v = at < 0 ? null : await parts[at]!.value();
       skVals.push(storedAs(v, def.skAffinity[k]!));
     }
-    const pkVals: Value[] = [];
+    const pkVals: (Value | undefined)[] = [];
     for (const c of def.pk) {
       const at = outCols.findIndex((n2) => same(n2, c) || (c === "rowid" && ROWID_NAMES.has(lower(n2))));
       pkVals.push(at < 0 ? null : storedAs(await parts[at]!.value(), def.affinity[c] ?? "INTEGER"));
     }
+    // Worker が SQLite と同じに揃えられないキーの値があれば、行の置き場所を決められない。Worker の SQLite に入れさせる (基準経路)。
+    if ([...skVals, ...pkVals].some((v) => v === undefined)) viaWorker = true;
     if (auto) {
       const v = id ?? given[i];
       if (typeof v === "number") {
@@ -853,7 +884,8 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
       }
     }
     built.push({
-      sk: keyString(skVals), pk: keyString(pkVals), uniq,
+      // undefined が混じるときは viaWorker なので、この 2 つは使わない。
+      sk: keyString(skVals.map((v) => v ?? null)), pk: keyString(pkVals.map((v) => v ?? null)), uniq,
       sql: `(${parts.map((p) => p.sql).join(", ")})`, params: parts.flatMap((p) => p.params),
     });
   }
@@ -878,8 +910,14 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
     for (let at = 0; at < list.length; ) {
       const chunk: Built[] = [];
       let count = tailParams.length;
-      while (at < list.length && (chunk.length === 0 || count + list[at]!.params.length <= MAX_PARAMS)) {
+      // 文の長さも上限に収める (行を literal で並べた INSERT は、変数がなくても長くなる)。収まらない 1 行は、シャードが断り、
+      // 基準経路で実行し直す (src/shard-limits.ts)。束縛の書き換えで延びる分 (変数 1 つにつき 30 バイト以下) を見込む。
+      const fixed = utf8Length(`${prefix}${colSql} VALUES ${tailSql ? ` ${tailSql}` : ""}`) + 30 * tailParams.length;
+      let bytes = fixed;
+      const size = (b: Built) => utf8Length(b.sql) + 2 + 30 * b.params.length;
+      while (at < list.length && (chunk.length === 0 || (count + list[at]!.params.length <= MAX_PARAMS && bytes + size(list[at]!) <= SHARD_LIMITS.sqlBytes))) {
         count += list[at]!.params.length;
+        bytes += size(list[at]!);
         chunk.push(list[at++]!);
       }
       const isDefault = body.type === "default_values" && outCols.length === 0;

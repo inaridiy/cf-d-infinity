@@ -122,8 +122,12 @@ evaluation is never reimplemented, which is why the same statement gives the sam
 Everything else the planner (the only part written from scratch) does is an optimization of that path. If it can
 prove that one shard owns all the rows, the statement is sent there unchanged; a simple aggregate is computed per
 shard and merged. When an optimized path finds out while running that one shard cannot answer (the statement reads
-a table that is not in its `FROM` clause, it resolves a conflict with a row on another shard, a shard's SQLite
-refuses it), the statement is planned again on the reference path and run there. That switch is in one place, and
+a table that is not in its `FROM` clause, it resolves a conflict with a row on another shard, it is too big for a
+shard's SQLite), the statement is planned again on the reference path and run there. A shard measures every statement
+it is sent against the Durable Object SQLite limits (100 KB, 100 parameters, five compound terms) before running it,
+and refuses an oversized one with a typed error rather than leaving it to SQLite's message. Whether a statement hits
+those limits depends on how its rows are split into per-shard statements, so a refusal would make the outcome depend on
+placement. The scans the reference path sends are kept within the limits when they are planned. That switch is in one place, and
 nothing is refused because of where rows happen to be. Multi-shard `UPDATE` and `DELETE` run only when the statement
 spells them out; the planner does not rewrite a statement into something else silently.
 
@@ -222,10 +226,11 @@ The checks are layered. Each one catches what the layer before it cannot see.
    transactions, table rebuilds, the ordering of schema changes and splits, `UNIQUE` across pending writes, and a transaction id reused by two continuations. TLC explores them exhaustively on small
    instances. Each model has variants with a known bug put back, and the checker must find every one.
 2. **Counterexamples replayed against the code.** A model only checks the design. For each bug variant that the
-   implementation guards against, a fault switch puts the same bug back into the code, and a deterministic simulator
-   test drives the model's counterexample step by step. The test checks that the switch produces the violation and the
-   real code does not. Without it, a rare ordering is left to a random seed that may never produce it. The
-   [coverage table](./model-coverage.md) maps every variant to its switch and replay.
+   implementation guards against, a deterministic simulator test drives the model's counterexample against the real
+   code. For most of them (48 of 70) a fault switch also puts the same bug back into the code, and the test checks that
+   the switch produces the violation; the others replay the ordering on the fixed code only. Without the replays, a rare
+   ordering is left to a random seed that may never produce it. The [coverage table](./model-coverage.md) maps every
+   variant to its switch and replay.
 3. **A deterministic simulator.** The real shard code runs on `node:sqlite` under simulated delays, clock skew,
    restarts and splits. Time, timers, randomness and transaction IDs come from the seed, so the same seed gives the
    same run, down to every RPC, and every failure is reproduced from its seed. Every statement a shard runs is checked

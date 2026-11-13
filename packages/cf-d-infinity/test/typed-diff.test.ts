@@ -57,6 +57,11 @@ function script(seed: number, length: number): Step[] {
       () => ({ sql: `INSERT INTO ${keyTable()}(k, v) VALUES (?, ?)`, args: [vk(), v()] }),
       () => ({ sql: `INSERT INTO ${keyTable()}(k, v) VALUES (?, ?)`, args: [vk(), v()] }),
       () => ({ sql: `UPDATE tv SET ${pick(["i", "r", "n", "t", "u"])} = ? WHERE id = ?`, args: [v(), BigInt(1 + n(Math.max(id, 1)))] }),
+      // INSERT … SELECT は、SELECT の結果を Worker で引数に戻して入れ直す経路を通る (2026-11-13 の Codex の指摘 C6)。
+      () => ({ sql: "INSERT INTO tv(id, i, r, n, t, u) SELECT ?, i, r, n, t, u FROM tv WHERE id = ?", args: [BigInt(++id), BigInt(1 + n(Math.max(id - 1, 1)))] }),
+      () => ({ sql: "INSERT INTO tv(id, u, t) SELECT ?, ?, ?", args: [BigInt(++id), v(), v()] }),
+      () => ({ sql: `INSERT INTO tv(id, u) VALUES (?, ${pick(["5.0", "2.0e0", "-0.0", "1e14", "7"])})`, args: [BigInt(++id)] }),
+      () => ({ sql: `INSERT OR IGNORE INTO ${keyTable()}(k, v) SELECT u, r FROM tv WHERE id = ? AND u IS NOT NULL`, args: [BigInt(1 + n(Math.max(id, 1)))] }),
       () => ({ sql: "SELECT id, typeof(i), i, typeof(r), r, typeof(n), n, typeof(t), t, typeof(u), u FROM tv WHERE id = ?", args: [BigInt(1 + n(Math.max(id, 1)))] }),
       () => ({ sql: "SELECT id, typeof(u), u, typeof(n), n FROM tv WHERE id >= ? ORDER BY id", args: [BigInt(1 + n(Math.max(id, 1)))] }),
       () => ({ sql: "SELECT id, typeof(u), u, u || '', typeof(t), t FROM tv ORDER BY id", args: [] }),

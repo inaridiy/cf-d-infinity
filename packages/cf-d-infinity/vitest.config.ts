@@ -24,7 +24,7 @@ const workerd = tests.filter((f) => /from "miniflare"/.test(readFileSync(join(im
 //          試験は、最適化の経路そのものの試験なので、入れない。
 const oracles = [
   "compat", "fuzz", "slt-more", "conflict-clauses", "basic", "insert-subquery", "autowrite-subquery", "collated-keys",
-  "admission", "unique-reads", "export-import", "replay", "history", "elle-sim", "typed-diff", "storage-class", "key-affinity",
+  "admission", "unique-reads", "export-import", "replay", "history", "elle-sim", "typed-diff", "storage-class", "key-affinity", "key-conversions", "shard-limits", "wide-integers",
 ].map((name) => `test/${name}.test.ts`);
 
 export default defineConfig({

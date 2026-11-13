@@ -263,7 +263,8 @@ describe("the simulator is deterministic for this workload", () => {
     const b = await run(o);
     expect(b.c.fingerprint()).toBe(a.c.fingerprint());
     expect(b.history.length).toBe(a.history.length);
-  });
+    // 同じ実行を 2 回流すので、単独でも 25 秒かかる (基準経路だけの実行)。既定の 30 秒では、ほかの試験と CPU を取り合うと落ちる。
+  }, 120000);
 });
 
 // 欠陥を戻して、検査が気付くことを確かめる。欠陥は最適化の経路の上で現れるものなので、基準経路だけの実行では流さない。
