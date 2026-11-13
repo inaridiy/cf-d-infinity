@@ -154,9 +154,13 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number) {
     }
   })();
   let splits = 0;
+  // 割る回数に上限を置く。書き手が動いている間ずっと割ると、悲観的な取引の実行のように長く続く実行では数百回割り、分割ごとに
+  // 全シャードへ版を適用させる費用がシャードの数に比例するので、全体で 2 乗に膨らむ (seed 207690027 で 581 回、RPC 17 万回。
+  // 計画書の未解決の問題 13)。本物の Autoscaler は、負荷の閾値を超えたときにしか割らない。
+  const MAX_SPLITS = 12;
   const grower = (async () => {
     let next = c.shardIds.length;
-    while (!stop && o.splits) {
+    while (!stop && o.splits && splits < MAX_SPLITS) {
       await c.sleep(25);
       const { routing } = await c.catalog();
       const list = shardsOf(routing);
