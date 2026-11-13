@@ -45,6 +45,68 @@ export interface Compiled {
   metadata: boolean;
 }
 
+/**
+ * 文から、文字列の literal と注釈を除き、識別子を残した文面。引用した識別子 ("..."、`...`、[...]) は中身を残す。
+ * 表定義を読む PRAGMA の関数の名前を探すのに使う。正規表現で文字列と注釈を順に消すと、`/* ' *\/ ... /* ' *\/` のように
+ * 2 つを重ねた書き方で、間の名前を文字列と取り違えて見落とす (2026-11-12 の入口の安全の確認、指摘 3)。
+ */
+export function identifierText(sql: string): string {
+  let out = "";
+  let i = 0;
+  const n = sql.length;
+  while (i < n) {
+    const c = sql[i]!;
+    if (c === "'") {
+      i++;
+      while (i < n) {
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") {
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        i++;
+      }
+      out += " ";
+    } else if (c === '"' || c === "`") {
+      let id = "";
+      i++;
+      while (i < n) {
+        if (sql[i] === c) {
+          if (sql[i + 1] === c) {
+            id += c;
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        id += sql[i];
+        i++;
+      }
+      out += ` ${id} `;
+    } else if (c === "[") {
+      const j = sql.indexOf("]", i + 1);
+      out += ` ${j < 0 ? sql.slice(i + 1) : sql.slice(i + 1, j)} `;
+      i = j < 0 ? n : j + 1;
+    } else if (c === "-" && sql[i + 1] === "-") {
+      const j = sql.indexOf("\n", i + 2);
+      i = j < 0 ? n : j + 1;
+      out += " ";
+    } else if (c === "/" && sql[i + 1] === "*") {
+      const j = sql.indexOf("*/", i + 2);
+      i = j < 0 ? n : j + 2;
+      out += " ";
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
 export class ScratchDb implements Backend {
   constructor(private db: Database) {}
   iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
@@ -128,8 +190,7 @@ export class ScratchDb implements Backend {
         }
       } else if (op.opcode === "VOpen") virtual = true;
     }
-    const text = sql.replace(/'(?:[^']|'')*'/g, "''").replace(/--[^\n]*|\/\*[\s\S]*?\*\//g, " ");
-    return { tables: [...out], read: [...read], metadata: schema || (virtual && /\bpragma_/i.test(text)) };
+    return { tables: [...out], read: [...read], metadata: schema || (virtual && /\bpragma_/i.test(identifierText(sql))) };
   }
 
   /** 行をまとめて投入する。1 回の取引で流すと 10 万行で 100 ms 前後である。 */

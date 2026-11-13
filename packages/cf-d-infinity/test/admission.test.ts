@@ -71,6 +71,11 @@ describe("the schema read inside a statement that touches a table (invariant 5: 
       "SELECT count(*) FROM sqlite_schema",
       "SELECT count(*) FROM main.sqlite_master",
       "SELECT count(*) FROM \"pragma_table_list\"",
+      // 文字列とコメントの見分けを狂わせる書き方 (2026-11-12 の入口の安全の確認、指摘 3)。
+      "SELECT count(*) FROM t /* ' */, pragma_table_list() AS p /* ' */",
+      "SELECT count(*) FROM pragma_table_list() AS \"it's\"",
+      "SELECT count(*) FROM t -- '\n, pragma_table_list() AS p",
+      "SELECT count(*) FROM [pragma_table_list]",
     ]) {
       // 利用者の表しかない SQLite と同じ答えを返す。シャードで実行すると、内部の表を数えた答えになる。
       const sql = `SELECT n, (${inner}) AS x FROM t WHERE tenant_id = 1 AND id = 1`;
@@ -84,6 +89,8 @@ describe("the schema read inside a statement that touches a table (invariant 5: 
     const { c, db } = await setup();
     expect(await refusal(db.query("UPDATE t SET n = (SELECT count(*) FROM sqlite_master) WHERE tenant_id = 1 AND id = 1"))).toMatch(REFUSED);
     expect(await refusal(db.query("DELETE FROM t WHERE tenant_id = 1 AND id = (SELECT count(*) FROM pragma_table_info('__intents'))"))).toMatch(REFUSED);
+    expect(await refusal(db.query("UPDATE t SET tags = /* ' */ (SELECT group_concat(name) FROM pragma_table_info('__intents')) /* ' */ WHERE tenant_id = 1 AND id = 1"))).toMatch(REFUSED);
+    expect(await refusal(db.query("UPDATE t SET tags = (SELECT group_concat(name) FROM pragma_table_info('__intents') AS \"it's\") WHERE tenant_id = 1 AND id = 1"))).toMatch(REFUSED);
     await db.query("BEGIN");
     expect(await refusal(db.query("UPDATE t SET n = (SELECT count(*) FROM sqlite_master) WHERE tenant_id = 1 AND id = 1"))).toMatch(REFUSED);
     await db.query("COMMIT");
