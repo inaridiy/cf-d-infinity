@@ -80,6 +80,19 @@ describe("authentication and the production surface", () => {
     expect((await raw("/v3/pipeline", TOKEN, { baton: null, requests: [{ type: "close" }] })).status).toBe(200);
   });
 
+  it("refuses malformed or oversized requests and bad admin names before doing any work", async () => {
+    // 入口の安全の確認 (2026-11-12、指摘 5 と 8)。
+    const bad = await dispatch("/sql", { method: "POST", body: "{not json", headers: { authorization: `Bearer ${TOKEN}` } });
+    expect(bad.status).toBe(400);
+    const many = await raw("/v3/pipeline", TOKEN, { baton: null, requests: Array.from({ length: 1001 }, () => ({ type: "execute", stmt: { sql: "SELECT 1" } })) });
+    expect(many.status).toBe(413);
+    const tooMany = await raw("/batch", TOKEN, { statements: Array.from({ length: 1001 }, () => ({ sql: "SELECT 1" })) });
+    expect(tooMany.status).toBe(413);
+    expect((await raw("/admin/status", ADMIN, { cluster: "../../x" })).status).toBe(400);
+    expect((await raw("/admin/status", ADMIN, { shards: 1e9 })).status).toBe(400);
+    expect((await raw("/admin/split", ADMIN, { parent: "shard-0", child: "elsewhere-1" })).status).toBe(400);
+  });
+
   it("has no benchmark endpoint in the production build", async () => {
     expect((await raw("/bench", ADMIN, { op: "ping" })).status).not.toBe(200);
   });

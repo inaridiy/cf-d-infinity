@@ -3,6 +3,7 @@
 import { decode, encode } from "../shard/rows";
 import { SqlError, type Value } from "../types";
 import { isReal, realOf } from "../value";
+import { checkCount, checkSql, ENTRY_LIMITS } from "../entry";
 import type { Params } from "../sql/cst";
 import type { Db, QueryResult } from "./db";
 import { sleep } from "../runtime";
@@ -131,13 +132,15 @@ interface Baton {
 
 /** 1 つの stream の上で Hrana の要求を 1 件実行する。HTTP の pipeline と WebSocket で共用する。 */
 async function runRequest(db: Db, r: Request, stored: Map<number, string>): Promise<{ type: string; [k: string]: unknown }> {
-  const sqlOf = (s: { sql?: string; sql_id?: number }) => s.sql ?? stored.get(s.sql_id!) ?? "";
+  // 文の長さと、batch の段の数に上限を置く (入口の安全の確認、指摘 5)。
+  const sqlOf = (s: { sql?: string; sql_id?: number }) => checkSql(s.sql ?? stored.get(s.sql_id!) ?? "");
   switch (r.type) {
     case "execute": {
       const out = await db.query(sqlOf(r.stmt), args(r.stmt));
       return { type: "execute", result: stmtResult(out) };
     }
     case "batch": {
+      checkCount(r.batch.steps.length, "batch steps");
       // BEGIN から始まる batch は文が全部分かっているので、競合したら丸ごとやり直せる。
       // ただし、途中の DDL が取引を確定した後は、前のほうの文がもう効いている。やり直すと 2 度実行するので、やり直さない
       // (Db.ddl、specs/m13_txn_schema_boundary.qnt の m13_red_retry_whole)。
@@ -174,7 +177,9 @@ async function runRequest(db: Db, r: Request, stored: Map<number, string>): Prom
     case "describe":
       return { type: "describe", result: { params: [], cols: [], is_explain: false, is_readonly: /^\s*SELECT/i.test(sqlOf(r)) } };
     case "store_sql":
-      stored.set(r.sql_id, r.sql);
+      // 保存した文は baton と接続に載り続けるので、数に上限を置く (入口の安全の確認、指摘 4 と 5)。
+      if (!stored.has(r.sql_id) && stored.size >= ENTRY_LIMITS.storedSql) throw new SqlError(`at most ${ENTRY_LIMITS.storedSql} stored statements per connection`);
+      stored.set(r.sql_id, checkSql(r.sql));
       return { type: "store_sql" };
     case "close_sql":
       stored.delete(r.sql_id);
@@ -260,7 +265,7 @@ type WsMessage = { type: "hello"; jwt: string | null } | { type: "request"; requ
  */
 export function serveHranaSocket(
   ws: WebSocket,
-  o: { authorize(jwt: string | null): boolean; open(): Promise<Db>; onClose?(): void },
+  o: { authorize(jwt: string | null): boolean; open(): Promise<Db>; onClose?(): void; onHello?(): void },
 ): void {
   let authed = false;
   const streams = new Map<number, Db>();
@@ -276,6 +281,7 @@ export function serveHranaSocket(
   const handle = async (m: WsMessage) => {
     if (m.type === "hello") {
       authed = o.authorize(m.jwt);
+      o.onHello?.();
       if (authed) send({ type: "hello_ok" });
       else {
         send({ type: "hello_error", error: { message: "unauthorized", code: "UNAUTHORIZED" } });
@@ -293,6 +299,7 @@ export function serveHranaSocket(
       let response: unknown;
       switch (r.type) {
         case "open_stream":
+          if (streams.size >= ENTRY_LIMITS.wsStreams) throw new SqlError(`at most ${ENTRY_LIMITS.wsStreams} streams per connection`);
           streams.set(r.stream_id, await o.open());
           response = { type: "open_stream" };
           break;
@@ -319,6 +326,11 @@ export function serveHranaSocket(
     }
   };
   ws.addEventListener("message", (ev) => {
+    const size = typeof ev.data === "string" ? ev.data.length : (ev.data as ArrayBuffer).byteLength;
+    if (size > ENTRY_LIMITS.wsMessage) {
+      ws.close(1009, "message too big");
+      return;
+    }
     let m: WsMessage;
     try {
       m = JSON.parse(typeof ev.data === "string" ? ev.data : new TextDecoder().decode(ev.data as ArrayBuffer)) as WsMessage;
