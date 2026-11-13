@@ -37,6 +37,7 @@ const REFUSALS = [
   "client/db.ts: a statement that writes cannot read sqlite_master or a PRAGMA function",
   "client/db.ts: BEGIN, COMMIT, ROLLBACK and SAVEPOINT inside a transaction object",
   "client/db.ts: a schema change inside a transaction",
+  "client/db.ts: the table ${def.name} is too wide for a shard to scan",
   // 値で決まる
   "shard/rows.ts: NULL in the primary key column",
   "shard/rows.ts: an INTEGER beyond",

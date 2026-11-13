@@ -146,3 +146,69 @@ describe("the size of a transaction is a total that does not depend on placement
     }, 120000);
   }
 });
+
+describe("a statement that one shard refuses for its size stays atomic inside a transaction", () => {
+  // 1 つの文が、あるシャードでは上限で断られ、ほかのシャードでは成功する。Worker は基準経路で実行し直すが、成功したシャードの
+  // 応答が後から届いても、その文の変更が取引に残ってはならない (2026-11-13 の Codex の 2 回目の見直し、指摘 2)。基準経路でも
+  // 文が失敗する (CHECK の違反) ので、文の変更は 1 つも入らないのが正しい。
+  for (const seed of seedsOr(Array.from({ length: 30 }, (_v, i) => i + 1))) {
+    it(`seed ${seed}`, async () => {
+      const c = new SimCluster({ shards: 4, seed });
+      const rnd = prng(seed);
+      c.net.jitter = () => (rnd() < 0.3 ? 0 : rnd() * 6);
+      const db = new Db(c);
+      await db.ddl("CREATE TABLE a(id INTEGER PRIMARY KEY, body TEXT CHECK (length(body) < 150000))");
+      const rows = Array.from({ length: 12 }, (_v, i) => `(${i + 1}, '${"s".repeat(10)}')`);
+      rows.push(`(99, '${"h".repeat(160_000)}')`); // 100 KB を超える 1 行。しかも CHECK に反する
+      const insert = `INSERT INTO a VALUES ${rows.join(", ")}`;
+      const outcome = (p: Promise<unknown>) => p.then(() => "ok", (e: Error) => `error ${e.message.slice(0, 40)}`);
+      let got: string;
+      if (seed % 2) {
+        // SQL の BEGIN は悲観の取引 (文の時点でロックを取る)。IMMEDIATE は読みにもロックを取る。
+        await db.query(seed % 4 === 1 ? "BEGIN IMMEDIATE" : "BEGIN");
+        got = await outcome(db.query(insert));
+        await db.query("INSERT INTO a VALUES (500, 'after')");
+        await db.query("COMMIT");
+      } else {
+        got = await db.transaction(async (tx) => {
+          const r = await outcome(tx.query(insert));
+          await tx.query("INSERT INTO a VALUES (500, 'after')");
+          return r;
+        });
+      }
+      await c.settle();
+      expect(got).toMatch(/^error CHECK constraint failed/);
+      expect((await new Db(c).query("SELECT id FROM a ORDER BY id")).rows).toEqual([{ id: 500 }]);
+    }, 60000);
+  }
+});
+
+describe("the shard limits are measured on the statement the shard runs", () => {
+  it("does not count quoted identifiers named like compound operators as compound terms (Codex review 2, finding 8)", async () => {
+    for (const shards of [1, 3]) {
+      const db = new Db(new SimCluster({ shards }));
+      await db.ddl(`CREATE TABLE k(id INTEGER PRIMARY KEY, "union", "intersect", "except", "UNION ALL")`);
+      await db.query(`INSERT INTO k VALUES (1, 2.0, 'b', x'03', 4), (2, 5, 'e', NULL, 6)`);
+      expect((await db.query(`SELECT id, "union", typeof("union") AS t FROM k ORDER BY id`)).rows).toEqual([
+        { id: 1, union: 2, t: "real" }, { id: 2, union: 5, t: "integer" },
+      ]);
+      expect((await db.query(`SELECT * FROM k WHERE "except" IS NULL`)).rows.map((r) => r.id)).toEqual([2]);
+    }
+  });
+
+  it("runs an INSERT whose text is just under the limit, although capturing its rows lengthens it (Codex review 2, finding 7)", async () => {
+    // 64 列の表。RETURNING で行を読む捕捉は、列ごとに typeof と 2^53 の確かめを足すので、文が数 KB 長くなる。
+    const cols = Array.from({ length: 64 }, (_v, i) => `c${i}`);
+    for (const shards of [1, 2]) {
+      for (const pad of [400, 1500, 4000, 9000]) {
+        const db = new Db(new SimCluster({ shards }));
+        await db.ddl(`CREATE TABLE w(id INTEGER PRIMARY KEY, ${cols.map((c) => `${c}`).join(", ")}, body TEXT)`);
+        const body = "b".repeat(100_000 - pad - 64 * 3 - 200);
+        const sql = `INSERT INTO w(id, ${cols.join(", ")}, body) VALUES (1, ${cols.map(() => "1").join(", ")}, '${body}')`;
+        const r = await db.transaction((tx) => tx.query(sql)).then(() => "ok", (e: Error) => `error ${e.message.slice(0, 60)}`);
+        expect(`${shards} shards, ${sql.length} chars: ${r}`).toBe(`${shards} shards, ${sql.length} chars: ok`);
+        expect((await db.query("SELECT length(body) AS n FROM w")).rows).toEqual([{ n: body.length }]);
+      }
+    }
+  });
+});

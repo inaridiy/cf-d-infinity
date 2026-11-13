@@ -1,5 +1,5 @@
 import { Hlc, SECOND, physicalToTs, tsToPhysical } from "../hlc";
-import { SHARD_LIMITS, ShardLimit, shardLimitOf } from "../shard-limits";
+import { SHARD_LIMITS, ShardLimit, shardLimitOf, withinShardLimits } from "../shard-limits";
 import type {
   Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, GroupPayload, LockOwner, MetaApi,
   Participant, PrepareReq, PrepareRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts, TxnStatus, Value,
@@ -1085,7 +1085,7 @@ export class ShardCore implements ShardApi {
             return this.run(req);
           });
         } catch (e) {
-          if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner) throw e;
+          if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner || e instanceof ShardLimit) throw e;
           // 文は F の状態を読んだうえで失敗した。読んだ時刻を付けて返し、呼び出し側に範囲を記録させる (ExecRes.error)。
           return { columns: [], values: [], changes: [], error: asSqlError(e).message, F, T: req.T ?? F, hlc: this.hlc.value, epoch: this.epoch };
         }
@@ -1379,7 +1379,7 @@ export class ShardCore implements ShardApi {
       try {
         return await this.lockedExec(req, req.lock);
       } catch (e) {
-        if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner) throw e;
+        if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner || e instanceof ShardLimit) throw e;
         throw asSqlError(e);
       }
     }
@@ -1421,7 +1421,7 @@ export class ShardCore implements ShardApi {
       });
       return { ...out, T, hlc: this.hlc.value, epoch: this.epoch };
     } catch (e) {
-      if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner) throw e;
+      if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner || e instanceof ShardLimit) throw e;
       // 文は T の状態を読んだうえで失敗した。読んだ時刻を付けて返し、呼び出し側に範囲を記録させる。
       return { columns: [], values: [], changes: [], error: asSqlError(e).message, T, hlc: this.hlc.value, epoch: this.epoch };
     }
@@ -1492,6 +1492,9 @@ export class ShardCore implements ShardApi {
     if (!capture || this.faults.triggerCapture || !span || req.spans.some((s) => s.table !== span.table)) return null;
     if (capture === "update" && span.kind !== "pk") return null;
     const def = this.def(span.table);
+    // RETURNING で行を読むと文が長くなる (列ごとに typeof と 2^53 の確かめ)。DO の SQLite の上限を超えるなら、文をそのまま
+    // 実行する trigger の捕捉に任せる。入口の確かめ (withinLimits) は、受け取った文を測っている (Codex の 2 回目の見直し、指摘 7)。
+    if (!withinShardLimits(`${req.sql} RETURNING ${imageList(def)}`, req.params)) return null;
     const sk = req.write!.sk;
     try {
       return this.b.tx(() => {
@@ -1840,8 +1843,13 @@ export class ShardCore implements ShardApi {
 
   async commit(req: CommitReq): Promise<CommitRes> {
     await this.ensureSchema(req.schema);
+    // 同じ 2PC の ID の実行は 1 つずつにする。同じ中身の COMMIT が 2 つ同時に届くと (再送が元の COMMIT を追い越す)、後の実行の
+    // prepare は、先の実行が適用した行に当たって断られ、中止の abort(ID) が先の実行の残りの intent を消した
+    // (specs/m17_txn_id_reuse.qnt の m17_red_resend、2026-11-13 の Codex の 2 回目の見直し、指摘 1)。先の実行が終わるのを待って
+    // から記録を確かめ、待ち終えてから実行を登録するまで await を挟まない。
+    for (let f = this.inflight.get(req.txn); f && !this.faults.concurrentDrives; f = this.inflight.get(req.txn)) await f.settled;
     // 2PC の ID は、取引の ID と続きの中身の指紋である (Txn.commit)。同じ ID の記録があるのは、同じ中身の COMMIT の再送なので、
-    // 前の結果を返す。baton の使い回しでできた中身の違う続きは、別の ID の別の 2PC になる (specs/m17_txn_id_reuse.qnt)。
+    // 前の結果を返す。baton の使い回しでできた中身の違う続きは、別の ID の別の 2PC になる。
     const done = this.b.exec(`SELECT status, c FROM __txn WHERE txn = ?`, req.txn)[0];
     if (done) return done.status === "committed" ? { ok: true, c: done.c as Ts } : { ok: false, reason: "aborted" };
     // 決着の記録は保持時間の後に消す。消した tombstone の後に同じ取引の COMMIT が届いて確定すると、
@@ -1850,14 +1858,13 @@ export class ShardCore implements ShardApi {
     if (this.deps.clock.now() - tsToPhysical(req.T) > (this.deps.txnRetainMs ?? TXN_RETAIN_MS) / 2) {
       return { ok: false, reason: "conflict: transaction older than the commit window" };
     }
-    const me = req.participants.find((p) => p.shard === this.id);
-    if (me) await this.ensureArrived(this.sksOf(me.spans, me.writes));
-
     let settle = () => {};
     const settled = new Promise<void>((r) => (settle = r));
     const flight: InFlight = { pushed: 0, decided: false, settled, settle };
     this.inflight.set(req.txn, flight);
     try {
+      const me = req.participants.find((p) => p.shard === this.id);
+      if (me) await this.ensureArrived(this.sksOf(me.spans, me.writes));
       return await this.drive(req, flight);
     } finally {
       this.inflight.delete(req.txn);
@@ -1924,6 +1931,11 @@ export class ShardCore implements ShardApi {
 
   private decideAbort(req: CommitReq, reason: string): CommitRes {
     this.b.exec(`INSERT OR IGNORE INTO __txn(txn, status, done, at) VALUES (?, 'aborted', 1, ?)`, req.txn, this.deps.clock.now());
+    // 記録が確定のまま残ったなら、同じ ID の別の実行が確定させている。abort を送るとその intent を消すので、送らずにその決着を
+    // 答える (同じ ID は同じ中身なので、確定が正しい答えである)。実行を 1 つずつにしてあるので、ここには来ないはずの 2 つ目の守り
+    // である (specs/m17_txn_id_reuse.qnt の ABORT_CHECKS)。
+    const kept = this.decided(req.txn);
+    if (kept?.status === "committed" && !this.faults.abortIgnoresRecord) return { ok: true, c: kept.c };
     for (const p of req.participants) {
       this.spawn(p.shard === this.id ? this.abort({ txn: req.txn }) : this.deps.peer(p.shard).abort({ txn: req.txn }));
     }

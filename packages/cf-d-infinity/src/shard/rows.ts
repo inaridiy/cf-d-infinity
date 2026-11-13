@@ -1,7 +1,7 @@
 import type { Backend, Change, Row, TableDef, Value } from "../types";
 import { SqlError } from "../types";
 import { keySql, keyString } from "../keys";
-import { realOf } from "../value";
+import { realOf, wideIntegerError } from "../value";
 
 export const q = (id: string) => `"${id.replaceAll('"', '""')}"`;
 
@@ -51,8 +51,7 @@ const WIDE = "__dinf_wide";
 const MAX_EXACT = Number.MAX_SAFE_INTEGER;
 const wideCheck = (def: Pick<TableDef, "columns" | "implicitRowid">) =>
   `(${[...(def.implicitRowid ? ["rowid"] : []), ...def.columns].map((c) => `(typeof(${q(c)}) = 'integer' AND (${q(c)} > ${MAX_EXACT} OR ${q(c)} < -${MAX_EXACT}))`).join(" OR ")}) AS ${q(WIDE)}`;
-const wideError = (table: string) =>
-  new SqlError(`unsupported: an INTEGER beyond ±${MAX_EXACT} (2^53 - 1) in ${table} cannot be stored exactly; store such values (for example 64-bit ids) as TEXT`);
+const wideError = (table: string) => wideIntegerError(table);
 
 /**
  * キーの JSON (keySql が SQL の中で作る) に、2^53 を超える整数があるか。JSON.parse すると桁が落ちるので、文字のまま見る。

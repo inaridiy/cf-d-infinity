@@ -9,6 +9,7 @@
 // 競合で片方が断られ、違う行なら両方が確定する。同じ中身の再送は同じ ID なので、同じ答えになる。
 import { describe, expect, it } from "vitest";
 import { Db, type ClientFaults } from "../src/client/db";
+import type { Faults } from "../src/types";
 import { handlePipeline, type PipelineReq } from "../src/client/hrana";
 import { keyString } from "../src/keys";
 import { ownerOf } from "../src/routing";
@@ -85,6 +86,43 @@ describe("two continuations of one baton committing at once (m17_red_abort)", ()
   it("put back m17_red_impl: with the transaction id as the 2PC id, some ordering loses committed rows", async () => {
     let lost = 0;
     for (let seed = 1; seed <= 60 && lost === 0; seed++) lost += (await concurrentContinuations(seed, { commitIdIsTxn: true })).length;
+    expect(lost).toBeGreaterThan(0);
+  }, 120000);
+});
+
+/**
+ * 書き込みを済ませた baton から、COMMIT だけを 2 回、同時に送る (再送が元の COMMIT を追い越す)。2 つは同じ中身なので、同じ 2PC の
+ * ID の 2 つの実行になる (specs/m17_txn_id_reuse.qnt の m17_red_resend、2026-11-13 の Codex の 2 回目の見直し、指摘 1)。
+ * 確定と答えたなら、書き込みは全部入る。どちらも同じ答え (確定) にならなければならない。
+ */
+async function concurrentResends(seed: number, faults: Faults = {}) {
+  const c = new SimCluster({ shards: 3, seed, faults });
+  const rnd = prng(seed);
+  c.net.jitter = () => (rnd() < 0.3 ? 0 : rnd() * 4);
+  await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+  const { routing } = await c.catalog();
+  const ids = ["s0", "s1", "s2"].map((s) => { for (let i = 1; ; i++) if (ownerOf(routing, keyString([i])) === s) return i; });
+  const begun = await step(c, null, ["BEGIN", ...ids.map((id) => `INSERT INTO t VALUES (${id}, 'r')`)]);
+  const [a, b] = await Promise.all([step(c, begun.baton, ["COMMIT"]), step(c, begun.baton, ["COMMIT"])]);
+  await c.settle();
+  const rows = (await new Db(c).query("SELECT id FROM t ORDER BY id")).rows.map((r) => r.id as number);
+  const told = [a!, b!].map((r) => (r.results.every((x) => x.type === "ok") ? "committed" : `failed ${r.results.find((x) => x.type !== "ok")?.error?.message}`));
+  const problems: string[] = [];
+  if (told.includes("committed") && rows.length !== ids.length) problems.push(`seed ${seed}: told ${told.join(" / ")} but ${ids.length - rows.length} rows are missing`);
+  if (told.some((t) => t !== "committed")) problems.push(`seed ${seed}: a resent COMMIT of the committed transaction was told ${told.find((t) => t !== "committed")}`);
+  return problems;
+}
+
+describe("the same COMMIT sent twice at once (m17_red_resend)", () => {
+  it("commits once, tells both committed, and loses nothing", async () => {
+    const problems: string[] = [];
+    for (const seed of seedsOr(Array.from({ length: 60 }, (_v, i) => i + 1))) problems.push(...await concurrentResends(seed));
+    expect(problems.slice(0, 5)).toEqual([]);
+  }, 120000);
+
+  it("put back m17_red_resend: drives of one id run at once and an abort ignores the record, and some ordering loses committed rows", async () => {
+    let lost = 0;
+    for (let seed = 1; seed <= 60 && lost === 0; seed++) lost += (await concurrentResends(seed, { concurrentDrives: true, abortIgnoresRecord: true })).filter((p) => /missing/.test(p)).length;
     expect(lost).toBeGreaterThan(0);
   }, 120000);
 });

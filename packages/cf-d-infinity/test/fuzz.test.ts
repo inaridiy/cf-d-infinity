@@ -19,6 +19,7 @@ CREATE TABLE t2(k TEXT PRIMARY KEY, a INTEGER, c REAL);
 CREATE TABLE t3(x INTEGER, y INTEGER, v TEXT, PRIMARY KEY (x, y));
 CREATE TABLE t4(id INTEGER PRIMARY KEY, u TEXT UNIQUE, n INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE t5(id INTEGER PRIMARY KEY, x);
+CREATE TABLE t6(id INTEGER PRIMARY KEY, "union" TEXT, "except" INTEGER);
 CREATE INDEX i1 ON t1(a);
 CREATE INDEX i3 ON t3(x, v);
 `;
@@ -64,6 +65,10 @@ function script(seed: number, length: number): string {
     () => `INSERT OR IGNORE INTO t5(id, x) SELECT id, a FROM t1 WHERE id ${cmp()} ${n(12)}`,
     () => `UPDATE t5 SET x = ${pick(["x * 1.0", "x + 1", "x || ''", "CAST(x AS INTEGER)", "round(x)"])} WHERE id ${cmp()} ${n(12)}`,
     () => `SELECT id, x, typeof(x) FROM t5 ORDER BY id`,
+    // SQL の予約語の名前の列 (シャードの上限の数え方が、引用符の中を数えないこと。test/shard-limits.test.ts)。
+    () => `INSERT OR REPLACE INTO t6 VALUES (${n(12)}, ${str()}, ${num()})`,
+    () => `SELECT id, "union", "except" FROM t6 WHERE "except" ${cmp()} ${n(12)} ORDER BY id`,
+    () => `SELECT "union", count(*) FROM t6 GROUP BY "union" ORDER BY 1`,
     () => `SELECT * FROM t1 WHERE ${cond1()} ORDER BY id`,
     () => `SELECT * FROM t1 ORDER BY id`,
     () => `SELECT * FROM t2 ORDER BY k`,
@@ -98,7 +103,7 @@ describe("random statements against real SQLite", () => {
   for (let seed = 1; seed <= SEEDS; seed++) {
     it(`seed ${seed}`, async () => {
       const problems = await diff(script(seed, LENGTH), 1 + (seed % 6), [
-        "SELECT * FROM t1 ORDER BY id", "SELECT * FROM t2 ORDER BY k", "SELECT * FROM t3 ORDER BY x, y", "SELECT id, u, n FROM t4 ORDER BY id", "SELECT * FROM t5 ORDER BY id",
+        "SELECT * FROM t1 ORDER BY id", "SELECT * FROM t2 ORDER BY k", "SELECT * FROM t3 ORDER BY x, y", "SELECT id, u, n FROM t4 ORDER BY id", "SELECT * FROM t5 ORDER BY id", "SELECT * FROM t6 ORDER BY id",
       ]);
       expect(problems.slice(0, 3).join("\n\n")).toBe("");
     }, 120000);

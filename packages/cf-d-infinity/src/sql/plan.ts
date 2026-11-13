@@ -7,7 +7,7 @@ import type { GlobalIndexDef, TableDef, Value, WritePlan } from "../types";
 import { SqlError, utf8Length } from "../types";
 import { bindParams, constant, ident, render, text, walk, type Node, type Params } from "./cst";
 import { keyString, storedAs } from "../keys";
-import { isReal } from "../value";
+import { fromTyped, isReal, typedScalarSql } from "../value";
 import { SHARD_LIMITS, withinShardLimits } from "../shard-limits";
 import { isInternalName } from "./ddl";
 
@@ -98,13 +98,13 @@ export interface PlanContext {
   nextId(table: string, n: number): Promise<number>;
   /** 利用者が明示した rowid を知らせる。以後の採番はこれより大きくする。 */
   sawId(table: string, id: number): void;
-  /** 定数でない値を Worker の SQLite で評価する。 */
-  evaluate(sql: string, params: Value[]): Promise<Value>;
+  /** 定数でない値を Worker の SQLite で評価し、最初の行を返す。値の型は typedScalarSql と fromTyped で戻す。 */
+  evaluate(sql: string, params: Value[]): Promise<Value[] | null>;
   /**
    * 表を読む式の値を、取引の読みとして求める。読んだ範囲は commit で検証される。
    * 取引の外では呼べないので、無いときは計画が `inTxn` を返し、呼び出し側が取引の中で計画し直す。
    */
-  read?(sql: string, params: Value[]): Promise<Value>;
+  read?(sql: string, params: Value[]): Promise<Value[] | null>;
   /** 最適化の経路を使わず、基準経路だけで計画する (Reference)。試験が使う。 */
   reference?: Reference;
 }
@@ -620,7 +620,11 @@ function partialAggregate(stmt: Node, s: Scope, values: Value[]): Plan | null {
   const shardParams: Value[] = [];
   for (const [i, item] of (sel.columns.items as Node[]).entries()) {
     const e = item.type === "alias" ? item.expr : item;
-    const label = item.type === "alias" ? ident(item.alias) : text(item);
+    // 結果の列名は SQLite と同じにする。列を名指すだけの項は、引用符を外した列名になる (`"union"` は union)。
+    // 文面のままにすると引用符が残った (test/partial-column-names.test.ts)。
+    const label = item.type === "alias" ? ident(item.alias)
+      : item.type === "identifier" ? ident(item)
+        : item.type === "member_expr" && item.property?.type === "identifier" ? ident(item.property) : text(item);
     if (e.type === "func_call") {
       const fn = lower(ident(e.name));
       if (!["count", "sum", "min", "max", "avg"].includes(fn) || e.over || e.filter) return null;
@@ -841,11 +845,17 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
       const rr = render(node, values);
       if (reads[i]![j]) {
         let v: Promise<Value> | undefined;
-        const value = () => (v ??= ctx.read!(`SELECT ${rr.sql}`, rr.params));
+        // 読んだ値は引数として束縛し直すので、typeof と一緒に読んで型を戻す (src/value.ts の fromTyped)。
+        const value = () => (v ??= ctx.read!(typedScalarSql(rr.sql), rr.params).then((row) => fromTyped(row?.[1] ?? null, row?.[0], def.name)));
         return { sql: "?", params: [], value, late: value };
       }
       const c = constant(node, values);
-      return { sql: rr.sql, params: rr.params, value: async () => (c ? c.value : ctx.evaluate(`SELECT ${rr.sql}`, rr.params)), fixed: c ?? undefined };
+      // 計算した値は行の置き場所を決めるのに使う。REAL を整数と取り違えると、TEXT のキーが SQLite と違う (CAST(5 AS REAL) は "5.0")。
+      const evaluated = async () => {
+        const row = await ctx.evaluate(typedScalarSql(rr.sql), rr.params);
+        return fromTyped(row?.[1] ?? null, row?.[0], def.name);
+      };
+      return { sql: rr.sql, params: rr.params, value: async () => (c ? c.value : evaluated()), fixed: c ?? undefined };
     });
     if (auto && idAt < 0) parts.unshift({ sql: "?", params: [id!], value: async () => id! });
     for (const p of parts) if (p.late) p.params = [await p.late()];

@@ -10,11 +10,11 @@ Test references are `packages/cf-d-infinity/test/<file>.test.ts:<line>` or a tes
 counterexample.
 
 Categories:
-- A: the implementation has the guard, and a deterministic replay exists (70 rows; every row with a guard).
-  Of these, 48 also have a fault switch, and the replay checks that the switch produces the violation. 16 have no switch,
+- A: the implementation has the guard, and a deterministic replay exists (71 rows; every row with a guard).
+  Of these, 49 also have a fault switch, and the replay checks that the switch produces the violation. 16 have no switch,
   and 6 have a switch whose replay runs only the fixed code; for those 22 the replay checks the fixed code on the
   model's ordering, not that removing the guard breaks it. (Recounted from this table on 2026-11-13.)
-- D: a design alternative the implementation never had or no longer has; no switch needed (12 rows, M16 and M17 included).
+- D: a design alternative the implementation never had or no longer has, or a variant another mechanism already covers; no switch needed (13 rows, M16 and M17 included).
 
 | module | flaw modelled | fault switch | deterministic replay | cat |
 |---|---|---|---|---|
@@ -97,6 +97,8 @@ Categories:
 | m16_red_body_only | prepare checks UNIQUE only against the body, not with other intents applied (added 2026-11-12) | autoIgnoresUniqueIntents (the autocommit path; transactions use the same `uniquePending`) | review-regressions:65 | A |
 | m16_red_intents_only | prepare checks UNIQUE only with other intents applied, not against the body (added 2026-11-12) | none: the body check is SQLite's own UNIQUE constraint on the shard's table, which the code cannot run without | none | D |
 | m17_red_abort | the 2026-11-12 design: the transaction id is the 2PC id and both sides compare fingerprints; a refused continuation's abort deletes the committed one's intents (added 2026-11-13, Codex review C1) | none (the design is no longer in the code; m17_red_impl's switch puts the id back) | baton-reuse ("two continuations of one baton committing at once", a 60-seed generator; fixed) | D |
+| m17_red_resend | per-continuation ids, but two drives of one id run at once and a refused drive's abort ignores the committed record; the later drive's abort deletes the earlier drive's intents (added 2026-11-13, Codex review 2, finding 1) | concurrentDrives + abortIgnoresRecord | baton-reuse ("the same COMMIT sent twice at once", a 60-seed generator, and "put back m17_red_resend ...") | A |
+| m17_red_resend_abort_check_only | the abort guard without serializing drives: the later drive decides commit, its record INSERT fails, and it answers an error although the id committed | none (concurrentDrives alone does not show it: the Worker asks the anchor for the outcome after the error and learns it committed) | none | D |
 | m17_red_impl | the transaction id is the 2PC id, and neither side tells two continuations apart | commitIdIsTxn | baton-reuse ("put back m17_red_impl ...", sequential and concurrent) | A |
 | m17_red_prepare_only | the transaction id is the 2PC id; the anchor returns the earlier outcome to a COMMIT with other writes | none (design no longer in the code) | none | D |
 | m17_red_commit_only | the transaction id is the 2PC id; a participant answers ok to a second prepare of the same id with other writes | none (design no longer in the code) | none | D |

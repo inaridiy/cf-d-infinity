@@ -2,13 +2,13 @@ import type {
   Change, CommitRes, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
 } from "../types";
 import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, utf8Length } from "../types";
-import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, q, scanList, typedValues } from "../shard/rows";
+import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, imageList, q, scanList, typedValues } from "../shard/rows";
 import type { Catalog, SplitMove, SplitSlot } from "../meta";
 import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import { ident, parseStatements, text, type Node, type Params } from "../sql/cst";
 import { keyString } from "../keys";
-import { realOf } from "../value";
+import { fromTyped, typedScalarSql } from "../value";
 import { sha256Text } from "../sha256";
 import { SHARD_LIMITS, isShardLimit, withinShardLimits } from "../shard-limits";
 import { scanSql, untypedOf, SCHEMA_STATEMENTS, findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
@@ -740,7 +740,7 @@ export class Txn extends ReadScope {
   planContext(): PlanContext {
     return {
       ...this.db.planContext(this.cat),
-      read: async (sql, params) => (await this.statement(parseStatements(sql)[0], params)).values[0]?.[0] ?? null,
+      read: async (sql, params) => (await this.statement(parseStatements(sql)[0], params)).values[0] ?? null,
     };
   }
 
@@ -837,9 +837,14 @@ export class Txn extends ReadScope {
       await one(head.t, head.target);
       byShard.get(head.target.shard)!.shift();
     }
-    await Promise.all([...byShard.values()].map(async (list) => {
+    // 全部のシャードの応答を待ってから失敗を返す。1 つのシャードの失敗で先に返すと、まだ応答を待っているシャードの変更が、
+    // 文を取り消した後 (atomically) に取引へ入る。基準経路で実行し直すときも同じで、失敗した文の変更が確定した
+    // (2026-11-13 の Codex の 2 回目の見直し、指摘 2。test/shard-limits.test.ts の「stays atomic」)。
+    const settled = await Promise.allSettled([...byShard.values()].map(async (list) => {
       for (const j of list) await one(j.t, j.target);
     }));
+    const failed = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed) throw failed.reason;
     return new QueryResult(out.columns, out.values, changes, p.lastRowid);
   }
 
@@ -1006,10 +1011,7 @@ export class Txn extends ReadScope {
         `WITH ${q("__dinf_s")}(${names.join(", ")}) AS (${p.selectSql}) SELECT ${names.map((c) => `${c}, typeof(${c})`).join(", ")} FROM ${q("__dinf_s")}`,
         p.selectParams,
       );
-      src = new QueryResult(src.columns, typed.values.map((row) => Array.from({ length: n }, (_v, i) => {
-        const v = row[2 * i] ?? null;
-        return row[2 * i + 1] === "real" && typeof v === "number" ? realOf(v) : v;
-      })));
+      src = new QueryResult(src.columns, typed.values.map((row) => Array.from({ length: n }, (_v, i) => fromTyped(row[2 * i] ?? null, row[2 * i + 1], p.def.name))));
     }
     const cols = p.columns ? `(${p.columns.map(q).join(", ")}) ` : "";
     let changes = 0;
@@ -1310,7 +1312,7 @@ export class Db {
       evaluate: async (sql, params) => {
         const w = await openScratch(cat);
         try {
-          return w.raw(sql, ...params).values[0]?.[0] ?? null;
+          return w.raw(sql, ...params).values[0] ?? null;
         } finally {
           w.close();
         }
@@ -1344,14 +1346,31 @@ export class Db {
    */
   private async assertReplays(sql: string, cat: Catalog): Promise<void> {
     const parsed = parseDdl(sql, cat);
+    // 基準経路は、条件を押し下げられなければ表を丸ごと読む (scanOf)。その走査と、行イメージを読む文は、作りとして DO の SQLite の
+    // 上限に収まらなければならない。収まらない表 (極端に長い列名など) は、表定義で断る (src/shard-limits.ts、計画書の不変条件 13)。
+    for (const def of parsed.defs ?? []) {
+      if (!withinShardLimits(scanSql(fullScan(def)), []) || !withinShardLimits(`SELECT ${imageList(def)} FROM ${q(def.name)} WHERE ${def.pk.map((c) => `${q(c)} IS ?`).join(" AND ")}`, def.pk.map(() => 0))) {
+        throw new SqlError(`unsupported: the table ${def.name} is too wide for a shard to scan within Durable Object SQLite limits; use fewer or shorter column names`);
+      }
+    }
     // 既存の行から作る index の文は、公開のときに再生する。ここで確かめておく。
     const user = parsed.user ?? parsed.build?.user;
     if (parsed.noop || !user) return;
     const w = await openScratch(cat);
     try {
-      w.exec(user);
-    } catch (e) {
-      throw new SqlError((e as Error)?.message ?? String(e));
+      try {
+        w.exec(user);
+      } catch (e) {
+        throw new SqlError((e as Error)?.message ?? String(e));
+      }
+      // 列の DEFAULT は、ADD COLUMN では既存の行へ行イメージを作らずに入る。2^53 を超える整数の DEFAULT は、行イメージの確かめ
+      // (src/shard/rows.ts) を通らないので、ここで値を計算して断る (計画書の K1、2026-11-13 の Codex の 2 回目の見直し、指摘 5)。
+      for (const def of parsed.defs ?? []) {
+        for (const col of w.raw(`SELECT name, dflt_value FROM pragma_table_info(?) WHERE dflt_value IS NOT NULL`, def.name).values) {
+          const row = w.raw(typedScalarSql(`(${col[1] as string})`)).values[0];
+          fromTyped(row?.[1] ?? null, row?.[0], `the DEFAULT of ${def.name}.${col[0] as string}`);
+        }
+      }
     } finally {
       w.close();
     }

@@ -382,6 +382,17 @@ export interface Faults {
   ddlIgnoresIntents?: boolean;
   /** DROP の守りの確認 (unchanged) が、決着していない intent を変更として数えない (specs/m14_rebuild_guard.qnt の m14_red_no_drain の 2 つ目の守り)。 */
   unchangedIgnoresIntents?: boolean;
+  /**
+   * anchor が、同じ 2PC の ID の実行を 1 つずつにしない。abortIgnoresRecord と合わせると m17_red_resend になる。
+   * これだけでは、モデルの m17_red_resend_abort_check_only (確定したのに誤りと答える) は実装に現れない。記録の INSERT が失敗した
+   * 実行の誤りを受けた Worker は、anchor に決着を尋ねて (status)、確定と知るからである。
+   */
+  concurrentDrives?: boolean;
+  /**
+   * 中止を決めた実行が、確定の記録が残っていても abort を送る。concurrentDrives と合わせると m17_red_resend で、後の実行の中止が、
+   * 先に確定した実行の intent を消す。
+   */
+  abortIgnoresRecord?: boolean;
   /** 増設の子が、親からグループを受け取るときに表定義を追いつかせない。 */
   childKeepsOldSchema?: boolean;
   /** 行ロックや intent を待った後で、表定義を確かめ直さない。待ちの間に作られた index を保守しない書き込みが通る。 */

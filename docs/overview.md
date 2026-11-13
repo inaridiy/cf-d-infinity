@@ -227,7 +227,7 @@ The checks are layered. Each one catches what the layer before it cannot see.
    instances. Each model has variants with a known bug put back, and the checker must find every one.
 2. **Counterexamples replayed against the code.** A model only checks the design. For each bug variant that the
    implementation guards against, a deterministic simulator test drives the model's counterexample against the real
-   code. For most of them (48 of 70) a fault switch also puts the same bug back into the code, and the test checks that
+   code. For most of them (49 of 71) a fault switch also puts the same bug back into the code, and the test checks that
    the switch produces the violation; the others replay the ordering on the fixed code only. Without the replays, a rare
    ordering is left to a random seed that may never produce it. The [coverage table](./model-coverage.md) maps every
    variant to its switch and replay.

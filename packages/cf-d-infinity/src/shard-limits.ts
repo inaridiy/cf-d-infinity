@@ -34,16 +34,51 @@ export const SHARD_LIMITS = {
 const utf8 = new TextEncoder();
 
 /**
+ * 複合 SELECT の項の数を、多めに数える。文字列の literal、引用符で囲んだ識別子 ("union" など)、コメントを除いた文の
+ * UNION、INTERSECT、EXCEPT を数えて 1 を足す。SQLite が数えるのは 1 つの複合 SELECT の項なので、別々の複合 SELECT が
+ * あれば多めになるが、少なめにはならない。引用符の中の識別子を数えると、そういう名前の列のある表は、どの走査も上限を超える
+ * ことになり、基準経路でも読めなかった (2026-11-13 の Codex の 2 回目の見直し、指摘 8)。test/sim.ts の DO の模倣も、これで数える。
+ */
+export function compoundTerms(sql: string): number {
+  let code = "";
+  for (let i = 0; i < sql.length; ) {
+    const c = sql[i]!;
+    const close = c === "'" ? "'" : c === '"' ? '"' : c === "`" ? "`" : c === "[" ? "]" : null;
+    if (close) {
+      for (i++; i < sql.length; i++) {
+        if (sql[i] === close) {
+          if (close !== "]" && sql[i + 1] === close) i++;
+          else break;
+        }
+      }
+      i++;
+      code += " ";
+    } else if (c === "-" && sql[i + 1] === "-") {
+      const j = sql.indexOf("\n", i + 2);
+      i = j < 0 ? sql.length : j + 1;
+      code += " ";
+    } else if (c === "/" && sql[i + 1] === "*") {
+      const j = sql.indexOf("*/", i + 2);
+      i = j < 0 ? sql.length : j + 2;
+      code += " ";
+    } else {
+      code += c;
+      i++;
+    }
+  }
+  return 1 + (code.match(/\b(UNION|INTERSECT|EXCEPT)\b/gi)?.length ?? 0);
+}
+
+/**
  * 文が上限を超えるなら、その理由を返す。超えなければ null。束縛のための書き換え (src/value.ts の bindTyped) で文が長くなるので、
- * 書き換えた後の文で測る。複合 SELECT の項は、文字列の literal を除いた文の UNION、INTERSECT、EXCEPT を数える。SQLite が
- * 数えるのは 1 つの複合 SELECT の項なので、これは多めの数え方で、超えないのに超えると答えることはあっても、その逆はない。
+ * 書き換えた後の文で測る。複合 SELECT の項は compoundTerms で多めに数える。
  */
 export function shardLimitOf(sql: string, params: Value[]): string | null {
   const b = bindTyped(sql, params, "real");
   const bytes = utf8.encode(b.sql).length;
   if (bytes > SHARD_LIMITS.sqlBytes) return `the statement is ${bytes} bytes, more than ${SHARD_LIMITS.sqlBytes}`;
   if (b.params.length > SHARD_LIMITS.params) return `the statement binds ${b.params.length} parameters, more than ${SHARD_LIMITS.params}`;
-  const terms = 1 + (sql.replace(/'(?:[^']|'')*'/g, "''").match(/\b(UNION|INTERSECT|EXCEPT)\b/gi)?.length ?? 0);
+  const terms = compoundTerms(sql);
   if (terms > SHARD_LIMITS.compoundTerms) return `the statement has ${terms} compound SELECT terms, more than ${SHARD_LIMITS.compoundTerms}`;
   for (const p of b.params) {
     const n = typeof p === "string" ? utf8.encode(p).length : p instanceof Uint8Array ? p.byteLength : 0;

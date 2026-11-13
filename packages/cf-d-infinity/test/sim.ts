@@ -1,3 +1,4 @@
+import { compoundTerms } from "../src/shard-limits";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Db, type ClientFaults, type Cluster } from "../src/client/db";
@@ -19,7 +20,9 @@ export const DO_MAX_SQL_BYTES = 100_000;
 export const DO_MAX_BOUND_PARAMS = 100;
 export const DO_MAX_VALUE_BYTES = 2_000_000;
 function checkDoLimits(sql: string, params: Value[] = []): void {
-  const terms = 1 + (sql.replace(/'(?:[^']|'')*'/g, "''").match(/\b(UNION|INTERSECT|EXCEPT)\b/gi)?.length ?? 0);
+  // 本物の DO は複合 SELECT の項を数える。シャードの側の確かめ (src/shard-limits.ts) と同じ数え方にする。引用符の中の識別子まで
+  // 数えると、本物では通る文をここだけが断る (検査の誤り。2026-11-13)。
+  const terms = compoundTerms(sql);
   if (terms > DO_COMPOUND_SELECT_LIMIT) throw new Error("too many terms in compound SELECT: SQLITE_ERROR");
   if (Buffer.byteLength(sql) > DO_MAX_SQL_BYTES) throw new Error("statement too long: SQLITE_TOOBIG");
   if (params.length > DO_MAX_BOUND_PARAMS) throw new Error("too many SQL variables: SQLITE_ERROR");
