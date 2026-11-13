@@ -1,4 +1,5 @@
 import { Hlc, SECOND, physicalToTs, tsToPhysical } from "../hlc";
+import { SHARD_LIMITS, ShardLimit, shardLimitOf, withinShardLimits } from "../shard-limits";
 import type {
   Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, GroupPayload, LockOwner, MetaApi,
   Participant, PrepareReq, PrepareRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts, TxnStatus, Value,
@@ -86,7 +87,7 @@ export const ORPHAN_AGE_MS = 2000;
 /** 移動できる 1 グループ (同じ shard key の行の集まり) の大きさの上限。分割転送がないので、これより大きいと移動が終わらない。 */
 export const GROUP_MAX_BYTES = 16_000_000;
 export const SHARD_MAX_ROWS = 200_000;
-export const SHARD_MAX_BYTES = 16_000_000;
+export const SHARD_MAX_BYTES = SHARD_LIMITS.resultBytes;
 /** 値のおおよその大きさ (バイト)。上限の判定に使うだけで、正確である必要はない。 */
 const sizeOf = (v: Value): number =>
   typeof v === "string" ? v.length * 2 : v instanceof Uint8Array ? v.byteLength : 8;
@@ -133,22 +134,15 @@ interface Waiter extends LockOwner {
 }
 
 /** シャード 1 個のプロトコル本体。DO に依存せず、Node の SQLite でも同じコードが動く。 */
+
 /**
- * 確定の記録の指紋。参加者と、参加者ごとの書き込みの 64 ビットの hash (FNV-1a を 2 通り) と長さである。同じ取引の ID で
- * 中身の違う COMMIT を見分けるのに使う (specs/m17_txn_id_reuse.qnt)。安全の境目ではない。わざと衝突させても、損をするのは
- * 衝突させた側の取引だけである。crypto.subtle の hash は本物の非同期で、シミュレータの出来事の順序を変えるので使わない。
+ * 2PC の ID (`<取引の ID>#<続きの中身の指紋>`、Txn.commit) から、行ロックの持ち主の ID を取り出す。ロックは、COMMIT の前の
+ * 文が取引の ID で取るので、prepare と確定と中止は、この ID で自分のロックを見分けて手放す。
  */
-function commitDigest(req: CommitReq): string {
-  const text = encode(req.participants.map((p) => [p.shard, p.writes]));
-  let h1 = 0x811c9dc5;
-  let h2 = 0x050c5d1f;
-  for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    h1 = Math.imul(h1 ^ c, 0x01000193);
-    h2 = Math.imul(h2 ^ c, 0x01000193) ^ (h2 >>> 15);
-  }
-  return `${(h1 >>> 0).toString(16)}${(h2 >>> 0).toString(16)}:${text.length}`;
-}
+export const lockIdOf = (txn: string): string => {
+  const at = txn.indexOf("#");
+  return at < 0 ? txn : txn.slice(0, at);
+};
 
 export class ShardCore implements ShardApi {
   readonly id: string;
@@ -211,7 +205,7 @@ export class ShardCore implements ShardApi {
     b.exec(`CREATE TABLE IF NOT EXISTS __moved_txn(txn TEXT NOT NULL, g TEXT NOT NULL, dest TEXT NOT NULL, PRIMARY KEY(txn, g))`);
     b.exec(`CREATE TABLE IF NOT EXISTS __arrived(g TEXT PRIMARY KEY, m INTEGER NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __txn(
-      txn TEXT PRIMARY KEY, status TEXT NOT NULL, c INTEGER, participants TEXT, done INTEGER NOT NULL DEFAULT 0, at INTEGER, digest TEXT)`);
+      txn TEXT PRIMARY KEY, status TEXT NOT NULL, c INTEGER, participants TEXT, done INTEGER NOT NULL DEFAULT 0, at INTEGER)`);
     this.initStorage();
 
     for (const r of b.exec(`SELECT entry FROM __ddl ORDER BY version`)) {
@@ -953,8 +947,9 @@ export class ShardCore implements ShardApi {
   }
 
   private releaseLocks(txn: string): void {
+    const id = lockIdOf(txn);
     for (const [key, l] of this.locks) {
-      if (l.txn !== txn) continue;
+      if (l.txn !== id) continue;
       this.locks.delete(key);
       this.wakeNext(key);
     }
@@ -1028,10 +1023,10 @@ export class ShardCore implements ShardApi {
    */
   private async waitForForeignLocks(txn: string, writes: Pick<Change, "table" | "pk">[]): Promise<void> {
     const deadline = this.deps.clock.now() + LOCK_WAIT_MS;
-    const me: LockOwner = { txn, start: Number.MAX_SAFE_INTEGER };
+    const me: LockOwner = { txn: lockIdOf(txn), start: Number.MAX_SAFE_INTEGER };
     for (const w of writes) {
       const key = this.lockKey(w.table, w.pk);
-      for (let l = this.liveLock(key); l && l.txn !== txn; l = this.liveLock(key)) {
+      for (let l = this.liveLock(key); l && l.txn !== me.txn; l = this.liveLock(key)) {
         if (this.deps.clock.now() >= deadline) return;
         await this.waitForRow(key, me, deadline).catch(() => undefined);
       }
@@ -1090,7 +1085,7 @@ export class ShardCore implements ShardApi {
             return this.run(req);
           });
         } catch (e) {
-          if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner) throw e;
+          if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner || e instanceof ShardLimit) throw e;
           // 文は F の状態を読んだうえで失敗した。読んだ時刻を付けて返し、呼び出し側に範囲を記録させる (ExecRes.error)。
           return { columns: [], values: [], changes: [], error: asSqlError(e).message, F, T: req.T ?? F, hlc: this.hlc.value, epoch: this.epoch };
         }
@@ -1260,7 +1255,7 @@ export class ShardCore implements ShardApi {
    * 文の意味は SQLite が解釈し、変更行は trigger が捕捉するので、UPSERT や
    * INSERT ... SELECT のような構文でも Worker 側で解析する必要がない。
    */
-  private run(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number } {
+  private run(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number; bytes?: number; over?: boolean } {
     const out = this.checked(req, () => this.runStatement(req));
     // 取引の文は、ここでは変更を返すだけで、確定のときにもう一度確かめられる (assertWriteSetFits)。
     // ここでも断るのは、COMMIT まで待たずに、文の時点で伝えるためである。
@@ -1326,7 +1321,7 @@ export class ShardCore implements ShardApi {
     return true;
   }
 
-  private runStatement(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number } {
+  private runStatement(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number; bytes?: number; over?: boolean } {
     if (!req.write) return { ...this.readLimited(req), changes: [] };
     const captured = this.runCaptured(req);
     if (captured) return captured;
@@ -1348,7 +1343,7 @@ export class ShardCore implements ShardApi {
   }
 
   /** 読み取りの文を実行し、上限を超えた時点で打ち切る。全行を集めてから数えると、数える前にメモリが尽きる。 */
-  private readLimited(req: ExecReq): { columns: string[]; values: Value[][] } {
+  private readLimited(req: ExecReq): { columns: string[]; values: Value[][]; bytes?: number; over?: boolean } {
     const maxRows = Math.min(req.maxRows ?? SHARD_MAX_ROWS, SHARD_MAX_ROWS);
     const maxBytes = Math.min(req.maxBytes ?? SHARD_MAX_BYTES, SHARD_MAX_BYTES);
     const { columns, rows } = this.b.iterate(req.sql, ...req.params);
@@ -1358,19 +1353,33 @@ export class ShardCore implements ShardApi {
       values.push(row);
       for (const v of row) bytes += sizeOf(v);
       if (values.length > maxRows) throw new SqlError(`result too large: more than ${maxRows} rows from one shard; narrow the query`);
-      if (bytes > maxBytes) throw new SqlError(`result too large: more than ${maxBytes} bytes from one shard; narrow the query or select fewer columns`);
+      if (bytes > maxBytes) {
+        // 予算を配り直す読みは、拒否せずに溢れたことだけを返す。Worker が残りの予算で読み直すか、合計で断る。
+        if (req.budgeted) return { columns, values: [], bytes, over: true };
+        throw new SqlError(`result too large: more than ${maxBytes} bytes from one shard; narrow the query or select fewer columns`);
+      }
     }
-    return { columns, values };
+    return req.maxBytes !== undefined ? { columns, values, bytes } : { columns, values };
+  }
+
+  /**
+   * Worker から届いた文を、DO の SQLite の上限で測る。超える文は、何も読まず書かずに ShardLimit で断る。Worker はそれを受けて、
+   * 文を基準経路で実行し直す (src/shard-limits.ts、計画書の不変条件 13)。
+   */
+  private withinLimits(req: Pick<ExecReq, "sql" | "params">): void {
+    const over = shardLimitOf(req.sql, req.params ?? []);
+    if (over) throw new ShardLimit(over);
   }
 
   /** 時刻 T の状態 (と自分の未 commit write) の上で文を実行し、ROLLBACK する。 */
   async exec(req: ExecReq): Promise<ExecRes> {
+    this.withinLimits(req);
     await this.ensureSchema(req.schema);
     if (req.lock && (req.write || req.lockRows)) {
       try {
         return await this.lockedExec(req, req.lock);
       } catch (e) {
-        if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner) throw e;
+        if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner || e instanceof ShardLimit) throw e;
         throw asSqlError(e);
       }
     }
@@ -1412,7 +1421,7 @@ export class ShardCore implements ShardApi {
       });
       return { ...out, T, hlc: this.hlc.value, epoch: this.epoch };
     } catch (e) {
-      if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner) throw e;
+      if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner || e instanceof ShardLimit) throw e;
       // 文は T の状態を読んだうえで失敗した。読んだ時刻を付けて返し、呼び出し側に範囲を記録させる。
       return { columns: [], values: [], changes: [], error: asSqlError(e).message, T, hlc: this.hlc.value, epoch: this.epoch };
     }
@@ -1420,6 +1429,7 @@ export class ShardCore implements ShardApi {
 
   /** シングルシャードの autocommit 書き込み。1 回の RPC で完結する。 */
   async execAuto(req: ExecReq): Promise<ExecRes> {
+    this.withinLimits(req);
     await this.ensureSchema(req.schema);
     await this.ensureArrived(this.sksOf(req.spans));
     this.observe(req.minTs);
@@ -1482,6 +1492,9 @@ export class ShardCore implements ShardApi {
     if (!capture || this.faults.triggerCapture || !span || req.spans.some((s) => s.table !== span.table)) return null;
     if (capture === "update" && span.kind !== "pk") return null;
     const def = this.def(span.table);
+    // RETURNING で行を読むと文が長くなる (列ごとに typeof と 2^53 の確かめ)。DO の SQLite の上限を超えるなら、文をそのまま
+    // 実行する trigger の捕捉に任せる。入口の確かめ (withinLimits) は、受け取った文を測っている (Codex の 2 回目の見直し、指摘 7)。
+    if (!withinShardLimits(`${req.sql} RETURNING ${imageList(def)}`, req.params)) return null;
     const sk = req.write!.sk;
     try {
       return this.b.tx(() => {
@@ -1588,7 +1601,7 @@ export class ShardCore implements ShardApi {
       if (held && held.txn !== txn) return `intent on ${w.table} ${w.pk}`;
       // prepare は待たない。待つと、prepare 済みの取引を待つ DML との間に閉路ができる。
       const lock = this.liveLock(this.lockKey(w.table, w.pk));
-      if (lock && lock.txn !== txn) return `row locked by ${lock.txn}`;
+      if (lock && lock.txn !== lockIdOf(txn)) return `row locked by ${lock.txn}`;
       // ロックを持っていても検証は省かない。ロックは再起動、TTL、wound で消えているかもしれない。
       const since = this.faults.validateFromT ? T : (w.since ?? T);
       const trusted = this.faults.trustLocks && w.since !== undefined;
@@ -1747,18 +1760,8 @@ export class ShardCore implements ShardApi {
 
   private prepareSync(req: PrepareReq): PrepareRes {
     const dup = this.b.exec(`SELECT prepare_ts FROM __intents WHERE txn = ? LIMIT 1`, req.txn)[0];
-    if (dup) {
-      // 同じ取引の ID の intent がもうある。同じ書き込みなら再送なので、同じ答えを返す。違う書き込みなら、baton の使い回しで
-      // できた別の続きである。前の intent を残して ok と答えると、後の続きの書き込みは捨てられ、前の続きの確定がそれを適用する
-      // (specs/m17_txn_id_reuse.qnt の m17_red_commit_only、不変条件 12)。
-      const have = (this.b.exec(`SELECT tbl, pk, change FROM __intents WHERE txn = ?`, req.txn) as { tbl: string; pk: string; change: string }[])
-        .map((r) => `${r.tbl}\0${r.pk}\0${r.change}`).sort();
-      const want = req.writes.map((w) => `${w.table}\0${w.pk}\0${encode(w)}`).sort();
-      if (!this.faults.prepareKeepsFirst && (have.length !== want.length || have.some((x, i) => x !== want[i]))) {
-        return { ok: false, reason: `conflict: transaction ${req.txn} was prepared here with other writes` };
-      }
-      return { ok: true, prepareTs: dup.prepare_ts as Ts };
-    }
+    // 同じ 2PC の ID の intent がもうある。ID は続きの中身の指紋を含むので、同じ書き込みの prepare の再送である。同じ答えを返す。
+    if (dup) return { ok: true, prepareTs: dup.prepare_ts as Ts };
     // phase 2 で初めて上限に当たると、確定した取引が適用できなくなる。intent を置く前に拒否する。
     try {
       this.assertWriteSetFits(req.writes);
@@ -1840,30 +1843,28 @@ export class ShardCore implements ShardApi {
 
   async commit(req: CommitReq): Promise<CommitRes> {
     await this.ensureSchema(req.schema);
-    const done = this.b.exec(`SELECT status, c, digest FROM __txn WHERE txn = ?`, req.txn)[0];
-    const digest = commitDigest(req);
-    if (done) {
-      // 同じ取引の ID で、中身の違う COMMIT が来た。baton の使い回し (再送を含む) で、1 つの取引から 2 つの続きができた。
-      // 前の結果を返すと、後の続きは確定したと聞くのに、その書き込みは入らない (specs/m17_txn_id_reuse.qnt、不変条件 12)。
-      if (!this.faults.commitIgnoresDigest && done.digest !== null && done.digest !== undefined && done.digest !== digest) {
-        return { ok: false, reason: `conflict: transaction ${req.txn} was already decided with other writes` };
-      }
-      return done.status === "committed" ? { ok: true, c: done.c as Ts } : { ok: false, reason: "aborted" };
-    }
+    // 同じ 2PC の ID の実行は 1 つずつにする。同じ中身の COMMIT が 2 つ同時に届くと (再送が元の COMMIT を追い越す)、後の実行の
+    // prepare は、先の実行が適用した行に当たって断られ、中止の abort(ID) が先の実行の残りの intent を消した
+    // (specs/m17_txn_id_reuse.qnt の m17_red_resend、2026-11-13 の Codex の 2 回目の見直し、指摘 1)。先の実行が終わるのを待って
+    // から記録を確かめ、待ち終えてから実行を登録するまで await を挟まない。
+    for (let f = this.inflight.get(req.txn); f && !this.faults.concurrentDrives; f = this.inflight.get(req.txn)) await f.settled;
+    // 2PC の ID は、取引の ID と続きの中身の指紋である (Txn.commit)。同じ ID の記録があるのは、同じ中身の COMMIT の再送なので、
+    // 前の結果を返す。baton の使い回しでできた中身の違う続きは、別の ID の別の 2PC になる。
+    const done = this.b.exec(`SELECT status, c FROM __txn WHERE txn = ?`, req.txn)[0];
+    if (done) return done.status === "committed" ? { ok: true, c: done.c as Ts } : { ok: false, reason: "aborted" };
     // 決着の記録は保持時間の後に消す。消した tombstone の後に同じ取引の COMMIT が届いて確定すると、
     // 中止と判断して intent を無視した読み手と矛盾する (specs/m10_txn_record_gc.qnt の反例)。
     // 保持時間の半分より古い取引の COMMIT を受け付けなければ、消した後に確定することはない。
     if (this.deps.clock.now() - tsToPhysical(req.T) > (this.deps.txnRetainMs ?? TXN_RETAIN_MS) / 2) {
       return { ok: false, reason: "conflict: transaction older than the commit window" };
     }
-    const me = req.participants.find((p) => p.shard === this.id);
-    if (me) await this.ensureArrived(this.sksOf(me.spans, me.writes));
-
     let settle = () => {};
     const settled = new Promise<void>((r) => (settle = r));
     const flight: InFlight = { pushed: 0, decided: false, settled, settle };
     this.inflight.set(req.txn, flight);
     try {
+      const me = req.participants.find((p) => p.shard === this.id);
+      if (me) await this.ensureArrived(this.sksOf(me.spans, me.writes));
       return await this.drive(req, flight);
     } finally {
       this.inflight.delete(req.txn);
@@ -1872,7 +1873,6 @@ export class ShardCore implements ShardApi {
   }
 
   private async drive(req: CommitReq, flight: InFlight): Promise<CommitRes> {
-    const digest = commitDigest(req);
     const self = req.participants.find((p) => p.shard === this.id);
     if (!self) throw new SqlError("anchor must be a participant");
     let others = req.participants.filter((p) => p.shard !== this.id);
@@ -1918,8 +1918,8 @@ export class ShardCore implements ShardApi {
     if (bad) return this.decideAbort(req, bad.reason ?? "refresh failed");
 
     this.b.exec(
-      `INSERT INTO __txn(txn, status, c, participants, at, digest) VALUES (?, 'committed', ?, ?, ?, ?)`,
-      req.txn, c, JSON.stringify(req.participants.map((p) => p.shard)), this.deps.clock.now(), digest,
+      `INSERT INTO __txn(txn, status, c, participants, at) VALUES (?, 'committed', ?, ?, ?)`,
+      req.txn, c, JSON.stringify(req.participants.map((p) => p.shard)), this.deps.clock.now(),
     );
     // record の確定を待ってから phase 2 と応答を送る。先に送ると、確定の前に再起動したとき、記録が消えて
     // 照会した参加者が tombstone を書き、phase 2 を受けた参加者とで決着が割れる (specs/m3_anchor_recovery.qnt の m3_red)。
@@ -1931,6 +1931,11 @@ export class ShardCore implements ShardApi {
 
   private decideAbort(req: CommitReq, reason: string): CommitRes {
     this.b.exec(`INSERT OR IGNORE INTO __txn(txn, status, done, at) VALUES (?, 'aborted', 1, ?)`, req.txn, this.deps.clock.now());
+    // 記録が確定のまま残ったなら、同じ ID の別の実行が確定させている。abort を送るとその intent を消すので、送らずにその決着を
+    // 答える (同じ ID は同じ中身なので、確定が正しい答えである)。実行を 1 つずつにしてあるので、ここには来ないはずの 2 つ目の守り
+    // である (specs/m17_txn_id_reuse.qnt の ABORT_CHECKS)。
+    const kept = this.decided(req.txn);
+    if (kept?.status === "committed" && !this.faults.abortIgnoresRecord) return { ok: true, c: kept.c };
     for (const p of req.participants) {
       this.spawn(p.shard === this.id ? this.abort({ txn: req.txn }) : this.deps.peer(p.shard).abort({ txn: req.txn }));
     }

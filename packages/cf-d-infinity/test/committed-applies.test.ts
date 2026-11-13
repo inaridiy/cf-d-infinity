@@ -58,7 +58,7 @@ describe("a transaction acknowledged as committed can always be applied", () => 
     pending("blob unique", T("BLOB"), "CREATE UNIQUE INDEX p_code ON p(tenant_id, code)",
       "INSERT INTO p VALUES (?, 5, x'0102', NULL)", "INSERT INTO p VALUES (?, 6, x'0102', NULL)"));
 
-  it("(5) text that is small in characters but large in bytes is refused before commit", async () => {
+  it("(5) text that is small in characters but large in bytes is refused before commit, at the statement", async () => {
     const c = new SimCluster({ shards: 2 });
     await c.client().ddl(`CREATE TABLE docs(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
     const [A, B] = await tenants(c);
@@ -67,9 +67,9 @@ describe("a transaction acknowledged as committed can always be applied", () => 
     expect(2 * cjk.length).toBeLessThan(MAX_WRITE_SET_BYTES);
     const tx = await new Db(c).begin();
     await tx.query("INSERT INTO docs VALUES (?, 1, 'small')", [A]);
-    await tx.query("INSERT INTO docs VALUES (?, 1, ?)", [B, cjk]);
-    await tx.query("INSERT INTO docs VALUES (?, 2, ?)", [B, cjk]);
-    await expect(tx.commit()).rejects.toThrow(/transaction too large/);
+    // 上限は UTF-8 のバイト数で、取引全体の合計で数え、上限を超えさせた文で断る (Txn.atomically)。1 行で 1.14 MB を超える。
+    await expect(tx.query("INSERT INTO docs VALUES (?, 1, ?)", [B, cjk])).rejects.toThrow(/transaction too large/);
+    await tx.unlockAll();
     await c.settle();
     expect(await quiescentProblems(c)).toEqual([]);
     expect((await new Db(c).query("SELECT count(*) AS n FROM docs")).rows).toEqual([{ n: 0 }]);

@@ -255,11 +255,19 @@ for m in m16_red_body_only m16_red_intents_only; do tests $f $m; done
 
 echo "== M17 txn id reuse (不変条件 12)"
 f=m17_txn_id_reuse.qnt
-green   $f m17_green safe
-red     $f m17_red_impl safe            # 2026-11 までの実装: 参加者も anchor も、同じ ID の別の続きを確かめない
-red     $f m17_red_prepare_only safe    # anchor が、同じ ID の決着があると、中身を見ずに結果を返す
-red     $f m17_red_commit_only safe     # 参加者が、同じ ID の intent があると、後の書き込みを捨てて ok と答える
+green   $f m17_green safe                # 2PC の ID は続きごと (取引の ID と中身の指紋)。anchor は同じ ID の実行を 1 つずつにし、中止は記録が中止のときだけ abort を送る
+green   $f m17_green_serialize_only safe # 実行を 1 つずつにするだけで足りる (中止の確かめは 2 つ目の守り)
+red     $f m17_red_resend safe           # 2026-11-13 の 1 回目の修正: 同じ中身の 2 つの実行が同時に走り、後の実行の中止が先の実行の intent を消す
+red     $f m17_red_resend_abort_check_only safe  # 中止の確かめだけ: 後の実行が確定を決めると記録の INSERT が失敗し、確定したのに誤りと答える
+red     $f m17_red_abort safe            # 2026-11-12 の修正: 指紋を両方で確かめるが、ID は取引の ID。断られた続きの中止が、確定した続きの intent を消す
+red     $f m17_red_impl safe             # 2026-11-12 より前の実装: 参加者も anchor も、同じ ID の別の続きを確かめない
+red     $f m17_red_prepare_only safe     # anchor が、同じ ID の決着があると、中身を見ずに結果を返す
+red     $f m17_red_commit_only safe      # 参加者が、同じ ID の intent があると、後の書き込みを捨てて ok と答える
 witness $f m17_green witnessOneCommittedOneRefused
+witness $f m17_green witnessConcurrent
+witness $f m17_green witnessResend
+tests   $f m17_red_abort
+tests   $f m17_red_resend
 tests   $f m17_red_impl
 
 echo "== M7 restore (S6 の全シャード同時点復元)"

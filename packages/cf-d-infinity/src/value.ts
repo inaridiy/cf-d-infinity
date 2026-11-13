@@ -9,7 +9,7 @@
 // 位置を字句で見つけ、型を変える式で包む (`bindTyped`)。包む式は型の親和性を持たない形にする。`CAST(? AS INTEGER)` だけだと
 // 列と同じ親和性を持ち、`'05' = ...` の比べ方が変わる。`(CAST(? AS INTEGER)+0)` は、比べ方、typeof、文字列への変換のどれも、
 // 素の INTEGER の引数と同じに振る舞う (2026-11-12 に node:sqlite で確かめた)。
-import type { Value } from "./types";
+import { SqlError, type Value } from "./types";
 
 /** 整数の値を持つ REAL。整数でない REAL は、ただの JS の数で表す。 */
 export interface Real {
@@ -188,4 +188,27 @@ export function restoreColumns(columns: string[], map: Map<string, string> | nul
     for (const [wrapped, token] of map) if (name.includes(wrapped)) name = name.split(wrapped).join(token);
     return name;
   });
+}
+
+/**
+ * 2^53 を超える INTEGER を保存しようとした書き込みの誤り (計画書の K1、2026-11-13 の持ち主の決定)。D∞ の値は JS の数で、
+ * DO の SQLite も読み出しで JS の数にするので、その値は正確に運べない。値で決まる拒否なので、置き場所に依らない。
+ */
+export const wideIntegerError = (where: string): SqlError =>
+  new SqlError(`unsupported: an INTEGER beyond ±${Number.MAX_SAFE_INTEGER} (2^53 - 1) in ${where} cannot be stored exactly; store such values (for example 64-bit ids) as TEXT`);
+
+/** 値を、その typeof と一緒に読む文。`expr` は 1 つの値の式である。結果は [typeof, 値] の 1 行になる (fromTyped で戻す)。 */
+export const typedScalarSql = (expr: string): string =>
+  `SELECT typeof("__dinf_v"), "__dinf_v" FROM (SELECT ${expr} AS "__dinf_v")`;
+
+/**
+ * 読んだか計算した値を、束縛し直してよい値にする。Worker が結果を引数に戻して書く場所は、すべてここを通す
+ * (INSERT … SELECT の行、VALUES の中のサブクエリ、計画が計算するキーの式)。読んだ結果では、整数の値の REAL (5.0) が JS の 5 に
+ * なる (DO の SQLite は読み出しで区別しない) ので、typeof が real なら印を付ける。2^53 を超える整数は、桁が落ちているので断る
+ * (2026-11-13 の Codex の 2 回目の見直し、指摘 3、4)。
+ */
+export function fromTyped(v: Value, t: unknown, where = "the statement"): Value {
+  if (t === "real" && typeof v === "number") return realOf(v);
+  if (t === "integer" && typeof v === "number" && !Number.isSafeInteger(v)) throw wideIntegerError(where);
+  return v;
 }

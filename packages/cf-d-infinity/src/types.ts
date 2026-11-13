@@ -149,6 +149,11 @@ export interface ExecReq {
    */
   maxRows?: number;
   maxBytes?: number;
+  /**
+   * maxBytes を超えたときに、拒否せずに over を返す。Worker は、集める予算の合計を、溢れたシャードへ配り直して読み直す
+   * (ReadScope.scan、計画書の不変条件 13)。
+   */
+  budgeted?: boolean;
   /** 悲観的な DML。最新の状態で実行し、変更行のロックを取る。 */
   lock?: LockOwner;
   /** 読み取りでロックを取る行。BEGIN IMMEDIATE の主キー読みに使う。 */
@@ -177,6 +182,10 @@ export interface ExecRes {
   T: Ts;
   hlc: Ts;
   epoch: number;
+  /** 読みの結果のバイト数 (src/shard/core.ts の sizeOf で数える)。maxBytes を指定した読みで返す。 */
+  bytes?: number;
+  /** budgeted の読みが maxBytes を超えた。values は空である。 */
+  over?: boolean;
   /**
    * 文が SQLite のエラーで失敗した (制約の違反など)。例外にせず、読んだ時刻と一緒に結果として返す。
    * 失敗した文も、状態を読んでいる (「同じ主キーの行がある」など)。取引は、その読みも commit で検証しなければならない。
@@ -373,10 +382,17 @@ export interface Faults {
   ddlIgnoresIntents?: boolean;
   /** DROP の守りの確認 (unchanged) が、決着していない intent を変更として数えない (specs/m14_rebuild_guard.qnt の m14_red_no_drain の 2 つ目の守り)。 */
   unchangedIgnoresIntents?: boolean;
-  /** anchor が、同じ取引の ID の決着があると、指紋を見ずに前の結果を返す (specs/m17_txn_id_reuse.qnt の m17_red_prepare_only)。 */
-  commitIgnoresDigest?: boolean;
-  /** 参加者が、同じ取引の ID の intent があると、書き込みを比べずに ok と答える (specs/m17_txn_id_reuse.qnt の m17_red_commit_only)。 */
-  prepareKeepsFirst?: boolean;
+  /**
+   * anchor が、同じ 2PC の ID の実行を 1 つずつにしない。abortIgnoresRecord と合わせると m17_red_resend になる。
+   * これだけでは、モデルの m17_red_resend_abort_check_only (確定したのに誤りと答える) は実装に現れない。記録の INSERT が失敗した
+   * 実行の誤りを受けた Worker は、anchor に決着を尋ねて (status)、確定と知るからである。
+   */
+  concurrentDrives?: boolean;
+  /**
+   * 中止を決めた実行が、確定の記録が残っていても abort を送る。concurrentDrives と合わせると m17_red_resend で、後の実行の中止が、
+   * 先に確定した実行の intent を消す。
+   */
+  abortIgnoresRecord?: boolean;
   /** 増設の子が、親からグループを受け取るときに表定義を追いつかせない。 */
   childKeepsOldSchema?: boolean;
   /** 行ロックや intent を待った後で、表定義を確かめ直さない。待ちの間に作られた index を保守しない書き込みが通る。 */
@@ -458,8 +474,11 @@ export class ReadTooOld extends Error {
  * 全 DO が入れ替わってから新しい版で送り始める (2 段階のデプロイ)。
  * 永続データの形式の変更は、この版ではなく保存の形式の版 (STORAGE_FORMAT) で扱う (docs/storage-format.md)。
  */
-export const PROTOCOL_VERSION = 1;
-export const MIN_PROTOCOL_VERSION = 1;
+// 版 2 (2026-11-13): 値の表現を変えた (整数の値の REAL の印 `{ real }`、INTEGER と REAL の束縛。src/value.ts)。版 1 の要求の数は
+// 意味が違うので、受け付けない。値の表現を変えたのに版を上げ忘れていた (Codex の指摘 C5)。test/protocol.test.ts が、
+// 値の表現の見本の指紋を版ごとに持ち、表現が変わったのに版が同じなら落ちる。
+export const PROTOCOL_VERSION = 2;
+export const MIN_PROTOCOL_VERSION = 2;
 
 export class VersionSkew extends Error {
   readonly retryable = true;

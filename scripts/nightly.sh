@@ -3,6 +3,7 @@
 #
 #   scripts/nightly.sh                   # 既定: 上限 4 時間、並列 6、検査ごとに 300 seed
 #   scripts/nightly.sh --hours 2 --procs 4 --seeds 100
+#   scripts/nightly.sh --hours 15 --procs 10 --seeds 4200 --from 900001   まとめて回す (夜間の 2 週間分。範囲は夜間と重ならない)
 #
 # 流すのは、その時点の origin/main を取り出した worktree である。作業中のツリーには触らない。
 # seed は日付から決める。同じ日に流し直すと同じ seed になり、日が変われば新しい seed になる。
@@ -10,19 +11,20 @@
 # 落ちた seed は、そのコミットで `SEEDS=<seed> npx vitest run <検査> -t "seed <seed>"` と流せば、同じように落ちる。
 # 上限を超えた検査は、プロセスのグループごと止め、summary に「止まった」と書く。
 set -u
-hours=4; procs=6; seeds=300
+hours=4; procs=6; seeds=300; from=
 while [ $# -gt 0 ]; do
   case "$1" in
     --hours) hours=$2; shift 2 ;;
     --procs) procs=$2; shift 2 ;;
     --seeds) seeds=$2; shift 2 ;;
-    *) echo "usage: scripts/nightly.sh [--hours h] [--procs n] [--seeds n]" >&2; exit 2 ;;
+    --from) from=$2; shift 2 ;;
+    *) echo "usage: scripts/nightly.sh [--hours h] [--procs n] [--seeds n] [--from seed]" >&2; exit 2 ;;
   esac
 done
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
 day=$(date +%F)
-out="${DINF_NIGHTLY_DIR:-$HOME/.dinf-nightly}/$day"
+out="${DINF_NIGHTLY_DIR:-$HOME/.dinf-nightly}/$day${from:+-from$from}"
 mkdir -p "$out"
 exec >>"$out/nightly.log" 2>&1
 echo "== $(date -Is) start: hours=$hours procs=$procs seeds=$seeds"
@@ -43,7 +45,8 @@ ln -s "$repo/packages/cf-d-infinity/node_modules" "$wt/packages/cf-d-infinity/no
 echo "commit $commit" | tee "$out/commit"
 
 # 日付ごとに違う seed の範囲。日数 × 10000 から始めるので、2 週間のどの晩とも重ならない。
-from=$(( ($(date +%s) / 86400) % 100000 * 10000 + 1 ))
+# --from を与えると、その seed から始める (まとめて回すとき。結果の置き場は <日付>-from<seed> になる)。
+if [ -z "$from" ]; then from=$(( ($(date +%s) / 86400) % 100000 * 10000 + 1 )); fi
 to=$(( from + seeds - 1 ))
 budget=$(( hours * 3600 / 3 ))
 

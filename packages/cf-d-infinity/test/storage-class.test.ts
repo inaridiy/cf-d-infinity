@@ -12,6 +12,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { D1Compatible } from "../src/client/d1";
+import { split } from "../src/autoscaler";
 import { Db } from "../src/client/db";
 import { clientOf } from "./libsql";
 import { SimCluster } from "./sim";
@@ -60,5 +61,19 @@ describe("the storage class of a value", () => {
     const point = (await db.query("SELECT typeof(v) AS t FROM kv WHERE k = 5")).rows;
     const range = (await db.query("SELECT typeof(v) AS t FROM kv WHERE k >= 5 ORDER BY k")).rows;
     expect({ point, range }).toEqual({ point: [{ t: "real" }], range: [{ t: "real" }, { t: "integer" }] });
+  });
+
+  it("keeps INTEGER and REAL in an untyped column through a shard split", async () => {
+    // README の「分割を含めて」の裏付け (2026-11-13 の README の確認の指摘 R8)。分割は行を行イメージで運ぶ。
+    const c = new SimCluster({ shards: 1 });
+    const db = new Db(c);
+    await db.ddl(DDL);
+    for (let k = 1; k <= 40; k++) await db.query(`INSERT INTO kv(k, v, s) VALUES (?, ${k % 2 ? "5.0" : "5"}, 'x')`, [k]);
+    const before = (await db.query("SELECT k, typeof(v) AS t FROM kv ORDER BY k")).rows;
+    const moved = await split(c, "s0", "s1");
+    expect(moved!.groups).toBeGreaterThan(0);
+    const after = (await new Db(c).query("SELECT k, typeof(v) AS t FROM kv ORDER BY k")).rows;
+    expect(after).toEqual(before);
+    expect(new Set(after.map((r) => r.t))).toEqual(new Set(["real", "integer"]));
   });
 });

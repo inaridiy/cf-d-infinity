@@ -64,8 +64,11 @@ export async function diff(script: string, shards = 4, dumps: string[] = [], uns
     }
     if (a.error) continue;
     if (dumps.length) {
-      // 書き込みの度に全表を比べて、最初に分かれた文を見つける。
-      for (const d of dumps) {
+      // 書き込みの度に全表を比べて、最初に分かれた文を見つける。値は quote() で比べる。JS の値では、INTEGER の 2 と REAL の
+      // 2.0 が同じ数になり、格納の型の違いを見落とす (2026-11-13 の README の確認の指摘 R8)。
+      for (const plain of dumps) {
+        const cols = real(sqlite, `SELECT * FROM (${plain.replace(/\s+ORDER\s+BY[\s\S]*$/i, "")}) LIMIT 0`).columns;
+        const d = cols.length ? plain.replace(/^\s*SELECT\s+[\s\S]*?\s+FROM\s/i, `SELECT ${cols.map((c) => `quote("${c.replaceAll('"', '""')}")`).join(", ")} FROM `) : plain;
         const inTx = db.inTransaction;
         const x = real(sqlite, d);
         const y = await ours(db, d);

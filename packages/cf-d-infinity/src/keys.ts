@@ -31,23 +31,15 @@ function realAsInteger(x: number): number | null {
   return Number.isInteger(x) && Math.abs(x) < 2 ** 63 ? x : null;
 }
 
-/** SQLite が REAL を文字列にする書き方 (`%!.15g`)。有効数字 15 桁で、整数の値にも小数点を付ける。 */
-export function realText(x: number): string {
-  if (Number.isNaN(x)) return "";
-  if (!Number.isFinite(x)) return x > 0 ? "Inf" : "-Inf";
-  if (x === 0) return "0.0";
-  const [mant, expStr] = x.toExponential(14).split("e") as [string, string];
-  const e = Number(expStr);
-  const trim = (t: string) => {
-    const u = t.replace(/0+$/, "");
-    return u.endsWith(".") ? `${u}0` : u;
-  };
-  if (e < -4 || e >= 15) return `${trim(mant)}e${e < 0 ? "-" : "+"}${String(Math.abs(e)).padStart(2, "0")}`;
-  return trim(x.toFixed(14 - e));
-}
-
-/** 値が、型の親和性 a の列に入ったときに SQLite が入れる値。 */
-export function storedAs(v: Value, a: Affinity): Value {
+/**
+ * 値が、型の親和性 a の列に入ったときに SQLite が入れる値。Worker が SQLite と同じに作れない変換では undefined を返す。
+ *
+ * 今は、REAL を TEXT にする変換だけがそれに当たる。SQLite は `%!.15g` で書くが、15 桁への丸め方は版ごとのアルゴリズムで決まる
+ * (3.43 で変わった)。JS で写すと、1 つの値でも違えば、その行は Worker が思うのと別のシャードにある。写した関数は 1e14 を "1" と
+ * 書き (2026-11-13 の Codex の指摘 C8)、直した後も 15 桁目の丸めが SQLite と違った (test/key-conversions.test.ts)。
+ * 呼ぶ側は、その値では行の置き場所を絞らず、書き込みは基準経路に回して、変換を SQLite にさせる。
+ */
+export function storedAs(v: Value, a: Affinity): Value | undefined {
   if (v === null || v instanceof Uint8Array || a === "BLOB") return v;
   if (typeof v === "string") {
     if (a === "TEXT") return v;
@@ -56,7 +48,7 @@ export function storedAs(v: Value, a: Affinity): Value {
     return a === "REAL" ? toReal(n) : toNumeric(n);
   }
   // 数。整数の JS の数は INTEGER、それ以外は REAL (src/value.ts)。
-  if (a === "TEXT") return isIntegerValue(v) ? String(v) : realText(isReal(v) ? v.real : (v as number));
+  if (a === "TEXT") return isIntegerValue(v) ? String(v) : undefined;
   if (a === "REAL") return toReal(v);
   return toNumeric(v);
 }
@@ -95,7 +87,3 @@ export function keySql(exprs: string[]): string {
   return `json_array(${exprs.map((e) => `CASE typeof(${e}) WHEN 'blob' THEN json_object('$b', lower(hex(${e}))) WHEN 'real' THEN json(quote(${e})) ELSE ${e} END`).join(", ")})`;
 }
 
-/** 列に入る値のキー文字列。Worker が、文の中の値から行の置き場所を決めるときに使う。 */
-export function keyOfValues(values: Value[], affinities: Affinity[]): string {
-  return keyString(values.map((v, i) => storedAs(v, affinities[i] ?? "BLOB")));
-}

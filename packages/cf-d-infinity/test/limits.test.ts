@@ -41,7 +41,8 @@ describe("the size of a result", () => {
     const c = new SimCluster({ shards: 2 });
     await c.client().ddl(DOCS);
     for (let t = 1; t <= 12; t++) await new Db(c).query("INSERT INTO docs VALUES (?, 1, ?)", [t, text(100_000)]);
-    await expect(new Db(c, { limits: { bytes: 1_000_000 } }).query("SELECT * FROM docs")).rejects.toThrow(/bytes from one shard/);
+    // 予算は文全体の合計で、シャードの数で割らない (test/shard-limits.test.ts、計画書の不変条件 13)。
+    await expect(new Db(c, { limits: { bytes: 1_000_000 } }).query("SELECT * FROM docs")).rejects.toThrow(/result too large: the statement reads more than 1000000 bytes/);
     expect((await new Db(c).query("SELECT tenant_id FROM docs")).rows).toHaveLength(12);
   });
 
@@ -72,13 +73,14 @@ describe("the size of a result", () => {
 describe("the size of a transaction", () => {
   const big = Math.ceil(MAX_WRITE_SET_BYTES * 0.6);
 
-  it("is refused before commit on one shard, and nothing is applied", async () => {
+  // 上限は取引全体で数え、上限を超えさせた文で断る (Txn.atomically)。その文だけが取り消され、取引は続く (SQLite の文の誤りと同じ)。
+  it("is refused at the statement that crosses it on one shard, and nothing is applied when the transaction is dropped", async () => {
     const c = new SimCluster({ shards: 2 });
     await c.client().ddl(DOCS);
     const tx = await new Db(c).begin();
     await tx.query("INSERT INTO docs VALUES (1, 1, ?)", [text(big)]);
-    await tx.query("INSERT INTO docs VALUES (1, 2, ?)", [text(big)]);
-    await expect(tx.commit()).rejects.toThrow(/transaction too large/);
+    await expect(tx.query("INSERT INTO docs VALUES (1, 2, ?)", [text(big)])).rejects.toThrow(/transaction too large/);
+    await tx.unlockAll(); // ROLLBACK と同じく、取引を捨てる (書き込みはまだどのシャードにもない)
     expect(await count(c)).toBe(0);
     // ロックを残していないので、同じ行への次の書き込みは待たされない。
     const t0 = c.time;
@@ -99,16 +101,17 @@ describe("the size of a transaction", () => {
     expect((await new Db(c).query("SELECT sum(length(body)) AS n FROM docs")).rows).toEqual([{ n: big * 2 }]);
   });
 
-  it("is refused across shards before any participant keeps an intent", async () => {
+  it("is refused across shards at the statement, and the rest of the transaction commits", async () => {
     const c = new SimCluster({ shards: 2 });
     await c.client().ddl(DOCS);
     const [A, B] = [await tenantOn(c, "s0"), await tenantOn(c, "s1")];
     const tx = await new Db(c).begin();
     await tx.query("INSERT INTO docs VALUES (?, 1, 'small')", [A]);
     await tx.query("INSERT INTO docs VALUES (?, 1, ?)", [B, text(big)]);
-    await tx.query("INSERT INTO docs VALUES (?, 2, ?)", [B, text(big)]);
-    await expect(tx.commit()).rejects.toThrow(/transaction too large/);
-    expect(await count(c)).toBe(0);
+    await expect(tx.query("INSERT INTO docs VALUES (?, 2, ?)", [B, text(big)])).rejects.toThrow(/transaction too large/);
+    // 断った文の後も取引は続き、残りは確定する。
+    await tx.commit();
+    expect(await count(c)).toBe(2);
     expect(await quiescentProblems(c)).toEqual([]);
   });
 

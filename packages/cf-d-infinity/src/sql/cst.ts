@@ -2,6 +2,7 @@
 import { parse, show } from "sql-parser-cst";
 import type { Affinity, Value } from "../types";
 import { SqlError } from "../types";
+import { isReal, realOf } from "../value";
 
 // 公開 API にない内部の予約語表を直接直す。
 import { sqliteKeywords } from "sql-parser-cst/lib/keywords/sqlite.keywords.js";
@@ -170,10 +171,22 @@ export function affinityOf(type: string | null): Affinity {
 
 /** 列の型親和性で値を揃える。`id = '1'` と INSERT の 1 を同じシャードへ送るためである。 */
 
+/**
+ * 数の literal の値。SQLite は、小数点か指数のある literal と、64 ビットに収まらない整数の literal を REAL にする。
+ * パーサの value は JS の数なので、`5.0` は整数の 5 になる。整数の値の REAL は印を付けて返す (src/value.ts)。
+ * 付けないと、TEXT の列に入る値のキーが "5" になり、SQLite が入れる "5.0" と違うシャードを指す (2026-11-13 の Codex の指摘 C7)。
+ */
+function numberLiteral(text: string, value: number): Value {
+  if (/^0x/i.test(text)) return value;
+  if (/[.eE]/.test(text)) return realOf(value);
+  const big = BigInt(text);
+  return big > 2n ** 63n - 1n ? realOf(value) : value;
+}
+
 /** 定数として評価できるなら値を返す。 */
 export function constant(n: Node, values: Value[]): { value: Value } | null {
   switch (n?.type) {
-    case "number_literal": return { value: n.value };
+    case "number_literal": return { value: numberLiteral(n.text, n.value) };
     case "string_literal": return { value: n.value };
     case "null_literal": return { value: null };
     case "boolean_literal": return { value: n.value ? 1 : 0 };
@@ -183,6 +196,7 @@ export function constant(n: Node, values: Value[]): { value: Value } | null {
     case "prefix_op_expr": {
       if (n.operator !== "-" && n.operator !== "+") return null;
       const inner = constant(n.expr, values);
+      if (inner && isReal(inner.value)) return { value: n.operator === "-" ? realOf(-inner.value.real) : inner.value };
       if (!inner || typeof inner.value !== "number") return null;
       return { value: n.operator === "-" ? -inner.value : inner.value };
     }

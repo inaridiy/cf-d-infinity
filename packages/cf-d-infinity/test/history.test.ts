@@ -154,9 +154,13 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number) {
     }
   })();
   let splits = 0;
+  // 割る回数に上限を置く。書き手が動いている間ずっと割ると、悲観的な取引の実行のように長く続く実行では数百回割り、分割ごとに
+  // 全シャードへ版を適用させる費用がシャードの数に比例するので、全体で 2 乗に膨らむ (seed 207690027 で 581 回、RPC 17 万回。
+  // 計画書の未解決の問題 13)。本物の Autoscaler は、負荷の閾値を超えたときにしか割らない。
+  const MAX_SPLITS = 12;
   const grower = (async () => {
     let next = c.shardIds.length;
-    while (!stop && o.splits) {
+    while (!stop && o.splits && splits < MAX_SPLITS) {
       await c.sleep(25);
       const { routing } = await c.catalog();
       const list = shardsOf(routing);
@@ -259,7 +263,8 @@ describe("the simulator is deterministic for this workload", () => {
     const b = await run(o);
     expect(b.c.fingerprint()).toBe(a.c.fingerprint());
     expect(b.history.length).toBe(a.history.length);
-  });
+    // 同じ実行を 2 回流すので、単独でも 25 秒かかる (基準経路だけの実行)。既定の 30 秒では、ほかの試験と CPU を取り合うと落ちる。
+  }, 120000);
 });
 
 // 欠陥を戻して、検査が気付くことを確かめる。欠陥は最適化の経路の上で現れるものなので、基準経路だけの実行では流さない。
