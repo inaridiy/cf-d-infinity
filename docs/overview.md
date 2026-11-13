@@ -225,7 +225,7 @@ The checks are layered. Each one catches what the layer before it cannot see.
    implementation guards against, a fault switch puts the same bug back into the code, and a deterministic simulator
    test drives the model's counterexample step by step. The test checks that the switch produces the violation and the
    real code does not. Without it, a rare ordering is left to a random seed that may never produce it. The
-   [coverage table](../.agents/execplans/evidence/2026-11-12-model-coverage.md) maps every variant to its switch and replay.
+   [coverage table](./model-coverage.md) maps every variant to its switch and replay.
 3. **A deterministic simulator.** The real shard code runs on `node:sqlite` under simulated delays, clock skew,
    restarts and splits. Time, timers, randomness and transaction IDs come from the seed, so the same seed gives the
    same run, down to every RPC, and every failure is reproduced from its seed. Every statement a shard runs is checked

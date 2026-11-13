@@ -6,13 +6,16 @@ Durable Objects. Design: `docs/overview.md` (English). Development notes: `packa
 
 ## Read this first
 
-There is work in progress on the foundation. Before changing code, read the living plan:
+There is work in progress on the foundation. The living plan is kept on the owner's machine, not in the repository
+(`.agents/` is git-ignored):
 
     .agents/execplans/2026-11-10-foundation-rework.md
 
-It states the goal, the rules the owner set, the current design decisions, what is done, what is open, and the next
-step. It is written in Japanese. Keep it current: update it at milestones, direction changes and stopping points,
-in the same commit as the change. How plans are written here: `.agents/PLANS.md`.
+If you have it, read it before changing code. It states the goal, the rules the owner set, the current design
+decisions, what is done, what is open, and the next step. It is written in Japanese. Keep it current: update it at
+milestones, direction changes and stopping points. How plans are written here: `.agents/PLANS.md`. Without the plan,
+`docs/overview.md` describes the design and how it is checked, and `docs/model-coverage.md` maps every model
+counterexample to its fault switch and replay test.
 
 ## Rules set by the owner
 

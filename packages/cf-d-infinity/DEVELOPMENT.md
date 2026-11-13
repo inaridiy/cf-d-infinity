@@ -248,7 +248,7 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `test/determinism.test.ts` | ソースが時計、タイマー、乱数を直に呼ばないこと。同じ seed が同じ実行になること |
 | `test/open/` | 見つかっているが直していない欠陥の再現。正しい挙動を期待して書く。既定の実行から外してある (`OPEN=1`) |
 
-モデルの反例ごとの、欠陥のスイッチと、反例をシミュレータで決定的に流す試験の対応は、[.agents/execplans/evidence/2026-11-12-model-coverage.md](../../.agents/execplans/evidence/2026-11-12-model-coverage.md) にある。
+モデルの反例ごとの、欠陥のスイッチと、反例をシミュレータで決定的に流す試験の対応は、[docs/model-coverage.md](../../docs/model-coverage.md) にある。
 乱択の検査は `scripts/sweep.mjs` で seed を大量に流し、`scripts/fault-table.mjs` で欠陥のスイッチごとにどの検査が見つけるかを表にする。リポジトリの直下の `scripts/nightly.sh` が毎晩新しい seed で流す。`scripts/cloudflare-check.sh` は、一時的な Worker を本物の Cloudflare に置いて workerd の試験を流し、消す (持ち主に頼まれたときだけ流す)。`npm run demo` は、シャードを割りながら取引を続けて答えが変わらないことを見せる。
 
 `Faults` 型のスイッチは検証済みの欠陥を再導入する。

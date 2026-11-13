@@ -1,13 +1,11 @@
-# Model counterexamples, fault switches and deterministic replays (2026-11-12)
+# Model counterexamples, fault switches and deterministic replays
 
 For every `red` module in `specs/check.sh` (a model configuration that TLC must find a counterexample for), this table
 names the fault switch that puts the same flaw into the code and a deterministic simulator test that replays the
-scenario. It answers the owner's question of whether model checking can stand in front of the random tests: the
-models find the design flaws; the replays check that the implementation behaves on the dangerous orderings the
-models found, without waiting for a random seed to produce them (Decision Log 2026-11-12).
+scenario. The models find the design flaws; the replays check that the implementation behaves on the dangerous orderings the
+models found, without waiting for a random seed to produce them.
 
-Survey made read-only by a subagent on `fa1a2cd`; rows `m5b_red_range`, `m5b_red_p2_window`, `m3_red` and the
-`validateFromT` note were checked by hand. Test references are `packages/cf-d-infinity/test/<file>.test.ts:<line>`.
+Test references are `packages/cf-d-infinity/test/<file>.test.ts:<line>` or a test title.
 "fixed" means the test runs only the fixed code; "guard-only" means it checks the guard step, not the whole
 counterexample.
 
