@@ -6,7 +6,11 @@
 //
 // 材料を足すのは、保存の形式の版 (STORAGE_FORMAT) を上げたときだけである。新しい版の材料を書くには:
 //   WRITE_STORAGE_FIXTURE=1 npx vitest run test/upgrade.test.ts --project sim
-// 既にある版の材料は書き換えない。書き換えると、古い版のデータを開けることを確かめられなくなる。
+// 公開した版の材料は書き換えない。書き換えると、利用者のデータを開けることを確かめられなくなる。
+// 最初の公開 (npm への本物のリリース) の前は、版 1 の保存形式も自由に変えてよい (持ち主の決定、2026-11-13)。形式を変えたら、
+// 材料を作り直す:
+//   REWRITE_STORAGE_FIXTURE=1 WRITE_STORAGE_FIXTURE=1 npx vitest run test/upgrade.test.ts --project sim
+// 最初の公開の後は、REWRITE_STORAGE_FIXTURE を使わず、版を上げて移行を書く。
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
@@ -116,7 +120,9 @@ describe("data written by a released version", () => {
   if (process.env.WRITE_STORAGE_FIXTURE) {
     it(`writes the fixture for storage format ${STORAGE_FORMAT}`, async () => {
       const file = join(DIR, `format-${STORAGE_FORMAT}.json`);
-      if (existsSync(file)) throw new Error(`${file} exists; a released format's fixture is never rewritten`);
+      if (existsSync(file) && !process.env.REWRITE_STORAGE_FIXTURE) {
+        throw new Error(`${file} exists; a released format's fixture is never rewritten (before the first release, set REWRITE_STORAGE_FIXTURE=1)`);
+      }
       const c = await workload();
       const fixture: Fixture = {
         format: STORAGE_FORMAT,

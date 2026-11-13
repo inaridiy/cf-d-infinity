@@ -253,6 +253,15 @@ red     $f m16_red_intents_only committedApplies   # 本体の行だけの状態
 witness $f m16_green witnessBothApplied
 for m in m16_red_body_only m16_red_intents_only; do tests $f $m; done
 
+echo "== M17 txn id reuse (不変条件 12)"
+f=m17_txn_id_reuse.qnt
+green   $f m17_green safe
+red     $f m17_red_impl safe            # 2026-11 までの実装: 参加者も anchor も、同じ ID の別の続きを確かめない
+red     $f m17_red_prepare_only safe    # anchor が、同じ ID の決着があると、中身を見ずに結果を返す
+red     $f m17_red_commit_only safe     # 参加者が、同じ ID の intent があると、後の書き込みを捨てて ok と答える
+witness $f m17_green witnessOneCommittedOneRefused
+tests   $f m17_red_impl
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect

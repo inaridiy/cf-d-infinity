@@ -7,9 +7,10 @@ import { collectMetrics, decide, DEFAULTS, healthProblems, needsFollowUp, nextSh
 import { MetaCore, type Catalog, type SplitMove } from "./meta";
 import { planSplit, shardsOf } from "./routing";
 import { ShardCore } from "./shard/core";
-import { batonSealer, handlePipeline, serveHranaSocket, type PipelineReq } from "./client/hrana";
+import { batonSealer, handlePipeline, serveHranaSocket, type BatonSeal, type PipelineReq } from "./client/hrana";
 import { setSqlWasm } from "./sql/scratch";
 import { bindTyped, restoreColumns } from "./value";
+import { BadRequest, checkCount, checkSql, clusterName, ENTRY_LIMITS, readJson, sameToken, shardCount, shardName } from "./entry";
 import { checkProtocol, PROTOCOL_VERSION, type Backend, type Row, type ShardApi, type ShardHealth, type Value } from "./types";
 // @ts-expect-error wrangler と esbuild がバンドル時に解決する
 import sqlWasm from "./sql-wasm.wasm";
@@ -266,6 +267,9 @@ export class DinfMeta extends DurableObject<Env> {
   splits() {
     return this.core.splits();
   }
+  batonSecret() {
+    return this.core.batonSecret();
+  }
   finishLock(version: number, sql: string) {
     return this.core.finishLock(version, sql);
   }
@@ -510,7 +514,23 @@ function sessionCluster(env: Env): Cluster & { sweep(): void; close(): void } {
   };
 }
 
-const batonSeal = (env: Env) => batonSealer(env.DINF_BATON_SECRET ?? `baton:${env.DINF_API_TOKEN ?? ""}`);
+/**
+ * baton に署名する鍵。DINF_BATON_SECRET が設定されていればそれを、なければ Meta が乱数で作って保存した鍵を使う (isolate ごとに覚える)。
+ * データ用のトークンから鍵を作ってはならない (2026-11-12 の入口の安全の確認)。トークンを持つ人が、取引の状態を書き換えた baton
+ * を作れ、シャードはそれを信じるからである。
+ */
+let storedSeal: { name: string; seal: Promise<BatonSeal> } | null = null;
+const batonSeal = (env: Env, name = "shard"): Promise<BatonSeal> => {
+  if (env.DINF_BATON_SECRET) return Promise.resolve(batonSealer(env.DINF_BATON_SECRET));
+  if (storedSeal?.name !== name) {
+    const seal = env.DINF_META.getByName(name).batonSecret().then((secret) => batonSealer(secret));
+    seal.catch(() => {
+      if (storedSeal?.seal === seal) storedSeal = null;
+    });
+    storedSeal = { name, seal };
+  }
+  return storedSeal.seal;
+};
 
 function hranaSocket(request: Request, env: Env): Response {
   const offered = (request.headers.get("sec-websocket-protocol") ?? "").split(",").map((p) => p.trim());
@@ -521,10 +541,14 @@ function hranaSocket(request: Request, env: Env): Response {
   server.accept();
   const cluster = sessionCluster(env);
   const timer = setInterval(() => cluster.sweep(), SESSION_IDLE_MS);
+  // hello が期限までに届かない接続は閉じる (入口の安全の確認、指摘 4)。認証の前の接続が、資源を持ち続けないようにする。
+  const hello = setTimeout(() => server.close(1008, "hello timeout"), ENTRY_LIMITS.helloMs);
   serveHranaSocket(server, {
     authorize: (jwt) => authorized(env, "data", jwt),
+    onHello: () => clearTimeout(hello),
     open: () => dbOn(cluster, 0, slowSink(env)),
     onClose: () => {
+      clearTimeout(hello);
       clearInterval(timer);
       cluster.close();
     },
@@ -607,8 +631,9 @@ interface AdminReq {
 }
 
 async function admin(env: Env, path: string, b: AdminReq): Promise<unknown> {
-  const name = b.cluster ?? "shard";
-  const cluster = clusterOf(env, b.shards, name);
+  // 名前と数は Durable Object の名前と数になるので、形を確かめる (入口の安全の確認、指摘 8)。
+  const name = clusterName(b?.cluster);
+  const cluster = clusterOf(env, shardCount(b?.shards), name);
   const scaler = env.DINF_AUTOSCALER.getByName(name);
   switch (path) {
     case "/admin/ddl": {
@@ -617,7 +642,7 @@ async function admin(env: Env, path: string, b: AdminReq): Promise<unknown> {
       if (name === "shard") cached = null;
       return (await cluster.catalog()).version;
     }
-    case "/admin/split": return split(cluster, b.parent!, b.child!);
+    case "/admin/split": return split(cluster, shardName(name, b.parent), shardName(name, b.child));
     case "/admin/rowstats": {
       // 全シャードの内訳を合計する。同じ isolate の DO は表を共有するので、読んだら必ず消す。
       const cat = await cluster.catalog();
@@ -649,7 +674,8 @@ const bearer = (request: Request) => request.headers.get("authorization")?.repla
  */
 export function authorized(env: Env, kind: "data" | "admin", token: string | null): boolean {
   const want = kind === "data" ? env.DINF_API_TOKEN : env.DINF_ADMIN_TOKEN;
-  return !!want && token === want;
+  // 一定時間で比べる (入口の安全の確認、指摘 6)。
+  return !!want && token !== null && sameToken(token, want);
 }
 
 /** 本番の入口。計測用の入口は src/bench.ts が足す。 */
@@ -661,18 +687,25 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
   if (path.startsWith("/admin/")) {
     if (!authorized(env, "admin", bearer(request))) return new Response("unauthorized", { status: 401 });
     try {
-      return Response.json(await admin(env, path, (await request.json()) as AdminReq));
+      return Response.json(await admin(env, path, (await readJson(request)) as AdminReq));
     } catch (e) {
-      return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 });
+      return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: e instanceof BadRequest ? e.status : 400 });
     }
   }
   if (!authorized(env, "data", bearer(request))) return new Response("unauthorized", { status: 401 });
   if (path === "/v3" || path === "/v2") return new Response(null, { status: 200 });
-  if (path === "/v3/pipeline" || path === "/v2/pipeline") {
-    return Response.json(await handlePipeline((await request.json()) as PipelineReq, (token) => dbFor(env, token, background), batonSeal(env)));
-  }
   try {
-    const body = (await request.json()) as Statement & { token?: number; statements?: Statement[] };
+    if (path === "/v3/pipeline" || path === "/v2/pipeline") {
+      const req = (await readJson(request)) as PipelineReq;
+      checkCount(req?.requests?.length ?? 0, "pipeline requests");
+      return Response.json(await handlePipeline(req, (token) => dbFor(env, token, background), await batonSeal(env)));
+    }
+    const body = (await readJson(request)) as Statement & { token?: number; statements?: Statement[] };
+    if (body.sql !== undefined) checkSql(body.sql);
+    if (body.statements !== undefined) {
+      checkCount(body.statements.length, "statements");
+      for (const s of body.statements) checkSql(s.sql);
+    }
     const token = body.token ?? 0;
     if (path === "/ddl") {
       // SQL の DDL と同じ経路を通す。Meta だけを更新すると、全シャードへの適用、UNIQUE の重複検査、
@@ -693,7 +726,7 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
     }
     return new Response("not found", { status: 404 });
   } catch (e) {
-    return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 });
+    return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: e instanceof BadRequest ? e.status : 400 });
   }
 }
 

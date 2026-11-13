@@ -373,6 +373,10 @@ export interface Faults {
   ddlIgnoresIntents?: boolean;
   /** DROP の守りの確認 (unchanged) が、決着していない intent を変更として数えない (specs/m14_rebuild_guard.qnt の m14_red_no_drain の 2 つ目の守り)。 */
   unchangedIgnoresIntents?: boolean;
+  /** anchor が、同じ取引の ID の決着があると、指紋を見ずに前の結果を返す (specs/m17_txn_id_reuse.qnt の m17_red_prepare_only)。 */
+  commitIgnoresDigest?: boolean;
+  /** 参加者が、同じ取引の ID の intent があると、書き込みを比べずに ok と答える (specs/m17_txn_id_reuse.qnt の m17_red_commit_only)。 */
+  prepareKeepsFirst?: boolean;
   /** 増設の子が、親からグループを受け取るときに表定義を追いつかせない。 */
   childKeepsOldSchema?: boolean;
   /** 行ロックや intent を待った後で、表定義を確かめ直さない。待ちの間に作られた index を保守しない書き込みが通る。 */

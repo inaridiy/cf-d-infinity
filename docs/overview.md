@@ -216,16 +216,16 @@ the range table. See [scaling.md](./scaling.md) for the timestamp rules that kee
 
 The checks are layered. Each one catches what the layer before it cannot see.
 
-1. **Formal models.** Seventeen Quint models cover the risky protocol parts: commit and snapshot reads, read refresh, 2PC
+1. **Formal models.** Eighteen Quint models cover the risky protocol parts: commit and snapshot reads, read refresh, 2PC
    recovery, HLC across restarts, split fencing and live migration, row locks, garbage collection of transaction
    records, schema changes under concurrent transactions, building a cross-shard `UNIQUE` index, schema changes inside
-   transactions, table rebuilds, the ordering of schema changes and splits, and `UNIQUE` across pending writes. TLC explores them exhaustively on small
+   transactions, table rebuilds, the ordering of schema changes and splits, `UNIQUE` across pending writes, and a transaction id reused by two continuations. TLC explores them exhaustively on small
    instances. Each model has variants with a known bug put back, and the checker must find every one.
 2. **Counterexamples replayed against the code.** A model only checks the design. For each bug variant that the
    implementation guards against, a fault switch puts the same bug back into the code, and a deterministic simulator
    test drives the model's counterexample step by step. The test checks that the switch produces the violation and the
    real code does not. Without it, a rare ordering is left to a random seed that may never produce it. The
-   [coverage table](../.agents/execplans/evidence/2026-11-12-model-coverage.md) maps every variant to its switch and replay.
+   [coverage table](./model-coverage.md) maps every variant to its switch and replay.
 3. **A deterministic simulator.** The real shard code runs on `node:sqlite` under simulated delays, clock skew,
    restarts and splits. Time, timers, randomness and transaction IDs come from the seed, so the same seed gives the
    same run, down to every RPC, and every failure is reproduced from its seed. Every statement a shard runs is checked

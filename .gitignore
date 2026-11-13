@@ -11,3 +11,5 @@ specs/tmp/
 packages/cf-d-infinity/bench/results/*.history.json.gz
 .DS_Store
 .claude/worktrees/
+# 計画書と証拠は持ち主の計算機にだけ置く (2026-11-13、持ち主の決定)
+.agents/

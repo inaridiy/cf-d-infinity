@@ -11,6 +11,7 @@ import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { drizzleMigrationsTable } from "../src/binding";
+import { batonSealer } from "../src/client/hrana";
 import { ADD, INIT, REBUILD, migrations } from "./drizzle-fixtures";
 
 const LIVE = process.env.DINF_LIVE_URL?.replace(/\/$/, "");
@@ -79,8 +80,34 @@ describe("authentication and the production surface", () => {
     expect((await raw("/v3/pipeline", TOKEN, { baton: null, requests: [{ type: "close" }] })).status).toBe(200);
   });
 
+  it("refuses malformed or oversized requests and bad admin names before doing any work", async () => {
+    // 入口の安全の確認 (2026-11-12、指摘 5 と 8)。
+    const bad = await dispatch("/sql", { method: "POST", body: "{not json", headers: { authorization: `Bearer ${TOKEN}` } });
+    expect(bad.status).toBe(400);
+    const many = await raw("/v3/pipeline", TOKEN, { baton: null, requests: Array.from({ length: 1001 }, () => ({ type: "execute", stmt: { sql: "SELECT 1" } })) });
+    expect(many.status).toBe(413);
+    const tooMany = await raw("/batch", TOKEN, { statements: Array.from({ length: 1001 }, () => ({ sql: "SELECT 1" })) });
+    expect(tooMany.status).toBe(413);
+    expect((await raw("/admin/status", ADMIN, { cluster: "../../x" })).status).toBe(400);
+    expect((await raw("/admin/status", ADMIN, { shards: 1e9 })).status).toBe(400);
+    expect((await raw("/admin/split", ADMIN, { parent: "shard-0", child: "elsewhere-1" })).status).toBe(400);
+  });
+
   it("has no benchmark endpoint in the production build", async () => {
     expect((await raw("/bench", ADMIN, { op: "ping" })).status).not.toBe(200);
+  });
+
+  it("refuses a baton signed with a key derived from the data token", async () => {
+    // 署名の鍵は、データ用のトークンから計算できてはならない。計算できると、トークンを持つ人が、取引の状態を自由に書き換えた
+    // baton を作れ、シャードはそれを信じる (2026-11-12 の入口の安全の確認)。直す前の鍵は `baton:<DINF_API_TOKEN>` だった。
+    const first = (await (await raw("/v3/pipeline", TOKEN, { baton: null, requests: [{ type: "execute", stmt: { sql: "BEGIN" } }] })).json()) as { baton: string };
+    const payload = first.baton.slice(0, first.baton.lastIndexOf("."));
+    const forged = await batonSealer(`baton:${TOKEN}`).seal(payload);
+    const res = (await (await raw("/v3/pipeline", TOKEN, { baton: forged, requests: [{ type: "execute", stmt: { sql: "SELECT 1" } }] })).json()) as {
+      results: { error?: { code: string } }[];
+    };
+    expect(res.results[0]!.error?.code).toBe("BATON_INVALID");
+    await raw("/v3/pipeline", TOKEN, { baton: first.baton, requests: [{ type: "execute", stmt: { sql: "ROLLBACK" } }] });
   });
 
   it("rejects a tampered baton", async () => {

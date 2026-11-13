@@ -65,6 +65,7 @@
     "@libsql/client": "^0.18.0",
     "@types/node": "^24.0.0",
     "@types/sql.js": "^1.4.11",
+    "drizzle-kit": "0.31.11",
     "drizzle-orm": "0.45.4",
     "esbuild": "^0.25.0",
     "miniflare": "4.20260730.0",

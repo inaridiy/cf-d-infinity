@@ -1,6 +1,5 @@
 # D∞ (cf-d-infinity)
 
-[![npm version](https://img.shields.io/npm/v/cf-d-infinity/alpha.svg?color=007acc)](https://www.npmjs.com/package/cf-d-infinity)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
 
@@ -51,14 +50,17 @@ Distributed SQL systems such as CockroachDB, TiDB, YugabyteDB and Spanner bring 
 - **Scales past one database.** Tables are spread over up to 4,096 hash slots, and a shard can be split online. The autoscaler watches every shard and, once you opt in with `DINF_AUTOSCALE = "split"`, splits hot or large ones itself. One shard takes ~950 single-shard writes/s; 64 shards reached 18,784 writes/s. Transactions that span shards are far slower: about 44–60 per second per shard (see [When not to use it](#when-not-to-use-it)).
 - **SQLite semantics, not a reimplementation.** Each shard is SQLite, and cross-shard statements re-run the original SQL in a WebAssembly SQLite inside the Worker. All 8,884 queries of sqllogictest `select1`–`select5` match.
 - **Pay per row, no instance to size.** Durable Object pricing: 2 billed rows per single-row `UPDATE`, $0.20 per GB-month. When nothing is happening, the only activity is the autoscaler waking each shard once a minute.
-- **Checked, not only claimed.** Seventeen formal models whose counterexamples are replayed against the code, a deterministic fault-injecting simulator, differential tests against real SQLite on every execution path, and Elle-style black-box checks against production Cloudflare while Durable Objects crash and shards split.
+- **Checked, not only claimed.** Eighteen formal models whose counterexamples are replayed against the code, a deterministic fault-injecting simulator, differential tests against real SQLite on every execution path, and Elle-style black-box checks against production Cloudflare while Durable Objects crash and shards split.
 
 ## Quick start
 
-Run `init` in a Workers project, the directory that holds your `wrangler.jsonc`. (For a project that uses the [`cf` CLI](https://developers.cloudflare.com/cf/) and `cloudflare.config.ts`, see [Wrangler and cf](#wrangler-and-cf).) The database becomes part of that Worker: its configuration lives in `wrangler.jsonc`, its version in `package.json`, and one `wrangler dev` runs both. You need Node 20 or later; local development needs no Cloudflare account.
+> **Not on npm yet.** `cf-d-infinity` and `create-cf-d-infinity` are reserved on npm with an empty 0.0.0 placeholder; the first real release will be announced here. Until then, try D∞ from a clone of this repository (see the demo above and [Develop](#develop)).
+
+After the first release, run `init` in a Workers project, the directory that holds your `wrangler.jsonc`. (For a project that uses the [`cf` CLI](https://developers.cloudflare.com/cf/) and `cloudflare.config.ts`, see [Wrangler and cf](#wrangler-and-cf).) The database becomes part of that Worker: its configuration lives in `wrangler.jsonc`, its version in `package.json`, and one `wrangler dev` runs both. You need Node 20 or later; local development needs no Cloudflare account.
 
 ```sh
-npx create-cf-d-infinity@alpha init    # edits wrangler.jsonc and package.json, writes src/dinf.ts
+# after the first npm release:
+# npx create-cf-d-infinity@alpha init    # edits wrangler.jsonc and package.json, writes src/dinf.ts
 npm install
 npx wrangler dev
 ```
@@ -281,8 +283,8 @@ Rows are placed by `hash(shard key)`; the shard key defaults to the first primar
 
 None of the following is a proof of the implementation:
 
-- **Formal models** ([specs/](specs/README.md)): seventeen Quint models of the risky protocol parts (the newest cover building a cross-shard `UNIQUE` index, schema changes inside transactions, table rebuilds, and the ordering of schema changes and shard splits), exhaustively checked with TLC on small instances. Each has variants with a known bug re-introduced, and TLC finds every one.
-- **Model counterexamples replayed against the code**: for each re-introduced bug that the implementation guards against, a fault switch puts the bug back into the code, and a deterministic simulator test drives the model's counterexample step by step. It checks that the switch produces the violation and the real code does not. All 69 such variants are replayed; the other 9 model design alternatives the code does not use ([the table](.agents/execplans/evidence/2026-11-12-model-coverage.md)).
+- **Formal models** ([specs/](specs/README.md)): eighteen Quint models of the risky protocol parts (the newest cover building a cross-shard `UNIQUE` index, schema changes inside transactions, table rebuilds, and the ordering of schema changes and shard splits), exhaustively checked with TLC on small instances. Each has variants with a known bug re-introduced, and TLC finds every one.
+- **Model counterexamples replayed against the code**: for each re-introduced bug that the implementation guards against, a fault switch puts the bug back into the code, and a deterministic simulator test drives the model's counterexample step by step. It checks that the switch produces the violation and the real code does not. All 72 such variants are replayed; the other 9 model design alternatives the code does not use ([the table](docs/model-coverage.md)).
 - **Simulator**: the real shard code runs on `node:sqlite` under simulated delays, clock skew, restarts and splits, with a serializability checker over the history.
 - **Black-box checks** (Elle-style list-append): run in the simulator and against production Cloudflare while Durable Objects are crashed, shards split and code redeployed. The latest production run (10 minutes, 38 crashes, 22,798 commits) found no anomaly; earlier runs found three real bugs, including an undocumented Durable Object limit of 5 terms per compound `SELECT`.
 - **Compatibility**: sqllogictest (`select1`–`select5` in full, ~174,000 further queries), differential fuzzing against real SQLite (200 seeds), and a generator that sends typed arguments through a stock `@libsql/client` and compares values and `typeof` with SQLite. The differential suites (not the large sqllogictest set) run three times: as planned, with every scan gathered, and with every statement on the reference path.
@@ -304,6 +306,7 @@ None of the following is a proof of the implementation:
 - **No region control.** A shard is created near the Worker that first reaches it and never moves, so latency grows with distance from there.
 - **Stability.** The storage formats are listed in [docs/storage-format.md](docs/storage-format.md) and will be frozen with the first release. Data written by format 1 is kept as a test fixture that every later version must open, read, write, split and migrate. A release that does not understand a newer format refuses to open it and says so. The admin API may still change.
 - **Splitting a shard cannot be undone or cancelled, so automatic splitting is opt-in.** By default the autoscaler only records that a shard should be split (`npx cf-d-infinity status` shows `would-split`); set the var `DINF_AUTOSCALE` to `"split"` to let it act. Splitting has been measured with 128 shard-key groups per shard, not with millions. A shard-key group larger than 16 MB cannot be moved, and a split that meets one stops with an error naming it. Such a split also keeps holding the maintenance slot, so every schema change waits (and after 60 seconds asks to be retried) until the group is made smaller; `status` lists the splits in progress under `splits`. A statement that reads a whole table is retried for under a second and then fails while a split is still moving data.
+- **Request limits.** An HTTP body is at most 8 MB, a request carries at most 1,000 statements (a `/batch`, a Hrana pipeline or a Hrana batch), and a statement is at most 1 MB of text. A WebSocket message is at most 8 MB, a socket opens at most 64 streams and stores at most 1,000 statements, and its `hello` must arrive within 10 seconds. Larger requests are refused with status 413 (or close code 1009 on a WebSocket) before any work is done.
 - **The schema is fetched from one Durable Object.** Each Worker isolate caches it for 2 seconds and refetches on the request path, so that object is a dependency of every request.
 
 ## Develop

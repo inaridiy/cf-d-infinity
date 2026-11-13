@@ -172,6 +172,19 @@ export class MetaCore {
     return last?.build || last?.guard ? last : null;
   }
 
+  /**
+   * Hrana の baton に署名する鍵。DINF_BATON_SECRET が設定されていないときに使う。最初に呼ばれたときに乱数で作って保存し、
+   * 以後は同じ値を返す。データ用のトークンから計算できる鍵だと、トークンを持つ人が取引の状態を書き換えた baton を作れる。
+   * 乱数は Runtime の uuid (本番は crypto.randomUUID、122 ビットの乱数) を 2 つつなげる。
+   */
+  batonSecret(): string {
+    const have = this.b.exec(`SELECT v FROM __meta WHERE k = 'baton_secret'`)[0]?.v as string | undefined;
+    if (have) return have;
+    const secret = `${this.rt.uuid()}${this.rt.uuid()}`;
+    this.b.exec(`INSERT INTO __meta(k, v) VALUES ('baton_secret', ?) ON CONFLICT(k) DO NOTHING`, secret);
+    return this.b.exec(`SELECT v FROM __meta WHERE k = 'baton_secret'`)[0]!.v as string;
+  }
+
   private splitSlots(): SplitSlot[] {
     const r = this.b.exec(`SELECT v FROM __meta WHERE k = 'splits'`)[0];
     return r ? (JSON.parse(r.v as string) as SplitSlot[]) : [];

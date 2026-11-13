@@ -118,8 +118,10 @@ sql.js は `process.versions.node` があると Node で動いているとみな
 確定したのに適用できない取引、30 秒を超えて決着を待つ intent、失敗を繰り返す再駆動、シャードごとに違う保存形式が対象である。
 
 保存形式の版は `STORAGE_FORMAT` (`src/types.ts`) で、シャードと Meta の `__meta` の `format` に書く。
-内部の表の形や意味を互換でない形で変えるときに上げる。
-版が新しすぎる DO は、起動時に `storage format too new` で拒否する。古いコードに書き換えさせないためである。
+固める形式と作り直せる形式の一覧は [docs/storage-format.md](../../docs/storage-format.md) にある。
+内部の表の形や意味を互換でない形で変えるときは、版を上げ、1 つ前の版から進める移行を `STORAGE_MIGRATIONS` に足し、古い版の材料を `test/fixtures/storage/` に残す。
+材料は、決まった作業負荷を流した Meta と全シャードの SQLite を `quote()` で SQL に写したもので、`test/upgrade.test.ts` が今のコードでそこから起動して確かめる。公開した版の材料は書き換えない。最初の公開 (npm への本物のリリース) の前は、版 1 の形式も自由に変えてよく、変えたら `REWRITE_STORAGE_FIXTURE=1 WRITE_STORAGE_FIXTURE=1 npx vitest run test/upgrade.test.ts --project sim` で材料を作り直す。
+DO は起動するときに、古い版のデータへ移行を順に流す。移行のない古い版と、新しすぎる版 (`storage format too new`) は、起動を拒否する。
 
 `export` は利用者が実行した DDL (`schemaSql`) と、各表の行 (`exportRows`) を SQL にする。
 行はシャードごとに主キーの順で読み、時点はそろえない。移動の途中のシャードがあれば断る。
@@ -192,7 +194,9 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `src/sql/ddl.ts` | DDL の解釈、index の配置 |
 | `src/sql/scratch.ts` | Worker の中の SQLite (sql.js) |
 | `src/sql/cst.ts` | パーサのラッパー |
-| `src/meta.ts` | 表定義、DDL 履歴、範囲表 |
+| `src/meta.ts` | 表定義、DDL 履歴、範囲表、index の作成と書き込み禁止の期限、保守の操作の枠 |
+| `src/value.ts` | 値の格納の型 (INTEGER と REAL)。束縛の関数 `bindTyped` (DO、シミュレータ、Worker の SQLite の 3 つの Backend が通す) |
+| `src/keys.ts` | キー文字列を作る関数 (`keyString` と、trigger の中の `keySql`)。SQLite の型の親和性を写す `storedAs` |
 | `src/routing.ts` | 4,096 スロットの範囲表 |
 | `src/autoscaler.ts` | 増設の判断と手順 |
 | `src/analytics.ts` | 変更ログの収集と watermark |
@@ -235,6 +239,17 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `test/elle-sim.test.ts` | 黒箱検査をシミュレータで回す。欠陥スイッチを入れた実装で異常を検出すること |
 | `test/bench-build.test.ts` | 計測用の構成。障害注入を挟んだ負荷と黒箱検査 |
 | `test/analytics.test.ts` | 変更ログから DuckDB まで |
+| `test/replay.test.ts` | 並行に流した文を、確定の時刻の順に 1 つの SQLite で再生し、1 文ずつ結果が同じこと (取引の中の DDL を含む) |
+| `test/typed-diff.test.ts` | 型のある引数を @libsql/client から流し、値と `typeof` を node:sqlite と比べる。`test/storage-class.test.ts`、`test/key-affinity.test.ts` も値の型とキー |
+| `test/upgrade.test.ts` | 保存形式の版ごとの材料 (`test/fixtures/storage/`) から起動して、答え、書き込み、分割、表定義の変更が通ること |
+| `test/unique-index-build.test.ts`、`test/rebuild-guard.test.ts`、`test/txn-across-schema-change.test.ts`、`test/migration-tools.test.ts`、`test/split-slot.test.ts` | 表定義の変更の安全 (モデル M12 から M15) と、本物の Drizzle の移行 |
+| `test/drizzle-kit.test.ts` | 本物の drizzle-kit が作った移行を、Drizzle の移行で流す |
+| `test/closed-stream-locks.test.ts`、`test/unique-pending-cost.test.ts`、`test/add-column-mixed-scan.test.ts` | 2026-11-12 に直した欠陥の再現 |
+| `test/determinism.test.ts` | ソースが時計、タイマー、乱数を直に呼ばないこと。同じ seed が同じ実行になること |
+| `test/open/` | 見つかっているが直していない欠陥の再現。正しい挙動を期待して書く。既定の実行から外してある (`OPEN=1`) |
+
+モデルの反例ごとの、欠陥のスイッチと、反例をシミュレータで決定的に流す試験の対応は、[docs/model-coverage.md](../../docs/model-coverage.md) にある。
+乱択の検査は `scripts/sweep.mjs` で seed を大量に流し、`scripts/fault-table.mjs` で欠陥のスイッチごとにどの検査が見つけるかを表にする。リポジトリの直下の `scripts/nightly.sh` が毎晩新しい seed で流す。`scripts/cloudflare-check.sh` は、一時的な Worker を本物の Cloudflare に置いて workerd の試験を流し、消す (持ち主に頼まれたときだけ流す)。`npm run demo` は、シャードを割りながら取引を続けて答えが変わらないことを見せる。
 
 `Faults` 型のスイッチは検証済みの欠陥を再導入する。
 本番の DO は `faults` を渡さないので、すべて無効のまま動く。
