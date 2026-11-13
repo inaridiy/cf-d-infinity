@@ -8,7 +8,7 @@ import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import { ident, parseStatements, text, type Node, type Params } from "../sql/cst";
 import { keyString } from "../keys";
-import { fromTyped, typedScalarSql } from "../value";
+import { fromTyped } from "../value";
 import { sha256Text } from "../sha256";
 import { SHARD_LIMITS, isShardLimit, withinShardLimits } from "../shard-limits";
 import { scanSql, untypedOf, SCHEMA_STATEMENTS, findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
@@ -1365,10 +1365,18 @@ export class Db {
       }
       // 列の DEFAULT は、ADD COLUMN では既存の行へ行イメージを作らずに入る。2^53 を超える整数の DEFAULT は、行イメージの確かめ
       // (src/shard/rows.ts) を通らないので、ここで値を計算して断る (計画書の K1、2026-11-13 の Codex の 2 回目の見直し、指摘 5)。
+      // 値は、同じ宣言の型の列に SQLite 自身に入れさせてから読む。型の親和性で、文字列の既定値 ('9007199254740993') も整数になる
+      // (Codex の 3 回目の確かめ)。
       for (const def of parsed.defs ?? []) {
-        for (const col of w.raw(`SELECT name, dflt_value FROM pragma_table_info(?) WHERE dflt_value IS NOT NULL`, def.name).values) {
-          const row = w.raw(typedScalarSql(`(${col[1] as string})`)).values[0];
-          fromTyped(row?.[1] ?? null, row?.[0], `the DEFAULT of ${def.name}.${col[0] as string}`);
+        for (const col of w.raw(`SELECT name, type, dflt_value FROM pragma_table_info(?) WHERE dflt_value IS NOT NULL`, def.name).values) {
+          w.exec(`CREATE TEMP TABLE "__dinf_default"(v ${(col[1] as string) || ""})`);
+          try {
+            w.exec(`INSERT INTO "__dinf_default" VALUES (${col[2] as string})`);
+            const row = w.raw(`SELECT typeof(v), v FROM "__dinf_default"`).values[0];
+            fromTyped(row?.[1] ?? null, row?.[0], `the DEFAULT of ${def.name}.${col[0] as string}`);
+          } finally {
+            w.exec(`DROP TABLE "__dinf_default"`);
+          }
         }
       }
     } finally {

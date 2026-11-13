@@ -80,12 +80,15 @@ describe("integers beyond 2^53", () => {
       const db = new Db(new SimCluster({ shards }));
       await db.ddl("CREATE TABLE d(id INTEGER PRIMARY KEY, v TEXT)");
       await db.query("INSERT INTO d VALUES (1, 'a')");
-      for (const dflt of ["9007199254740993", "(1 << 60)", "-9223372036854775808"]) {
+      // 文字列で書いた既定値も、INTEGER の列の型の親和性で整数になる (Codex の 3 回目の確かめ、指摘 5 の残り)。
+      for (const dflt of ["9007199254740993", "(1 << 60)", "-9223372036854775808", "'9007199254740993'", "' 9007199254740993 '"]) {
         await expect(db.ddl(`ALTER TABLE d ADD COLUMN w INTEGER DEFAULT ${dflt}`)).rejects.toThrow(/^unsupported: an INTEGER beyond/);
-        await expect(db.ddl(`CREATE TABLE e${shards}(id INTEGER PRIMARY KEY, w DEFAULT ${dflt})`)).rejects.toThrow(/^unsupported: an INTEGER beyond/);
+        await expect(db.ddl(`CREATE TABLE e${shards}(id INTEGER PRIMARY KEY, w INTEGER DEFAULT ${dflt})`)).rejects.toThrow(/^unsupported: an INTEGER beyond/);
       }
+      // TEXT の列の文字列の既定値は文字列のまま入るので、断らない。
+      await db.ddl("ALTER TABLE d ADD COLUMN t TEXT DEFAULT '9007199254740993'");
       await db.ddl("ALTER TABLE d ADD COLUMN w INTEGER DEFAULT 9007199254740991");
-      expect((await db.query("SELECT id, w FROM d")).rows).toEqual([{ id: 1, w: 9007199254740991 }]);
+      expect((await db.query("SELECT id, t, w FROM d")).rows).toEqual([{ id: 1, t: "9007199254740993", w: 9007199254740991 }]);
     }
   });
 });
