@@ -7,7 +7,7 @@ import { collectMetrics, decide, DEFAULTS, healthProblems, needsFollowUp, nextSh
 import { MetaCore, type Catalog, type SplitMove } from "./meta";
 import { planSplit, shardsOf } from "./routing";
 import { ShardCore } from "./shard/core";
-import { batonSealer, handlePipeline, serveHranaSocket, type PipelineReq } from "./client/hrana";
+import { batonSealer, handlePipeline, serveHranaSocket, type BatonSeal, type PipelineReq } from "./client/hrana";
 import { setSqlWasm } from "./sql/scratch";
 import { bindTyped, restoreColumns } from "./value";
 import { checkProtocol, PROTOCOL_VERSION, type Backend, type Row, type ShardApi, type ShardHealth, type Value } from "./types";
@@ -266,6 +266,9 @@ export class DinfMeta extends DurableObject<Env> {
   splits() {
     return this.core.splits();
   }
+  batonSecret() {
+    return this.core.batonSecret();
+  }
   finishLock(version: number, sql: string) {
     return this.core.finishLock(version, sql);
   }
@@ -510,7 +513,23 @@ function sessionCluster(env: Env): Cluster & { sweep(): void; close(): void } {
   };
 }
 
-const batonSeal = (env: Env) => batonSealer(env.DINF_BATON_SECRET ?? `baton:${env.DINF_API_TOKEN ?? ""}`);
+/**
+ * baton に署名する鍵。DINF_BATON_SECRET が設定されていればそれを、なければ Meta が乱数で作って保存した鍵を使う (isolate ごとに覚える)。
+ * データ用のトークンから鍵を作ってはならない (2026-11-12 の入口の安全の確認)。トークンを持つ人が、取引の状態を書き換えた baton
+ * を作れ、シャードはそれを信じるからである。
+ */
+let storedSeal: { name: string; seal: Promise<BatonSeal> } | null = null;
+const batonSeal = (env: Env, name = "shard"): Promise<BatonSeal> => {
+  if (env.DINF_BATON_SECRET) return Promise.resolve(batonSealer(env.DINF_BATON_SECRET));
+  if (storedSeal?.name !== name) {
+    const seal = env.DINF_META.getByName(name).batonSecret().then((secret) => batonSealer(secret));
+    seal.catch(() => {
+      if (storedSeal?.seal === seal) storedSeal = null;
+    });
+    storedSeal = { name, seal };
+  }
+  return storedSeal.seal;
+};
 
 function hranaSocket(request: Request, env: Env): Response {
   const offered = (request.headers.get("sec-websocket-protocol") ?? "").split(",").map((p) => p.trim());
@@ -669,7 +688,7 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
   if (!authorized(env, "data", bearer(request))) return new Response("unauthorized", { status: 401 });
   if (path === "/v3" || path === "/v2") return new Response(null, { status: 200 });
   if (path === "/v3/pipeline" || path === "/v2/pipeline") {
-    return Response.json(await handlePipeline((await request.json()) as PipelineReq, (token) => dbFor(env, token, background), batonSeal(env)));
+    return Response.json(await handlePipeline((await request.json()) as PipelineReq, (token) => dbFor(env, token, background), await batonSeal(env)));
   }
   try {
     const body = (await request.json()) as Statement & { token?: number; statements?: Statement[] };
