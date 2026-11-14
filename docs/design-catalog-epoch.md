@@ -42,7 +42,7 @@ DDL の版と事後の取り消し (`revokeDdl`、逆操作の SQL `undo`)、シ
 ```ts
 /** Meta の列の 1 行。epoch は行の番号で、1 から始まる。 */
 type EpochRecord =
-  | { kind: "prepare"; mode: "plain" | "trial" | "build" | "guard"; ddl: ParsedDdl; fence: string[]; staging: string[] }
+  | { kind: "prepare"; mode: "plain" | "trial" | "build" | "guard"; ddl: ParsedDdl; fence: string[]; staging?: { sql: string[]; defs: TableDef[] } }
   | { kind: "commit"; of: number; at?: Ts }
   | { kind: "abort"; of: number; reason: string }
   | { kind: "move-start"; from: string; to: string; start: number; end: number }
@@ -51,7 +51,7 @@ type EpochRecord =
 
 - `prepare.ddl` は、今の `DdlEntry` が運ぶもの (シャードで実行する文、表定義、Worker の SQLite で再生する文) である。実行するのは `commit` を適用するときで、`prepare` では実行しない。
 - `prepare.fence` は、書き込み禁止にする表である。行か形が、`prepare` から `commit` まで変わってはならない表を入れる (表を消す、名前を変える、列を足す、行を確かめる、行を読んで index を作る)。新しい表を作るだけの DDL では空になる。
-- `prepare.staging` は、`prepare` を適用したシャードが作る内部の表の名前である。`build` の `__gidx_<index>` だけが使う。
+- `prepare.staging` は、`prepare` を適用したシャードが作る内部の表 (作る文と表定義) である。`build` の `__gidx_<index>` だけが使う。進める側は、`commit` の前に、この表へ項目を書く。`abort` を適用したシャードは、`defs` の名前で表を消す。
 - `commit.of`、`abort.of`、`move-end.of` は、終える遷移を始めた epoch である。
 - `commit.at` は、index を公開する `commit` が運ぶ時刻である (今の `DdlEntry.at`、M12 の時計のモデル)。
 
@@ -114,6 +114,9 @@ Meta、シャード、Worker が同じ関数を使い、M21 の遷移の条件�
 | `build` | 行のある表への、シャードをまたぐ UNIQUE の index | 適用したこと | 止まった行を読み、項目を書く。読んだ時刻の最大を `commit.at` に載せる (今の `buildIndex`) |
 | `guard` | 取引が読んだ表の DROP TABLE | 適用したこと | 取引が読んだ範囲に、読んだ時刻より後の変更がないことを、各シャードに確かめる (今の `unchanged`) |
 
+`fence` が空なのは、CREATE TABLE、CREATE VIEW、DROP VIEW、DROP INDEX、行で失敗しない CREATE INDEX である。
+ほかの DDL は、対象の表を `fence` に入れる。
+
 `trial` の試し方は、rollback-read と同じ形である (`ShardCore.rollback`、`src/shard/core.ts:1379`)。
 表は書き込み禁止なので、試した結果は `commit` の適用まで変わらない。
 `commit` を適用するシャードは、同じ文をもう一度、今度は残す形で実行する。
@@ -172,6 +175,7 @@ index を作っている間に同じ表の DROP が確定すると、index の `
 | `move-start` | なし (intent は決着させない。行と一緒に運ぶ) | 自分が `from` なら `__fenced` に、`to` なら `__incoming` に行を足す。`__epoch` に書く |
 | `move-end` | なし | `__epoch` に書く |
 
+`prepare` の適用が intent の決着を待っている間、そのシャードは、古い `schema` の新しい要求を受けない (今の `ensureSchema` の `schemaChange` の確認、`src/shard/core.ts:440`)。受けると intent が増え続けて、禁止を掛けられない。
 表定義の記録は、移動の途中のシャードでは適用しない (今と同じ)。Meta が並べないので、起きるのは Meta の条件が破れたときだけである。
 
 遅れているシャードと、分割で生まれたシャードは、`prepare` と、その `abort` を続けて見ることがある。
@@ -269,13 +273,16 @@ try {
 ```
 
 `prepared` はシャードの新しい入口で、その epoch まで列を適用し、`trial` なら文を試して、結果を返す。
-`syncSchema` (`src/shard/core.ts:1274`) は `syncEpoch` になり、Autoscaler が子に `move-start` を知らせるのと、`commit` の後で禁止を早く解くのに使う。
 自分のスナップショットで、その遷移がもう開いていなければ (先に `abort` が記録された)、`stale epoch` で断る。
 `commit` の後で全シャードへ適用させる手は、正しさには要らない。禁止を早く解くために、今と同じく送ってよい。
+その手と、Autoscaler が子に `move-start` を知らせる手には、`syncSchema` (`src/shard/core.ts:1274`) を `syncEpoch` に改めて使う。
 
 重複のある列への UNIQUE を記録の前に調べる `Db.checkUnique` は、`trial` の試適用に含まれるので、なくなる。
 Worker のキャッシュは、今の `Db.cached` (`src/client/db.ts:1239`) がスナップショットを持つだけで、捨てる条件 (`not owner:`、`migrating`、`stale` で始まる誤り、`TableLocked` の後の取り直し) は変えない。
 取引は、最初に読むか書くかしたときのスナップショットを確定まで使う (`Txn.catalog`、`src/client/db.ts:630`)。今と同じである。
+範囲表だけが進んだ後も、取引は古いスナップショットのまま進む。
+動いていない行への文は、そのシャードが移動の記録を適用していても通る (M21 の `witnessPinnedSurvives`)。
+動いた区間に触った文は、今と同じく `not owner:` で失敗し、利用者が取引をやり直す。
 
 ## 今の仕組みとの対応
 
@@ -293,6 +300,15 @@ Worker のキャッシュは、今の `Db.cached` (`src/client/db.ts:1239`) が�
 | 範囲表の切り替え (`switchRange`、`Routing.version`) | `move-start` の記録。範囲表の版は epoch |
 | 親の fence (`fence` の RPC) | 親が `move-start` を適用すること |
 | 分割の再開 (`splitsToResume`) | `moves()` の一覧から。再開は、子に epoch を知らせるだけになる |
+
+逆操作の文 (`undo`) を作っている 4 か所は、次のように置き換わる。
+
+| `undo` を作っている所 | 今の逆操作 | 変更後 |
+|---|---|---|
+| シャード内の index (`createIndex`、`src/sql/ddl.ts:261`) | `DROP INDEX IF EXISTS` | `trial`。`prepare` は index を作らず、試すだけである。`abort` に文はない |
+| シャードをまたぐ UNIQUE の index (`createIndex`、`src/sql/ddl.ts:273`) | `DROP TABLE __gidx_<index>` と、行の側の index の `DROP INDEX` | `build`。`prepare` は空の `__gidx_<index>` だけを作り (`staging`)、`abort` を適用したシャードが名前で消す。行の側の index (`__gidx_<index>__rows`) は、`commit` の文に移す。一意でない index なので、行で失敗しない |
+| ADD COLUMN (`alterTable`、`src/sql/ddl.ts:359`) | 捕捉の trigger を消し、`DROP COLUMN` し、trigger を作り直す | `trial`。`abort` に文はない |
+| DROP の前の禁止 (`lockTables`、`src/meta.ts:448`) | 空の `undo` (取り消せる版であることの印) | `guard`。`abort` が禁止を解く |
 
 ## 止まったときに誰が終えるか
 
@@ -424,7 +440,7 @@ M21 は、最新の epoch で計画した要求を、その epoch の持ち主�
 
 - 表定義の遷移の条件は、どれも外すと破れる。書き込み禁止、intent の決着、`prepare` を適用した後の確かめ、全シャードの ok、終わり方は 1 つ、開くのは 1 つ、の 6 つである。
 - 行で失敗し得る DDL (`CHECK` の場面) は、古い `schema` の要求を断らなくても、待ちの後で確かめ直さなくても、`commit` を適用できる (`m21_check_no_reject`)。守っているのは、書き込み禁止と、適用した後の表そのもの (SQLite が制約を確かめる) である。版の確認が要るのは、計画の作り方が変わる DDL (index) である。
-- 表定義の遷移と移動の排他は、両方向とも要る。移動の途中に `prepare` を記録する形 (`m15_red_no_slot` の後継) と、遷移が開いている間に `move-start` を記録する形 (`m15_red_no_based_on` の後継) は、どちらも `servable` を破る。
+- 表定義の遷移と移動の排他は、両方向とも要る。移動の途中に `prepare` を記録する形 (`m15_red_no_slot` と同じ形) と、遷移が開いている間に `move-start` を記録する形 (`m15_red_no_based_on` の後継) は、どちらも `servable` を破る。
 - M15 の残りの 2 つの赤 (`stale_begin`、`late_start`) は、形がなくなる。子は列を順に適用するので、親より古い表定義で受け取り始められず、枠を取る手と始める手の間がないので、期限切れの後に始まることがない。
 
 確かめていないこと。
