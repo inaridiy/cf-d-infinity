@@ -384,6 +384,89 @@ witness $f m20_green witnessChildWrote                  # 揃った後で、子�
 witness $f m20_green_child_reads_parent witnessChildWroteEarly
 for m in m20_green m20_red_piecewise m20_red_piecewise_note m20_red_late_intent m20_red_child_early m20_red_child_reads_parent_per_piece; do tests $f $m; done
 
+echo "== M21 catalog epoch (Meta の版と排他を、1 本の epoch の列と、2 相の遷移にまとめる。実装より先に書いたモデル)"
+f=m21_catalog_epoch.qnt
+green   $f m21_green_build epochSafe                    # 行のある表に、シャードをまたぐ UNIQUE の index を作る。取引 2 件が、どの epoch のスナップショットでも計画する
+green   $f m21_green_check epochSafe                    # 行で失敗し得る DDL。各シャードが、書き込みを止めた表で試してから確定する (事後の取り消しの代わり)
+green   $f m21_green_ddl2 epochSafe                     # 同時に出された 2 つの DDL。表定義の遷移は 1 つずつ開く
+green   $f m21_green_drop epochSafe                     # 取引が読んだ表の DROP。copy の後の書き込みがあれば取り消す
+green   $f m21_green_split epochSafe                    # 移動と DDL。分割を進める側は、start の後ならいつ止まってもよい
+green   $f m21_green_split_txns epochSafe               # 移動の前後のスナップショットの取引 2 件。動かない行の取引は、分割の記録を適用したシャードでも通る
+green   $f m21_check_no_reject commitApplies            # 外しても破れない条件: 行で失敗し得る DDL は、版の確認がなくても、確定を適用できる
+# BUILD の場面 (M12 と、M11 のうち Meta の仕組みに依る赤)
+red     $f m21_red_online indexMatches                  # 2026-11 までの設計 (作りながら書く)。他人の項目を消す (m12_red_online)
+red     $f m21_red_online notRelied
+red     $f m21_red_no_fence indexMatches                # 書き込みを止めない (m12_red_no_lock、m11_impl_backfill)
+red     $f m21_red_visible notRelied                    # 作っている最中の index を計画が使う (m12_red_visible)
+red     $f m21_red_no_drain noWriteWhileFenced          # intent を持ったまま表定義の記録を適用する (m12_red_no_drain、m11_impl_inflight)
+red     $f m21_red_stale indexMatches                   # 古い表定義の計画を断らない (m12_red_stale、m11_red_no_reject)
+red     $f m21_red_stale noServeBelowAck
+red     $f m21_red_two_exits oneExit                    # 取り消された後に commit が通る (m12_red_two_exits)
+red     $f m21_red_two_exits indexMatches
+red     $f m21_red_repin indexMatches                   # 取引が、計画し直さずに新しい表定義の epoch を名乗る (m12_red_repin、m13_red_repin)
+red     $f m21_red_repin pinned
+red     $f m21_red_scan_early indexMatches              # prepare を適用する前のシャードの行を読んで埋める (m12_red_scan_early)
+red     $f m21_red_scan_early noServeBelowAck
+red     $f m21_red_no_recheck indexMatches              # 待ちの後で版を確かめ直さない (m11_impl_wait)。ok と答えた prepare より古い計画を受ける
+red     $f m21_red_no_recheck noServeBelowAck
+red     $f m21_red_early_commit indexMatches            # 全シャードの ok を待たずに commit を記録する (m11_red_early_public)
+# CHECK の場面 (取り消しの代わりが頼る条件)
+red     $f m21_red_trial_no_fence commitApplies         # 試適用の間、書き込みを止めない
+red     $f m21_red_trial_missing_ack commitApplies      # 全シャードの ok を待たずに commit を記録する
+red     $f m21_red_trial_early commitApplies            # prepare を適用する前のシャードが、試適用に ok と答える
+red     $f m21_red_trial_no_drain commitApplies         # intent を持ったまま prepare を適用する
+# DROP の場面 (M14 と、M11 の作り直し)
+red     $f m21_red_drop_no_fence guardHolds             # 確かめるが、書き込みを止めない (m14_red_no_lock)
+red     $f m21_red_drop_no_check guardHolds             # 書き込みは止めるが、確かめない (m14_red_no_check)
+red     $f m21_red_drop_check_early guardHolds          # prepare を適用する前に確かめる (m14_red_check_early)
+red     $f m21_red_drop_no_drain guardHolds             # intent を決着させずに適用する (m14_red_no_drain)
+red     $f m21_red_drop_no_drain noResurrect            # 同上。DROP を適用したシャードに、書き込みが適用される (m11_impl_drop)
+red     $f m21_red_drop_untied guardHolds               # 期限切れで禁止が解けた後に、DROP の commit が通る (m14_red_untied)
+red     $f m21_red_drop_missing_ack noLostAfterReturn   # 全シャードが prepare を適用する前に、DDL が完了を返す (m11_red_no_sync)
+red     $f m21_red_two_open commitApplies               # 表定義の遷移を 2 つ開く: index を作っている間に、同じ表の DROP が確定する
+# 移動の場面 (M15 と、未解決の問題 17)
+red     $f m21_red_ddl_during_move servable             # 移動が開いている間に、表定義の遷移を開く (m15_red_no_slot)
+red     $f m21_red_move_during_ddl servable             # 表定義の遷移が開いている間に、移動を開く (m15_red_no_based_on の後継)
+red     $f m21_red_end_early servable                   # 子が受け取り終える前に end を記録する (m15_red_early_release)
+red     $f m21_red_pull_unfenced moveKeepsWrites        # pull が start の epoch を運ばない: 親が、fence の前に行を渡す
+red     $f m21_red_pull_unfenced readConsistent
+red     $f m21_red_pull_unfenced sameShape
+red     $f m21_red_fence_first servable                 # いまの実装: 親の fence が、範囲表の切り替えより先の別の手である (未解決の問題 17)
+red     $f m21_red_owner_unchecked moveKeepsWrites      # シャードが、所有を自分のスナップショットで引かない
+red     $f m21_red_owner_unchecked readConsistent
+red     $f m21_red_strict_epoch pinnedSurvives          # シャードが、epoch が等しいことを求める: 分割が、動いていない行の取引を巻き込む
+witness $f m21_green_build witnessPublicThenWrite
+witness $f m21_green_build witnessAbortedOnDuplicate
+witness $f m21_green_build witnessRefusedByFence
+witness $f m21_green_build witnessLiftedAfterStall      # 進める側が止まった後、Meta が取り消し、その後の書き込みが通る
+witness $f m21_green_check witnessTrialRejectedThenWrite    # 試適用が通らずに取り消され、その後の書き込みが通る (逆操作の文なしで)
+witness $f m21_green_check witnessCheckCommittedThenWrite
+witness $f m21_green_ddl2 witnessBothCommitted
+witness $f m21_green_ddl2 witnessBuildAfterRejectedCheck
+witness $f m21_green_drop witnessDroppedAfterWrites
+witness $f m21_green_drop witnessGuardRefused
+witness $f m21_green_split witnessServedWhileDriverDead # 進める側が止まっていても、子への書き込みが通る (end の前)
+witness $f m21_green_split witnessEndedDriverDead
+witness $f m21_green_split witnessDdlAfterMove
+witness $f m21_green_split witnessMoveAfterDdl
+witness $f m21_green_split witnessParentAnswersUncut    # 親が、start を適用した後で、まだ渡していない行の読みに答える (M19)
+witness $f m21_green_split_txns witnessPinnedSurvives   # 分割より前のスナップショットの取引が、分割の記録を適用したシャードで通る
+# 時刻に依る 2 つの性質 (M12 の公開の時刻と、M14 の確かめが比べる時刻を、epoch の言葉に直した小さなモデル)
+green   $f m21_clock_green commitIsAPoint
+red     $f m21_clock_red_no_clock commitIsAPoint        # commit が時刻を運ばない (m12_clock_red_no_clock)
+red     $f m21_clock_red_skip_empty commitIsAPoint      # 行のないシャードを読まない (m12_clock_red_skip_empty)
+witness $f m21_clock_green witnessAwareOnSlowShard
+green   $f m21_guard_green guardSafe
+red     $f m21_guard_red_commit_ts noLostWrite          # copy の確定の時刻と比べる (m14_red_commit_ts)
+witness $f m21_guard_green witnessDroppedAfterWrites
+witness $f m21_guard_green witnessRefusedByCheck
+for m in m21_green_build m21_green_check m21_green_drop m21_green_split m21_green_split_txns \
+         m21_red_online m21_red_no_fence m21_red_visible m21_red_no_drain m21_red_stale m21_red_two_exits m21_red_repin m21_red_scan_early \
+         m21_red_no_recheck m21_red_early_commit m21_red_trial_no_fence m21_red_trial_missing_ack m21_red_trial_early m21_red_trial_no_drain \
+         m21_red_drop_no_fence m21_red_drop_no_check m21_red_drop_check_early m21_red_drop_no_drain m21_red_drop_untied m21_red_drop_missing_ack \
+         m21_red_two_open m21_red_ddl_during_move m21_red_move_during_ddl m21_red_end_early m21_red_pull_unfenced m21_red_fence_first \
+         m21_red_owner_unchecked m21_red_strict_epoch m21_clock_red_no_clock m21_clock_red_skip_empty m21_guard_red_commit_ts; do tests $f $m; done
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect
