@@ -5,7 +5,10 @@
 #   witness: 到達可能性 (not(到達したい状態) を invariant にして違反 = 成功。vacuous でないことの確認)
 #   test:  run (決定的な反例・到達トレース) が通る
 #   inductive: Apalache で帰納的不変条件を確認 (M4)
+#   live:  TLC で時相の性質 (活性) を確かめる (M19)
 # 使い方: cd specs && ./check.sh            (HEAVY=1 ./check.sh で NTXN=3 の M1 も回す)
+#   TLC_CONFIG=<file> ./check.sh で、TLC の heap と worker の数を JSON で渡す (例: { "maxHeap": "-Xmx2500m", "workers": 8 })。
+#   quint は TLC を -Xmx8G で起動する。コマンド行の指定なので、JAVA_TOOL_OPTIONS では下がらない
 set -u
 cd "$(dirname "$0")"
 # TLC には Java 17 以上が要る。specs/.tools/jdk に置いてあればそれを使い、なければ PATH の java を使う。
@@ -14,11 +17,13 @@ if [ -d "$PWD/.tools/jdk" ]; then export JAVA_HOME="$PWD/.tools/jdk" PATH="$PWD/
 pass=0; fail=0
 ok()   { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf '  FAIL %s\n' "$1"; }
+tlc_config=()
+if [ -n "${TLC_CONFIG:-}" ]; then tlc_config=(--tlc-config="$TLC_CONFIG"); fi
 
 # verify_expect <expected: ok|violation> <file> <module> <invariant>
 verify_expect() {
   local expect=$1 file=$2 mod=$3 inv=$4 out
-  out=$(npx quint verify --backend=tlc --main="$mod" --invariant="$inv" "$file" 2>&1)
+  out=$(npx quint verify --backend=tlc ${tlc_config[@]+"${tlc_config[@]}"} --main="$mod" --invariant="$inv" "$file" 2>&1)
   local states
   states=$(printf '%s\n' "$out" | grep -oE '[0-9,]+ distinct states found' | tail -1)
   case "$expect" in
@@ -31,6 +36,21 @@ verify_expect() {
 green()   { verify_expect ok "$@"; }
 red()     { verify_expect violation "$@" "red     "; }
 witness() { verify_expect violation "$@" "witness "; }
+# live_expect <expected: ok|violation> <file> <module> <temporal property>
+live_expect() {
+  local expect=$1 file=$2 mod=$3 prop=$4 out
+  out=$(npx quint verify --backend=tlc ${tlc_config[@]+"${tlc_config[@]}"} --main="$mod" --temporal="$prop" "$file" 2>&1)
+  local states
+  states=$(printf '%s\n' "$out" | grep -oE '[0-9,]+ distinct states found' | tail -1)
+  case "$expect" in
+    ok)
+      if printf '%s\n' "$out" | grep -q '\[ok\] No violation found'; then ok "live     $mod $prop ($states)"; else bad "live     $mod $prop"; printf '%s\n' "$out" | tail -5; fi ;;
+    violation)
+      if printf '%s\n' "$out" | grep -q '\[violation\]'; then ok "live red $mod $prop ($states)"; else bad "live red $mod $prop (no violation found)"; printf '%s\n' "$out" | tail -5; fi ;;
+  esac
+}
+live()     { live_expect ok "$@"; }
+live_red() { live_expect violation "$@"; }
 tests() {
   local file=$1 mod=$2 out
   out=$(npx quint test --main="$mod" "$file" 2>&1)
@@ -288,6 +308,48 @@ witness $f m18_green witnessIntentMovedThenApplied
 witness $f m18_green_chunks witnessHalfArrived
 witness $f m18_green_chunks witnessReadWhileMoving      # 移動の途中でも、claim を piece で分け直せばテナントの読みが揃う
 for m in m18_green m18_green_clock m18_green_chunks m18_red_partial_answer m18_red_child_partial m18_red_answer_held m18_red_piece_without_clock m18_red_write_by_slot m18_red_intents_by_group; do tests $f $m; done
+
+echo "== M19 claim resplit (移動の途中のテナントの読みを、claim を piece で分け直して通す)"
+f=m19_claim_resplit.qnt
+green   $f m19_green resplitSafe                        # 断る応答が piece の表を運び、Worker が claim を分け直す。取引 X あり。最初の claim は範囲表のとおり
+green   $f m19_green_clock resplitSafe                  # 答えた読みの時刻を覚えて、noWriteBelowRead を確かめる
+green   $f m19_green_any resplitSafe                    # 最初の claim の分け方は任意 (古い表の控え)。取引 X なし
+green   $f m19_green_any_x resplitSafe                  # 同上で、取引 X が、移る piece 2 つに書く
+live    $f m19_live readTerminates                      # 活性: あきらめなければ、読みはいつか揃う。新しい piece を切る手に公平性は置かない
+red     $f m19_red_stale_map readConsistent             # P が、分け直した claim を、いまの表で確かめずに答える (読みの T より古い表)
+red     $f m19_red_stale_map answeredOnlyHeld
+red     $f m19_red_mixed_t readAtSomeT                  # T を上げたときに、古い T の答えを残して合わせる
+red     $f m19_red_gap readConsistent                   # 分け直した claim の間に抜けがある (区間の終わりを含めない)
+red     $f m19_red_forget_map boundedRetries            # Worker が P の表を忘れる: 飛んでいる piece を、P と C が断り続ける
+live_red $f m19_live_red_child_waits readTerminates     # C が、claim の全部が届くまで断らずに待つ (M18 までの規則): 移動が止まると読みが終わらない
+red     $f m19_live_red_child_waits readNotStuck
+red     $f m19_red_piece_without_clock noWriteBelowRead # piece が時刻を運ばない
+witness $f m19_green witnessResplitWhileMoving          # 移動の途中の読みが、分け直した後で、両方のシャードの答えで揃う
+witness $f m19_green witnessResplitTwice                # 読みの間に piece が移り、P に 2 度断られてから揃う
+witness $f m19_green witnessDoneWhilePieceFlying        # 揃った時点で、切られて飛んでいる piece がある
+witness $f m19_green witnessRestartedThenDone           # T を上げて聞き直してから揃う
+witness $f m19_green witnessXSeenOnBoth                 # 分け直した読みが、P の答えと C の答えの両方に X の行を見る
+witness $f m19_green witnessRetryMaxReached             # 断られる回数の上限はきつい
+witness $f m19_green_any witnessRetryMaxReached
+for m in m19_green m19_green_clock m19_green_any m19_red_stale_map m19_red_mixed_t m19_red_gap m19_red_forget_map m19_live_red_child_waits m19_red_piece_without_clock; do tests $f $m; done
+
+echo "== M20 unique piecewise (グループを piece に分けて運ぶ間の UNIQUE。不変条件 2)"
+f=m20_unique_piecewise.qnt
+green   $f m20_green uniqueSafe                         # 親は、グループの最初の piece を切る前に、グループの intent を決着させる
+green   $f m20_green_per_piece uniqueSafe               # 決着させるのを、切る piece の中の intent だけにしても破れない
+green   $f m20_green_child_reads_parent uniqueSafe      # 子が、揃う前でも、親に残る行と合わせて確かめる。グループの全部を決着させる規則の下でだけ成り立つ
+red     $f m20_red_piecewise committedApplies           # 決着させずに切る: piece ごとに適用され、確定した取引が適用できなくなる
+green   $f m20_red_piecewise uniqueVisible              # 同上。見える状態は UNIQUE を守ったままで、破れるのは適用だけである
+red     $f m20_red_late_intent uniqueVisible            # fence の後も、親が intent を受ける
+red     $f m20_red_late_intent committedApplies
+red     $f m20_red_child_early uniqueVisible            # 子が、グループが揃う前に、手元の行だけで確かめて受ける
+red     $f m20_red_child_early committedApplies
+red     $f m20_red_child_reads_parent_per_piece uniqueVisible   # 親に残る行と合わせて確かめても、切る piece の中だけを決着させる規則では破れる
+witness $f m20_green witnessCrossAppliedThenMoved       # 2 つの piece にまたがる取引が適用され、グループが 2 つの piece で子へ移る
+witness $f m20_green witnessFirstCutWaited              # 未決着の取引の決着を待ってから、最初の piece を切る
+witness $f m20_green witnessChildWrote                  # 揃った後で、子が UNIQUE の値を書く取引を受ける
+witness $f m20_green_child_reads_parent witnessChildWroteEarly
+for m in m20_green m20_red_piecewise m20_red_piecewise_note m20_red_late_intent m20_red_child_early m20_red_child_reads_parent_per_piece; do tests $f $m; done
 
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
