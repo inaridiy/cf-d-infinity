@@ -190,7 +190,7 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `src/shard/kernel.ts` | シャードの核。状態を読み書きするのは、ここだけである (rollback-read、検証、anchor 2PC、回復、ライブ移動)。同期で、async の関数を持たない (`test/determinism.test.ts` が確かめる)。要求は、同期の 1 歩 (`xxxStep`) で処理する。1 歩は、frame (待ちをまたいで残るデータ) を見て、終えるか、待ちたいこと (Effect) を返す。待ちの後の確かめ直し (表定義の版、範囲の持ち主) は `enter` にだけあり、文の実行と検証は `enter` が返す印を受け取る。印は frame に入れられないので、待ちの後へ持ち越せない |
 | `src/shard/core.ts` | シャードの殻 (`ShardCore`)。核の 1 歩を呼び、返った待ち (相手のシャード、Meta、保存先の確定、行ロック、タイマー) を実行して、同じ 1 歩を先頭から呼び直す。状態は持たない (待ちの合流のための Promise だけを持つ) |
 | `src/shard/step.ts` | 核と殻の間の型 (Effect、Step、Fork) |
-| `src/shard/rows.ts` | 行の適用と set-based undo |
+| `src/shard/rows.ts` | 行イメージ (表定義の列の順のタプル) の読み書き、行の適用と set-based undo、変更の捕捉 (共有の `__cap` に書く trigger) |
 | `src/client/db.ts` | Worker 側の入口。OCC の取引、経路決定、scatter |
 | `src/client/d1.ts` | D1 互換 API |
 | `src/client/hrana.ts` | Hrana over HTTP と WebSocket、baton の署名 |
@@ -200,8 +200,9 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `src/sql/lexer.ts`、`parser.ts`、`printer.ts` | SQLite の方言の字句解析、構文解析、文面への出し直し |
 | `src/sql/cst.ts` | 構文木の入口。解析の前の書き換え、引数の束縛、定数の読み取り |
 | `src/meta.ts` | 表定義、DDL 履歴、範囲表、index の作成と書き込み禁止の期限、保守の操作の枠 |
-| `src/value.ts` | 値の格納の型 (INTEGER と REAL)。束縛の関数 `bindTyped` (DO、シミュレータ、Worker の SQLite の 3 つの Backend が通す) |
-| `src/keys.ts` | キー文字列を作る関数 (`keyString` と、trigger の中の `keySql`)。SQLite の型の親和性を写す `storedAs` |
+| `src/value.ts` | 値の格納の型 (INTEGER と REAL)。束縛の関数 `bindTyped` (DO、シミュレータ、Worker の SQLite の 3 つの Backend が通す)。行イメージの要素とタプル (`tupleSql`、`decodeElem`) と、要素を今の値に戻す橋 `fromTypedValue` |
+| `src/keys.ts` | キー文字列を作る関数 (`keyStringExact`) と読み戻す関数 (`keyValues`、`keyParams`)。SQLite の型の親和性を写す `storedAs` |
+| `src/sql/depth.ts` | 式の木の深さの見積もり (DO の SQLite の上限は 100)。表を作るときに、D∞ が作る文を確かめる |
 | `src/routing.ts` | 範囲表と、行の置き場所の計算。置き場所は token (region、65,536 個の slot、その中の 65,536 個の subslot を並べた 40 ビットの整数) で、範囲表は token の区間をシャードに対応させる。いまの区間は、どれも両端が slot の境目にある ([docs/design-subslots.md](../../docs/design-subslots.md) の段 1) |
 | `src/autoscaler.ts` | 増設の判断と手順 |
 | `src/analytics.ts` | 変更ログの収集と watermark |

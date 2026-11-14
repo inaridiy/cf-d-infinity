@@ -10,7 +10,7 @@
 // ここでは、文の字句から、その深さを多めに見積もる。演算子の優先順位は parse.y のとおりに読む。SQLite が高さを数えない節
 // (値の組 (a, b) の中身、BETWEEN の上端と下端、COLLATE の下) も数えるので、SQLite より大きく出ることはあるが、小さく出ないように
 // 作ってある。sqlite3 3.45.1 の CLI (`.limit expr_depth`) と突き合わせて確かめた (2026-11-14)。D∞ が作る文の形 (行イメージの文、
-// 走査、AND と OR の鎖) では一致するか 1 から 2 大きく、乱択の式 600 個では一度も小さくなかった。test/expression-depth.test.ts が
+// 走査、AND と OR の鎖) では一致するか 1 から 2 大きく、乱択の式 (異なる文 799 個) では一度も小さくなかった。test/expression-depth.test.ts が
 // その一部を持つ。見積もりは、表を作るときに D∞ が作る文を確かめるのに使う (Db.assertReplays)。利用者の文の判定には使っていない。
 import { tokenize, type Token } from "./lexer";
 

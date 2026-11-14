@@ -10,6 +10,7 @@ import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 // @ts-expect-error -- JavaScript のモジュール
 import { workerBundle } from "../scripts/esbuild-options.mjs";
+import { STORAGE_FORMAT } from "../src/types";
 
 const run = promisify(execFile);
 const CLI = resolve("bin/cli.js");
@@ -179,7 +180,7 @@ describe("the cf-d-infinity command", () => {
     const json = JSON.parse((await cli(["status", "--json", ...to])).stdout);
     expect(json.problems).toEqual([]);
     expect(json.health).toHaveLength(4);
-    expect(json.health[0]).toMatchObject({ format: 1, intents: 0, unapplied: 0, redriveErrors: [] });
+    expect(json.health[0]).toMatchObject({ format: STORAGE_FORMAT, intents: 0, unapplied: 0, redriveErrors: [] });
   });
 
   it("exports schema and rows as SQL, and imports them into an empty database with the same contents", async () => {

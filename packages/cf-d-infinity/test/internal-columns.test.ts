@@ -11,6 +11,7 @@
 import { describe, expect, it } from "vitest";
 import { split } from "../src/autoscaler";
 import { Db } from "../src/client/db";
+import { handlePipeline, type PipelineReq } from "../src/client/hrana";
 import { encode, typedScanList } from "../src/shard/rows";
 import { INTERNAL_COLUMN_PREFIXES, isInternalColumn } from "../src/sql/ddl";
 import type { TableDef } from "../src/types";
@@ -80,5 +81,23 @@ describe("internal column names", () => {
     await split(c, "s1", "s3");
     expect(await read()).toEqual(want);
     expect((await db.query(`SELECT count(*) AS n FROM m WHERE "$f" = 9e999`)).rows).toEqual([{ n: 4 }]);
+  });
+
+  it("uses such columns in a Hrana transaction whose writes travel in the baton", async () => {
+    // baton は取引の書き出しを JSON にし、`{"$b": ...}` の印を BLOB に戻して読む (src/client/hrana.ts)。取引が溜めた行イメージも
+    // baton に入るので、列名が印と同じ行が印と取り違えられないことを、要求をまたぐ取引で確かめる。
+    const c = new SimCluster({ shards: 2 });
+    await new Db(c).ddl(`CREATE TABLE m(id INTEGER PRIMARY KEY, "$b", "$f")`);
+    const step = (baton: string | null, sql: string[]) =>
+      handlePipeline({ baton, requests: sql.map((s) => ({ type: "execute", stmt: { sql: s } })) } as PipelineReq, async (token) => new Db(c, { token })) as Promise<{
+        baton: string | null; results: { type: string; error?: { message: string } }[];
+      }>;
+    const begun = await step(null, ["BEGIN", ...Array.from({ length: 6 }, (_, i) => `INSERT INTO m VALUES (${i + 1}, x'0${i}ff', 9e999)`)]);
+    expect(begun.results.filter((r) => r.type !== "ok")).toEqual([]);
+    const done = await step(begun.baton, [`UPDATE m SET "$f" = -9e999 WHERE id <= 3`, "COMMIT"]);
+    expect(done.results.filter((r) => r.type !== "ok")).toEqual([]);
+    await c.settle();
+    expect((await new Db(c).query(`SELECT id, "$b", "$f" FROM m ORDER BY id`)).rows).toEqual(
+      Array.from({ length: 6 }, (_, i) => ({ id: i + 1, $b: new Uint8Array([i, 255]), $f: i < 3 ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY })));
   });
 });

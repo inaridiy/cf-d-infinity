@@ -66,7 +66,7 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 | 主キーの列に NULL のある行 | 断る。SQLite は INTEGER でない主キーに NULL をいくつでも入れられるが、行を主キーの値で名指しするので区別できない。`INTEGER PRIMARY KEY` に NULL を渡すと rowid が入るのは SQLite と同じである |
 | 書き込みの文の中の `sqlite_master` と PRAGMA の関数 (`pragma_table_info(...)` など) | 断る。読みの文の中なら、利用者の表定義について答える (シャードの内部の表は見えない) |
 | shard key を含まない、UNIQUE の部分 index と式の index | 断る (`unsupported:`)。シャードをまたぐ UNIQUE の index の表は、列の値だけで項目を作るからである |
-| 名前が `$` か `__dinf_` で始まる列、`__dinf_` で始まる表 | 断る (`unsupported:`)。行イメージの JSON の印 (`{"$b": ...}`) と、Worker が文に足す列の別名に使う。同じ名前の列があると、行を印と取り違える |
+| 名前が `__dinf_` で始まる列と表 | 断る (`unsupported:`)。Worker とシャードが文に足す列の別名に使う。同じ名前の列があると、足した列が利用者の列を上書きする。`$` で始まる列名は、行イメージが列名を持たなくなったので使える (2026-11-14) |
 
 ### DO の SQLite の制限
 

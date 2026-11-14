@@ -1,6 +1,6 @@
 # 保存と通信の形式
 
-状態：Early 版で固める形式の一覧 (2026-11-12)。2026-11-14 に、行の置き場所を token の区間にした ([design-subslots.md](./design-subslots.md))
+状態：Early 版で固める形式の一覧 (2026-11-12)。2026-11-14 に、行の置き場所を token の区間にした ([design-subslots.md](./design-subslots.md))。同じ日に、行イメージをタプルにし、キー文字列の数の書き方を決めた ([design-values.md](./design-values.md) の段 2。保存の形式の版 2、通信の版 4)
 
 D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker と Durable Object のあいだを RPC でつなぐ。
 公開した後に新しい版を置くと、古い版が書いたデータを新しい版が開き、古い版と新しい版の Worker と Durable Object がしばらく混ざって動く。
@@ -8,7 +8,7 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 
 形式は 3 つに分ける。
 
-- **固定**：Early 版から変えない。変えるときは、保存の形式の版 (`STORAGE_FORMAT`、`src/types.ts`) を上げ、1 つ前の版から進める移行を `STORAGE_MIGRATIONS` に足し、更新の試験 (`test/upgrade.test.ts`) に古い版のデータを残す (`test/fixtures/storage/format-<版>.json`。公開した版の材料は書き換えない。最初の公開の前は、版 1 の形式も変えてよく、材料を作り直す)。DO は起動するときに、古い版のデータへ移行を順に流す。古い版のコードは、新しい版のデータを開くと起動を拒否する (`checkStorageFormat`)。
+- **固定**：Early 版から変えない。変えるときは、保存の形式の版 (`STORAGE_FORMAT`、`src/types.ts`) を上げ、1 つ前の版から進める移行を `STORAGE_MIGRATIONS` に足し、更新の試験 (`test/upgrade.test.ts`) に古い版のデータを残す (`test/fixtures/storage/format-<版>.json`。公開した版の材料は書き換えない)。DO は起動するときに、古い版のデータへ移行を順に流す。古い版のコードは、新しい版のデータを開くと起動を拒否する (`checkStorageFormat`)。最初の公開の前は後方互換を持たない。形式を変えたら材料を作り直し、古い版のデータを読み違える変更なら版を上げて、移行を書かずに古い版の材料を消す (版 2 で、版 1 の材料を消した)。移行のない古い版のデータは、起動を拒否する。
 - **版で守る**：互換でない変更は、通信の版 (`PROTOCOL_VERSION`、`MIN_PROTOCOL_VERSION`) を上げて行う。シャードは受け付ける範囲の版だけを処理する。
 - **作り直せる**：失っても、作り直すか、利用者がやり直せば済む。版を上げずに変えてよい。
 
@@ -17,12 +17,12 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 | 形式 | 中身 | 区分 |
 |---|---|---|
 | 値の型 | 整数の JS の数は INTEGER、整数でない数は REAL、整数の値の REAL は `{ "real": 数 }` (`src/value.ts`) | 固定 |
-| キー文字列 | 主キーと shard key の値の並びを JSON にしたもの (`src/keys.ts` の `keyString`)。INTEGER の 5 と REAL の 5.0 は同じ `5`。BLOB は `{"$b":"小文字の 16 進"}`、無限大は `{"$f":"Infinity"}`。値は列の型の親和性で揃えてから作る (`storedAs`) | 固定 |
+| キー文字列 | 主キーと shard key の値の並びを JSON にしたもの (`src/keys.ts` の `keyStringExact`)。INTEGER は、桁数に関わらず 10 進の数字で書く。REAL は、整数の値で 64 ビットの整数の範囲にあればその整数の数字で、そうでなければ `JSON.stringify` の表記で書く。INTEGER の 5 と REAL の 5.0 は同じ `5`。BLOB は `{"$b":"小文字の 16 進"}`、無限大は `{"$f":"Infinity"}`。値は列の型の親和性で揃えてから作る (`storedAs`)。読み戻すときは `keyValues` が数字の桁を落とさずに読む | 固定 |
 | 行の置き場所 (token) | `token = region × 2^32 + slot × 2^16 + subslot` の 40 ビットの整数 (`src/routing.ts`)。region はいまは 0 で、行ごとに置く地域を決める拡張のために 8 ビットを空けてある。slot は、shard key のキー文字列の hash (FNV-1a と murmur3 の finalizer、32 ビット) の上位 16 ビット。subslot は、主キーのキー文字列の同じ hash の下位 16 ビット。表の名前は混ぜない。行ごとに保存するものはない。同じ shard key の行は、連続した 65,536 個の token (その slot のブロック) に載る | 固定 |
 | 範囲 | token の半開区間 `[start, end)`。範囲表、読む範囲の claim、範囲の移動の要求、分割の枠が、この形で範囲を運ぶ | 固定 |
 | 位置 (`Pos`) | グループの中の行の位置。`[表の名前, 主キーのキー文字列]` で、表の名前の順、表の中は主キーの順に並ぶ。端は `null`。表の列には、JSON の文字列で書く (端は `null` の 4 文字) | 固定 |
 | 時刻 (`Ts`) | 物理の ms × 1024 + 論理のカウンタ (`src/hlc.ts`)。2^53 に収まる | 固定 |
-| 行イメージと変更 (`Change`) | `{ table, pk, sk, before, after }`。行は列名から値への object を JSON にしたもの (`src/shard/rows.ts` の `encode`)。BLOB と無限大は上と同じ印、整数の値の REAL は `{ "real": 数 }` | 固定 |
+| 行イメージと変更 (`Change`) | `{ table, pk, sk, before, after }`。行は、表定義の列の順に並べた要素の配列 (タプル。`src/value.ts`)。PRIMARY KEY のない表は先頭に rowid を置く。列名は持たない。要素は、INTEGER が `"i"` と 10 進の数字、TEXT が `"t"` と文字列、REAL が `"r"` と `quote()` の文字列、BLOB が `"b"` と大文字の 16 進、NULL が `null`。変更の並びは JSON にする (`src/shard/rows.ts` の `encode`) | 固定 |
 
 ## シャード (`DinfShard`)
 
@@ -40,7 +40,7 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 | `__moved(g, lo, hi, after, up_to, m, dest, acked)` | 渡した piece。主キーは `(g, lo, after)`。`g` は shard key のキー文字列、`[lo, hi)` は fence の区間、`(after, up_to]` は位置の区間、`m` は手放した時刻である | 固定 |
 | `__moved_txn(txn, g, lo, after, dest)` | 渡した piece に intent を持っていた取引。決着を渡した先へ転送するのに使う | 固定 |
 | `__arrived(g, lo, hi, after, up_to, m)` | 受け取った piece と、渡した側が手放した時刻 | 固定 |
-| `__cap`、`__cap_on`、`__capv_<表>`、trigger `__cap_<表>_I/U/D` | 1 つの文の変更を捕まえる表。文の外では空である | 作り直せる (表定義の版を適用するときに作る) |
+| `__cap(seq, tbl, old, new)`、`__cap_on`、trigger `__cap_<表>_I/U/D` | 1 つの文の変更を捕まえる表。trigger が、変更前と変更後の行のタプルを JSON で書く。文の外では空である | 作り直せる (trigger は表定義の版を適用するときに作る。Meta の `__ddl` の版は、その trigger の文を含む) |
 
 移動の単位は piece で、グループ `g` の行のうち、token が fence の区間に入り、位置が区間 `(after, up_to]` に入るものである。
 いまのコードは、形式だけを持つ (設計書の段 1)。
@@ -66,7 +66,7 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 
 | 形式 | 中身 | 区分 |
 |---|---|---|
-| Worker と Durable Object の RPC | 要求と応答の object (`ShardApi`、`src/types.ts`)。要求は版を運ぶ。版 3 から、範囲は token の区間で、読む範囲は `claim` (区間の組) を、範囲の移動は piece (`Piece`、`PieceWant`、`PiecePayload`) を運ぶ | 版で守る (`PROTOCOL_VERSION` = 3。版 2 以前は受け付けない) |
+| Worker と Durable Object の RPC | 要求と応答の object (`ShardApi`、`src/types.ts`)。要求は版を運ぶ。版 3 から、範囲は token の区間で、読む範囲は `claim` (区間の組) を、範囲の移動は piece (`Piece`、`PieceWant`、`PiecePayload`) を運ぶ。版 4 から、行イメージ (`Change` の `before` と `after`、`PiecePayload` の `rows`、取引が溜める変更) はタプルである | 版で守る (`PROTOCOL_VERSION` = 4。版 3 以前は受け付けない) |
 | Hrana の baton | 開いている取引の書き出し (`Db.dump`) を JSON にして署名したもの | 作り直せる。読めない baton は `BATON_INVALID` で断り、クライアントは取引をやり直す |
 | 読みの session token | `Ts` の数 | 固定 |
 | エクスポート | 1 行に 1 文の `INSERT INTO "表"("列", ...) VALUES (...), ...;`。REAL は小数点か指数を付けて書く。BLOB は `X'...'`、無限大は `9e999` | 固定 (利用者の形式) |

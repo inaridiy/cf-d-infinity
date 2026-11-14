@@ -21,7 +21,7 @@
 // 乱択の検査は、既知の欠陥に当たる種類の違反だけを許し、それ以外は 1 件でも失敗にする。
 // 許す種類は scenario ごとに KNOWN で列挙する。欠陥を直したら KNOWN から消す。
 import { afterAll, describe, expect, it } from "vitest";
-import { seedsOr, SimCluster } from "./sim";
+import { REFERENCE_ONLY, seedsOr, SimCluster } from "./sim";
 import { Db } from "../src/client/db";
 import { split } from "../src/autoscaler";
 import { ownerOf, shardsOf } from "../src/routing";
@@ -461,7 +461,10 @@ describe("known bugs, as deterministic interleavings", () => {
     expect(r).toEqual({ table: [`${r.A}/1 v=99`], read: [`${r.A}/1`], missing: [], dangling: [], A: r.A });
   });
   // 待ちの後の確かめ直しを外すと、index を保守しない古い計画の書き込みが通る。index の照合がそれを見つけることを確かめる。
-  it("BUG-3 put back: the index agreement check reports the entry that the stale write did not maintain", async () => {
+  // 欠陥が現れるのは、autocommit の書き込みがシャードで行ロックを待つ経路 (execAuto) である。基準経路だけの実行では、書き込みは
+  // Worker の SQLite で実行して取引として確定するので、シャードの行ロックの待ちを通らず、守りを外しても反例にならない
+  // (値の作り直しの段 2 の前から、基準経路だけの実行ではこの試験は落ちていた。2026-11-14 に確かめた)。
+  it.skipIf(REFERENCE_ONLY)("BUG-3 put back: the index agreement check reports the entry that the stale write did not maintain", async () => {
     const r = await lockWaitAcrossIndex({ noSchemaRecheck: true });
     expect(r.table).toEqual([`${r.A}/1 v=99`]);
     expect([...r.missing, ...r.dangling].length).toBeGreaterThan(0);

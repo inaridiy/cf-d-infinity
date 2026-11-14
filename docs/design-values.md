@@ -1,6 +1,6 @@
 # 値と行イメージの作り直しの設計
 
-状態：設計。段 0 (検査) と段 1 (符号とキー) を実装した。段 2 から先はまだない。持ち主の判断と、段 0 と段 1 の結果は末尾に記した
+状態：設計。段 0 (検査)、段 1 (符号とキー)、段 2 (行イメージと捕捉) を実装した。段 3 から先はまだない。持ち主の判断と、段 0 から段 2 の結果は末尾に記した
 作成日：2026-11-14
 前提：[storage-format.md](./storage-format.md)、[sql-language.md](./sql-language.md) の「値」、[design-subslots.md](./design-subslots.md)
 
@@ -547,7 +547,7 @@ UPDATE の変更前の行は、今と同じく、先に主キーで読む。
 
 - UPDATE の trigger の DDL (`old` と `new` のタプルを持ち、D∞ が作る文でいちばん長い)
 - 主キーでタプルを読む文 (`selectRow`)
-- 全表の走査を、型つきの読みの形に包んだ文
+- 全表の走査を、型つきの読みの形に包んだ文 (段 2 では、型つきの読みはまだないので、今の走査の形 (`scanSql`) を確かめる)
 - 行を入れ直す文 (`insertRow`)。束縛の変数が 100 を超えないこと
 
 どの文も、式の木の深さが 100 に収まることも確かめる (主キーの列を AND でつなぐ条件は、主キーの列の数だけ深くなる)。
@@ -610,7 +610,10 @@ UPDATE の変更前の行は、今と同じく、先に主キーで読む。
 
 ## 永続データと通信で変わるもの
 
-保存の形式の版 (`STORAGE_FORMAT`) は 1 のままにし、材料 (`test/fixtures/storage/format-1.json`) を作り直す (公開の前なので許される)。
+保存の形式の版 (`STORAGE_FORMAT`) は 2 に上げ、材料を `test/fixtures/storage/format-2.json` に作り直す。版 1 からの移行は書かない (公開の前なので後方互換を持たない)。
+版を上げるのは、版 1 のデータを今のコードが黙って読み違えるからである。`CREATE TABLE IF NOT EXISTS __cap` は版 1 の `__cap(seq, tbl, oldk, newk)` を作り替えず、Meta の `__ddl` の版は、捕捉の trigger の文 (`__capv_<表>` に書く形) を含み、intent と変更ログは列名つきの行イメージを持つ。
+版 1 のデータは、移行がないと言って起動を拒否する (`test/health.test.ts`)。
+(段 2 の前のこの節は「版は 1 のままにし、材料を作り直す」と書いていた。`__ddl` の trigger の文と `__cap` の形を見落としていた。)
 
 | 形式 | 変更 |
 |---|---|
@@ -818,3 +821,62 @@ workerd の事実は「確かめた事実」の節に書いた。
 - シミュレータの確かめ (検査の 5) のうち、捕捉でまとめた `after` と本体の行の比較、タプルの長さの確かめを足す。
 - 段 0 で見つかった欠陥の 2 (式の木の深さ) は、`imageList` の 2^53 の確かめがなくなれば、原因がなくなる。再現が通ることを確かめて `test/` へ移す。3 (結果の列の数) は、行を集める走査が `typeof` の列を足すのをやめる段 3 まで残る。
 
+
+## 段 2 の結果 (2026-11-14)
+
+行イメージをタプルにし、捕捉を共有の `__cap` にした。`Value` は今の形のままである。
+
+| 場所 | 変えたこと |
+|---|---|
+| `src/types.ts` | `Change` の `before` と `after`、`PiecePayload.rows` をタプルにした。`PROTOCOL_VERSION` と `MIN_PROTOCOL_VERSION` を 4、`STORAGE_FORMAT` を 2 にした |
+| `src/value.ts` | 橋 `fromTypedValue` (`typedOf` の逆)。タプルの要素を値に戻すときは、どれもここを通り、2^53 以上の INTEGER はここで K1 の誤りになる |
+| `src/keys.ts` | `keyString` (形式 1) を消し、呼んでいた場所を `keyStringExact` にした。`keySql` を消した。キー文字列を今の `Value` に戻す `keyParams` を足した |
+| `src/shard/rows.ts` | 行を読み書きする関数をタプルにした (`selectRow`、`selectGroup`、`insertRow`、`setBasedRestore`、`applyChanges`)。`imageAt`、`valuesOf`、`tupleKey`。捕捉の trigger と `capturedChanges`。`imageList`、`typedRow`、`__dinf_wide`、`hasWideInteger`、`__capv_<表>` を消した。`imageStatements` (表を作るときに確かめる文)。`joinTerms` (釣り合った条件) |
+| `src/shard/kernel.ts` | `runCaptured` (RETURNING のタプル)、`exportRows` (走査と同じ列の並び)、範囲の検査の `deleteOutside` (タプルで読む)、値の長さの上限の誤りの言い換え |
+| `src/client/db.ts` | 行イメージを列名で引く 3 か所を `imageAt` に、index の表の項目を `tupleOfRow` にした。表を作るときの確かめ |
+| `src/sql/depth.ts`、`src/shard-limits.ts` | 式の木の深さの見積もりと、D∞ が作る文の上限 `builtLimitOf` |
+| `src/sql/ddl.ts` | 列名の予約の `$` を外した |
+| `src/analytics.ts` | 出す行に、表定義の列名を付け直す (`rowOf`。段 1 までの行イメージと同じ形) |
+
+### 設計書から変えた点
+
+- 関数の名前は `keyStringExact` のままにした (指示書のとおり。設計書は、入れ替えた後の名前を `keyString` と書いている)。形式 1 の関数は `test/key-string-old.ts` に残し、`test/key-conversions.test.ts` が新旧を比べ続ける。
+- キー文字列から値に戻す場所 (`pkValues`、`selectGroup`、捕捉のキー、Worker の衝突の探し方、述語の判定) は、`keyValues` の結果を `keyParams` で今の `Value` に直す。`fromTypedValue` は通さない。キーの整数には、2^53 以上の整数の値の REAL から作ったものがあり (K1 が断るのは格納の型が INTEGER の値だけ)、橋を通すと、そういう行が引けなくなるからである。`keyParams` は整数を JS の数に正確に戻し、戻らない整数だけを K1 と同じ誤りにする (`test/large-real-keys.test.ts`)。
+- 保存の形式の版は 2 に上げた (「永続データと通信で変わるもの」の節を直した)。
+- 「位置の比較」は、今のコードにない。位置 (`Pos`) は JSON の文字列として保存して比べるだけで (`posKey`、`posOf`)、キー文字列を値に戻していない。どの piece もグループの全体だからである。
+- 表を作るときの確かめは、捕捉の trigger (3 つ)、主キーの読み、グループの読み、行を入れ直す文、今の走査の形 (`scanSql`) を測る。式の木の深さは、`src/sql/depth.ts` の見積もりで測る。見積もりは、SQLite の数え方 (式の節の高さと、名前を解決するときに副問い合わせの式の高さを足すこと) を字句から写したもので、sqlite3 3.45.1 の CLI (`.limit expr_depth`) と突き合わせた。D∞ が作る文の形と、乱択の式 (3 つの seed で、文法に合う異なる文 799 個) で、SQLite より小さく出たことはない。node:sqlite と sql.js は深さの上限を変えられないので、シミュレータの試験には使わず、単体の試験 (`test/expression-depth.test.ts`) と workerd の試験 (`test/wide-table-expression-depth.test.ts`) で見る。
+- 主キーと shard key の列を AND でつなぐ条件と、基準経路の衝突の探し方が問いを OR でつなぐ条件は、16 項を超えたら釣り合った木に組む (`joinTerms`)。99 列の主キーの表は、組む前は `CREATE TABLE` で断られ (深さ 102)、組んだ後は workerd で書き換えも削除も通る。ただし、利用者の文が 99 列の主キーを引数で名指しすると、利用者の文そのものが深さ 100 を超える (`bindTyped` が整数の引数を包む式は、1 項あたり深さを 2 足す)。利用者の文の深さは、段 3 に残すことに書いた。条件の span (`src/client/spans.ts`) も、UNIQUE の列を AND でつなぐ。表を作るときの確かめには入っていない。
+- 行イメージのタプルが DO の値の長さの上限を超えて SQLite が捕捉の中で止めた書き込みは、取引の大きさの上限の誤りに言い換える (「大きさの勘定」の節)。RETURNING の捕捉と trigger の捕捉の両方で、workerd で確かめた。
+- 範囲の検査 (試験用の `deleteOutside`) も、行をタプルで読む。素の列で読む文を減らすためである。
+
+### 検査の 5 と、見つかった危険
+
+捕捉でまとめた `after` と本体の行の比較、タプルの長さと表定義の比較を、シミュレータのどの試験にも掛けた (`test/setup.ts`、`src/shard/rows.ts` の `imageChecks`)。シャードの捕捉と、Worker の SQLite での捕捉 (基準経路の書き込み) の両方に掛かる。
+報告するだけで処理を変えないので、RPC の列は変わらない。
+
+この検査が、計画と取引の表定義の食い違いを見つけた。
+`Db.transaction` は、やり直すたびに表定義を取り直すが、文の計画は最初のものを使い続ける。そのため、基準経路の書き込み (`Txn.wasmWrite`) では、Worker の SQLite は取引の新しい表定義 (`this.cat`) で作られ、捕捉の trigger は計画の古い表定義 (`p.tables`) で作られることがあった。古い trigger は列の少ないタプルを書く。
+列名つきの行イメージの間は、変更後の行を本体から読み直していたので、食い違いは捕捉に現れなかった。
+trigger を、Worker の SQLite を作った表定義で作るようにした。基準経路だけの実行の `test/ddl-concurrent.test.ts` (ADD COLUMN と並行する取引、14 本) で見つかった。
+同じ食い違いは、行を集める走査にも残っている。走査は計画の表定義の列だけを読むので、足された列は Worker の SQLite で既定値になり、文がその列に触らなくても、確定した値を既定値で上書きする。段 1 でも同じだった (変更後の行を本体から読み直していたので、既定値を書いた)。直していない。再現は `test/open/reference-write-after-add-column.test.ts` にある。同じ場所の 2 つ目の直しになるので (規則 1)、計画を取引の表定義と結び付ける形 (表定義が変わったら計画し直す) を、持ち主に諮る。
+
+守りを外した反例の試験 (`m14_red_no_drain` の 2 つの守りを外す場面) では、長さの確かめが、古い表定義の intent を新しい表に当てはめたことを見つける。その試験は反例そのものを確かめるので、確かめを切る (`SimOptions.noImageCheck`)。
+
+### RPC の列の比較
+
+`test/history.test.ts` と `test/replay.test.ts` の既定の seed (61 本の試験) で、RPC の送り元、宛先、メソッドの列を、変更の前 (`775dd08`) と後で比べた (`RPC_TRACE`、`test/setup.ts`)。
+キーの入れ替えの後も、タプルと捕捉の後も、釣り合った条件の後も、61 本すべてで 1 行も違わなかった。
+移動の 1 通は大きさで切るが、この作業負荷の行は小さく、切れ目が変わらなかった。
+
+### 課金
+
+trigger で捕捉する 1 行の UPDATE (`test/rowcost.test.ts` に足した操作) は、手元の workerd で 1 操作 6 行から 5 行になった。捕捉が書く行が、`__cap`、`__capv_<表>`、`__cap_on` の 3 行から、`__cap` と `__cap_on` の 2 行になった分である (残りは、下書きの本体の 1 行、確定の適用の 1 行、変更ログの 1 行)。RETURNING で捕捉する操作の行数は変わらない。
+
+### 段 3 に残ること
+
+- `Value` を型のある値にし、`fromTypedValue`、`keyParams`、`TypedValue`、`typedOf` を消す。K1 を外す。
+- 行を集める走査 (`Scan.typed`、`scanSql`、`typedValues`、`__dinf_typeof_<i>`) と `exportRows` を型つきの読みにする。型のない列が 50 以上の表で、行を集める SELECT が結果の列の上限に当たる (`test/open/untyped-columns-result-limit.test.ts`。INSERT、UPDATE、DELETE は段 2 で通るようになった)。
+- NUL を含む TEXT (`test/open/nul-in-text.test.ts`)。段 2 は、利用者の TEXT を素の列で読む文を足していない。シャードの `listGroups`、`exportRows`、Worker の `scanShard` と走査は、今も素の列で読む。
+- 列名の予約の `__dinf_`。`PROTOCOL_VERSION` を 5 にする。
+- 欠陥のスイッチ `unfencedRead` と `roundedImages`。
+- 利用者の文の式の木の深さ。シャードは、届いた文の深さを測らない。D∞ が作る文は表を作るときに確かめるが、深い利用者の文は、DO でだけ失敗し、シミュレータでは通る。見積もりを利用者の文の判定 (`shardLimitOf`) とシミュレータの模倣に使うかは、見積もりの多めの幅を確かめてから決める (不変条件 3)。

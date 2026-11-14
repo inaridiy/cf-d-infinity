@@ -73,8 +73,9 @@ describe("real Durable Object SQLite", () => {
     const post = on(worker());
     await post("/ddl", { sql: "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)" });
     await post("/sql", { sql: "INSERT INTO users(id, name) VALUES (1, 'a')", params: [] });
-    const cols = ["id INTEGER PRIMARY KEY", ...Array.from({ length: 99 }, (_, i) => `c${i} INTEGER`)].join(", ");
-    // 100 列の表は、変更を捕捉する内部の表が 101 列になるので作れない。
+    // 101 列の表は、DO の SQLite の列の上限 (100) で作れない。(値の作り直しの段 1 までは、変更を捕捉する写しの表が 1 列多かったので、
+    // 100 列の表も作れなかった。段 2 で写しの表はなくなり、主キーのある 100 列の表は作れる。test/expression-depth.test.ts)
+    const cols = ["id INTEGER PRIMARY KEY", ...Array.from({ length: 100 }, (_, i) => `c${i} INTEGER`)].join(", ");
     for (const sql of ["ALTER TABLE users ADD COLUMN x INTEGER NOT NULL", `CREATE TABLE wide(${cols})`]) {
       expect((await post("/ddl", { sql })).status).not.toBe(200);
     }
