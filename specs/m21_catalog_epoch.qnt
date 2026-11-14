@@ -11,7 +11,7 @@
 //   start         範囲の移動を開く。その区間の宛先は、この epoch から子である
 //   end           範囲の移動を閉じる
 // モデルでは、op ごとに prepare、commit、abort の epoch を持つ。移動 (SPLIT) は start を prepare の欄、end を commit の欄に
-// 置く。同じ 1 つの表で、開いているか、どちらで終わったかを引く。
+// 置く。表定義の遷移も移動も、同じ 3 つの欄で、開いているか、どちらで終わったかを引く。
 //
 // シャードは、列を先頭から順に適用する (ep)。表定義の記録を適用する前に、持っている intent を決着させる。移動の記録は待たずに
 // 適用する。親にとって、start を適用したことが fence である。
@@ -62,6 +62,8 @@ module m21_core {
   const PULL_AT_EPOCH: bool    // pull は start の epoch を運び、親は適用してから答える
   const FENCE_IS_EPOCH: bool   // 親の fence は「start を適用したこと」である (false はいまの実装: 親が先に fence し、範囲表は後で切り替わる)
   const OWNER_CHECK: int       // 0 設計どおり。1 epoch が等しいことを求める。2 所有をスナップショットで引かない
+  // ---- 設計の選択肢 ----
+  const SCHEMA_ON_PREPARE: bool // 表定義の epoch は、prepare と abort でも進む (false なら、commit だけで進む)
 
   pure val P = 1
   pure val Q = 2
@@ -78,7 +80,7 @@ module m21_core {
   pure val SPLIT = 4
   pure val DDLS = Set(1, 2, 3)
   pure val OPS = Set(1, 2, 3, 4)
-  pure val MAXE = 7                       // epoch の上限 (どのインスタンスでも届かない)
+  pure val MAXE = 9                       // epoch の上限 (どのインスタンスでも届かない)
 
   pure val NO_INDEX = 0
   pure val BUILDING = 1
@@ -144,9 +146,13 @@ module m21_core {
   // ---- スナップショット (epoch e まで畳んだもの) ----
   def openAt(op: int, e: int): bool =
     within(prepE.get(op), e) and not(within(commitE.get(op), e)) and not(within(abortE.get(op), e))
-  /** 表定義が最後に変わった epoch。 */
+  /**
+   * 表定義の epoch。取引が名乗り、シャードが比べる。決めた設計では、表定義の記録 (prepare、commit、abort) のどれでも進む。
+   * 別の案 (SCHEMA_ON_PREPARE = false) では、commit だけで進む。prepare と abort は、表定義の中身を変えないからである。
+   */
   def schemaAt(e: int): int =
-    DDLS.fold(0, (m, op) => max(m, max(cap(prepE.get(op), e), max(cap(commitE.get(op), e), cap(abortE.get(op), e)))))
+    DDLS.fold(0, (m, op) => max(m, max(cap(commitE.get(op), e),
+      if (SCHEMA_ON_PREPARE) max(cap(prepE.get(op), e), cap(abortE.get(op), e)) else 0)))
   def isSchemaEpoch(e: int): bool = DDLS.exists(op => prepE.get(op) == e or commitE.get(op) == e or abortE.get(op) == e)
   /** 表が書き込み禁止か。開いている表定義の遷移がある。 */
   def fencedAt(e: int): bool = DDLS.exists(op => openAt(op, e))
@@ -377,10 +383,11 @@ module m21_core {
     keepCoord, ep' = ep, store' = store, truth' = truth, txns' = txns, keepSide, g' = g,
   }
 
-  // 進める側が止まる。DDL は prepare の後、分割は fence か start の後で止まる場合を見る。
+  // 進める側が止まる。DDL は prepare の後で止まる。分割は、fence か start の後、行が子に届く前に止まる
+  // (止まった後で行が届くことを、witness が順序つきで示せるようにする)。
   action die(op: int): bool = all {
     has(op), not(dead.get(op)),
-    if (op == SPLIT) (prepE.get(SPLIT) > 0 or pfenced) and commitE.get(SPLIT) == 0 else openAt(op, len),
+    if (op == SPLIT) (prepE.get(SPLIT) > 0 or pfenced) and commitE.get(SPLIT) == 0 and not(pulled) else openAt(op, len),
     dead' = dead.set(op, true),
     acks' = acks, keepLog, ep' = ep, keepData, txns' = txns, keepSide, g' = g,
   }
@@ -453,7 +460,7 @@ module m21_core {
   // intent のないときにだけ起きる。この後の書き込みが、写されていない行である。
   action copy = all {
     HAS_DROP, not(copied), prepE.get(DROP) == 0,
-    noIntents(P), noIntents(Q),
+    SHARDS.forall(s => noIntents(s)),
     copied' = true,
     late' = late, pulled' = pulled, drained' = drained, pfenced' = pfenced,
     keepLog, keepCoord, ep' = ep, keepData, txns' = txns, g' = g,
@@ -518,8 +525,8 @@ module m21_core {
   }
 
   // ---- 不変条件 -------------------------------------------------------------
-  // M12 (M11 の indexComplete、noDangling、uniqueSafe を含む)
-  val indexMatches = commitE.get(BUILD) == 0 or
+  // M12 (M11 の indexComplete、noDangling、uniqueSafe を含む)。表が消えた後は、index も一緒に消えている。
+  val indexMatches = commitE.get(BUILD) == 0 or commitE.get(DROP) > 0 or
     (ROWS.forall(r => lv(r) == 0 or idx.get(lv(r)) == r) and
      VALS.forall(v => idx.get(v) == 0 or lv(idx.get(v)) == v))
   val noWriteWhileFenced = not(g.wroteFenced)
@@ -531,7 +538,7 @@ module m21_core {
   val noLostAfterReturn = not(g.wroteAfterDrop)
   val noResurrect = not(g.resurrected)
   // M14 の noLostWrite
-  val guardHolds = not(commitE.get(DROP) > 0 and (late.get(P) or late.get(Q)))
+  val guardHolds = not(commitE.get(DROP) > 0 and SHARDS.exists(s => late.get(s)))
   // M13 の pinned
   val pinned = not(g.badPin)
   // M15 の servable と、未解決の問題 17
@@ -545,11 +552,23 @@ module m21_core {
   val readConsistent = not(g.badRead)
   val sameShape = not(g.shapeMismatch)
 
-  val epochSafe = and {
+  /** シャードが、次の記録を適用できる。 */
+  def canApply(s: int): bool =
+    ep.get(s) < len and (not(isSchemaEpoch(ep.get(s) + 1)) or (not(movingNow(s)) and (not(DRAIN) or noIntents(s))))
+  // 移動が始まってから行が子に届くまで、行き止まりがない。進める側が止まっていても、親か子が列を適用する、親の intent が
+  // 確定する、子が行を引き取る、のどれかの手が打てる。servable は断られた要求だけを数えるので、子が行を引き取れずに
+  // 要求が待ち続ける形は、この不変条件が受け持つ (M19 の readNotStuck と同じ書き方)。
+  val moveNotStuck = not(HAS_SPLIT and prepE.get(SPLIT) > 0 and not(pulled)) or
+    canApply(P) or canApply(C) or TXNS.exists(t => txns.get(t).phase == 2) or
+    (movedAt(ep.get(C)) and (not(PULL_AT_EPOCH) or movedAt(ep.get(P))) and noIntents(P))
+
+  // 別の案 (表定義の epoch を commit だけで進める) でも成り立つもの。noServeBelowAck だけを除く。
+  val epochSafeCommitOnly = and {
     indexMatches, noWriteWhileFenced, notRelied, oneExit, noIntentWhileFenced,
     noLostAfterReturn, noResurrect, guardHolds, pinned, servable,
-    commitApplies, noServeBelowAck, pinnedSurvives, moveKeepsWrites, readConsistent, sameShape,
+    commitApplies, pinnedSurvives, moveKeepsWrites, readConsistent, sameShape, moveNotStuck,
   }
+  val epochSafe = epochSafeCommitOnly and noServeBelowAck
 
   // ---- witness (not(到達したい状態) を invariant にして、違反が出れば到達できる) ----
   def wroteAt(e: int): bool = TXNS.exists(t => txns.get(t).ok and txns.get(t).ps == e)
@@ -574,7 +593,7 @@ module m21_core {
   val witnessDroppedAfterWrites = not(commitE.get(DROP) > 0 and copied and TXNS.exists(t => txns.get(t).ok)
                                       and ep.get(P) >= commitE.get(DROP) and ep.get(Q) >= commitE.get(DROP))
   // copy の後の書き込みを見つけて、DROP を取り消す
-  val witnessGuardRefused = not(abortE.get(DROP) > 0 and copied and (late.get(P) or late.get(Q)) and acks.get(DROP) != Set())
+  val witnessGuardRefused = not(abortE.get(DROP) > 0 and copied and SHARDS.exists(s => late.get(s)) and acks.get(DROP) != Set())
   // 分割を進める側が start の後で止まっても、子が行を引き取り、子への書き込みが確定する (end はまだ)
   val witnessServedWhileDriverDead = not(dead.get(SPLIT) and commitE.get(SPLIT) == 0 and pulled
                                          and TXNS.exists(t => txns.get(t).ok and txns.get(t).dest == C))
@@ -587,6 +606,8 @@ module m21_core {
   val witnessMoveAfterDdl = not(commitE.get(CHECK) > 0 and prepE.get(SPLIT) > commitE.get(CHECK) and pulled)
   // 親が、start を適用した後で、まだ渡していない行の読みに答える (M19)
   val witnessParentAnswersUncut = not(g.uncutRead)
+  // 別の案で、ok と答えた prepare より前の計画が、その遷移が取り消された後で受け付けられる
+  val witnessOldPlanAfterAbort = not(g.belowAck and DDLS.forall(op => commitE.get(op) == 0))
 }
 
 // ---- 決めた設計 ----------------------------------------------------------------
@@ -596,7 +617,8 @@ module m21_green_build {
   import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   // 書き込み禁止の epoch で計画した書き込みを、シャードが断る。公開の後は、index を使う書き込みが通る。
   run fencedThenPublicTest =
     initWith(1, 0).then(prepareOp(BUILD)).then(applyNext(P)).then(applyNext(Q))
@@ -610,13 +632,18 @@ module m21_green_build {
     initWith(1, 0).then(prepareOp(BUILD)).then(applyNext(P)).then(ackBuild(P)).then(die(BUILD)).then(expire(BUILD))
         .then(applyNext(P)).then(plan(1, 1, 2, 2)).then(prepare(1)).then(commit(1))
         .expect(epochSafe and store.get(P) == 2 and idx == noEntries)
+  // 同じ値の行が 2 つある。2 つ目の行を読んだところで重複が見つかり、取り消される。項目は残らない。
+  run duplicateAbortsTest =
+    initWith(1, 1).then(prepareOp(BUILD)).then(applyNext(P)).then(applyNext(Q)).then(ackBuild(P)).then(ackBuild(Q))
+        .expect(epochSafe and abortE.get(BUILD) == 2 and idx == noEntries and not(fencedAt(len)))
 }
 // CHECK: 行で失敗し得る DDL。各シャードが、書き込みを止めた表で試してから、確定する。事後の取り消しの代わりである。
 module m21_green_check {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   // 制約に反する行があるシャードが、試適用を断る。取り消しは禁止を解くだけで、その後の書き込みが通る。
   run trialRejectedTest =
     initWith(1, 2).then(prepareOp(CHECK)).then(applyNext(P)).then(applyNext(Q)).then(ackCheck(P)).then(ackCheck(Q))
@@ -634,14 +661,16 @@ module m21_green_ddl2 {
   import m21_core(HAS_BUILD = true, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = false, NTXN = 1, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
 }
 // DROP: 取引が読んだ表を消す。copy が読んだ後の書き込みがあれば、取り消す。copy のない DROP も、同じ遷移である。
 module m21_green_drop {
   import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   // copy の後に書き込みがあったシャードが、確かめで見つけて、DROP を取り消す。行は失われない。
   run guardRefusesTest =
     initWith(1, 1).then(copy).then(plan(1, 1, 2, 0)).then(prepare(1)).then(commit(1))
@@ -653,7 +682,8 @@ module m21_green_split {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = true, NTXN = 1, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   // 未解決の問題 17 の形。進める側が start の直後に止まっても、移る行の読みと書きは、子が行を引き取って答える。
   run driverStopsAfterStartTest =
     initWith(1, 1).then(startSplit).then(die(SPLIT))
@@ -669,23 +699,78 @@ module m21_green_split_txns {
   import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = true, NTXN = 2, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   // 分割より前のスナップショットの取引は、分割の記録を適用したシャードでも、動かなかった行なら通る。動いた行は断られる。
   run pinnedAcrossSplitTest =
     initWith(1, 1).then(plan(1, 2, 2, 0)).then(plan(2, 1, 2, 0)).then(startSplit).then(applyNext(Q)).then(applyNext(P))
         .then(prepare(1)).then(commit(1)).then(prepare(2))
         .expect(epochSafe and txns.get(1).ok and store.get(Q) == 2 and txns.get(2).phase == 3 and not(txns.get(2).ok) and g.acceptedOlder)
 }
+// SPLIT と BUILD: index を作る DDL が、移動の前後に入る。M12 が扱わなかった組み合わせである (分割と index の作成の重なり)。取引は 1 件。
+module m21_green_split_build {
+  import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = true, NTXN = 1, FIXED_INIT = false,
+    REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
+    ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
+  // 移動が閉じた後で index を作る。行を埋める処理は、子の行を読む。親は、渡した行の控えを数えない。
+  run buildAfterMoveTest =
+    initWith(1, 2).then(startSplit).then(applyNext(C)).then(applyNext(P)).then(pull).then(finishData).then(endSplit)
+        .then(prepareOp(BUILD))
+        .then(applyNext(P)).then(applyNext(P)).then(applyNext(Q)).then(applyNext(Q)).then(applyNext(Q)).then(applyNext(C)).then(applyNext(C))
+        .then(ackBuild(P)).then(ackBuild(Q)).then(ackBuild(C)).then(commitOp(BUILD))
+        .expect(epochSafe and idx.get(1) == 1 and idx.get(2) == 2)
+        .then(applyNext(C)).then(plan(1, 1, 0, 4)).then(prepare(1)).then(commit(1))
+        .expect(epochSafe and idx.get(1) == 0 and store.get(C) == 0)
+  // 移動が閉じた後で index が公開され、行 1 の項目は、子が持つ行を指す
+  val witnessBuildAfterMove = not(commitE.get(SPLIT) > 0 and commitE.get(BUILD) > commitE.get(SPLIT) and lv(1) != 0 and idx.get(lv(1)) == 1)
+  // index が公開された後で移動が始まり、子への書き込みが index を保守する
+  val witnessMoveAfterBuild = not(commitE.get(BUILD) > 0 and prepE.get(SPLIT) > commitE.get(BUILD) and pulled
+                                  and TXNS.exists(t => txns.get(t).ok and txns.get(t).dest == C) and lv(1) != 0 and idx.get(lv(1)) == 1)
+}
 
 // ---- 外しても破れない条件 --------------------------------------------------------
 
-// CHECK の DDL は、古い計画を断らず、待ちの後で確かめ直さなくても、確定を適用できる。守っているのは、書き込み禁止と、
-// 適用した後の表そのもの (SQLite が制約を確かめる) である。版の確認が要るのは、計画の作り方が変わる DDL (index) である。
+// CHECK の場面では、古い計画を断らず、待ちの後で確かめ直さなくても、記録された commit を適用できる (commitApplies)。
+// この不変条件を守っているのは、書き込み禁止と、適用した後の表そのもの (SQLite が制約を確かめる) である。
+// 確かめたのは、この 1 つの不変条件だけである。モデルの制約は行の値の性質で、行の形を変えない。列を足す DDL では、
+// 古い形の行イメージを持つ計画を断るために、版の確認が要る。版の確認を外してよい、という意味ではない。
 module m21_check_no_reject {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = false, RECHECK = false, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
+}
+// 別の案: 表定義の epoch を、commit だけで進める (prepare と abort では進めない)。prepare より前の計画は、禁止が掛かっている間は
+// 書き込み禁止で断られ、取り消された後は、そのまま通る。取引が古くなるのは、DDL が確定したときの 1 回だけになる。
+// noServeBelowAck (ok と答えた prepare より古い計画を受けない) は、この案では定義から成り立たないので、除いて確かめる。
+module m21_alt_commit_only_build {
+  import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
+    REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
+    ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = false).*
+}
+// 同じ案を、CHECK の場面で確かめる。
+module m21_alt_commit_only_check {
+  import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
+    REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
+    ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = false).*
+  // prepare より前に計画した書き込みが、その DDL が取り消された後で、計画し直さずに通る。
+  run oldPlanAfterAbortTest =
+    initWith(1, 2).then(plan(1, 1, 0, 0))
+        .then(prepareOp(CHECK)).then(applyNext(P)).then(applyNext(Q)).then(ackCheck(P)).then(ackCheck(Q))
+        .expect(abortE.get(CHECK) == 2)
+        .then(applyNext(P)).then(prepare(1)).then(commit(1))
+        .expect(epochSafeCommitOnly and txns.get(1).ok and store.get(P) == 0 and not(noServeBelowAck))
+  // 禁止が掛かっている間は、同じ計画が、書き込み禁止で断られる。
+  run oldPlanWhileFencedTest =
+    initWith(1, 1).then(plan(1, 1, 0, 0)).then(prepareOp(CHECK)).then(applyNext(P)).then(prepare(1))
+        .expect(epochSafeCommitOnly and txns.get(1).phase == 3 and not(txns.get(1).ok) and g.refusedByFence)
 }
 
 // ---- 赤: BUILD の場面 ----------------------------------------------------------
@@ -695,7 +780,8 @@ module m21_red_online {
   import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = false, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = true,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run onlineTest =
     initWith(1, 1).then(prepareOp(BUILD)).then(applyNext(P)).then(applyNext(Q)).then(ackBuild(P))
         .then(plan(1, 2, 2, 1)).expect(not(notRelied))
@@ -708,7 +794,8 @@ module m21_red_no_fence {
   import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = false, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run noFenceTest =
     initWith(2, 0).then(prepareOp(BUILD)).then(applyNext(P)).then(applyNext(Q)).then(ackBuild(P)).then(ackBuild(Q))
         .then(plan(1, 1, 1, 1)).then(prepare(1)).then(commit(1))
@@ -720,7 +807,8 @@ module m21_red_visible {
   import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = true,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run visibleTest = initWith(1, 2).then(prepareOp(BUILD)).then(plan(1, 1, 2, 1)).expect(not(notRelied))
 }
 // シャードが、intent を持ったまま表定義の記録を適用する。禁止の前に受け付けた取引が、禁止の後で確定する (m12_red_no_drain、m11_impl_inflight)。
@@ -728,7 +816,8 @@ module m21_red_no_drain {
   import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = false, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run noDrainTest =
     initWith(1, 0).then(plan(1, 1, 2, 0)).then(prepare(1)).then(prepareOp(BUILD)).then(applyNext(P)).then(commit(1))
         .expect(not(noWriteWhileFenced))
@@ -738,7 +827,8 @@ module m21_red_stale {
   import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = false, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run staleTest =
     initWith(1, 0).then(prepareOp(BUILD)).then(applyNext(P)).then(applyNext(Q)).then(ackBuild(P)).then(ackBuild(Q))
         .then(commitOp(BUILD)).then(applyNext(P))
@@ -751,7 +841,8 @@ module m21_red_two_exits {
   import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = false, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run twoExitsTest =
     initWith(1, 0).then(prepareOp(BUILD)).then(applyNext(P)).then(applyNext(Q)).then(ackBuild(P)).then(ackBuild(Q))
         .then(expire(BUILD)).then(commitOp(BUILD))
@@ -762,7 +853,8 @@ module m21_red_repin {
   import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = false, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run repinTest =
     initWith(1, 0).then(plan(1, 1, 2, 0))
         .then(prepareOp(BUILD)).then(applyNext(P)).then(applyNext(Q)).then(ackBuild(P)).then(ackBuild(Q))
@@ -776,7 +868,8 @@ module m21_red_scan_early {
   import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = false, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run scanEarlyTest =
     initWith(1, 0).then(prepareOp(BUILD)).then(ackBuild(P))
         .then(plan(1, 1, 2, 0)).then(prepare(1)).expect(not(noServeBelowAck))
@@ -789,7 +882,8 @@ module m21_red_no_recheck {
   import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = false, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run noRecheckTest =
     initWith(1, 0).then(plan(1, 1, 2, 0)).then(enter(1))
         .then(prepareOp(BUILD)).then(applyNext(P)).then(applyNext(Q)).then(ackBuild(P)).then(ackBuild(Q))
@@ -803,7 +897,8 @@ module m21_red_early_commit {
   import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = false, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run earlyCommitTest = initWith(1, 0).then(prepareOp(BUILD)).then(commitOp(BUILD)).expect(not(indexMatches))
 }
 
@@ -814,7 +909,8 @@ module m21_red_trial_no_fence {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = false, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run trialNoFenceTest =
     initWith(1, 1).then(prepareOp(CHECK)).then(applyNext(P)).then(applyNext(Q)).then(ackCheck(P))
         .then(plan(1, 1, 2, 1)).then(prepare(1)).then(commit(1))
@@ -826,7 +922,8 @@ module m21_red_trial_missing_ack {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = false, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run missingAckTest =
     initWith(1, 2).then(prepareOp(CHECK)).then(applyNext(P)).then(ackCheck(P)).then(commitOp(CHECK))
         .then(applyNext(Q)).then(applyNext(Q))
@@ -837,7 +934,8 @@ module m21_red_trial_early {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = false, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run trialEarlyTest =
     initWith(1, 1).then(prepareOp(CHECK)).then(ackCheck(P))
         .then(plan(1, 1, 2, 0)).then(prepare(1)).expect(not(noServeBelowAck))
@@ -850,7 +948,8 @@ module m21_red_trial_no_drain {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = false, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run trialNoDrainTest =
     initWith(1, 1).then(plan(1, 1, 2, 0)).then(prepare(1))
         .then(prepareOp(CHECK)).then(applyNext(P)).then(ackCheck(P)).then(commit(1))
@@ -862,10 +961,11 @@ module m21_red_trial_no_drain {
 
 // 確かめるが、書き込みを止めない。確かめた後、DROP までの間の書き込みが消える (m14_red_no_lock)。
 module m21_red_drop_no_fence {
-  import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
+  import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = false, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run dropNoFenceTest =
     initWith(1, 1).then(copy).then(prepareOp(DROP)).then(applyNext(P)).then(applyNext(Q)).then(ackDrop(P))
         .then(plan(1, 1, 2, 1)).then(prepare(1)).then(commit(1))
@@ -874,10 +974,11 @@ module m21_red_drop_no_fence {
 }
 // 書き込みは止めるが、確かめない。copy の確定から禁止までの間の書き込みが消える (m14_red_no_check)。
 module m21_red_drop_no_check {
-  import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
+  import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = false,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run dropNoCheckTest =
     initWith(1, 1).then(copy).then(plan(1, 1, 2, 0)).then(prepare(1)).then(commit(1))
         .then(prepareOp(DROP)).then(applyNext(P)).then(applyNext(Q)).then(ackDrop(P)).then(ackDrop(Q)).then(commitOp(DROP))
@@ -885,10 +986,11 @@ module m21_red_drop_no_check {
 }
 // prepare を適用する前に確かめる。確かめた後、適用までの間の書き込みが消える (m14_red_check_early)。
 module m21_red_drop_check_early {
-  import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
+  import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = false, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run dropCheckEarlyTest =
     initWith(1, 1).then(copy).then(prepareOp(DROP)).then(ackDrop(P))
         .then(plan(1, 1, 2, 0)).then(prepare(1)).then(commit(1))
@@ -898,10 +1000,11 @@ module m21_red_drop_check_early {
 // intent を決着させずに表定義の記録を適用する。確かめた後で、禁止の前の intent が確定する (m14_red_no_drain)。
 // DROP を適用した後で確定すれば、消えた表に書き込みが適用される (m11_impl_drop)。
 module m21_red_drop_no_drain {
-  import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
+  import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = false, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run dropNoDrainTest =
     initWith(1, 1).then(copy).then(plan(1, 1, 2, 0)).then(prepare(1))
         .then(prepareOp(DROP)).then(applyNext(P)).then(ackDrop(P)).then(commit(1))
@@ -916,10 +1019,11 @@ module m21_red_drop_no_drain {
 }
 // DROP の commit が、禁止と結び付いていない。期限切れで禁止が解けた後に、commit が通る (m14_red_untied)。
 module m21_red_drop_untied {
-  import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
+  import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = false, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run dropUntiedTest =
     initWith(1, 1).then(copy).then(prepareOp(DROP)).then(applyNext(P)).then(applyNext(Q)).then(ackDrop(P)).then(ackDrop(Q))
         .then(expire(DROP)).then(applyNext(P))
@@ -930,10 +1034,11 @@ module m21_red_drop_untied {
 // 全シャードが prepare を適用する前に commit を記録し、DDL が完了を返す。古い表定義の Worker が、まだ適用していないシャードへ書き、
 // 後から DROP が適用されて消える (m11_red_no_sync)。
 module m21_red_drop_missing_ack {
-  import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = false,
+  import m21_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 2, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = false, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run dropMissingAckTest =
     initWith(1, 1).then(prepareOp(DROP)).then(applyNext(P)).then(ackDrop(P)).then(commitOp(DROP))
         .then(plan(1, 2, 2, 0)).then(prepare(1)).then(commit(1))
@@ -945,11 +1050,13 @@ module m21_red_drop_missing_ack {
 // ---- 赤: 2 つの遷移が同時に開く --------------------------------------------------
 
 // 表定義の遷移を、同時に 2 つ開く。index を作っている間に、同じ表の DROP が確定する。index の commit は、消えた表に適用できない。
+// 取引は要らないので、置かない (反例が深く、取引があると探索に時間がかかる)。
 module m21_red_two_open {
-  import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 1, FIXED_INIT = false,
+  import m21_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, NTXN = 0, FIXED_INIT = false,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = false, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run twoOpenTest =
     initWith(1, 0).then(prepareOp(BUILD)).then(prepareOp(DROP))
         .then(applyNext(P)).then(applyNext(P)).then(applyNext(Q)).then(applyNext(Q))
@@ -966,7 +1073,8 @@ module m21_red_ddl_during_move {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = true, NTXN = 1, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = false, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = false, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run ddlDuringMoveTest =
     initWith(1, 1).then(startSplit).then(applyNext(C)).then(prepareOp(CHECK)).then(read(2, 1))
         .expect(not(servable))
@@ -977,7 +1085,8 @@ module m21_red_move_during_ddl {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = true, NTXN = 1, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = false, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = false, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run moveDuringDdlTest =
     initWith(1, 1).then(prepareOp(CHECK)).then(startSplit).then(expire(CHECK))
         .then(applyNext(C)).then(applyNext(C)).then(read(3, 1))
@@ -988,7 +1097,8 @@ module m21_red_end_early {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = true, NTXN = 1, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = false, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = false, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run endEarlyTest =
     initWith(1, 1).then(startSplit).then(applyNext(C)).then(endSplit).then(prepareOp(CHECK)).then(applyNext(C)).then(read(3, 1))
         .expect(not(servable))
@@ -998,7 +1108,8 @@ module m21_red_pull_unfenced {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = true, NTXN = 1, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = false, FENCE_IS_EPOCH = true, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = false, FENCE_IS_EPOCH = true, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run pullUnfencedTest =
     initWith(1, 1).then(startSplit).then(applyNext(C)).then(pull)
         .then(plan(1, 1, 2, 0)).then(prepare(1)).then(commit(1))
@@ -1017,7 +1128,8 @@ module m21_red_fence_first {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = true, NTXN = 1, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = false, OWNER_CHECK = 0).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = false, OWNER_CHECK = 0,
+    SCHEMA_ON_PREPARE = true).*
   run fenceFirstTest =
     initWith(1, 1).then(fenceFirst).then(die(SPLIT)).then(read(0, 1))
         .expect(not(servable) and len == 0)
@@ -1027,7 +1139,8 @@ module m21_red_owner_unchecked {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = true, NTXN = 1, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 2).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 2,
+    SCHEMA_ON_PREPARE = true).*
   run ownerUncheckedTest =
     initWith(1, 1).then(startSplit).then(applyNext(P)).then(applyNext(C)).then(pull)
         .then(plan(1, 1, 2, 0)).then(prepare(1)).then(commit(1))
@@ -1039,7 +1152,8 @@ module m21_red_strict_epoch {
   import m21_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = true, NTXN = 1, FIXED_INIT = true,
     REJECT_STALE = true, RECHECK = true, FENCE = true, DRAIN = true, CHECK_AT_EPOCH = true, GUARD_CHECK = true,
     ALL_ACKS = true, ONE_EXIT = true, ONE_OPEN = true, PIN = true, BUILD_VISIBLE = false,
-    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 1).*
+    DDL_WAITS_MOVE = true, MOVE_WAITS_DDL = true, END_AFTER_DRAIN = true, PULL_AT_EPOCH = true, FENCE_IS_EPOCH = true, OWNER_CHECK = 1,
+    SCHEMA_ON_PREPARE = true).*
   run strictEpochTest =
     initWith(1, 1).then(plan(1, 2, 2, 0)).then(startSplit).then(applyNext(Q)).then(prepare(1))
         .expect(not(pinnedSurvives) and not(txns.get(1).ok))

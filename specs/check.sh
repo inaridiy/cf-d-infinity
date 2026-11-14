@@ -392,7 +392,9 @@ green   $f m21_green_ddl2 epochSafe                     # 同時に出された 
 green   $f m21_green_drop epochSafe                     # 取引が読んだ表の DROP。copy の後の書き込みがあれば取り消す
 green   $f m21_green_split epochSafe                    # 移動と DDL。分割を進める側は、start の後ならいつ止まってもよい
 green   $f m21_green_split_txns epochSafe               # 移動の前後のスナップショットの取引 2 件。動かない行の取引は、分割の記録を適用したシャードでも通る
-green   $f m21_check_no_reject commitApplies            # 外しても破れない条件: 行で失敗し得る DDL は、版の確認がなくても、確定を適用できる
+green   $f m21_check_no_reject commitApplies            # 外しても破れない: CHECK の場面では、版の確認がなくても、記録された commit を適用できる (この不変条件に限る。版の確認を外してよい、ではない)
+green   $f m21_alt_commit_only_build epochSafeCommitOnly   # 別の案: 表定義の epoch を commit だけで進める (prepare と abort では進めない)。noServeBelowAck を除いて成り立つ
+green   $f m21_alt_commit_only_check epochSafeCommitOnly
 # BUILD の場面 (M12 と、M11 のうち Meta の仕組みに依る赤)
 red     $f m21_red_online indexMatches                  # 2026-11 までの設計 (作りながら書く)。他人の項目を消す (m12_red_online)
 red     $f m21_red_online notRelied
@@ -451,6 +453,12 @@ witness $f m21_green_split witnessDdlAfterMove
 witness $f m21_green_split witnessMoveAfterDdl
 witness $f m21_green_split witnessParentAnswersUncut    # 親が、start を適用した後で、まだ渡していない行の読みに答える (M19)
 witness $f m21_green_split_txns witnessPinnedSurvives   # 分割より前のスナップショットの取引が、分割の記録を適用したシャードで通る
+witness $f m21_alt_commit_only_check witnessOldPlanAfterAbort   # 別の案で、prepare より前の計画が、取り消しの後で、計画し直さずに通る
+if [ "${HEAVY:-0}" = "1" ]; then                   # 移動と index の作成の組み合わせ (M12 が扱わなかった)。緑が 1 本で 10 分ほど、witness も同じくらいかかる
+  green   $f m21_green_split_build epochSafe            # 行を埋める処理は、移動が閉じた後なら子の行を読む
+  witness $f m21_green_split_build witnessBuildAfterMove  # 移動が閉じた後で index が公開され、項目は子が持つ行を指す
+  witness $f m21_green_split_build witnessMoveAfterBuild  # index が公開された後で行が動き、子への書き込みが index を保守する
+fi
 # 時刻に依る 2 つの性質 (M12 の公開の時刻と、M14 の確かめが比べる時刻を、epoch の言葉に直した小さなモデル)
 green   $f m21_clock_green commitIsAPoint
 red     $f m21_clock_red_no_clock commitIsAPoint        # commit が時刻を運ばない (m12_clock_red_no_clock)
@@ -460,12 +468,12 @@ green   $f m21_guard_green guardSafe
 red     $f m21_guard_red_commit_ts noLostWrite          # copy の確定の時刻と比べる (m14_red_commit_ts)
 witness $f m21_guard_green witnessDroppedAfterWrites
 witness $f m21_guard_green witnessRefusedByCheck
-for m in m21_green_build m21_green_check m21_green_drop m21_green_split m21_green_split_txns \
+for m in m21_green_build m21_green_check m21_green_drop m21_green_split m21_green_split_txns m21_green_split_build \
          m21_red_online m21_red_no_fence m21_red_visible m21_red_no_drain m21_red_stale m21_red_two_exits m21_red_repin m21_red_scan_early \
          m21_red_no_recheck m21_red_early_commit m21_red_trial_no_fence m21_red_trial_missing_ack m21_red_trial_early m21_red_trial_no_drain \
          m21_red_drop_no_fence m21_red_drop_no_check m21_red_drop_check_early m21_red_drop_no_drain m21_red_drop_untied m21_red_drop_missing_ack \
          m21_red_two_open m21_red_ddl_during_move m21_red_move_during_ddl m21_red_end_early m21_red_pull_unfenced m21_red_fence_first \
-         m21_red_owner_unchecked m21_red_strict_epoch m21_clock_red_no_clock m21_clock_red_skip_empty m21_guard_red_commit_ts; do tests $f $m; done
+         m21_red_owner_unchecked m21_red_strict_epoch m21_alt_commit_only_check m21_clock_red_no_clock m21_clock_red_skip_empty m21_guard_red_commit_ts; do tests $f $m; done
 
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
