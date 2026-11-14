@@ -186,7 +186,6 @@ const ENTER = Symbol("enter");
  *
  * 印は、作った 1 歩の中だけで使う。待ちをまたいで残るのは frame だけで、frame には印を入れない (frame の宣言に Section が
  * 現れないことを、test/determinism.test.ts が確かめる)。だから、待ちの後で印が要る処理は、enter をもう一度通る。
- * 例外が 1 つだけ残っている。確かめずに印を作る unchecked で、autocommit の高速経路から戻った後の道が使う。
  */
 class Section<K extends Check> {
   /** 確かめ直したこと。多く確かめた印は、少なく求める関数へ渡せる。逆は渡せない。 */
@@ -1848,14 +1847,6 @@ export class ShardKernel {
     return { to, method, req };
   }
 
-  /**
-   * 確かめ直さずに、同期区間の印を作る。今日のコードが、待ちの後で確かめ直していない所を、そのまま写すためにある。
-   * 引数は、未解決の問題の番号である。直すときは、enter に置き換える。
-   */
-  private unchecked(_problem: 26): Section<Check> {
-    return Section[ENTER]({ schema: true, owned: true });
-  }
-
   // ---- 手続き: 表定義 ----
 
   /**
@@ -2564,9 +2555,13 @@ export class ShardKernel {
         const direct = unwrap(f.direct);
         f.direct = undefined;
         if (direct) return done(direct);
-        // 高速経路の応答を受け取るまでに、制御を 1 回手放している。ここでは区間に入り直さず、下の下書きは、手放す前の確かめのまま
-        // 実行する。版は、確定の直前に確かめ直す。持ち主は確かめ直さない (未解決の問題 26)。
-        sec = this.unchecked(26);
+        // 高速経路は使えなかった。その結果を待つ間に、制御を 1 回手放している。区間に入り直して、入口と同じことを確かめ直す。
+        // 手放している間に走れるのは、もう起こされていた行の待ち手の続きだけで、持ち主も intent も変えない
+        // (test/autocommit-fallback.test.ts)。それでも、待ちの前の確かめは、待ちの後へ持ち越さない。
+        sec = this.enter(claim);
+        if (!this.faults.ignoreIntentsInValidation && this.overlapping(req.spans, Number.MAX_SAFE_INTEGER).length > 0) {
+          throw new ConflictError("pending intent");
+        }
       } else {
         // 行を待った後。autocommit は取引より若いものとして順番を待つ。待っている間に行が変わるので、区間に入り直して実行し直す。
         unwrap(f.waited!);
@@ -2590,9 +2585,7 @@ export class ShardKernel {
       const pending = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, dry.changes);
       if (pending) throw new ConflictError(pending);
       this.assertWriteSetFits(sec, dry.changes);
-      // 下書きを取った区間の続きで、間に待ちはない。高速経路が null を返した後の道では、制御を手放した後の確かめ直しは、
-      // これだけである。
-      this.enter({ schema: req.schema });
+      // 下書きを取った区間の続きで、間に待ちはない。版も持ち主も、この区間の入口 (enter) で確かめてある。
       const c = this.issue();
       if (dry.changes.length) this.b.tx(() => this.applyAndLog(`auto-${c}`, c, dry.changes));
       return done({ ...dry, T: c, hlc: this.hlc.value, epoch: this.epoch });
