@@ -119,7 +119,24 @@ witness $f m5b_green witnessIntentMovedThenApplied
 green   $f m5b_green_range migrationSafe
 red     $f m5b_red_range noWriteBelowRead
 witness $f m5b_green_range witnessOpenWritten
-for m in m5b_green m5b_green_range m5b_red_range m5b_red_s3 m5b_red_s3_parent m5b_red_p2 m5b_red_p2_window m5b_red_intents; do tests $f $m; done
+# 空にされたグループと範囲の床。親が fence の前に行を全部消したグループを、消す前の時刻 T で、子に読む
+red     $f m5b_red_emptied readConsistent          # 2026-11-14 の実装: 子は到着の記録も床も持たず、「行なし」と答える
+green   $f m5b_green_floor floorSafe               # 範囲の床: 子は、移動を終えた範囲のグループの T < m の読みを断る
+green   $f m5b_green_floor_clock floorSafe         # 答えた読みの時刻を覚えて、noWriteBelowRead も確かめる (取引 X なし)
+red     $f m5b_red_floor_volatile readConsistent   # 床を、子の再起動で忘れる
+red     $f m5b_red_floor_no_clock readConsistent   # 床はあるが、移動を終えるときに親の時計を子へ渡さない
+green   $f m5b_green_floor_resplit floorSafe       # 同じ範囲をもう一度移す (子を親にして、新しいシャードへ。取引 X なし)
+if [ "${HEAVY:-0}" = "1" ]; then                   # 取引 X を入れた版 (2,986 万状態と 4,332 万状態。合わせて 10〜20 分)
+  green $f m5b_green_floor_clock_x floorSafe
+  green $f m5b_green_floor_resplit_x floorSafe
+fi
+witness $f m5b_green_floor witnessEmptiedWritten
+witness $f m5b_green_floor_clock witnessEmptiedRead
+witness $f m5b_green_floor_resplit witnessSecondHopWritten
+witness $f m5b_green_floor_resplit witnessSecondHopEmptied
+for m in m5b_green m5b_green_range m5b_red_range m5b_red_s3 m5b_red_s3_parent m5b_red_p2 m5b_red_p2_window m5b_red_intents \
+         m5b_red_emptied m5b_green_floor m5b_green_floor_clock m5b_green_floor_clock_x m5b_red_floor_volatile m5b_red_floor_no_clock \
+         m5b_green_floor_resplit m5b_green_floor_resplit_x; do tests $f $m; done
 
 echo "== M6 watermark"
 f=m6_watermark.qnt

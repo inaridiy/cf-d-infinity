@@ -45,10 +45,17 @@ red と green は同じ core モジュールを `const` フラグで切り替え
 | M6 `m6_green` | `watermarkSafe` | shard 2、SKEW 1、MARGIN 2、DELAY 1、now 0..6、write 2/shard | 34,053,946 (生成 1.9 億、251 s) | 22 | No violation |
 | M6 `m6_red_dirty` / `m6_red_resolved` / `m6_red_skew` | `watermarkSafe` | 同上 (skew は SKEW 2) | 反例 | | 反例 |
 | M6 `m6_red_skew` | `watermarkSafeOrDetected` | SKEW 2 | 90,863,609 (569 s、HEAVY) | 24 | No violation (遅延検出で補える) |
-| M5b `m5b_green` | `migrationSafe` | P/C、group 2、write 2、intent 1、worker 2、tick 2、T 0..6 | 9,512,226 (生成 9,356 万、112 s) | 22 | No violation |
+| M5b `m5b_green` | `migrationSafe` | P/C、group 2、write 2、intent 1、worker 2、tick 2、T 0..6 | 9,719,448 (生成 9,692 万。`finishRange` を足す前は 9,512,226) | 22 | No violation |
 | M5b `m5b_red_s3` / `_s3_parent` / `_p2` / `_p2_window` / `_intents` | `migrationSafe` | 同上 | 反例 | | 反例 (5 本すべて) |
 | M5b `m5b_green_range` | `migrationSafe` (`noWriteBelowRead` を含む) | 同上で T 0..3、答えた読みの時刻を覚える、範囲の移動を終える手順あり | 8,306,186 (76 s) | | No violation |
 | M5b `m5b_red_range` | `noWriteBelowRead` | 同上、移動を終えるときに親の時計を子へ渡さない | 25,013 で反例 | | 反例 |
+| M5b `m5b_red_emptied` | `readConsistent` | P/C、group 2、write 2、intent 1、worker 2、tick 2、T 0..4、行を全部消す書き込みをグループごとに 1 回。床なし (2026-11-14 の実装) | 約 4 万で反例 | 最短の反例は 6 手 | 反例 (実装の欠陥) |
+| M5b `m5b_green_floor` | `floorSafe` (= migrationSafe ∧ openReadConsistent ∧ clockAboveFloor) | 同上、範囲の床あり | 20,667,159 (生成 1.72 億) | 23 | No violation |
+| M5b `m5b_green_floor_clock` | `floorSafe` (`noWriteBelowRead` を含む) | 同上、答えた読みの時刻を覚える、取引 X なし | 4,150,998 (生成 3,481 万) | 21 | No violation |
+| M5b `m5b_green_floor_clock_x` | `floorSafe` (`noWriteBelowRead` を含む) | 答えた読みの時刻を覚える、取引 X あり、削除は X が書くグループ 1 だけ、T 0..3 (HEAVY) | 29,856,308 (生成 2.27 億) | 22 | No violation |
+| M5b `m5b_red_floor_volatile` / `m5b_red_floor_no_clock` | `readConsistent` | `m5b_green_floor` から条件を 1 つずつ外す (床を子の再起動で忘れる / 移動を終えるときに親の時計を渡さない) | 反例 | 最短の反例は 7 / 9 手 | 反例 (2 本とも) |
+| M5b `m5b_green_floor_resplit` | `floorSafe` | 範囲の床あり。子が受け取り終えた範囲を、新しい空のシャードへもう一度移す。削除は両方のグループ、tick 1、T 0..5、取引 X なし | 6,127,304 (生成 3,933 万) | 28 | No violation |
+| M5b `m5b_green_floor_resplit_x` | `floorSafe` | 同上、取引 X あり、削除は X が書くグループ 1 だけ、tick なし、T 0..4 (HEAVY) | 43,323,996 (生成 2.55 億) | 29 | No violation |
 | M7 `m7_green` | `restoreCorrect` | shard 2、APPROX 1、MARGIN 1、now 0..4、write 2/shard | 46,114,036 (生成 1.5 億、123 s) | 26 | No violation |
 | M7 `m7_red` | `restoreCorrect` | 同上 | 反例 | | 反例 |
 
@@ -109,6 +116,10 @@ witness (vacuous でないことの確認。`not(到達したい状態)` を inv
 | M6 | `witnessPublished`, `witnessIntentApplied` | W が公開され、intent が適用された commit も flush される |
 | M5b | `witnessMovedAndWritten` | 全グループが移動し、子で write を受理し、X も適用された |
 | M5b | `witnessIntentMovedThenApplied` | 親で prepare した intent が子へ移り、子で適用された |
+| M5b | `witnessOpenWritten` (`m5b_green_range`) | 子が到着なしで受け持ったグループに、子が書き込みを受理した |
+| M5b | `witnessEmptiedWritten` (`m5b_green_floor`) | 親が移動の前に空にしたグループを、子が到着なしで受け持ち、その後で子が書き込みを受理した |
+| M5b | `witnessEmptiedRead` (`m5b_green_floor_clock`) | 親が移動の前に空にしたグループを、子が床以上の T で答えた (床があっても、読みを全部断ってはいない) |
+| M5b | `witnessSecondHopWritten` / `witnessSecondHopEmptied` (`m5b_green_floor_resplit`) | 範囲を移し直した後で、新しい子が全部のグループを受け持って書き込みを受理した / 最初の親が空にしたグループを、新しい子が到着なしで受け持った |
 | M7 | `witnessRestoredNonEmpty` | 全シャードを復元し、復元結果が空でない |
 | M9 | `witnessPessWaitedCommit` / `witnessWoundTaken` / `witnessImmROValidated` / `witnessSecondDml` | 待った悲観取引が commit、wound で奪う、IMMEDIATE 読み取り専用が検証を通して commit、2 回目の DML を経て commit |
 | M11 | `witnessPublicWithWriters` | DDL の途中に、index を知らない計画の取引と write-only の計画の取引が 1 件ずつ確定し、index が 2 行とも持って public になる |
@@ -158,6 +169,54 @@ phase 2 は moved 表で現オーナー (子) へ転送し、子が未到着な�
 「intent がある DO に適用する」ではなく「moved 表で決めた DO に適用する」。
 
 S3 の字義そのものの反例 (`m5b_red_s3`, `m5b_red_s3_parent`) は報告本文に時系列で書いた。
+
+### M5b: 親が空にしたグループを、古い読みの時刻で子に読む (範囲の床)
+
+`m5b_red_emptied.counterexampleTest`。2026-11-14 の実装の欠陥である。実装では `packages/cf-d-infinity/test/open/old-read-of-emptied-group.test.ts` が再現する。
+
+行のあるグループは、pull が時刻 m を運び、子は T < m の読みを ReadTooOld で断る。親が fence の前に行を全部消したグループは、行がないので pull されず、m を運ばない。範囲の移動が終わると、子はそのグループを到着なしで受け持つ。子にはそのグループの履歴がないので、どの T の読みにも「行なし」と答える。
+
+それまでのモデルは、到着なしで受け持つグループを、一度も書かれていないグループに限っていた (`finishRange` の条件が `hist == initVers`)。書かれた後で空になったグループがモデルになかったので、`m5b_green_range` は通っていた。今回、行を全部消す書き込み (`del`、`DELETES`) を足し、`finishRange` の条件を「親の最新の版が行なし」に広げた。削除のない既存のインスタンスでは、2 つの条件は同じである。
+
+1. 親がグループ 2 に行を書く (c = 1)。取引が T = 1 でその行を読む。
+2. 別の接続が、その行を消す (c = 2)。グループは空になる。
+3. 親が fence し、Meta が経路を子へ切り替え、範囲の移動を終える。運ぶ行はない。親は m = 3 を発行し、子は時計を 3 に進めて、グループを到着なしで受け持つ。
+4. 取引が別の接続で続く。T は 1 のままで、送り先は新しい範囲表で決まるので、子へ行く。子は「行なし」と答える。T = 1 の時点では行があった。
+
+取引は、同じ行を 2 回読んで、違う答えを得る。読むだけの取引は確定のときに検証を受けないので、そのまま確定する。最短の反例は、1 の読みを省いた 6 手である (書く、消す、fence、経路の切り替え、移動を終える、子で読む)。
+
+モデルの読み (`read(C, g, T)`) は、T も送り先も自由に選ぶ。接続をまたいで続く取引も、分割の後に始まって時計の遅れた別のシャードから T を取る取引も、この読みに含まれる。子が到着なしのグループを答えるのは `finishRange` の後だけで、そのとき Meta の経路は子を指している。
+
+修正 (`m5b_green_floor`) は、範囲の床である。子は、範囲の移動を終えるときに受け取った時刻 m を、範囲と一緒に残す。その範囲のグループを T < m で読む要求は、pull されたグループでも、されなかったグループでも、ReadTooOld で断る。m は、親が fence の後に発行した時刻なので、親がその範囲に確定したどの書き込みよりも大きい。T ≥ m の読みは親の書き込みを全部見るので、子の持つ状態がそのまま答えになる。
+
+`floorSafe` は、`migrationSafe` に次の 2 つを足したものである。
+
+- `openReadConsistent`: 子が到着なしで受け持つグループを答える T では、子の持つ値が、その時刻の真の値と一致する。`readConsistent` は、読みが起きたときに比べる。こちらは、どの状態でも、子が答えるはずの T を全部比べる。
+- `clockAboveFloor`: 床を持つシャードの時計は、床以上である。
+
+床に要ることを、次のインスタンスで確かめた。
+
+| 確かめたこと | インスタンス | 結果 |
+|---|---|---|
+| 床は、子の再起動の後も残っていなければならない | `m5b_red_floor_volatile` | 再起動で床を忘れると、床のない実装と同じ反例になる |
+| 床は、時計を渡す手順の代わりにならない | `m5b_red_floor_no_clock` | 親がグループ 1 を書いて (c = 1) 空にする (c = 2)。子は床 3 を残すが、時計は 0 のままである。子が取引 X の書き込みを c = 1 で適用する。時刻の順では削除が後なので、T = 3 の真の値は「行なし」だが、子は X の値を答える |
+| 全部のグループが pull された範囲にも、床を残してよい | `m5b_green_floor` (run は `pulledGroupTest`) | pull されたグループは、到着の m 以上で床より小さい T も断るようになる。断る読みが増えるだけである |
+| 書き込みの側 (答えた読みの時刻以下で書き込みを受理しない) は、床と削除があっても成り立つ | `m5b_green_floor_clock`、`m5b_green_floor_clock_x` | `noWriteBelowRead` を含めて違反なし |
+| 同じ範囲をもう一度移すとき、新しい子は前の床を知らなくてよい | `m5b_green_floor_resplit`、`m5b_green_floor_resplit_x` | 違反なし |
+
+答えた読みの時刻を覚えるインスタンスと、範囲を移し直すインスタンスは、状態が多い。`check.sh` がいつも回すのは、取引 X を外した版である (`CROSS = false`。書き込みは blind write と削除だけ)。X を入れた版 (`_x`) は、定数を小さくして、`HEAVY=1` のときだけ回す。削除は、X が書くグループ 1 だけにしてある。空にされたグループへ X の書き込みが届く形は、読みと持ち主の不変条件については `m5b_green_floor` がいつも確かめる。`noWriteBelowRead` と、移し直しについては、`_x` の版だけが確かめる。
+
+`m5b_red_range` (時計を渡さない) は、親が答えた読みがあって初めて破れた。空にされたグループがあると、`m5b_red_floor_no_clock` のとおり、親の確定だけで破れる。
+
+移し直し (`nextHop`) は、受け取り終えた子を親に読み替え、新しい空のシャードを子にして、同じ手順をもう一度進める。新しい親は、前の移動で受け取った時計、行、到着の m、床を持ち続け、到着の m か床より小さい T の読みは、親になっても断る。新しい子の床は、新しい親が発行する時刻である。新しい親の時計は自分の床以上 (`clockAboveFloor`) なので、新しい床は前の床より大きく、新しい子は前の床を受け取らなくてよい。親の時計が床以上なのは、範囲の移動を終えるときに時計を受け取っているからである。
+
+モデルにないもの。
+
+- 全表の読み。M5b は読みをグループ単位で扱う。実装の子は、全表の読みを、到着の m の最大 (`maxArrived`) より小さい T で断る。行を 1 つも運ばなかった分割では、これが 0 のままなので、子は古い T の全表の読みを断らない。答えが実際に欠けるかどうかは、親が残りの範囲について返す行にもよるので、走らせて確かめてはいない。床は、全表の読みにも当てる (床を持つ範囲に重なる読みを、T < m で断る)。
+- `finishMove` と `finishIncoming` の間。実装では別々の RPC で、モデルの `finishRange` は 1 手である。間に、要求から始まる pull が入ると、そのグループの到着の m は、床より大きくなる。子が到着の m と床の両方で断るかぎり、断る読みが増えるだけである。範囲の移動を終えるときに到着の記録を消す設計 (`docs/design-subslots.md` の「drain と finishMove」) は、この順序を含めては確かめていない。`finishMove` をやり直すと、親は新しい m を発行する。fence の後は親の範囲の行が変わらないので、どの m も床として使えるはずだが、これも確かめていない。
+- 範囲の一部だけの移し直し。モデルの範囲は、グループの全部である。子が受け取った範囲の一部を渡すときは、残りの部分の床を残す。
+- 読みと書き込みの両方をする取引の検証。書き込みは blind write だけである。
+- M18 の「行のない piece」。piece でも同じ形のはずだが、M18 には足していない。
 
 ### M1b で見つかった穴 (claim 3: 「読みの開始前に確定した書き込みは必ず見える」)
 
@@ -514,6 +573,15 @@ invariant は 4 つである。
   `P2_MODE` (phase 2 の宛先: 0 prepare 先、1 intent の物理位置、2 moved 表)、`MOVE_INTENTS`。
 - green = 版を保って物理的に移す、親は移動済みグループに常に NotOwner、子は T < m に ReadTooOld、phase 2 は moved 表で転送、intent は pull で運ぶ。
   fence の有無や Meta 切替との順序は nondet なので、「切替を先にして親は未移動グループを受理し続ける」(S2 の字義) も含めて安全。
+- 範囲の移動を終える手順 (`finishRange`)。親に行も intent もないグループは pull されず、子が到着なしで受け持つ。親は時刻 m を発行し、
+  `FINISH_CARRIES_CLOCK` なら子は時計を m まで進める。`noWriteBelowRead` (答えた読みの時刻以下で、同じグループへの書き込みを受理しない) は、
+  答えた読みの時刻を覚えるインスタンス (`TRACK_READS`) で確かめる。
+- 空にされたグループと範囲の床 (2026-11-14)。`DELETES` のグループは、行を全部消す blind write (`del`) を 1 回受ける。確定の時刻で「行なし」の版を置く。
+  `RANGE_FLOOR` なら、子は `finishRange` で受け取った m を床として残し、その範囲のグループの T < m の読みを断る。
+  `FLOOR_DURABLE = false` は、床を子の再起動 (`restartC`) で忘れる。`HOPS` は、同じ範囲をもう一度移す回数である (`nextHop`)。
+  `CROSS = false` は、取引 X を外す (状態を減らすため)。
+  床のあるインスタンスは `floorSafe` (= migrationSafe ∧ openReadConsistent ∧ clockAboveFloor) を確かめる。
+  欠陥と修正は「M5b: 親が空にしたグループを、古い読みの時刻で子に読む」の節に書いた。
 
 ### M7 `m7_restore.qnt` — W への同時点復元 (S6)
 
@@ -537,8 +605,10 @@ invariant は 4 つである。
 - M3 は取引 1 件、anchor は参加者とは別ノードとして扱う。tombstone の書き込みは durable とみなす (照会応答は確定後)。
 - M5 の split は右半分のキーだけ。コピー速度・追いつきは扱わない (サイズ・性能の話はベンチ側)。
 - M6 の Meta の時計は真の時刻。compactor の再生成そのものはモデル外 (検出までを見る)。
-- M5b: 書き込みは blind write (検証無し)。移動の単位はグループ 1 個 = 行 1 個 (チャンク分割は扱わない)。親の行イメージの GC、
-  子の再 split (連鎖) は扱わない。pull の応答喪失で親と子の再起動を表す (永続状態以外は持たない)。
+- M5b: 書き込みは blind write (検証無し)。移動の単位はグループ 1 個 = 行 1 個 (チャンク分割は扱わない)。親の行イメージの GC は扱わない。
+  子の再 split は、受け取り終えた範囲の全部を新しい空のシャードへ移す形だけを、`m5b_green_floor_resplit` で扱う (範囲の一部だけ、
+  3 回以上、元の親へ戻す形は扱わない)。pull の応答喪失で親と子の再起動を表す (永続状態以外は持たない)。床を永続させない場合だけ、
+  子の再起動を別の手 (`restartC`) にしてある。範囲の移動の終わりは 1 手で、`finishMove` と `finishIncoming` の間は扱わない。
 - M7: 時計ずれ無し、intent 無し。bookmark の概算は「時刻 b の commit 集合」で表す。
 - M11: index の項目は取引の確定と同時に変わる (index の表への 2PC と、その途中を読む読み手は M1 と M9 に任せる)。時刻はなく、
   backfill の読みは「確定済みの intent は適用後の値を読み、未確定の intent は読み飛ばす」で表す。
