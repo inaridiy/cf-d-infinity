@@ -364,7 +364,7 @@ export interface SettleFrame {
 export interface ExecFrame {
   req: ExecReq;
   // ---- 確かめ直さないこと ----
-  /** 版を、入口で確かめた (表定義の同期を待った)。intent の決着を待った後は、確かめ直さない (未解決の問題 27)。 */
+  /** 表定義の同期を、入口で待った。待つのは 1 回だけで、版そのものは、文を実行する同期区間で確かめ直す。 */
   planned?: true;
   /** グループの到着を待った。 */
   arrived?: true;
@@ -2264,7 +2264,7 @@ export class ShardKernel {
     f.deadline ??= this.deps.clock.now() + LOCK_WAIT_MS;
     const deadline = f.deadline;
     // 最新の状態を読むので、読む時刻はない。
-    const claim: Rows = { spans: req.spans, writes: [], at: null };
+    const claim: Plan & Rows = { schema: req.schema, spans: req.spans, writes: [], at: null };
     if (f.waiting !== undefined) {
       // 行を待って、起こされた。到着の待ちからやり直す。
       f.woken = f.waiting;
@@ -2294,8 +2294,8 @@ export class ShardKernel {
       return wait(this.call("settle", { spans: req.spans, T: f.F }), "applied");
     }
     const F = f.F;
-    // ここから先は待たない。版は確かめ直さない。行ロックや intent の決着を待っている間に DDL が適用されると、この文は
-    // 古い計画のまま実行される。文の変更は、取引の確定 (commitLocal、prepare、commit) が版を確かめる (未解決の問題 27)。
+    // ここから先は待たない。行ロックや intent の決着を待っている間に DDL が適用されていたら、この文は古い計画である。
+    // 入口で断るのと同じに、ここで断る (待ちの後の確かめ直し)。
     const sec = this.enter(claim);
     this.count("writes", req.spans);
     this.renew(me.txn);
@@ -2446,9 +2446,10 @@ export class ShardKernel {
     // phase 2 が届いていない参加者の時計は commit 時刻に追いついていない。anchor の時計が進んでいると c > T になり、
     // そのまま T で読むと、開始前に確定して応答まで返った書き込みが見えない。T を取り直させる。
     if (req.T !== undefined && req.realtime && applied > T && !this.faults.noRealtimeBump) throw new ReadTooOld(`moved at ${this.hlc.value}`);
-    // ここから先は待たない。版は確かめ直さない。intent の決着を待っている間に DDL が適用されると、この文は古い計画の
-    // まま実行される。取引の文の変更は、取引の確定 (commitLocal、prepare、commit) が版を確かめる (未解決の問題 27)。
-    const sec = this.enter({ spans: req.spans, writes: [], at: T });
+    // ここから先は待たない。intent の決着を待っている間に DDL が適用されていたら、この文は古い計画である。入口で断るのと同じに、
+    // ここで断る。断らないと、読むだけの取引が、古い計画の読みの答えを、検証なしでそのまま使う
+    // (test/stale-plan-after-wait.test.ts)。
+    const sec = this.enter({ schema: req.schema, spans: req.spans, writes: [], at: T });
     this.count(req.write ? "writes" : "reads", req.spans);
     if (req.fresh && req.spans.some((s) => this.changedSince(sec, s, T))) {
       throw new ReadTooOld(`moved at ${this.hlc.value}`);
