@@ -7,6 +7,8 @@ import { MetaCore, type SplitMove, type SplitSlot } from "../src/meta";
 import { initialRouting, shardsOf, tokenOf, type Interval, type Routing } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
+import { bindParams, ident, parseStatements, render, type Node } from "../src/sql/cst";
+import { returningClause, rewriteReturning } from "../src/sql/returning";
 import { ShardCore, type SpanEscape, type WriteCheck } from "../src/shard/core";
 import { imageColumns } from "../src/shard/rows";
 import type { Backend, Change, Faults, Row, ShardApi, Span, TableDef, Ts, Value } from "../src/types";
@@ -160,6 +162,76 @@ export class VirtualRuntime implements Runtime {
  */
 const lossy = (v: unknown): Value => (typeof v === "bigint" ? Number(v) : (v as Value));
 
+/**
+ * DO のドライバは、結果の TEXT を NUL (U+0000) を含めて全部返す。node:sqlite のドライバは、最初の NUL で切って返す
+ * (docs/design-values.md の「確かめた事実」)。シミュレータがそのまま返すと、NUL を含む TEXT を、シャードの側も基準の側も
+ * 同じように切って、食い違いが見えない (test/open/nul-in-text.test.ts が見つけた検査の欠け)。
+ *
+ * そこで、結果を返す文 (SELECT、VALUES、WITH で始まる文) は、DO のドライバと同じ値になるように包み直して読む。TEXT は BLOB に
+ * して運び (CAST(... AS BLOB) は全部のバイトを返す)、UTF-8 として戻す。BLOB は 16 進の文字列で運ぶ。結果の列を 2 回以上参照する
+ * ので、`LIMIT -1 OFFSET 0` で、包む前の文を 1 行につき 1 回だけ評価させる。DML の RETURNING は包めないので、そのまま読む
+ * (D∞ は RETURNING の項を、TEXT を BLOB で運ぶ要素の式に書き換えて送る)。
+ */
+const READS_ROWS = /^\s*(?:(?:--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)\s*)*(SELECT|VALUES|WITH)\b/i;
+const wholeTextCache = new Map<string, string>();
+function wholeTextSql(sql: string, n: number): string {
+  const key = `${n}\0${sql}`;
+  let hit = wholeTextCache.get(key);
+  if (hit === undefined) {
+    const cols = Array.from({ length: n }, (_v, i) => `"c${i}"`);
+    const read = cols.map((c) => `CASE typeof(${c}) WHEN 'text' THEN CAST(${c} AS BLOB) WHEN 'blob' THEN hex(${c}) ELSE ${c} END`);
+    hit = `WITH "__dinf_sim"(${cols.join(", ")}) AS (\n${sql}\n) SELECT ${read.join(", ")} FROM (SELECT * FROM "__dinf_sim" LIMIT -1 OFFSET 0)`;
+    if (wholeTextCache.size >= 4096) wholeTextCache.delete(wholeTextCache.keys().next().value!);
+    wholeTextCache.set(key, hit);
+  }
+  return hit;
+}
+const utf8Text = new TextDecoder();
+const fromHex = (s: string) => Uint8Array.from(s.match(/../g) ?? [], (h) => parseInt(h, 16));
+/** 包み直して読んだ値を、DO のドライバが返す値にする。TEXT は BLOB で、BLOB は 16 進で届く。INTEGER は DO と同じく JS の数に丸める。 */
+const asDriver = (v: unknown): Value =>
+  v instanceof Uint8Array ? utf8Text.decode(v) : typeof v === "string" ? fromHex(v) : lossy(v);
+
+/**
+ * DML の RETURNING は包めないので、項ごとに書き換えて読む (src/sql/returning.ts)。どの格納の型にも印を付け、TEXT は BLOB で運ぶ。
+ * 読んだ値は、DO のドライバが返す値にする。書き換えた文は、元の文と、書く表の列ごとに覚える。
+ */
+const returnedElem = (c: string) =>
+  `CASE typeof(${c}) WHEN 'integer' THEN 'i'||${c} WHEN 'text' THEN CAST(${c} AS BLOB) WHEN 'real' THEN 'r'||quote(${c}) WHEN 'blob' THEN 'b'||hex(${c}) END`;
+const returnedAsDriver = (v: unknown): Value => {
+  if (v === null || v === undefined) return null;
+  if (v instanceof Uint8Array) return utf8Text.decode(v);
+  const s = v as string;
+  return s[0] === "i" ? Number(BigInt(s.slice(1))) : s[0] === "r" ? Number(s.slice(1)) : fromHex(s.slice(1));
+};
+const returningCache = new Map<string, { sql: string; order: number[] } | null>();
+/** 文の RETURNING を書き換えた文と、引数の並び (元の引数の番号) を返す。RETURNING のない文は null。 */
+function wholeReturning(db: DatabaseSync, sql: string, paramCount: number): { sql: string; order: number[] } | null {
+  // `*` は表定義の列に開くので、表定義が変われば書き換え直す。
+  const key = `${(db.prepare("PRAGMA schema_version").get() as { schema_version: number }).schema_version}\0${paramCount}\0${sql}`;
+  let hit = returningCache.get(key);
+  if (hit === undefined) {
+    hit = null;
+    const stmt = parseStatements(sql)[0];
+    const clause = returningClause(stmt);
+    if (clause) {
+      // 引数の値の代わりに番号を束縛して、書き換えた後の文の引数が、元のどの引数かを知る。
+      const values = bindParams(stmt, Array.from({ length: paramCount }, (_v, i) => i));
+      const head = (stmt.clauses as Node[]).find((c) => /^(insert|update|delete)_clause$/.test(c.type));
+      let t: Node = head.type === "insert_clause" ? head.table : head.tables.items[0];
+      while (t.type === "alias" || t.expr) t = t.expr;
+      const table = ident(t.type === "member_expr" ? t.property : t);
+      const columns = (db.prepare(`SELECT name FROM pragma_table_info(?)`).all(table) as { name: string }[]).map((r) => r.name);
+      rewriteReturning(clause, columns, returnedElem);
+      const r = render(stmt, values);
+      hit = { sql: r.sql, order: r.params as number[] };
+    }
+    if (returningCache.size >= 4096) returningCache.delete(returningCache.keys().next().value!);
+    returningCache.set(key, hit);
+  }
+  return hit;
+}
+
 /** node:sqlite の Backend。fence() 後の操作は失敗する (DO 基盤が旧 instance を止めるのと同じ)。 */
 export class SqliteBackend implements Backend {
   fenced = false;
@@ -167,53 +239,67 @@ export class SqliteBackend implements Backend {
   /** quorum の確定の待ちに使う。SimCluster が自分のものに差し替える。 */
   rt: Runtime = systemRuntime;
   constructor(readonly db = new DatabaseSync(":memory:")) {}
-  exec(sql: string, ...params: Value[]): Row[] {
+  /**
+   * 文を用意して、結果の列名と、行を読む関数を返す。結果のない文は、ここで実行する。
+   * node:sqlite も DO の SQLite と同じく、JS の数を REAL として束縛する。束縛の仕方は DO と同じにする (src/value.ts)。
+   * DO の上限は、束縛のために書き換えた後の文に掛かる (書き換えで文が長くなる)。
+   */
+  private prepare(sql: string, params: Value[]): { columns: string[]; read: ((all: boolean) => Iterable<Value[]>) | null } {
     if (this.fenced) throw new Error("fenced instance");
-    // node:sqlite も DO の SQLite と同じく、JS の数を REAL として束縛する。束縛の仕方は DO と同じにする (src/value.ts)。
-    // DO の上限は、束縛のために書き換えた後の文に掛かる (書き換えで文が長くなる)。
     const b = bindTyped(sql, params, "real");
     checkDoLimits(b.sql, b.params);
     const st = this.db.prepare(b.sql);
     const p = b.params as never[];
-    checkDoColumns(st.columns().length);
-    if (st.columns().length === 0) return (st.run(...p), []);
-    const names = restoreColumns(st.columns().map((c) => c.name), b.columns);
-    st.setReturnArrays(true);
-    st.setReadBigInts(true);
-    return (st.all(...p) as unknown as Value[][]).map((r) => Object.fromEntries(names.map((c, i) => [c, lossy(r[i] ?? null)])));
+    const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
+    checkDoColumns(columns.length);
+    if (columns.length === 0) {
+      st.run(...p);
+      return { columns, read: null };
+    }
+    let reader = st;
+    let args = p;
+    let convert = lossy;
+    let wrapped = false;
+    if (READS_ROWS.test(b.sql)) {
+      try {
+        reader = this.db.prepare(wholeTextSql(b.sql, columns.length));
+        convert = asDriver;
+        wrapped = true;
+      } catch {
+        // WITH で始まる DML (RETURNING のある書き込み) は包めない。下で、RETURNING を書き換えて読む。
+      }
+    }
+    if (!wrapped) {
+      const r = wholeReturning(this.db, b.sql, b.params.length);
+      if (r) {
+        reader = this.db.prepare(r.sql);
+        args = r.order.map((i) => b.params[i]) as never[];
+        convert = returnedAsDriver;
+      }
+    }
+    reader.setReturnArrays(true);
+    reader.setReadBigInts(true);
+    return {
+      columns,
+      read: (all) => {
+        if (all) return (reader.all(...args) as unknown as unknown[][]).map((r) => r.map(convert));
+        const it = reader.iterate(...args) as unknown as Iterable<unknown[]>;
+        return (function* () { for (const r of it) yield r.map(convert); })();
+      },
+    };
+  }
+  exec(sql: string, ...params: Value[]): Row[] {
+    const { columns, read } = this.prepare(sql, params);
+    if (!read) return [];
+    return [...read(true)].map((r) => Object.fromEntries(columns.map((c, i) => [c, r[i] ?? null])));
   }
   iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
-    if (this.fenced) throw new Error("fenced instance");
-    const b = bindTyped(sql, params, "real");
-    checkDoLimits(b.sql, b.params);
-    const st = this.db.prepare(b.sql);
-    const p = b.params as never[];
-    const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
-    checkDoColumns(columns.length);
-    if (columns.length === 0) {
-      st.run(...p);
-      return { columns, rows: [] };
-    }
-    st.setReturnArrays(true);
-    st.setReadBigInts(true);
-    const it = st.iterate(...p) as unknown as Iterable<Value[]>;
-    return { columns, rows: (function* () { for (const r of it) yield r.map(lossy); })() };
+    const { columns, read } = this.prepare(sql, params);
+    return { columns, rows: read ? read(false) : [] };
   }
   raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] } {
-    if (this.fenced) throw new Error("fenced instance");
-    const b = bindTyped(sql, params, "real");
-    checkDoLimits(b.sql, b.params);
-    const st = this.db.prepare(b.sql);
-    const p = b.params as never[];
-    const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
-    checkDoColumns(columns.length);
-    if (columns.length === 0) {
-      st.run(...p);
-      return { columns, values: [] };
-    }
-    st.setReturnArrays(true);
-    st.setReadBigInts(true);
-    return { columns, values: (st.all(...p) as unknown as Value[][]).map((r) => r.map(lossy)) };
+    const { columns, read } = this.prepare(sql, params);
+    return { columns, values: read ? [...read(true)] : [] };
   }
   tx<T>(fn: () => T): T {
     const name = `sp${this.depth++}`;

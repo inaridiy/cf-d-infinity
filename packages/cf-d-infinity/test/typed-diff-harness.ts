@@ -9,6 +9,8 @@
 // これまでの seed が別の台本になる。足す値と文は、ここの 2 つ目の生成器 (script2) に置く。
 import type { Client } from "@libsql/client";
 import { DatabaseSync } from "node:sqlite";
+import { bindParams, ident, parseStatements, render, type Node } from "../src/sql/cst";
+import { returningClause, rewriteReturning } from "../src/sql/returning";
 import { clientOf } from "./libsql";
 import { prng, SimCluster } from "./sim";
 
@@ -75,6 +77,75 @@ function sameRows(want: Cell[][], got: Cell[][], relaxed: Relaxed): boolean {
   return true;
 }
 
+// ---- 基準の読み方 ----
+//
+// node:sqlite のドライバは、結果の TEXT を最初の NUL で切って返す (docs/design-values.md の「確かめた事実」)。そのまま読むと、
+// NUL を含む TEXT は、基準の側でも切れて、D∞ が切っても食い違いが見えない (test/open/nul-in-text.test.ts が見つけた検査の欠け)。
+// 基準は、TEXT を BLOB にして読み、UTF-8 として戻す (CAST(... AS BLOB) は全部のバイトを返す)。
+// - 結果を返す文 (SELECT、VALUES、WITH) は、文を包み直して、結果の列ごとに TEXT を BLOB、BLOB を 16 進にする。
+// - DML の RETURNING は包めないので、項ごとに書き換える。項の切り分けは D∞ と同じ関数 (src/sql/returning.ts) を使うが、要素の式と
+//   読み方はここに独立に置く。台本の typeof() と hex() の項が、書き換えに頼らない確かめである。
+
+const READS_ROWS = /^\s*(SELECT|VALUES|WITH)\b/i;
+const utf8 = new TextDecoder();
+const unhex = (s: string) => Uint8Array.from(s.match(/../g) ?? [], (h) => parseInt(h, 16));
+
+/** 結果を返す文を包み直して、TEXT を全部読む。 */
+function wholeSelect(sql: string, n: number): string {
+  const cols = Array.from({ length: n }, (_v, i) => `"c${i}"`);
+  const read = cols.map((c) => `CASE typeof(${c}) WHEN 'text' THEN CAST(${c} AS BLOB) WHEN 'blob' THEN hex(${c}) ELSE ${c} END`);
+  return `WITH "__ref"(${cols.join(", ")}) AS (\n${sql}\n) SELECT ${read.join(", ")} FROM (SELECT * FROM "__ref" LIMIT -1 OFFSET 0)`;
+}
+const fromWhole = (v: unknown): unknown => (v instanceof Uint8Array ? utf8.decode(v) : typeof v === "string" ? unhex(v) : v);
+
+/** RETURNING の項の要素の式。どの格納の型にも印を付け、TEXT は BLOB で運ぶ。 */
+const returnedElem = (c: string) =>
+  `CASE typeof(${c}) WHEN 'integer' THEN 'i'||${c} WHEN 'text' THEN CAST(${c} AS BLOB) WHEN 'real' THEN 'r'||quote(${c}) WHEN 'blob' THEN 'b'||hex(${c}) END`;
+function fromReturned(v: unknown): unknown {
+  if (v === null || v === undefined) return null;
+  if (v instanceof Uint8Array) return utf8.decode(v);
+  const s = v as string;
+  return s[0] === "i" ? BigInt(s.slice(1)) : s[0] === "r" ? Number(s.slice(1)) : unhex(s.slice(1));
+}
+
+/** 文が書く表の名前。 */
+function writtenTable(stmt: Node): string {
+  const head = (stmt.clauses as Node[]).find((c) => /^(insert|update|delete)_clause$/.test(c.type));
+  let t: Node = head.type === "insert_clause" ? head.table : head.tables.items[0];
+  while (t.type === "alias" || t.expr) t = t.expr;
+  return ident(t.type === "member_expr" ? t.property : t);
+}
+
+/** 基準の node:sqlite で文を実行する。結果を返さない文は "ok"。 */
+export function referenceRows(lite: DatabaseSync, sql: string, args: Arg[]): Cell[][] | "ok" {
+  const st = lite.prepare(sql);
+  const n = st.columns().length;
+  if (n === 0) return (st.run(...(args as never[])), "ok");
+  let read = st;
+  let args2: unknown[] = args;
+  let convert: (v: unknown) => unknown = (v) => v;
+  if (READS_ROWS.test(sql)) {
+    read = lite.prepare(wholeSelect(sql, n));
+    convert = fromWhole;
+  } else {
+    const stmt = parseStatements(sql)[0];
+    const values = bindParams(stmt, args as never);
+    const clause = returningClause(stmt);
+    if (clause) {
+      const table = writtenTable(stmt);
+      const columns = (lite.prepare(`SELECT name FROM pragma_table_info(?)`).all(table) as { name: string }[]).map((r) => r.name);
+      rewriteReturning(clause, columns, returnedElem);
+      const r = render(stmt, values);
+      read = lite.prepare(r.sql);
+      args2 = r.params;
+      convert = fromReturned;
+    }
+  }
+  read.setReadBigInts(true);
+  read.setReturnArrays(true);
+  return (read.all(...(args2 as never[])) as unknown as unknown[][]).map((r) => r.map((v) => cell(convert(v))));
+}
+
 export interface TypedRun { problems: string[]; relaxed: Relaxed; statements: number }
 
 /**
@@ -96,10 +167,8 @@ export async function runTyped(schema: string[], steps: Step[], shards: number, 
     const norm = step.normalize ?? ((rows: Cell[][]) => rows);
     let want: Cell[][] | "ok" | "error";
     try {
-      const st = lite.prepare(step.sql);
-      st.setReadBigInts(true);
-      st.setReturnArrays(true);
-      want = st.columns().length ? norm((st.all(...(step.args as never[])) as unknown as unknown[][]).map((r) => r.map(cell))) : (st.run(...(step.args as never[])), "ok");
+      const rows = referenceRows(lite, step.sql, step.args);
+      want = rows === "ok" ? "ok" : norm(rows);
     } catch {
       want = "error";
     }
