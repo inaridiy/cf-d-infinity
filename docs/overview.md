@@ -33,8 +33,10 @@ This is the English summary of how D∞ (`cf-d-infinity`) works. The full design
 
 ## Placing rows
 
-There are 4,096 hash slots. A row's slot is `hash(shard key)`, and the range table in `DinfMeta` maps slot ranges to
-shards. The shard key is the first primary-key column (`rowid` for a table without one); D∞ adds no syntax to SQLite to choose it.
+There are 65,536 hash slots. A row's slot is `hash(shard key)`, and the range table in `DinfMeta` maps slot ranges to
+shards. (The range table is kept in tokens: a row's token is its slot followed by 16 bits of the hash of its whole
+primary key, so that a later version can put a boundary inside one slot and spread one shard key value over two
+shards. Today every boundary is a slot boundary; see [design-subslots.md](./design-subslots.md).) The shard key is the first primary-key column (`rowid` for a table without one); D∞ adds no syntax to SQLite to choose it.
 Rows with the same shard key value live on the same shard across tables, so a tenant's `users` and `orders` are
 colocated and a typical transaction touches one shard.
 

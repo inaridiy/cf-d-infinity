@@ -197,7 +197,7 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `src/meta.ts` | 表定義、DDL 履歴、範囲表、index の作成と書き込み禁止の期限、保守の操作の枠 |
 | `src/value.ts` | 値の格納の型 (INTEGER と REAL)。束縛の関数 `bindTyped` (DO、シミュレータ、Worker の SQLite の 3 つの Backend が通す) |
 | `src/keys.ts` | キー文字列を作る関数 (`keyString` と、trigger の中の `keySql`)。SQLite の型の親和性を写す `storedAs` |
-| `src/routing.ts` | 4,096 スロットの範囲表 |
+| `src/routing.ts` | 範囲表と、行の置き場所の計算。置き場所は token (region、65,536 個の slot、その中の 65,536 個の subslot を並べた 40 ビットの整数) で、範囲表は token の区間をシャードに対応させる。いまの区間は、どれも両端が slot の境目にある ([docs/design-subslots.md](../../docs/design-subslots.md) の段 1) |
 | `src/autoscaler.ts` | 増設の判断と手順 |
 | `src/analytics.ts` | 変更ログの収集と watermark |
 | `src/worker.ts` | 本番の入口。DO への配線、認証、HTTP と WebSocket、Cron |
@@ -222,6 +222,8 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `test/history.test.ts` | ランダムな並行実行が commit 時刻順の直列実行と一致すること (時計のずれ、遅延、再起動あり)。チェッカが欠陥を検出できることも確かめる |
 | `test/rollback-read.test.ts` | どの過去時点も正確に再構成できること |
 | `test/migration.test.ts` | ライブ移動、`m5b` の反例、Autoscaler の判断 |
+| `test/routing.test.ts` | 範囲表。前の 4,096 個の slot の境目で動かすかぎり、token にする前の範囲表と同じ持ち主になること。区間の移動を乱択で重ねても、どの token にも持ち主がちょうど 1 つあること。行の置き場所の値 |
+| `test/placement-formats.test.ts` | token の区間にした後の形式。Meta の範囲表と分割の枠、シャードの移動の記録、piece を運ぶ要求の形と、まだ扱えない形 (ブロックを途中で切る移動、グループの一部の piece) を断ること |
 | `test/workerd.test.ts` | 本物の workerd と DO の SQLite での結合テスト |
 | `test/ddl-concurrent.test.ts`、`test/ddl-harness.ts` | 取引と並行する DDL。index の作成、UNIQUE、DROP、列の追加、分割との競合を乱数の作業負荷で回し、index と表の一致、確定した書き込みの残存、表定義の収束を見る。見つかった欠陥の再現も含む |
 | `test/limits.test.ts` | シャード側の上限。結果の行数とバイト数、取引の大きさ、グループの列挙と大きさ |
@@ -234,7 +236,7 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `test/contention.test.ts` | 競合時の取引の失敗率。`CONTENTION=1` のときだけ動く |
 | `test/gc.test.ts` | 変更ログと取引記録の GC。窓の外を必要とする読みが黙って間違えないこと、古い COMMIT の拒否 |
 | `test/rowcost.test.ts` | 1 操作あたりの課金行数を workerd で数え、上限を検査する。`ROWCOST=1` のときだけ動く |
-| `test/protocol.test.ts` | 新旧コードが混在するときの版の検査 |
+| `test/protocol.test.ts` | 新旧コードが混在するときの版の検査。値の表現と、範囲の移動が運ぶ形の見本の指紋を、版ごとに持つ |
 | `test/elle.test.ts` | 黒箱の検査器が既知の異常 (G0、G1a、G1c、G2、消失、順序の矛盾) を検出すること |
 | `test/elle-sim.test.ts` | 黒箱検査をシミュレータで回す。欠陥スイッチを入れた実装で異常を検出すること |
 | `test/bench-build.test.ts` | 計測用の構成。障害注入を挟んだ負荷と黒箱検査 |

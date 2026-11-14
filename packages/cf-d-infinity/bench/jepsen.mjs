@@ -6,7 +6,7 @@
 // 環境変数: CLUSTER, DURATION (秒), CLIENTS (同時の /bench 呼び出し), LANES (呼び出しあたりの並列度),
 //   CRASH_EVERY (秒)、SPLIT_AT (秒のカンマ区切り)、DEPLOY_ACCEPT_AT と DEPLOY_SEND_AT (秒。空なら行わない)
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { check } from "./elle.mjs";
 import { post } from "./run.mjs";
@@ -22,6 +22,10 @@ const SPLIT_AT = (env.SPLIT_AT ?? "90,270").split(",").filter(Boolean).map((s) =
 const DEPLOY_ACCEPT_AT = env.DEPLOY_ACCEPT_AT === "" ? null : Number(env.DEPLOY_ACCEPT_AT ?? 180) * 1000;
 const DEPLOY_SEND_AT = env.DEPLOY_SEND_AT === "" ? null : Number(env.DEPLOY_SEND_AT ?? 420) * 1000;
 const SHARDS = 4;
+// 版を上げるデプロイの訓練は、いまの通信の版の 1 つ上を受け付けさせてから、その版で送らせる。いまの版は src/types.ts から読む。
+// 数を書いておくと、版を上げたときに直し忘れ、受け付ける上限がいまの版より低くなって、全部の要求が断られる。
+const PROTOCOL = Number(/export const PROTOCOL_VERSION = (\d+);/.exec(readFileSync(new URL("../src/types.ts", import.meta.url), "utf8"))[1]);
+const NEXT_PROTOCOL = String(PROTOCOL + 1);
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const events = [];
@@ -69,8 +73,8 @@ const faults = (async () => {
   const splits = [...SPLIT_AT];
   let nextChild = SHARDS;
   const deploys = [
-    DEPLOY_ACCEPT_AT !== null && { at: t0 + DEPLOY_ACCEPT_AT, vars: { DINF_PROTOCOL_ACCEPT: "2" }, name: "deploy step 1: accept v2, send v1" },
-    DEPLOY_SEND_AT !== null && { at: t0 + DEPLOY_SEND_AT, vars: { DINF_PROTOCOL_ACCEPT: "2", DINF_PROTOCOL_SEND: "2" }, name: "deploy step 2: send v2" },
+    DEPLOY_ACCEPT_AT !== null && { at: t0 + DEPLOY_ACCEPT_AT, vars: { DINF_PROTOCOL_ACCEPT: NEXT_PROTOCOL }, name: `deploy step 1: accept v${NEXT_PROTOCOL}, send v${PROTOCOL}` },
+    DEPLOY_SEND_AT !== null && { at: t0 + DEPLOY_SEND_AT, vars: { DINF_PROTOCOL_ACCEPT: NEXT_PROTOCOL, DINF_PROTOCOL_SEND: NEXT_PROTOCOL }, name: `deploy step 2: send v${NEXT_PROTOCOL}` },
   ].filter(Boolean);
   while (Date.now() < until - 20000) {
     await new Promise((r) => setTimeout(r, 500));

@@ -127,7 +127,7 @@ D1 との差は変更ログの 1 行で、これは過去時点の読み取り�
 
 分析の経路 (DuckDB、R2、Container) は、目標の OLTP に必須ではない。
 scatter の階層化、semijoin、本番でのスループットの追加計測も後にする。
-Serializable の既定、行ロック、merge を作らないこと、4,096 スロットの固定は変えない。
+Serializable の既定、行ロック、merge を作らないこと、スロットの数の固定は変えない (数は、2026-11-14 に配置を token の区間にしたときに、4,096 個から 65,536 個にした。[design-subslots.md](./design-subslots.md))。
 
 ## 増えすぎの検証についての訂正
 

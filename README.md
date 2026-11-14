@@ -50,7 +50,7 @@ Distributed SQL systems such as CockroachDB, TiDB, YugabyteDB and Spanner bring 
 
 - **Interactive transactions, across shards.** `BEGIN`, read, decide, write, `COMMIT`, serializable by default, with no central timestamp oracle. D1 offers `batch()` only.
 - **Works with the SQLite clients you have.** `@libsql/client` over HTTP or WebSocket, Drizzle, and a D1-compatible API. You change the URL.
-- **Scales past one database.** Tables are spread over up to 4,096 hash slots, and a shard can be split online. The autoscaler watches every shard and, once you opt in with `DINF_AUTOSCALE = "split"`, splits hot or large ones itself. One shard takes ~950 single-shard writes/s; 64 shards reached 18,784 writes/s (measured on 2026-11-06 with an earlier version, [docs/benchmarks.md](docs/benchmarks.md)). Transactions that span shards are far slower: about 44–60 per second per shard (see [When not to use it](#when-not-to-use-it)).
+- **Scales past one database.** Tables are spread over 65,536 hash slots, and a shard can be split online. The autoscaler watches every shard and, once you opt in with `DINF_AUTOSCALE = "split"`, splits hot or large ones itself. One shard takes ~950 single-shard writes/s; 64 shards reached 18,784 writes/s (measured on 2026-11-06 with an earlier version, [docs/benchmarks.md](docs/benchmarks.md)). Transactions that span shards are far slower: about 44–60 per second per shard (see [When not to use it](#when-not-to-use-it)).
 - **SQLite semantics, not a reimplementation.** Each shard is SQLite, and cross-shard statements re-run the original SQL in a WebAssembly SQLite inside the Worker. All 8,884 queries of sqllogictest `select1`–`select5` match.
 - **Pay per row, no instance to size.** Durable Object pricing: 2 billed rows per single-row `UPDATE`, $0.20 per GB-month. When nothing is happening, the only activity is the autoscaler waking each shard once a minute.
 - **Checked, not only claimed.** Eighteen formal models whose counterexamples are replayed against the code, a deterministic fault-injecting simulator, differential tests against real SQLite on every execution path, and Elle-style black-box checks against production Cloudflare while Durable Objects crash and shards split.
@@ -258,7 +258,7 @@ flowchart LR
   Client["Your Worker or any SQLite client<br/>(@libsql/client, Drizzle)"]
   subgraph Account["Your Cloudflare account"]
     Worker["Your Worker, or a database-only Worker (stateless)<br/>DinfDatabase: parse, plan, route by hash slot,<br/>cross-shard SQL in wasm SQLite"]
-    Meta["DinfMeta<br/>schema, 4,096-slot range table"]
+    Meta["DinfMeta<br/>schema, range table of hash slots"]
     Shards["DinfShard × N<br/>SQLite tables, change log, HLC"]
     Scaler["DinfAutoscaler<br/>decides and drives splits"]
   end
