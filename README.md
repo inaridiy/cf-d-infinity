@@ -68,7 +68,7 @@ npm install
 npx wrangler dev
 ```
 
-`init` adds three Durable Object classes, their migration, a Service Binding that points back at this Worker's `DinfDatabase` entrypoint, and a one-minute Cron Trigger that wakes the autoscaler. Comments in the file are kept, nothing is written if a name is already taken, and a second run changes nothing. It appends one line to your main module that re-exports the classes; the only change left to you is the `scheduled` line shown below.
+`init` adds three Durable Object classes, their migration, a Service Binding that points back at this Worker's `DinfDatabase` entrypoint, and a one-minute Cron Trigger that wakes the autoscaler. Comments in the file are kept, nothing is written if a name is already taken, and a second run changes nothing. If the configuration already declares Durable Object classes with `exports`, `init` declares the three classes there and adds no migration, because Cloudflare rejects a Worker that uses both. It appends one line to your main module that re-exports the classes; the only change left to you is the `scheduled` line shown below.
 
 ```jsonc
 // wrangler.jsonc (added by init; "my-app" is this Worker's own name)

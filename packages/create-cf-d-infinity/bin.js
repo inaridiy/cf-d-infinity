@@ -10,7 +10,9 @@ Usage: create-cf-d-infinity [init] [options]
 In a directory with a wrangler.jsonc, init adds cf-d-infinity to that Worker: three Durable Object
 bindings, their migration, a Service Binding to the DinfDatabase entrypoint, DINF_SHARD_COUNT and a
 one-minute Cron Trigger for the autoscaler. Comments in the file are kept. It also writes the module
-that re-exports the classes and adds the dependency to package.json.
+that re-exports the classes and adds the dependency to package.json. If the configuration already
+declares Durable Object classes with "exports", the three classes are declared there and no migration
+is added: Cloudflare rejects a Worker that uses both.
 
 In a directory without a wrangler config, init creates a database-only Worker that other Workers bind to.
 

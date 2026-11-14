@@ -93,12 +93,89 @@ test("appends to existing bindings, migrations, services and crons instead of re
   assert.deepEqual(c.triggers.crons, ["0 * * * *", "* * * * *"]);
 });
 
+// Durable Object のクラスの宣言には `migrations` と `exports` の 2 通りがある。`exports` の Durable Object の項目と
+// `migrations` は、同じ Worker の設定に両方は書けない (Cloudflare が検証で拒む)。Workflow の項目は両立する。
+// 出典 (2026-11-14 に確認): https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/
+const LIVE = { type: "durable-object", storage: "sqlite" };
+const USES_EXPORTS = `{
+  // my app
+  "name": "my-app",
+  "main": "src/index.ts",
+  "durable_objects": { "bindings": [{ "name": "ROOM", "class_name": "Room" }] },
+  "exports": {
+    // the chat room
+    "Room": { "type": "durable-object", "storage": "sqlite" }, // live
+    /* retired */
+    "OldRoom": { "type": "durable-object", "state": "deleted" },
+    "Mailer": { "type": "workflow", "name": "mailer" },
+  },
+}
+`;
+
+test("declares the classes in exports, and adds no migration, when the configuration declares Durable Object classes with exports", () => {
+  const d = dir({ ...APP, "wrangler.jsonc": USES_EXPORTS });
+  const r = run(d);
+  const text = read(d, "wrangler.jsonc");
+  for (const comment of ["// my app", "// the chat room", "// live", "/* retired */"]) assert.ok(text.includes(comment), comment);
+  const c = parse(text);
+  assert.equal(c.migrations, undefined, "a migration next to Durable Object exports is rejected by Cloudflare");
+  assert.deepEqual(c.exports, {
+    Room: LIVE,
+    OldRoom: { type: "durable-object", state: "deleted" },
+    Mailer: { type: "workflow", name: "mailer" },
+    DinfShard: LIVE, DinfMeta: LIVE, DinfAutoscaler: LIVE,
+  });
+  assert.deepEqual(c.durable_objects.bindings.map((b) => b.name), ["ROOM", "DINF_SHARD", "DINF_META", "DINF_AUTOSCALER"]);
+  assert.deepEqual(c.services, [{ binding: "DINF_DB", service: "my-app", entrypoint: "DinfDatabase" }]);
+  assert.ok(r.done.some((line) => line.includes("exports") && line.includes("DinfAutoscaler")), "reports the exports entries");
+  assert.ok(!r.done.some((line) => line.includes("migration cf-d-infinity-v1")), "reports no migration");
+
+  // 2 回目は何も変えない。
+  const again = run(d);
+  assert.equal(again.writes.length, 0);
+  assert.equal(read(d, "wrangler.jsonc"), text);
+  assert.ok(again.kept.some((line) => line.includes("exports")));
+});
+
+test("adds only the classes that exports does not declare yet", () => {
+  const d = dir({ ...APP, "wrangler.jsonc": `{\n  "name": "my-app",\n  "main": "src/index.ts",\n  "exports": {\n    "DinfShard": { "type": "durable-object", "state": "created", "storage": "sqlite" }\n  }\n}\n` });
+  run(d);
+  const c = parse(read(d, "wrangler.jsonc"));
+  assert.equal(c.migrations, undefined);
+  assert.deepEqual(c.exports, { DinfShard: { type: "durable-object", state: "created", storage: "sqlite" }, DinfMeta: LIVE, DinfAutoscaler: LIVE });
+});
+
+test("still adds the migration when exports holds only Workflow entries", () => {
+  // Workflow の項目は `migrations` と一緒に書ける。旧来の書き方のままにする。
+  const d = dir({ ...APP, "wrangler.jsonc": `{\n  "name": "my-app",\n  "main": "src/index.ts",\n  "exports": { "Mailer": { "type": "workflow", "name": "mailer" } }\n}\n` });
+  run(d);
+  const c = parse(read(d, "wrangler.jsonc"));
+  assert.deepEqual(c.migrations, [{ tag: "cf-d-infinity-v1", new_sqlite_classes: ["DinfShard", "DinfMeta", "DinfAutoscaler"] }]);
+  assert.deepEqual(c.exports, { Mailer: { type: "workflow", name: "mailer" } });
+});
+
+test("follows exports when only an environment declares Durable Object classes with it", () => {
+  // `migrations` は環境に継承されるので、最上位に足すと、`exports` を使う環境の設定が両方を持つことになる。
+  const d = dir({ ...APP, "wrangler.jsonc": `{\n  "name": "my-app",\n  "main": "src/index.ts",\n  "env": {\n    "staging": { "exports": { "Room": { "type": "durable-object", "storage": "sqlite" } } }\n  }\n}\n` });
+  run(d);
+  const c = parse(read(d, "wrangler.jsonc"));
+  assert.equal(c.migrations, undefined);
+  assert.deepEqual(c.exports, { DinfShard: LIVE, DinfMeta: LIVE, DinfAutoscaler: LIVE });
+  assert.deepEqual(c.env, { staging: { exports: { Room: LIVE } } });
+});
+
 test("refuses on a conflict and writes nothing at all", () => {
   const cases = {
     "a Durable Object binding with our name and another class": `"durable_objects": { "bindings": [{ "name": "DINF_META", "class_name": "Other" }] }`,
     "the binding name taken by D1": `"d1_databases": [{ "binding": "DINF_DB", "database_id": "x" }]`,
     "a Service Binding with our name pointing elsewhere": `"services": [{ "binding": "DINF_DB", "service": "other" }]`,
     "a migration that declares only some of the classes": `"migrations": [{ "tag": "v1", "new_sqlite_classes": ["DinfShard"] }]`,
+    "Durable Object exports and migrations together": `"exports": { "Room": { "type": "durable-object", "storage": "sqlite" } },\n  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }]`,
+    "Durable Object exports in an environment and migrations at the top level": `"migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],\n  "env": { "staging": { "exports": { "Room": { "type": "durable-object", "storage": "sqlite" } } } }`,
+    "a tombstone for one of our classes in exports": `"exports": { "Room": { "type": "durable-object", "storage": "sqlite" }, "DinfMeta": { "type": "durable-object", "state": "deleted" } }`,
+    "one of our classes on the key-value backend in exports": `"exports": { "DinfShard": { "type": "durable-object", "storage": "legacy-kv" } }`,
+    "one of our class names used by a Workflow in exports": `"exports": { "DinfShard": { "type": "workflow", "name": "shard" } }`,
+    "exports that is not an object": `"exports": ["Room"]`,
   };
   for (const [name, fragment] of Object.entries(cases)) {
     const files = { ...APP, "wrangler.jsonc": `{\n  "name": "my-app",\n  "main": "src/index.ts",\n  ${fragment}\n}\n` };

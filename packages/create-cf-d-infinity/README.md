@@ -21,6 +21,15 @@ Run it in the directory that holds `wrangler.jsonc` (or `wrangler.json`). It add
 | your `main` module | One line appended that re-exports the Durable Object classes; wrangler refers to them by name |
 | `package.json` | Adds the `cf-d-infinity` dependency |
 
+Cloudflare has two ways to declare Durable Object classes in a wrangler configuration, the `migrations` array and
+the `exports` map, and rejects a Worker whose configuration has both a migration and a Durable Object entry in
+`exports` ([Durable Object class exports](https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/)).
+`init` follows the configuration it finds:
+
+- When `exports` already has a Durable Object entry, at the top level or in an environment, `init` adds no migration.
+  It adds `{ "type": "durable-object", "storage": "sqlite" }` for each of the three classes to the top-level `exports`.
+- Otherwise it adds the migration. Workflow entries in `exports` do not count; they may stand next to `migrations`.
+
 The one thing it cannot do for you is call the autoscaler from your default export; it prints the line to add:
 
 ```ts
@@ -45,7 +54,9 @@ Without a wrangler config, `init` creates a database-only Worker (`package.json`
 ## Guarantees
 
 - The whole plan is computed before anything is written. If any step conflicts with what is already there (a binding
-  name in use, a class bound under another name, a partial migration), nothing is written and the exit code is 1.
+  name in use, a class bound under another name, a partial migration, `migrations` next to Durable Object entries in
+  `exports`, an `exports` entry under one of the class names that is not a live SQLite-backed class), nothing is
+  written and the exit code is 1.
 - A second run changes nothing and reports what it kept.
 - `wrangler.toml` is not edited; convert to `wrangler.jsonc` first.
 

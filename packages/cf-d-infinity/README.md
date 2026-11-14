@@ -23,6 +23,8 @@ After the first release, run this in a Workers project (the directory with your 
 
 `init` adds the Durable Object bindings, their migration, a Service Binding named `DINF_DB`, and a one-minute Cron
 Trigger for the autoscaler. It writes `src/dinf.ts` and re-exports the Durable Object classes from your main module.
+If the configuration already declares Durable Object classes with `exports`, the classes are declared there instead
+of in a migration.
 
 ## Use
 
