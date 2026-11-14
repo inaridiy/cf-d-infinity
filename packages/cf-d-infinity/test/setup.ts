@@ -9,7 +9,7 @@ import { spanFaults } from "../src/client/spans";
 import { imageChecks } from "../src/shard/rows";
 import { parseObserver } from "../src/sql/cst";
 import { openScratch } from "../src/sql/scratch";
-import { allSpanEscapes, imageCheckOff, injectedFault, tracedNets } from "./sim";
+import { allSpanEscapes, allWriteEscapes, imageCheckOff, injectedFault, tracedNets } from "./sim";
 
 // PARSER_CORPUS=<ディレクトリ> を付けて流すと、試験が解析に渡した文を、プロセスごとの 1 行 1 文の JSON のファイルに書き出す。
 // パーサの突き合わせ (test/parser-oracle.test.ts) が、これを文の集まりとして読む。同じ文は、プロセスの中で 1 度だけ書く。
@@ -71,4 +71,17 @@ afterEach(() => {
     distinct.map((e) => `${e.shard}: ${e.sql.slice(0, 160)} | spans ${JSON.stringify(e.spans).slice(0, 200)} | all rows: ${e.full.slice(0, 120)} | rows in spans only: ${e.narrowed.slice(0, 120)}`),
     "statements that depend on rows outside their declared spans",
   ).toEqual([]);
+});
+
+// 書き込みの側の範囲の検査 (sim.ts の checkWrites)。シミュレータのシャードが受け入れようとした書き込みのうち、宣言した範囲の外の
+// 行を書く文か、行を持ち主でないシャードに残す書き込みがあれば、その試験を失敗にする。シャードの守り (kernel.ts の claimed) が
+// 断った書き込みも数える。守りがあっても、Worker が宣言を誤ったことには変わりないからである。範囲の検査と同じく、
+// SimOptions の noSpanCheck で切る。
+afterEach(() => {
+  const found = allWriteEscapes.splice(0);
+  const seen = new Set<string>();
+  const distinct = found
+    .map((e) => `${e.shard}: ${e.sql === null ? "(a transaction's writes at commit)" : e.sql.slice(0, 160)} | ${e.row} | ${e.problem.slice(0, 240)}`)
+    .filter((s) => !seen.has(s) && seen.add(s));
+  expect(distinct.slice(0, 10), "writes outside their declared spans, or rows left on a shard that does not own them").toEqual([]);
 });

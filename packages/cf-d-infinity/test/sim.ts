@@ -2,13 +2,15 @@ import { compoundTerms } from "../src/shard-limits";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Db, type ClientFaults, type Cluster } from "../src/client/db";
+import { keyString } from "../src/keys";
 import { MetaCore, type SplitMove, type SplitSlot } from "../src/meta";
-import { shardsOf, type Interval } from "../src/routing";
+import { initialRouting, shardsOf, tokenOf, type Interval, type Routing } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
-import { ShardCore, type SpanEscape } from "../src/shard/core";
-import type { Backend, Faults, Row, ShardApi, Ts, Value } from "../src/types";
-import { bindTyped, restoreColumns } from "../src/value";
+import { ShardCore, type SpanEscape, type WriteCheck } from "../src/shard/core";
+import { imageColumns } from "../src/shard/rows";
+import type { Backend, Change, Faults, Row, ShardApi, Span, TableDef, Ts, Value } from "../src/types";
+import { bindTyped, decodeElem, fromTypedValue, restoreColumns, type Tuple } from "../src/value";
 
 /**
  * DO の SQLite の実測の制限 (公式の表にないもの)。node:sqlite は上限を変えられないので、文を見て模す。
@@ -322,7 +324,7 @@ export interface SimOptions {
   logGenMs?: number;
   txnRetainMs?: number;
   recentMax?: number;
-  /** 範囲の検査 (ShardDeps.spanEscape) を切る。既定では掛ける。 */
+  /** 範囲の検査 (ShardDeps.spanEscape) と、書き込みの側の範囲の検査 (ShardDeps.writeCheck) を切る。既定では掛ける。 */
   noSpanCheck?: boolean;
   /**
    * 行イメージの検査 (src/shard/rows.ts の imageChecks。捕捉の変更後の行と本体の行、タプルの長さと表定義) を、このクラスタを作った
@@ -341,9 +343,43 @@ export interface SimOptions {
   realTime?: boolean;
 }
 
+/**
+ * 書き込みの側の範囲の検査 (SimCluster の checkWrites) が見つけた書き込み。シャードが受け入れようとした変更の行が、宣言の外にあるか、
+ * そのシャードが持たない行として残るものである。
+ */
+export interface WriteEscape {
+  shard: string;
+  /** 文の実行なら、その文。取引が溜めた変更を確定のときに受け取る経路 (commitLocal、prepare) なら null。 */
+  sql: string | null;
+  /** `表 主キー` */
+  row: string;
+  problem: string;
+}
+
+/** 行イメージから、行の主キーと shard key のキー文字列を読む。シャードの読み方 (rows.ts の tupleKey) を使わずに、ここで読む。 */
+function keyOfImage(def: TableDef, t: Tuple): { pk: string; sk: string } {
+  const cols = imageColumns(def);
+  const at = (c: string): Value => {
+    const i = cols.indexOf(c);
+    return i >= 0 && i < t.length ? fromTypedValue(decodeElem(t[i] ?? null), def.name) : null;
+  };
+  return { pk: keyString(def.pk.map(at)), sk: keyString(def.shardKey.map(at)) };
+}
+
+/** 宣言した範囲 s が、行 (表 table、キー key、token) を覆うか。全表の範囲は、claim があれば、その token の区間の行だけを覆う。 */
+function declaresRow(s: Span, table: string, key: { pk: string; sk: string }, token: number): boolean {
+  if (s.table !== "*" && s.table !== table) return false;
+  if (s.kind === "pk") return s.pk === key.pk;
+  if (s.kind === "sk") return s.sk === key.sk;
+  if (s.kind === "pred" && s.sk !== undefined) return s.sk === key.sk;
+  return s.claim === undefined || s.claim.some((x) => token >= x.start && token < x.end);
+}
+
 /** Worker と DO の間の RPC だけをシミュレートしたクラスタ。ShardCore は本物を動かす。 */
 /** このプロセスの全クラスタで見つかった、範囲の外の行に依存する文。test/setup.ts が試験ごとに確かめて空にする。 */
 export const allSpanEscapes: SpanEscape[] = [];
+/** このプロセスの全クラスタで見つかった、宣言の外か持ち主でないシャードへの書き込み。test/setup.ts が試験ごとに確かめて空にする。 */
+export const allWriteEscapes: WriteEscape[] = [];
 /**
  * RPC_TRACE=<ディレクトリ> のとき、このプロセスで作ったクラスタの網。test/setup.ts が試験ごとに、RPC の送り元、宛先、種類の列を
  * 書き出して空にする。中身は書かない。変更の前後で、同じ seed の実行の RPC の列が同じかを比べるのに使う。
@@ -372,6 +408,8 @@ export class SimCluster implements Cluster {
   cores = new Map<string, ShardCore>();
   /** 宣言した範囲の外の行に依存していた文。空でなければ、取引の検証が成り立っていない。 */
   spanEscapes: SpanEscape[] = [];
+  /** 宣言の外の行か、持ち主でないシャードに残る行を書こうとした書き込み (checkWrites)。空でなければ、行の置き場所が壊れ得る。 */
+  writeEscapes: WriteEscape[] = [];
   backends = new Map<string, SqliteBackend>();
   /** Meta の SQLite。 */
   metaBackend: SqliteBackend;
@@ -486,7 +524,66 @@ export class SimCluster implements Cluster {
         this.spanEscapes.push(e);
         allSpanEscapes.push(e);
       },
+      writeCheck: this.o.noSpanCheck ? undefined : (e) => this.checkWrites(e),
     }));
+  }
+
+  /**
+   * 書き込みの側の範囲の検査。シャードが書き込みを受け入れる前に呼ばれる (KernelDeps.writeCheck)。シャードの守り (kernel.ts の
+   * claimed) とは別に、ここで確かめ直す。守りを欠陥のスイッチ (ignoreWriteClaim) で外しても、同じに確かめる。変更の行ごとに:
+   *   1. 変更が名乗る行 (pk と sk) が、行イメージから読んだ行と同じである。
+   *   2. 文の実行なら、文が宣言した範囲のどれかが、その行を覆う。
+   *   3. 変更後の行が残るなら、そのシャードが、その行の token を持っている。持ち主は、Meta の範囲表と、シャードが保存した範囲の
+   *      移動の記録 (__fenced と __incoming) から決める。シャードのメモリと、シャードの所有の規則は使わない。手放した token は
+   *      持たない。受け取った token と、範囲表がそのシャードに割り当てる token は持つ。
+   * 確かめるだけで、処理は変えない (RPC の列も変わらない)。見つけたものは test/setup.ts が試験ごとに確かめる。
+   */
+  private checkWrites(e: WriteCheck): void {
+    for (const c of e.changes) {
+      let problem: string | null;
+      try {
+        problem = this.writeProblem(e, c);
+      } catch (err) {
+        problem = `the check could not read the change: ${(err as Error)?.message ?? String(err)}`;
+      }
+      if (problem === null) continue;
+      const w: WriteEscape = { shard: e.shard, sql: e.sql, row: `${c.table} ${c.pk}`, problem };
+      this.writeEscapes.push(w);
+      allWriteEscapes.push(w);
+    }
+  }
+
+  private writeProblem(e: WriteCheck, c: Change): string | null {
+    const image = c.after ?? c.before;
+    // 取引の中で入れて消した行は、変更前も変更後もない変更として確定に届く (Txn.buffer)。何も書かず、何も残さない。
+    if (!image) return null;
+    const key = keyOfImage(e.def(c.table), image);
+    if (key.pk !== c.pk || key.sk !== c.sk) return `the change names row ${c.pk} (shard key ${c.sk}), but its image is row ${key.pk} (shard key ${key.sk})`;
+    const token = tokenOf(key.sk, key.pk);
+    if (e.spans && !e.spans.some((s) => declaresRow(s, c.table, key, token))) {
+      return `the statement wrote a row outside its declared spans ${JSON.stringify(e.spans).slice(0, 200)}`;
+    }
+    if (c.after && !this.ownsToken(e.shard, token)) {
+      return `the row would stay on ${e.shard}, which does not own token ${token} (the range table gives it to ${this.routingOwner(token)})`;
+    }
+    return null;
+  }
+
+  /** シャードが token を持っているか。Meta の範囲表と、シャードが保存した範囲の移動の記録から決める (checkWrites の 3)。 */
+  private ownsToken(shard: string, token: number): boolean {
+    const db = this.backends.get(shard)!.db;
+    const inside = (table: string) =>
+      (db.prepare(`SELECT lo, hi FROM ${table}`).all() as { lo: number; hi: number }[]).some((r) => token >= r.lo && token < r.hi);
+    if (inside("__fenced")) return false;
+    if (inside("__incoming")) return true;
+    return this.routingOwner(token) === shard;
+  }
+
+  /** Meta の今の範囲表で、token を持つシャード。範囲表がまだなければ、最初の範囲表で決める。 */
+  private routingOwner(token: number): string | undefined {
+    const r = this.metaBackend.db.prepare(`SELECT body FROM __routing ORDER BY version DESC LIMIT 1`).get() as { body: string } | undefined;
+    const routing: Routing = r ? (JSON.parse(r.body) as Routing) : initialRouting(this.shardIds);
+    return routing.ranges.find((x) => token >= x.start && token < x.end)?.shard;
   }
 
   /** 予約された alarm を発火させる。redrive が仕事を残したら、DO と同じく次の alarm を予約する。 */

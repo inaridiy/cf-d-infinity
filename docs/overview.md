@@ -154,6 +154,15 @@ the rows outside them are deleted and the statement is run again, and a differen
 that compare against real SQLite also run with every statement forced onto the reference path, with and without
 pushed-down filters; all three must agree.
 
+Writes have a guard in the shard itself, so that a wrong request from the Worker cannot place a row silently. Every
+row a statement changes must be owned by that shard and covered by the spans the statement declared, and every row a
+transaction hands over at commit must be the row its change names. Otherwise the shard refuses the whole write with
+`write outside claim:` before anything is applied. The error is not marked retryable and is not a routing refusal,
+because sending the same plan again would write the same rows. Rows that arrive already decided (an applied intent, a forwarded phase 2, a
+moved group) are not checked again. In the simulator a second check, written apart from the guard, finds the owner of
+each written row from the range table and the shards' move records and fails the test on any write outside its
+declaration or onto a shard that does not own the row.
+
 ## Schema changes
 
 DDL goes through `DinfMeta`, which versions the schema. The change is applied on every shard before the statement

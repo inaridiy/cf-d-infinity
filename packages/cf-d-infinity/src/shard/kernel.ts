@@ -16,8 +16,8 @@ import type {
   TxnStatus, Value,
 } from "../types";
 import {
-  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, TableLocked, checkStorageFormat, isWideSpan, spanCovers, utf8Length,
-  unprotectedSpans,
+  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, TableLocked, WriteOutsideClaim, checkStorageFormat, isWideSpan,
+  spanCovers, utf8Length, unprotectedSpans,
 } from "../types";
 import type { DdlEntry } from "../meta";
 import { blockOf, checkInterval, overlaps, rangeText, sameInterval, slotAligned, slotOf, tokenOf, type Interval } from "../routing";
@@ -59,6 +59,25 @@ export interface KernelDeps {
    * 指定すると、文ごとに、範囲の外の行を消した状態でも同じ結果になるかを確かめる。本番では指定しない。
    */
   spanEscape?: (e: SpanEscape) => void;
+  /**
+   * 試験用の検査。シャードが書き込みを受け入れる前に、その書き込みを渡す (書き込みの守り claimed の入口)。守りを欠陥のスイッチで
+   * 外していても呼ぶ。シミュレータは、守りとは別に、宣言した範囲と、範囲表での持ち主を確かめる。本番では指定しない。
+   */
+  writeCheck?: (e: WriteCheck) => void;
+}
+
+/** シャードが受け入れようとしている書き込み (KernelDeps.writeCheck)。 */
+export interface WriteCheck {
+  shard: string;
+  /**
+   * 文の実行なら、その文と、文が宣言した範囲。取引が溜めた変更を確定のときに受け取る経路 (commitLocal、prepare) では null である。
+   * そこでは、変更それぞれが名乗る行が、宣言である。
+   */
+  sql: string | null;
+  spans: Span[] | null;
+  changes: Change[];
+  /** 変更の表の定義。行イメージから行のキーを読むのに使う。 */
+  def(table: string): TableDef;
 }
 
 /** 文の結果が、宣言した範囲の外の行に依存していた。範囲の外の行は決着も検証もされないので、取引の検証が成り立たない。 */
@@ -109,6 +128,16 @@ function imageFits<T>(write: () => T): T {
     if (e instanceof Error && /string or blob too big/i.test(e.message)) throw new SqlError(writeSetTooLarge());
     throw e;
   }
+}
+/**
+ * 宣言した範囲 s が、変更の行を覆うか (書き込みの守り ShardKernel.claimed)。覆い方は spanCovers と同じで、全表の範囲に claim が
+ * あれば、claim の token の区間に載る行だけを覆う (Span.claim)。
+ */
+function declares(s: Span, c: Pick<Change, "table" | "pk" | "sk">): boolean {
+  if (!spanCovers(s, c.table, c.pk, c.sk)) return false;
+  if (!isWideSpan(s) || s.claim === undefined) return true;
+  const token = tokenOf(c.sk, c.pk);
+  return s.claim.some((x) => token >= x.start && token < x.end);
 }
 /** 値のおおよその大きさ (バイト)。上限の判定に使うだけで、正確である必要はない。 */
 const sizeOf = (v: Value): number =>
@@ -905,6 +934,17 @@ export class ShardKernel {
     }
     if (!slotAligned(x)) throw new SqlError(`moving a part of a slot is not supported yet: ${rangeText(x)}`);
   }
+  /**
+   * 区間 area (shard key sk の 1 行か、そのブロック) を、このシャードが持っていないときの、断る誤り。持っていれば null。
+   * 時刻に依らない部分だけを見る。手放した (fence した) 範囲は NotOwner で、受け取り中の範囲のまだ届いていないグループは競合である。
+   * 同期区間の入口 (assertOwned) と、書き込みの守り (claimed) が、同じこの規則で所有を引く。
+   */
+  private notOwned(sk: string, area: Interval): Error | null {
+    const f = this.fencedIn(area);
+    if (f && !this.faults.ignoreFence) return new NotOwner(f.to);
+    if (this.incomingIn(area) && !this.arrived.has(sk)) return new ConflictError(`group not arrived: ${sk}`);
+    return null;
+  }
   private sksOf(spans: Span[], writes: Pick<Change, "sk">[] = []): string[] {
     const out = new Set<string>(writes.map((w) => w.sk));
     for (const s of spans) if (s.kind === "pk" || s.kind === "sk" || (s.kind === "pred" && s.sk)) out.add(s.sk!);
@@ -922,9 +962,8 @@ export class ShardKernel {
    */
   private assertOwned({ spans, writes, at: T }: Rows): void {
     for (const { sk, area } of this.areasOf(spans, writes)) {
-      const f = this.fencedIn(area);
-      if (f && !this.faults.ignoreFence) throw new NotOwner(f.to);
-      if (this.incomingIn(area) && !this.arrived.has(sk)) throw new ConflictError(`group not arrived: ${sk}`);
+      const refused = this.notOwned(sk, area);
+      if (refused) throw refused;
       const m = this.arrived.get(sk);
       if (m !== undefined && T !== null && T < m && !this.faults.servePastMove) throw new ReadTooOld(`moved at ${m}`);
       // 範囲の床。受け取り終えた範囲のキーは、到着の記録があってもなくても、T < m では答えない。
@@ -1420,33 +1459,83 @@ export class ShardKernel {
    * どの文の形にも同じ検査が掛かるので、範囲の作り方を文の形ごとに確かめなくてよい。
    *
    * 要求の文は、run か、ここを通して実行する。同期区間の印を受け取るのは、区間に入っていない入口が文を実行できないように
-   * するためである。
+   * するためである。文が捕捉した変更は、ここで書き込みの守り (claimed) に掛ける。要求の文を実行する経路 (exec の下書き、悲観的な
+   * DML、autocommit の下書きと高速経路) は、どれもここを通るので、守りを経路ごとに並べない。
    */
-  private checked<T>(_sec: Section<"owned">, req: ExecReq, exec: () => T): T {
+  private checked<T extends { changes: Change[] } | null>(sec: Section<"owned">, req: ExecReq, exec: () => T): T {
+    // 範囲の検査の下書きの中では、守りを掛けない。下書きは巻き戻すので、守りは、結果を返す 1 回に掛ければ足りる。
+    if (this.checking) return exec();
     const report = this.deps.spanEscape;
-    if (!report || this.checking) return exec();
-    this.checking = true;
-    try {
-      const probe = (): string => {
-        try {
-          return encode(exec());
-        } catch (e) {
-          return `error: ${e === FALLBACK ? "fallback" : ((e as Error)?.message ?? String(e))}`;
+    if (report) {
+      this.checking = true;
+      try {
+        const probe = (): string => {
+          try {
+            return encode(exec());
+          } catch (e) {
+            return `error: ${e === FALLBACK ? "fallback" : ((e as Error)?.message ?? String(e))}`;
+          }
+        };
+        const narrowed = this.rollback(() => (this.deleteOutside(req) ? probe() : null));
+        if (narrowed !== null) {
+          const full = this.rollback(probe);
+          // random() などで実行のたびに結果が変わる文は、比べても意味がない。同じ状態で 2 回実行して確かめる。
+          const stable = full === this.rollback(probe);
+          if (stable && full !== narrowed) report({ shard: this.id, sql: req.sql, params: req.params, spans: req.spans, full, narrowed });
         }
-      };
-      const narrowed = this.rollback(() => (this.deleteOutside(req) ? probe() : null));
-      if (narrowed !== null) {
-        const full = this.rollback(probe);
-        // random() などで実行のたびに結果が変わる文は、比べても意味がない。同じ状態で 2 回実行して確かめる。
-        const stable = full === this.rollback(probe);
-        if (stable && full !== narrowed) report({ shard: this.id, sql: req.sql, params: req.params, spans: req.spans, full, narrowed });
+      } finally {
+        this.checking = false;
       }
-    } finally {
-      this.checking = false;
     }
-    return exec();
+    const out = exec();
+    // 守りが断ると、呼び出し側の巻き戻し (rollback か b.tx) が、文の書き込みを全部取り消す。変更は、返しも溜めもしない。
+    if (out) this.claimed(sec, out.changes, req);
+    return out;
   }
   private checking = false;
+
+  /**
+   * 書き込みの守り (計画書の不変条件 1 の書き込みの側: 行は、その token を持つシャードにだけある。未解決の問題 35)。
+   * シャードが受け入れようとしている変更の行のどれもが、次の 2 つを満たすことを確かめる。満たさない行が 1 つでもあれば、
+   * WriteOutsideClaim で書き込みの全体を断る。断った書き込みは、本体にも、intent にも、Worker へ返す変更にも残らない。
+   *   1. 行の token を、このシャードが持っている。所有は、同期区間の入口 (assertOwned) と同じ規則 (notOwned) で引く。
+   *   2. 行が、宣言の中にある。文の実行なら、文が宣言した範囲のどれかが行を覆う (全表の範囲は、claim の token の区間の中の行だけを
+   *      覆う)。取引が溜めた変更を確定のときに受け取る経路 (req が null。commitLocal と prepare) では、変更が名乗る行 (持ち主を
+   *      enter が確かめた行) が宣言で、変更後の行イメージのキーが、名乗る行と同じでなければならない。
+   *
+   * Worker は文を、宣言した範囲の持ち主へ送る。宣言の外の行を書いた文は、行を持ち主でないシャードに置くか、同じ行を 2 つの
+   * シャードに置く。今までは Worker だけがこれを守っていた。所有は「手放していない」で引くので、分割で生まれた兄弟のシャードの
+   * 行は、所有の確かめ (1) を通ってしまう。それを止めるのは 2 である。
+   *
+   * 掛けるのは、要求の文の実行 (checked) と、取引の変更の受け入れ (commitLocal、prepareSync) だけである。もう決まった書き込みは
+   * 掛けずに受け入れる: 確定した intent の適用 (finalize)、移動の後に転送された phase 2、届いた piece (receive、pull の応答)、
+   * 過去の時点への巻き戻し (restore)、overlay の適用。どれも、行の置き場所を、すでに一度この守りか移動の手順が決めている。
+   * 断ると、確定した取引が適用できなくなるか、移動が終わらない。
+   *
+   * いまの Worker は、書き込みの文に全表の範囲を付けない (書き込みは shard key で絞った宛先へだけ送る)。付けるようにするなら、
+   * 範囲表の古い Worker の claim は、受け取った範囲を含まないので、受け取ったシャードはこの守りで断り、渡した側は同じ文を
+   * NotOwner で断る。Worker は、経路の拒否を先に扱う。
+   */
+  private claimed(_sec: Section<"owned">, changes: Change[], req: Pick<ExecReq, "sql" | "spans"> | null): void {
+    if (changes.length === 0) return;
+    this.deps.writeCheck?.({ shard: this.id, sql: req?.sql ?? null, spans: req?.spans ?? null, changes, def: (t) => this.def(t) });
+    if (this.faults.ignoreWriteClaim) return;
+    const report = "nothing was written; the request was built wrongly, please report this";
+    for (const c of changes) {
+      const row = `${c.table} row ${c.pk}`;
+      if (!req && c.after) {
+        const k = tupleKey(this.def(c.table), c.after);
+        if (k.pk !== c.pk || k.sk !== c.sk) {
+          throw new WriteOutsideClaim(`a change for ${row} on shard ${this.id} carries the image of ${c.table} row ${k.pk}; ${report}`);
+        }
+      }
+      const refused = this.notOwned(c.sk, this.areaOf(c.sk, c.pk));
+      if (refused) throw new WriteOutsideClaim(`shard ${this.id} does not own ${row} (${refused.message}); ${report}`);
+      if (req && !req.spans.some((s) => declares(s, c))) {
+        throw new WriteOutsideClaim(`the statement wrote ${row} (shard key ${c.sk}) on shard ${this.id}, outside the spans it declared; ${report}`);
+      }
+    }
+  }
 
   /** 範囲の外の行を、利用者の表と index の表から消す。行が多すぎて検査を省くときは false を返す。 */
   private deleteOutside(req: ExecReq): boolean {
@@ -1765,6 +1854,13 @@ export class ShardKernel {
       // 参加者が非オーナーなら取引は abort で、Worker が経路を更新して再実行する。
       this.releaseLocks(req.txn);
       return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+    }
+    try {
+      // 取引が溜めた変更の行を、intent を置く前に確かめる (書き込みの守り)。断れば、anchor が取引を中止する。
+      this.claimed(sec, req.writes, null);
+    } catch (e) {
+      this.releaseLocks(req.txn);
+      return { ok: false, reason: (e as Error).message };
     }
     this.count("writes", req.spans, req.writes);
     const reason = this.validate(sec, req.txn, req.T, req.writes, req.spans);
@@ -2694,6 +2790,8 @@ export class ShardKernel {
     const sec = this.enter({ schema: req.schema, spans: req.spans, writes: req.writes, at: req.T });
     try {
       this.assertWriteSetFits(sec, req.writes);
+      // 取引が溜めた変更の行を、適用する前に確かめる (書き込みの守り)。
+      this.claimed(sec, req.writes, null);
     } catch (e) {
       this.releaseLocks(req.txn);
       throw e;

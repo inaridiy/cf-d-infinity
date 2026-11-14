@@ -128,6 +128,13 @@ Categories:
 - `childKeepsOldSchema`: split child does not catch up its schema when groups arrive. Only the `FAULT=` sweep uses it.
 - `validateFromT`: validates from T instead of F, which widens the window. Not the same as M9's `RED_F_IS_T` (that is `dmlAtT` + `dmlSkipsClock`). No test uses it.
 - `triggerCapture`: not a defect; it only forces the slower capture path. No test uses it.
+- `ignoreWriteClaim`: the shard's write guard is off, so a shard accepts captured changes and a transaction's writes
+  without checking that each row is its own and inside what the request declared (open problem 35: a Worker resent a
+  multi-row INSERT planned before a split, and both new shards took every row). Added 2026-11-14. No red module models
+  a Worker that declares less than its statement writes. The nearest is `m18_red_write_by_slot` (a shard accepts a write
+  of a piece it does not own), but its flaw is the granularity of the check, slot instead of piece, which the code cannot
+  show while every piece is a whole slot; it stays in P. Used in write-guard ("with the guard off (ignoreWriteClaim),
+  both new shards take every row ..." and "puts back the old behaviour with ignoreWriteClaim ...").
 
 ## Notes
 

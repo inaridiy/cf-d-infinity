@@ -491,6 +491,12 @@ export interface Faults {
   woundPrepared?: boolean;
   /** prepare が、書く行の他の取引のロックを待つ (モデル m9_red_prepare_waits)。 */
   prepareWaits?: boolean;
+  /**
+   * シャードの書き込みの守り (kernel.ts の claimed) を外す。シャードは、文が捕捉した変更の行を、持ち主かどうかも、文が宣言した
+   * 範囲に入るかどうかも確かめずに受け入れる (2026-11-14 までの挙動)。古い範囲表で計画した複数行の INSERT が、分割で生まれた
+   * 2 つのシャードの両方に全部の行を入れる (未解決の問題 35)。
+   */
+  ignoreWriteClaim?: boolean;
 }
 
 export class ConflictError extends Error {
@@ -560,6 +566,24 @@ export class TableLocked extends ConflictError {
 }
 /** TableLocked の誤りか。DO の間ではクラスが落ちるので、メッセージで見分ける。 */
 export const isTableLocked = (e: unknown): boolean => /(^|: )locked: table /.test((e as Error)?.message ?? "");
+/**
+ * シャードの書き込みの守りが、書き込みを断った (src/shard/kernel.ts の claimed)。文が捕捉した変更の行か、取引が確定のときに渡した
+ * 変更の行が、このシャードの持ち物でないか、文が宣言した範囲の外にある。何も書かずに断る。
+ *
+ * 範囲表が古いのではなく、要求の作り方 (Worker の計画か振り分け) の誤りである。範囲表を取り直して同じ計画を送り直しても、
+ * 同じ行を書くので、また断られる。だから、やり直してよい誤り (retryable の印、`conflict:`、`not owner:` などの接頭辞) にはしない。
+ * 経路の拒否 (NotOwner) と同じに扱うと、Worker は範囲表を取り直して同じ計画を送り直し、送り直した先で同じ行を書く
+ * (未解決の問題 35 は、その送り直しで行を 2 つのシャードに入れた)。
+ * DO の間ではクラスが落ちるので、Worker はメッセージの接頭辞 `write outside claim: ` で見分ける (isWriteOutsideClaim)。
+ */
+export class WriteOutsideClaim extends Error {
+  constructor(detail: string) {
+    super(`write outside claim: ${detail}`);
+    this.name = "WriteOutsideClaim";
+  }
+}
+/** WriteOutsideClaim の誤りか。Worker が包み直した誤り (`conflict: write outside claim: ...`) も見分ける。 */
+export const isWriteOutsideClaim = (e: unknown): boolean => /(^|: )write outside claim: /.test((e as Error)?.message ?? "");
 export class Migrating extends Error {
   readonly retryable = true;
   constructor() {

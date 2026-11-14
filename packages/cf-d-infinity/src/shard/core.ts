@@ -15,7 +15,7 @@ import { ShardKernel, WOUND_DELAY_MS, type KernelDeps, type Sig, type Waiter } f
 
 export {
   GROUP_MAX_BYTES, LOG_GEN_MS, LOG_RETAIN_MS, MAX_CLOCK_AHEAD_MS, ORPHAN_AGE_MS, SHARD_MAX_BYTES, SHARD_MAX_ROWS, TXN_RETAIN_MS, lockIdOf,
-  type SpanEscape,
+  type SpanEscape, type WriteCheck,
 } from "./kernel";
 
 /** シャードの依存。核の依存 (KernelDeps) に、待つ相手を足したものである。 */
