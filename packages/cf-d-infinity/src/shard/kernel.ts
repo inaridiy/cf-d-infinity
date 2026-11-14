@@ -1512,9 +1512,11 @@ export class ShardKernel {
    * 過去の時点への巻き戻し (restore)、overlay の適用。どれも、行の置き場所を、すでに一度この守りか移動の手順が決めている。
    * 断ると、確定した取引が適用できなくなるか、移動が終わらない。
    *
-   * いまの Worker は、書き込みの文に全表の範囲を付けない (書き込みは shard key で絞った宛先へだけ送る)。付けるようにするなら、
-   * 範囲表の古い Worker の claim は、受け取った範囲を含まないので、受け取ったシャードはこの守りで断り、渡した側は同じ文を
-   * NotOwner で断る。Worker は、経路の拒否を先に扱う。
+   * いまの Worker は、書き込みの文に全表の範囲を付けない (書き込みは shard key で絞った宛先へだけ送る)。付ける経路を足すなら、
+   * 次に気を付ける。範囲表の古い Worker の claim は、後で受け取った範囲を含まない。受け取ったシャードは同じ文をこの守りで断り、
+   * 渡した側は NotOwner で断る。その経路を足す者は、Worker が経路の拒否を先に扱い、範囲表を取り直して文を計画し直すように
+   * しなければならない (いまの Worker は、先に返った誤りを返す)。そうしないと、分割の途中の文が、どちらの拒否が先に返るかで、
+   * やり直されたり失敗したりする (AGENTS.md の規則 4)。
    */
   private claimed(_sec: Section<"owned">, changes: Change[], req: Pick<ExecReq, "sql" | "spans"> | null): void {
     if (changes.length === 0) return;
