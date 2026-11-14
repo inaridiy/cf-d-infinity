@@ -51,7 +51,7 @@ describe("the benchmark build", () => {
 
   it("runs an open-loop load and keeps the sum exact across an injected crash", async () => {
     const base = { cluster: "bb", shards: 2, tenants: 20, concurrency: 1 };
-    await post("/admin/ddl", { cluster: "bb", shards: 2, sql: "CREATE TABLE bench(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)" });
+    await post("/admin/ddl", { cluster: "bb", shards: 2, sql: "CREATE TABLE bench(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id))" });
     await post("/bench", { ...base, op: "seed", from: 1, to: 20, durationMs: 0 });
     const a = await post("/bench", { ...base, op: "write", durationMs: 1000, ratePerSec: 50 });
     expect(a.body.count).toBe(50);
@@ -63,7 +63,7 @@ describe("the benchmark build", () => {
 
   it("produces a history the black-box checker accepts, with crashes injected during the run", async () => {
     const base = { cluster: "jj", shards: 2, tenants: 1, concurrency: 6 };
-    await post("/admin/ddl", { cluster: "jj", shards: 2, sql: "CREATE TABLE jep(k INTEGER NOT NULL, id INTEGER NOT NULL, v TEXT NOT NULL, PRIMARY KEY (k, id)) SHARD KEY (k)" });
+    await post("/admin/ddl", { cluster: "jj", shards: 2, sql: "CREATE TABLE jep(k INTEGER NOT NULL, id INTEGER NOT NULL, v TEXT NOT NULL, PRIMARY KEY (k, id))" });
     const run = post("/bench", { ...base, op: "jepsen", durationMs: 3000, epochMs: 1000, keysPerEpoch: 6 });
     for (let i = 0; i < 4; i++) {
       await new Promise((r) => setTimeout(r, 500));

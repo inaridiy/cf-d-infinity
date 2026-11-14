@@ -302,10 +302,10 @@ describe("4. DDL racing with shard splits", () => {
 
 const T = `CREATE TABLE t(
   tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, n INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+  PRIMARY KEY (tenant_id, id))`;
 const U = `CREATE TABLE u(
   tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER,
-  PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+  PRIMARY KEY (tenant_id, id))`;
 
 async function two(faults?: Faults) {
   const c = new SimCluster({ shards: 2, faults });

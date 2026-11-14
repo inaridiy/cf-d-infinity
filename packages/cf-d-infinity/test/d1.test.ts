@@ -15,7 +15,7 @@ const users = sqliteTable("users", {
 async function setup() {
   const c = new SimCluster();
   const client = c.client();
-  await client.ddl(`CREATE TABLE users(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, name TEXT, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+  await client.ddl(`CREATE TABLE users(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, name TEXT, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, id))`);
   return { c, client, d1: new D1Compatible(client) };
 }
 

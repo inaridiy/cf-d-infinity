@@ -23,10 +23,10 @@ export function prng(seed: number) {
 
 export const ACCT = `CREATE TABLE acct(
   tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, n INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+  PRIMARY KEY (tenant_id, id))`;
 export const SIDE = `CREATE TABLE side(
   tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER NOT NULL,
-  PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+  PRIMARY KEY (tenant_id, id))`;
 export const INDEX = "acct_v";
 
 export const TENANTS = 6;

@@ -587,7 +587,7 @@ export function logRows(b: SqliteBackend): Row[] {
 
 export const USERS = `CREATE TABLE users(
   tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, name TEXT, n INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+  PRIMARY KEY (tenant_id, id))`;
 export const ORDERS = `CREATE TABLE orders(
   tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, user_id INTEGER NOT NULL, status TEXT, total INTEGER,
-  PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+  PRIMARY KEY (tenant_id, id))`;

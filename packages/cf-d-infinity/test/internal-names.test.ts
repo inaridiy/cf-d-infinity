@@ -88,15 +88,23 @@ describe("names starting with __ are internal everywhere a user names an object"
   });
 });
 
-describe("CREATE TABLE ... SHARD KEY followed by a second statement", () => {
+describe("CREATE TABLE followed by a second statement", () => {
   it("does not make multi-shard reads return a row that no shard holds", async () => {
     const c = new SimCluster({ shards: 2 });
     const db = c.client();
-    const ddl = await outcome(db.query("CREATE TABLE a(id INTEGER PRIMARY KEY, n INTEGER) SHARD KEY (id); INSERT INTO a VALUES (100, 7)"));
+    const ddl = await outcome(db.query("CREATE TABLE a(id INTEGER PRIMARY KEY, n INTEGER); INSERT INTO a VALUES (100, 7)"));
     const point = await outcome(new Db(c).query("SELECT n FROM a WHERE id = 100").then((r) => r.rows));
     const scan = await outcome(new Db(c).query("SELECT id, n FROM a ORDER BY n DESC").then((r) => r.rows));
     console.log(JSON.stringify({ ddl, point, scan }));
     // Either the INSERT ran (both reads see the row) or it did not (neither does).
     expect((scan as { ok: unknown[] }).ok?.length).toBe((point as { ok: unknown[] }).ok?.length);
+  });
+
+  it("refuses the removed SHARD KEY clause as a syntax error, since it is not SQLite", async () => {
+    // shard key は主キーの先頭の列で決まる。別の列を選ぶ句は 2026-11-14 に消した (src/sql/ddl.ts の createTable)。
+    const db = new SimCluster({ shards: 2 }).client();
+    await expect(db.ddl("CREATE TABLE s(tenant_id INTEGER, id INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)")).rejects.toThrow();
+    await expect(db.query("CREATE TABLE s(tenant_id INTEGER, id INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)")).rejects.toThrow();
+    expect(Object.keys((await db.query("SELECT name FROM sqlite_master WHERE type = 'table'")).rows)).toHaveLength(0);
   });
 });

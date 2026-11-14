@@ -10,7 +10,7 @@ async function scenario(viaTransaction: boolean) {
   const c = new SimCluster({ shards: 2 });
   const db = c.client();
   await db.ddl(`CREATE TABLE accounts(tenant_id INTEGER PRIMARY KEY, bal INTEGER NOT NULL)`);
-  await db.ddl(`CREATE TABLE ledger(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, amount INTEGER NOT NULL, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+  await db.ddl(`CREATE TABLE ledger(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, amount INTEGER NOT NULL, PRIMARY KEY (tenant_id, id))`);
   const { routing } = await c.catalog();
   const on = (s: string) => { for (let t = 1; ; t++) if (ownerOf(routing, JSON.stringify([t])) === s) return t; };
   const [A, B] = [on("s1"), on("s0")];

@@ -34,7 +34,7 @@ async function load(c: SimCluster, lines: string[]): Promise<void> {
   }
 }
 
-const DOCS = `CREATE TABLE docs(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, body, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+const DOCS = `CREATE TABLE docs(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, body, PRIMARY KEY (tenant_id, id))`;
 
 async function roundTrip(bodies: Value[]): Promise<void> {
   const src = new SimCluster({ shards: 2 });
@@ -69,7 +69,7 @@ describe("export followed by import", () => {
   it("pages through a composite primary key at every page size", async () => {
     // 主キーに NULL のある行は作れない (test/admission.test.ts)。以前は、そういう行でページが終わる場合をここで確かめていた。
     const c = new SimCluster({ shards: 1 });
-    await c.client().ddl("CREATE TABLE t(a INTEGER NOT NULL, b TEXT, v TEXT, PRIMARY KEY (a, b)) SHARD KEY (a)");
+    await c.client().ddl("CREATE TABLE t(a INTEGER NOT NULL, b TEXT, v TEXT, PRIMARY KEY (a, b))");
     await expect(new Db(c).query("INSERT INTO t VALUES (1, NULL, 'x')")).rejects.toThrow(/^unsupported: NULL in the primary key column b of t/);
     const rows: [number, string][] = [[1, ""], [1, "a"], [1, "x"], [2, ""], [2, "a"], [2, "b"], [3, ""], [3, "z"]];
     for (const [i, [a, b]] of rows.entries()) await new Db(c).query("INSERT INTO t VALUES (?, ?, ?)", [a, b, `v${i}`]);

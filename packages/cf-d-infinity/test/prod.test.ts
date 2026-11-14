@@ -30,8 +30,8 @@ describe.skipIf(!url)("production", () => {
   it("runs a stock client and measures latency by query type", async () => {
     for (const t of ["users", "orders", "members", "big"]) await db.execute(`DROP TABLE IF EXISTS ${t}`);
     await db.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, org INTEGER, email TEXT UNIQUE, name TEXT)");
-    await db.execute("CREATE TABLE orders(org INTEGER, id INTEGER, user_id INTEGER, total INTEGER, status TEXT, PRIMARY KEY (org, id)) SHARD KEY (org)");
-    await db.execute("CREATE TABLE members(org INTEGER, id INTEGER, role TEXT, PRIMARY KEY (org, id)) SHARD KEY (org)");
+    await db.execute("CREATE TABLE orders(org INTEGER, id INTEGER, user_id INTEGER, total INTEGER, status TEXT, PRIMARY KEY (org, id))");
+    await db.execute("CREATE TABLE members(org INTEGER, id INTEGER, role TEXT, PRIMARY KEY (org, id))");
     for (let at = 0; at < 600; at += 100) {
       await db.batch(Array.from({ length: 100 }, (_, i) => {
         const n = at + i + 1;

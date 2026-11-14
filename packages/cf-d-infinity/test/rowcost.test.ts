@@ -52,8 +52,8 @@ beforeAll(async () => {
       DINF_AUTOSCALER: { className: "DinfAutoscaler", useSQLite: true },
     },
   });
-  await post("/ddl", { sql: "CREATE TABLE b(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)" });
-  await post("/ddl", { sql: "CREATE TABLE u(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)" });
+  await post("/ddl", { sql: "CREATE TABLE b(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id))" });
+  await post("/ddl", { sql: "CREATE TABLE u(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT, PRIMARY KEY (tenant_id,id))" });
   await post("/ddl", { sql: "CREATE UNIQUE INDEX u_email ON u(email)" });
   for (let t = 1; t <= 200; t++) await post("/sql", { sql: "INSERT INTO b(tenant_id,id,n) VALUES (?,1,0)", params: [t] });
 }, 120000);

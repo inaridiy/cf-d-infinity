@@ -91,7 +91,7 @@ describe("a split takes its slot only after every shard applied the latest versi
   const scenario = async (clientFaults?: ClientFaults) => {
     const c = new SimCluster({ shards: 2, clientFaults });
     const db = new Db(c);
-    await db.ddl("CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, gone INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)");
+    await db.ddl("CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, gone INTEGER, PRIMARY KEY (tenant_id, id))");
     const { routing } = await c.catalog();
     const range = planSplit(routing, "s0")!;
     const tenants = Array.from({ length: 200 }, (_, i) => i + 1);

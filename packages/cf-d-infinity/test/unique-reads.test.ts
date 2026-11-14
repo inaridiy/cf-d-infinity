@@ -15,7 +15,7 @@ describe("a statement that reads another row through a local UNIQUE index", () =
   const setup = async () => {
     const c = new SimCluster({ shards: 2 });
     const db = c.client();
-    await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id), UNIQUE (tenant_id, code)) SHARD KEY (tenant_id)`);
+    await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id), UNIQUE (tenant_id, code))`);
     const { routing } = await c.catalog();
     const on = (s: string) => { for (let t = 1; ; t++) if (ownerOf(routing, JSON.stringify([t])) === s) return t; };
     const [A, B] = [on("s1"), on("s0")];

@@ -7,7 +7,7 @@ import { quiescentProblems } from "./invariants";
 import { SimCluster } from "./sim";
 
 const P = `CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, gone INTEGER, n INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (tenant_id, id), UNIQUE (tenant_id, code)) SHARD KEY (tenant_id)`;
+  PRIMARY KEY (tenant_id, id), UNIQUE (tenant_id, code))`;
 
 async function setup(extra: string[] = []) {
   const c = new SimCluster({ shards: 2 });

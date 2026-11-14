@@ -13,7 +13,7 @@ describe("split + a schema change + a committed transaction waiting to be applie
   it("ends in a state that recovers by itself", async () => {
     const c = new SimCluster({ shards: 2 });
     const db = c.client();
-    await db.ddl(`CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, x INTEGER, y INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+    await db.ddl(`CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, x INTEGER, y INTEGER, PRIMARY KEY (tenant_id, id))`);
     const { routing } = await c.catalog();
     const range = planSplit(routing, "s0")!;
     let G = 1; // a tenant on s0 inside the range that the split will move

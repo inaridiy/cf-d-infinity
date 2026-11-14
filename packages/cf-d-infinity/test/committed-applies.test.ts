@@ -46,7 +46,7 @@ describe("a transaction acknowledged as committed can always be applied", () => 
     expect(dup.filter((d) => d === "accepted")).toEqual([]);
     expect(problems).toEqual([]);
   };
-  const T = (col: string) => `CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code ${col}, deleted INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+  const T = (col: string) => `CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code ${col}, deleted INTEGER, PRIMARY KEY (tenant_id, id))`;
 
   it("(2) partial UNIQUE index (the soft-delete pattern)", () =>
     pending("partial unique", T("TEXT"), "CREATE UNIQUE INDEX p_code ON p(tenant_id, code) WHERE deleted IS NULL",
@@ -60,7 +60,7 @@ describe("a transaction acknowledged as committed can always be applied", () => 
 
   it("(5) text that is small in characters but large in bytes is refused before commit, at the statement", async () => {
     const c = new SimCluster({ shards: 2 });
-    await c.client().ddl(`CREATE TABLE docs(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+    await c.client().ddl(`CREATE TABLE docs(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (tenant_id, id))`);
     const [A, B] = await tenants(c);
     // 380,000 文字は UTF-8 で 1.14 MB になる。2 行で、変更ログの 1 行 (上限 2 MB) に収まらない。
     const cjk = "あ".repeat(380_000);

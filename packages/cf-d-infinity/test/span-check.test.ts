@@ -5,7 +5,7 @@ import { Db } from "../src/client/db";
 import { spanFaults } from "../src/client/spans";
 import { allSpanEscapes, SimCluster } from "./sim";
 
-const P = `CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+const P = `CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id))`;
 
 describe("the span check", () => {
   afterEach(() => {
@@ -59,7 +59,7 @@ describe("the span check", () => {
     const c = new SimCluster({ shards: 1 });
     const db = c.client();
     await db.ddl(P);
-    await db.ddl(`CREATE TABLE q(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+    await db.ddl(`CREATE TABLE q(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (tenant_id, id))`);
     await db.query("INSERT INTO p VALUES (1, 1, 'a')");
     await db.query("INSERT INTO q VALUES (1, 1)");
     const { version } = await c.catalog();

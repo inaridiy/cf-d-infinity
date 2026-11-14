@@ -93,12 +93,8 @@ export interface ReadRecord {
   from: Ts;
 }
 
-/** SHARD KEY はこの DB の拡張で、パーサは読めない。そういう CREATE TABLE は、DDL の解釈に直接渡す。 */
-const SHARD_KEY_TABLE = /^\s*CREATE\s+TABLE\b[\s\S]*\bSHARD\s+KEY\s*\(/i;
-
 /** 表定義を変える文を含むか。読めない文は、含まないものとして扱う (実行すれば、その誤りが返る)。 */
 export function changesSchema(sql: string): boolean {
-  if (SHARD_KEY_TABLE.test(sql)) return true;
   try {
     return parseStatements(sql).some((s) => SCHEMA_STATEMENTS.has(s.type));
   } catch {
@@ -1896,7 +1892,7 @@ export class Db {
       }
       await flush();
       // 1 文の DDL は、読んだ範囲を渡して実行する。複数の文を含むものは、1 文ずつ取引の外で実行する。
-      const one = SHARD_KEY_TABLE.test(s.sql) || parseStatements(s.sql).length === 1;
+      const one = parseStatements(s.sql).length === 1;
       if (one && !this.current) {
         await this.ddl(s.sql, reads);
         out.push(new QueryResult([], []));
@@ -1962,11 +1958,6 @@ export class Db {
 
   /** 文を実行する。`;` で区切った複数の文を渡すと順に実行し、最後の結果を返す。 */
   async query(sql: string, params: Params = []): Promise<QueryResult> {
-    // SHARD KEY はこの DB の拡張で、パーサは読めない。DDL の解釈に直接渡す。
-    if (SHARD_KEY_TABLE.test(sql)) {
-      await this.ddl(sql);
-      return new QueryResult([], []);
-    }
     let last = new QueryResult([], []);
     for (const stmt of parseStatements(sql)) last = await this.statement(stmt, params);
     return last;

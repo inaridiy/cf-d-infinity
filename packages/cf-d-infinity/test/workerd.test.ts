@@ -44,7 +44,7 @@ const sql = (s: string, params: unknown[] = [], extra: object = {}) => post("/sq
 
 beforeAll(async () => {
   if (LIVE) {
-    await post("/ddl", { sql: `CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT UNIQUE, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)` });
+    await post("/ddl", { sql: `CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT UNIQUE, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id))` });
     return;
   }
   execFileSync("npm", ["run", "-s", "bundle"], { stdio: "inherit" });
@@ -61,7 +61,7 @@ beforeAll(async () => {
       DINF_AUTOSCALER: { className: "DinfAutoscaler", useSQLite: true },
     },
   });
-  await post("/ddl", { sql: `CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT UNIQUE, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)` });
+  await post("/ddl", { sql: `CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT UNIQUE, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id))` });
 }, 60000);
 afterAll(async () => {
   // URL は書かない (アカウントの workers.dev の名前が出る)。

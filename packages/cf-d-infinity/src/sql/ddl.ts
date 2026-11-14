@@ -125,7 +125,7 @@ const isFk = (c: Node) => c.type === "references_specification" || c.type === "c
 const inner = (item: Node) => (item.type === "constraint" ? item.constraint : item);
 const specCols = (c: Node): string[] => c.columns.expr.items.map((i: Node) => ident(i.type === "index_specification" ? i.expr : i));
 
-function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: string[] | null): ParsedDdl {
+function createTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
   // TEMP の表は接続ごとのもので、シャードにも、Worker の SQLite にも置き場がない。普通の表として作ってしまうと、消えない。
   const kind = stmt.kind?.kindKw?.name;
   const schemaName = stmt.name?.type === "member_expr" ? ident(stmt.name.object).toLowerCase() : null;
@@ -171,10 +171,10 @@ function createTable(source: string, stmt: Node, schema: SchemaView, shardKey: s
   if (implicitRowid) pk = ["rowid"];
   const single = pk.length === 1 ? pk[0]! : null;
   const rowidAlias = !withoutRowid && single && /^INTEGER$/i.test((types.get(single) ?? "").trim()) ? single : null;
-  const sk = shardKey ?? [pk[0]!];
-  for (const c of sk) {
-    if (!pk.includes(c)) throw new SqlError(`SHARD KEY column ${c} must be part of the PRIMARY KEY`);
-  }
+  // shard key は主キーの先頭の列で決まる (主キーのない表では rowid)。同じ先頭の値の行は同じシャードに載る
+  // (`PRIMARY KEY (tenant_id, id)` ならテナントごと)。2026-11-14 に、別の列を選ぶ `SHARD KEY (...)` の句を消した
+  // (持ち主の決定)。使っていた所はどれも主キーの先頭の列を選んでいて、Drizzle などの道具は句を出せず、パーサも読めなかった。
+  const sk = [pk[0]!];
   // 行と shard key の同一性は、値をそのまま比べて決める。照合順序で等しい値 ('abc' と 'ABC') を同じ行として扱うには、
   // 経路、分割、ロック、検証のすべてで同じ規則が要る。その規則を確かめきるまで、キーの列の照合順序は受け付けない。
   for (const c of new Set([...pk, ...sk])) {
@@ -399,21 +399,14 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
 }
 
 export function parseDdl(source: string, schema: SchemaView): ParsedDdl {
-  let shardKey: string[] | null = null;
-  const clean = source
-    .replace(/\bSHARD\s+KEY\s*\(([^)]*)\)/i, (_m, cols: string) => {
-      shardKey = cols.split(",").map((c) => c.trim().replace(/^"|"$/g, ""));
-      return "";
-    })
-    .trim()
-    .replace(/;$/, "");
+  const clean = source.trim().replace(/;$/, "");
   // 1 回の DDL は 1 文だけにする。先頭の文しか調べないので、後ろに文が続いていると、調べていない SQL が
   // Meta と全シャードの SQLite でそのまま実行され、履歴にも残る。
   const stmts = parseStatements(clean);
   if (stmts.length !== 1) throw new SqlError("a schema change must be exactly one statement");
   const stmt = stmts[0];
   switch (stmt.type) {
-    case "create_table_stmt": return createTable(clean, stmt, schema, shardKey);
+    case "create_table_stmt": return createTable(clean, stmt, schema);
     case "create_index_stmt": return createIndex(clean, stmt, schema);
     case "drop_table_stmt": return dropTable(clean, stmt, schema);
     case "drop_index_stmt": return dropIndex(clean, stmt, schema);

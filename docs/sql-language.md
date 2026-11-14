@@ -175,22 +175,22 @@ shard key を含まない列への `CREATE UNIQUE INDEX` は、既存の行か�
 1 回の要求で埋めきれない大きさの表では、エラーで止まり、index は作られず、表は元のままである。CREATE TABLE で宣言した UNIQUE は、埋める作業が要らない。
 作る側が途中で止まっても、書き込みの禁止は 5 秒のうちに解ける (作る側が、作業の間、期限を延ばし続ける)。延ばし続けても、5 分で打ち切る。
 
-## 拡張する DDL
+## 分散のための DDL
 
-SQLite の構文に、分散のための宣言を 1 つだけ足している。
+SQLite の構文に、分散のための宣言は足していない。行は PRIMARY KEY の先頭の列のハッシュで分散し、PRIMARY KEY のない表は
+rowid で分散する。先頭の列が同じ行は、表をまたいで同じシャードに載る。
 
 ```sql
 CREATE TABLE orders (
   tenant_id INTEGER NOT NULL,
   id        INTEGER NOT NULL,
   status    TEXT,
-  PRIMARY KEY (tenant_id, id)
-) SHARD KEY (tenant_id);
+  PRIMARY KEY (tenant_id, id)   -- テナントの行が 1 つのシャードに集まる
+);
 ```
 
-`SHARD KEY` は省略できる。
-省略すると PRIMARY KEY の先頭列のハッシュで分散し、PRIMARY KEY のない表は rowid で分散する。
-既存のスキーマはそのまま流せるが、関連する行が別のシャードへ分かれるので、性能のためには明示が要る。
+既存のスキーマはそのまま流せる。関連する行を同じシャードに置きたいときは、それを決める列を PRIMARY KEY の先頭に置く。
+先頭の列の値の種類が少ない PK (`(type, id)` など) は、同じ値の行が 16 MB を超えると、そのシャードを分割できなくなる。
 
 index の配置は宣言しない。
 index は、shard key を含むかどうかにかかわらず、各シャードの中の SQLite index になる。

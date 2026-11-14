@@ -43,7 +43,7 @@ afterAll(async () => {
 describe("real Durable Object SQLite", () => {
   it("refuses, before commit, a transaction whose rows are small in characters but too large in bytes", async () => {
     const post = on(worker());
-    await post("/ddl", { sql: "CREATE TABLE docs(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)" });
+    await post("/ddl", { sql: "CREATE TABLE docs(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (tenant_id, id))" });
     const st = (await post("/admin/status", {}, "admin-test")).json as { routing: Routing };
     const tenantOn = (shard: string) => { for (let t = 1; ; t++) if (ownerOf(st.routing, JSON.stringify([t])) === shard) return t; };
     const [A, B] = [tenantOn("shard-0"), tenantOn("shard-1")];

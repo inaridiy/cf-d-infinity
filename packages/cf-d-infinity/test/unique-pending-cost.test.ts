@@ -12,7 +12,7 @@ describe("write on a table with a local UNIQUE index while N other transactions 
     const measure = async (pending: number, sameGroup: boolean) => {
       const c = new SimCluster({ shards: 2 });
       const db = c.client();
-      await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id), UNIQUE (tenant_id, code)) SHARD KEY (tenant_id)`);
+      await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id), UNIQUE (tenant_id, code))`);
       const { routing } = await c.catalog();
       const on = (s: string) => { for (let t = 1; ; t++) if (ownerOf(routing, JSON.stringify([t])) === s) return t; };
       const onAfter = (sh: string, after: number) => { for (let t = after + 1; ; t++) if (ownerOf(routing, JSON.stringify([t])) === sh) return t; };

@@ -9,7 +9,7 @@ describe("UPDATE routed through a global index while an earlier commit is still 
   it("must not undo the earlier, acknowledged update", async () => {
     const c = new SimCluster({ shards: 2 });
     const db = c.client();
-    await db.ddl(`CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, n INTEGER NOT NULL, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+    await db.ddl(`CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, n INTEGER NOT NULL, PRIMARY KEY (tenant_id, id))`);
     await db.ddl(`CREATE INDEX ix ON t(v)`);
     const { routing } = await c.catalog();
     // Two tenants on s1, one on s0. Pick index values whose index entries live on s0.

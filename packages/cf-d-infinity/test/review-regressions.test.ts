@@ -23,7 +23,7 @@ describe("a UNIQUE value held by another transaction's intent", () => {
     spanFaults.rowSpanDespiteUnique = narrow;
     const c = new SimCluster({ shards: 2, faults, noSpanCheck: narrow });
     const db = c.client();
-    await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+    await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id))`);
     await db.ddl(`CREATE UNIQUE INDEX p_code ON p(tenant_id, code)`);
     const tenants = [await tenantOn(c, "s0"), await tenantOn(c, "s1")];
     let release!: () => void;
@@ -153,7 +153,7 @@ describe("a schema change while a committed transaction is waiting to be applied
   const run = async (faults: Faults) => {
     const c = new SimCluster({ shards: 2, faults });
     await c.client().ddl(USERS);
-    await c.client().ddl(`CREATE TABLE notes(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+    await c.client().ddl(`CREATE TABLE notes(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (tenant_id, id))`);
     const tenants = [await tenantOn(c, "s0"), await tenantOn(c, "s1")];
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
@@ -217,7 +217,7 @@ describe("a transaction that reads through a global index and then writes", () =
   const setup = async () => {
     const c = new SimCluster({ shards: 2 });
     const db = c.client();
-    await db.ddl(`CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, n INTEGER NOT NULL, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+    await db.ddl(`CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, n INTEGER NOT NULL, PRIMARY KEY (tenant_id, id))`);
     await db.ddl(`CREATE INDEX ix ON t(v)`);
     const { routing } = await c.catalog();
     const onS1: number[] = [];

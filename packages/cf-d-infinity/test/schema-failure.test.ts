@@ -12,7 +12,7 @@ const CASES: [string, string[], string][] = [
   ["a STRICT table with a non-STRICT type", [], "CREATE TABLE s(id INTEGER PRIMARY KEY, name VARCHAR(20)) STRICT"],
   ["a duplicate column name", [], "CREATE TABLE d(id INTEGER PRIMARY KEY, a, a)"],
   ["DROP COLUMN of a column used by a local index",
-    ["CREATE TABLE x(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)", "CREATE INDEX x_v ON x(tenant_id, v)"],
+    ["CREATE TABLE x(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id))", "CREATE INDEX x_v ON x(tenant_id, v)"],
     "ALTER TABLE x DROP COLUMN v"],
   ["a table name SQLite reserves", [], "CREATE TABLE sqlite_things(id INTEGER PRIMARY KEY)"],
 ];
@@ -37,7 +37,7 @@ describe("a schema change that SQLite rejects on the shard", () => {
   it("CREATE UNIQUE INDEX IF NOT EXISTS over existing duplicates: is refused and leaves the shard usable", async () => {
     const c = new SimCluster({ shards: 2 });
     const db = c.client();
-    await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+    await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id))`);
     await db.query("INSERT INTO p VALUES (1, 1, 'x')");
     await db.query("INSERT INTO p VALUES (1, 2, 'x')");
         await expect(db.ddl("CREATE UNIQUE INDEX ux0 ON p(tenant_id, code)")).rejects.toThrow(/duplicate values/);
@@ -51,7 +51,7 @@ describe("a schema change that SQLite rejects on the shard", () => {
   const twoShards = async () => {
     const c = new SimCluster({ shards: 2 });
     const db = c.client();
-    await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, gone INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+    await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, gone INTEGER, PRIMARY KEY (tenant_id, id))`);
     // 片方のシャードにだけ、文に反する行を置く。
     const { routing } = await c.catalog();
     const tenants = [1, 2, 3, 4, 5, 6, 7, 8];

@@ -291,7 +291,7 @@ describe("HLC must not fall behind a served read after a restart", () => {
 describe("rollback-read and UNIQUE swap", () => {
   const scenario = async (faults: Faults) => {
     const { c, db } = await cluster(faults);
-    await db.ddl(`CREATE TABLE a(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT NOT NULL, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)`);
+    await db.ddl(`CREATE TABLE a(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT NOT NULL, PRIMARY KEY (tenant_id,id))`);
     await db.ddl(`CREATE UNIQUE INDEX a_code ON a(tenant_id, code)`);
     await db.query("INSERT INTO a VALUES (1,1,'x'),(1,2,'y')");
     const snap = await db.begin();
@@ -458,8 +458,8 @@ describe("every table a statement reads is validated", () => {
   it("catches a change to a table read only through a subquery", async () => {
     const c = new SimCluster({ shards: 3 });
     const db = new Db(c);
-    await db.ddl(`CREATE TABLE a(tenant INTEGER, id INTEGER, n INTEGER, PRIMARY KEY (tenant, id)) SHARD KEY (tenant)`);
-    await db.ddl(`CREATE TABLE b(tenant INTEGER, id INTEGER, n INTEGER, PRIMARY KEY (tenant, id)) SHARD KEY (tenant)`);
+    await db.ddl(`CREATE TABLE a(tenant INTEGER, id INTEGER, n INTEGER, PRIMARY KEY (tenant, id))`);
+    await db.ddl(`CREATE TABLE b(tenant INTEGER, id INTEGER, n INTEGER, PRIMARY KEY (tenant, id))`);
     await db.query("INSERT INTO a VALUES (1, 1, 0)");
     await db.query("INSERT INTO b VALUES (1, 1, 5)");
     c.time += 10;
@@ -549,7 +549,7 @@ describe("pessimistic transactions", () => {
   it("m9_red_leave_silent: a woken waiter that cannot take the lock wakes the next one", async () => {
     const c = new SimCluster({ shards: 1 });
     const db = new Db(c);
-    await db.ddl("CREATE TABLE g(t INTEGER, id INTEGER, n INTEGER, PRIMARY KEY (t, id)) SHARD KEY (t)");
+    await db.ddl("CREATE TABLE g(t INTEGER, id INTEGER, n INTEGER, PRIMARY KEY (t, id))");
     await db.query("INSERT INTO g VALUES (1, 1, 0), (1, 2, 0)");
     const holder = new Db(c);
     await holder.query("BEGIN IMMEDIATE");

@@ -9,7 +9,7 @@ describe("INSERT ... VALUES (..., (SELECT max(pos) + 1 ...)) in two concurrent t
   for (const begin of ["BEGIN", "BEGIN IMMEDIATE"]) {
     it(`${begin}: the two rows do not get the same position`, async () => {
       const c = new SimCluster({ shards: 2 });
-      await c.client().ddl(`CREATE TABLE items(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, pos INTEGER NOT NULL, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+      await c.client().ddl(`CREATE TABLE items(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, pos INTEGER NOT NULL, PRIMARY KEY (tenant_id, id))`);
       const [a, b] = [new Db(c), new Db(c)];
       await a.query(begin);
       await b.query(begin);
@@ -25,7 +25,7 @@ describe("INSERT ... VALUES (..., (SELECT max(pos) + 1 ...)) in two concurrent t
 
   it("control: the same read written as a separate SELECT is validated", async () => {
     const c = new SimCluster({ shards: 2 });
-    await c.client().ddl(`CREATE TABLE items(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, pos INTEGER NOT NULL, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+    await c.client().ddl(`CREATE TABLE items(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, pos INTEGER NOT NULL, PRIMARY KEY (tenant_id, id))`);
     const [a, b] = [new Db(c), new Db(c)];
     for (const d of [a, b]) await d.query("BEGIN");
     const next = async (d: Db) => Number((await d.query("SELECT coalesce(max(pos), 0) + 1 AS n FROM items WHERE tenant_id = 1")).rows[0]!.n);
