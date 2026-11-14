@@ -59,10 +59,10 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 
 | 項目 | 理由 |
 |---|---|
-| TEMP 表、`ATTACH`、仮想表 (FTS5 など) | DO の SQLite が許可しない、または Worker の SQLite に含まれない |
+| TEMP 表、`ATTACH`、仮想表 (`CREATE VIRTUAL TABLE`。FTS5 など) | DO の SQLite が許可しない、または Worker の SQLite に含まれない。TEMP 表と仮想表は `unsupported:` で断る |
 | trigger、生成列、`CREATE TABLE ... AS SELECT` | 検査が足りないので断る。エラーは `unsupported:` で始まる |
 | `ALTER TABLE` の `RENAME COLUMN` と `DROP COLUMN` | 同上 |
-| 主キー、shard key、shard key を含まない UNIQUE の列の、BINARY 以外の照合順序 | 同上。行と行き先のシャードを値で決めるので、照合順序で等しい値を同じ行として扱えない |
+| 主キー、shard key、shard key を含まない UNIQUE の列の、BINARY 以外の照合順序 | 同上。行と行き先のシャードを値で決めるので、照合順序で等しい値を同じ行として扱えない。列の定義に書いても (`a TEXT COLLATE NOCASE PRIMARY KEY`)、表の制約に書いても (`PRIMARY KEY (a COLLATE NOCASE)`) 同じである。`COLLATE BINARY` と書いたものは通る |
 | 主キーの列に NULL のある行 | 断る。SQLite は INTEGER でない主キーに NULL をいくつでも入れられるが、行を主キーの値で名指しするので区別できない。`INTEGER PRIMARY KEY` に NULL を渡すと rowid が入るのは SQLite と同じである |
 | 書き込みの文の中の `sqlite_master` と PRAGMA の関数 (`pragma_table_info(...)` など) | 断る。読みの文の中なら、利用者の表定義について答える (シャードの内部の表は見えない) |
 | shard key を含まない、UNIQUE の部分 index と式の index | 断る (`unsupported:`)。シャードをまたぐ UNIQUE の index の表は、列の値だけで項目を作るからである |

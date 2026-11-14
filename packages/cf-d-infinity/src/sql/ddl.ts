@@ -123,9 +123,44 @@ const rowIndexSql = (ix: Pick<GlobalIndexDef, "name" | "columns">, table: string
 
 const isFk = (c: Node) => c.type === "references_specification" || c.type === "constraint_foreign_key";
 const inner = (item: Node) => (item.type === "constraint" ? item.constraint : item);
-const specCols = (c: Node): string[] => c.columns.expr.items.map((i: Node) => ident(i.type === "index_specification" ? i.expr : i));
+/** 表の UNIQUE の列。パーサは、ここでは列の名前だけを読む (parser.ts の constraint)。 */
+const specCols = (c: Node): string[] => c.columns.expr.items.map((i: Node) => ident(i));
+
+/**
+ * 表の制約の PRIMARY KEY の 1 列。SQLite の文法では `式 [COLLATE 名前] [ASC | DESC]` で、式は列の名前でなければならない
+ * (括弧で包んでも、文字列の literal で書いてもよい)。列の名前と、書いてある照合順序を返す。
+ * 節の形を確かめずに名前を取り出すと、`PRIMARY KEY (a COLLATE NOCASE)` で名前が undefined になり、TypeError で落ちていた。
+ */
+function keyColumn(spec: Node): { name: string; collations: string[] } {
+  const collations: string[] = [];
+  let e: Node = spec.type === "index_specification" ? spec.expr : spec;
+  for (;;) {
+    if (e.type === "binary_expr" && e.operator?.name === "COLLATE") {
+      collations.push(ident(e.right).toUpperCase());
+      e = e.left;
+    } else if (e.type === "paren_expr" && e.expr?.type !== "list_expr") e = e.expr;
+    else break;
+  }
+  if (e.type === "string_literal") return { name: e.value, collations };
+  // SQLite の文言。列でない式 (`a + 1`、`lower(a)`) は、主キーにできない。
+  if (e.type !== "identifier") throw new SqlError("expressions prohibited in PRIMARY KEY and UNIQUE constraints");
+  return { name: ident(e), collations };
+}
+
+/**
+ * CREATE TABLE のうち、文の形だけで断るもの。表があるかどうかや IF NOT EXISTS より先に確かめるので、同じ文はいつも断られる。
+ * 計画 (plan.ts の planStatement) と DDL の解釈 (createTable) の両方がここを通す。`Db.query` に渡しても `Db.ddl` に渡しても、
+ * 同じ文言になる。前は計画だけが断り、`Db.ddl` に渡した文は、列の並びがないので TypeError で落ちていた。
+ */
+export function assertPlainCreateTable(stmt: Node): void {
+  // 仮想表 (FTS5、rtree など)。モジュールは Worker の SQLite に含まれず、行を主キーでシャードに分ける表でもない。
+  if (stmt.kind?.kindKw?.name === "VIRTUAL") unsupported("CREATE VIRTUAL TABLE; virtual table modules such as FTS5 are not available");
+  // 表の作成と行の挿入を 1 文で行うと、途中で失敗したときの後始末が要る。CREATE TABLE と INSERT ... SELECT に分けて書ける。
+  if ((stmt.clauses ?? []).some((c: Node) => c.type === "as_clause")) unsupported("CREATE TABLE ... AS SELECT; create the table, then INSERT ... SELECT");
+}
 
 function createTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
+  assertPlainCreateTable(stmt);
   // TEMP の表は接続ごとのもので、シャードにも、Worker の SQLite にも置き場がない。普通の表として作ってしまうと、消えない。
   const kind = stmt.kind?.kindKw?.name;
   const schemaName = stmt.name?.type === "member_expr" ? ident(stmt.name.object).toLowerCase() : null;
@@ -143,11 +178,17 @@ function createTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
   const collation: Record<string, string> = {};
   const defaults: string[] = [];
   let pk: string[] = [];
+  /** 表の制約の PRIMARY KEY に書いてある照合順序 (`PRIMARY KEY (a COLLATE NOCASE)`)。列ごと。 */
+  const keyCollations: Record<string, string[]> = {};
   const uniqueSets: string[][] = [];
   for (const item of items) {
     if (item.type !== "column_definition") {
       const c = inner(item);
-      if (c.type === "constraint_primary_key") pk = specCols(c);
+      if (c.type === "constraint_primary_key") {
+        const cols: { name: string; collations: string[] }[] = c.columns.expr.items.map(keyColumn);
+        pk = cols.map((k) => k.name);
+        for (const k of cols) keyCollations[k.name] = [...(keyCollations[k.name] ?? []), ...k.collations];
+      }
       if (c.type === "constraint_unique") uniqueSets.push(specCols(c));
       continue;
     }
@@ -177,8 +218,11 @@ function createTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
   const sk = [pk[0]!];
   // 行と shard key の同一性は、値をそのまま比べて決める。照合順序で等しい値 ('abc' と 'ABC') を同じ行として扱うには、
   // 経路、分割、ロック、検証のすべてで同じ規則が要る。その規則を確かめきるまで、キーの列の照合順序は受け付けない。
+  // 列の定義に書いた照合順序 (`a TEXT COLLATE NOCASE PRIMARY KEY`) も、表の制約に書いた照合順序 (`PRIMARY KEY (a COLLATE NOCASE)`) も、
+  // 主キーの一意性の比べ方を変えるので、同じに断る。BINARY と書いたものは、書かないのと同じである。
   for (const c of new Set([...pk, ...sk])) {
-    if ((collation[c] ?? "BINARY") !== "BINARY") unsupported(`COLLATE ${collation[c]} on the primary key or shard key column ${c}`);
+    const collated = [collation[c], ...(keyCollations[c] ?? [])].find((name) => name !== undefined && name !== "BINARY");
+    if (collated) unsupported(`COLLATE ${collated} on the primary key or shard key column ${c}`);
   }
   for (const cols of uniqueSets) {
     const bad = cols.find((c) => (collation[c] ?? "BINARY") !== "BINARY");

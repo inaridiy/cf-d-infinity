@@ -24,7 +24,7 @@ const REFUSALS = [
   // 表定義で決まる
   "sql/ddl.ts: TEMP tables",
   "sql/ddl.ts: generated columns",
-  "sql/ddl.ts: COLLATE ${collation[c]} on the primary key or shard key column",
+  "sql/ddl.ts: COLLATE ${collated} on the primary key or shard key column",
   "sql/ddl.ts: COLLATE ${collation[bad]} on column ${bad} of a UNIQUE constraint that does not include the shard key",
   "sql/ddl.ts: COLLATE ${def.collation[collatedCol]} on column ${collatedCol} of a UNIQUE index that does not include the shard key",
   "sql/ddl.ts: CREATE TRIGGER",
@@ -33,7 +33,8 @@ const REFUSALS = [
   "sql/ddl.ts: a UNIQUE partial or expression index that does not include the shard key",
   "sql/ddl.ts: column name ${name} is reserved for internal use",
   // 文の形で決まる
-  "sql/plan.ts: CREATE TABLE ... AS SELECT",
+  "sql/ddl.ts: CREATE TABLE ... AS SELECT",
+  "sql/ddl.ts: CREATE VIRTUAL TABLE",
   "client/db.ts: a statement that writes cannot read sqlite_master or a PRAGMA function",
   "client/db.ts: BEGIN, COMMIT, ROLLBACK and SAVEPOINT inside a transaction object",
   "client/db.ts: a schema change inside a transaction",
@@ -85,10 +86,19 @@ describe("the statements this database refuses", () => {
       "CREATE TABLE g(a INTEGER PRIMARY KEY, b INTEGER GENERATED ALWAYS AS (a + 1))",
       "CREATE TABLE c1(a TEXT COLLATE NOCASE PRIMARY KEY)",
       "CREATE TABLE c2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE UNIQUE)",
+      // 表の制約に書いた照合順序も、列の定義に書いたものと同じに断る。
+      "CREATE TABLE c3(a TEXT, b INTEGER, PRIMARY KEY (a COLLATE NOCASE))",
+      "CREATE TABLE c4(a TEXT, b INTEGER, PRIMARY KEY (b, a COLLATE rtrim DESC))",
       "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
       "ALTER TABLE t RENAME COLUMN n TO m",
       "ALTER TABLE t DROP COLUMN n",
       "CREATE TABLE copy AS SELECT * FROM t",
+      // 文の形で断るので、同じ名前の表があっても、IF NOT EXISTS や TEMP が付いていても、同じに断る。
+      "CREATE TABLE IF NOT EXISTS t AS SELECT 1 AS a",
+      "CREATE TEMP TABLE copy AS SELECT * FROM t",
+      "CREATE VIRTUAL TABLE ft USING fts5(a, b)",
+      "CREATE VIRTUAL TABLE IF NOT EXISTS t USING fts5(a, tokenize = 'porter')",
+      "CREATE VIRTUAL TABLE r USING rtree(id, minx, maxx)",
       "UPDATE t SET n = (SELECT count(*) FROM sqlite_master) WHERE tenant_id = 1 AND id = 1",
       "INSERT INTO k VALUES (NULL, 1)",
     ];
@@ -98,6 +108,10 @@ describe("the statements this database refuses", () => {
       const b = await three.query(sql).then(() => "ok", (e: Error) => e.message);
       expect(a, sql).toMatch(/^unsupported: /);
       expect(b, sql).toBe(a);
+      // 表定義の文は、DDL の入口 (Db.ddl) に直接渡しても、同じ文言で断られる。前は、CREATE TABLE ... AS SELECT と仮想表と、
+      // 表の制約の PRIMARY KEY に書いた照合順序が、TypeError で落ちていた。
+      if (!/^(CREATE|ALTER|DROP)\b/.test(sql)) continue;
+      for (const db of [one, three]) expect(await db.ddl(sql).then(() => "ok", (e: Error) => `${e.name}: ${e.message}`), sql).toBe(`SqlError: ${a}`);
     }
   });
 

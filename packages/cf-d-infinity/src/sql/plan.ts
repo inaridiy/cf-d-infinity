@@ -9,7 +9,7 @@ import { bindParams, constant, ident, render, text, walk, type Node, type Params
 import { keyString, storedAs } from "../keys";
 import { fromTyped, isReal, typedScalarSql } from "../value";
 import { SHARD_LIMITS, withinShardLimits } from "../shard-limits";
-import { isInternalName } from "./ddl";
+import { assertPlainCreateTable, isInternalName } from "./ddl";
 
 export type Route =
   | { by: "sk"; sks: string[] }
@@ -1000,10 +1000,9 @@ export const SCHEMA_STATEMENTS: ReadonlySet<string> = new Set([
 export async function planStatement(stmt: Node, input: Params, cat: Catalog, ctx: PlanContext): Promise<Plan> {
   const values = bindParams(stmt, input);
   if (SCHEMA_STATEMENTS.has(stmt.type)) {
-    // 表の作成と行の挿入を 1 文で行うと、途中で失敗したときの後始末が要る。CREATE TABLE と INSERT ... SELECT に分けて書ける。
-    if (stmt.type === "create_table_stmt" && clause(stmt, "as_clause")) {
-      throw new SqlError("unsupported: CREATE TABLE ... AS SELECT; create the table, then INSERT ... SELECT");
-    }
+    // 文の形だけで断る CREATE TABLE (仮想表、CREATE TABLE ... AS SELECT) は、ここで断る。DDL の入口 (Db.ddl) は、開いている取引を
+    // 確定してから文を解釈するので、そこまで行くと、断る文が取引を確定してしまう。断る条件と文言は ddl.ts の 1 か所にある。
+    if (stmt.type === "create_table_stmt") assertPlainCreateTable(stmt);
     return { kind: "ddl", sql: text(stmt) };
   }
   switch (stmt.type) {
