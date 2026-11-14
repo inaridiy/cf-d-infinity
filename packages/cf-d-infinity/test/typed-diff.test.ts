@@ -48,6 +48,16 @@ function script(seed: number, length: number): Step[] {
     }
   };
   const keyTable = () => pick(["tk", "nk", "ik", "uk"]);
+  // `CAST(? AS INTEGER)` に 1e20 を渡すと、SQLite は 2^63 - 1 にする。2^53 を超える INTEGER の保存は、値で決まる拒否である
+  // (計画書の K1。キーの式は計画が Worker の SQLite で計算し、src/value.ts の fromTyped が断る)。主キーの NULL と同じく、
+  // 断った文は SQLite と状態が分かれるので、作らない。seed 79、81、157 は、この組を作って落ちていた (検査の誤り)。
+  // この形がどの置き場所でも同じに断られることは、test/wide-integers.test.ts が確かめる。
+  const castKey = (type: string): Arg => {
+    for (;;) {
+      const x = vk();
+      if (!(type === "INTEGER" && typeof x === "number" && Math.abs(x) > Number.MAX_SAFE_INTEGER)) return x;
+    }
+  };
   let id = 0;
   const steps: Step[] = [];
   for (let i = 0; i < length; i++) {
@@ -64,7 +74,10 @@ function script(seed: number, length: number): Step[] {
       () => ({ sql: `INSERT OR IGNORE INTO ${keyTable()}(k, v) SELECT u, r FROM tv WHERE id = ? AND u IS NOT NULL`, args: [BigInt(1 + n(Math.max(id, 1)))] }),
       // 計画の途中で値を読むか計算する経路: VALUES の中のサブクエリと、キーの式 (2026-11-13 の Codex の 2 回目の見直し、指摘 3)。
       () => ({ sql: `INSERT OR IGNORE INTO ${keyTable()}(k, v) VALUES (ifnull((SELECT ${pick(["5.0", "r", "u", "2.5", "7"])} FROM tv WHERE id = ?), 1.0), ?)`, args: [BigInt(1 + n(Math.max(id, 1))), v()] }),
-      () => ({ sql: `INSERT OR IGNORE INTO ${keyTable()}(k, v) VALUES (CAST(? AS ${pick(["REAL", "INTEGER", "TEXT", "NUMERIC"])}), ?)`, args: [vk(), v()] }),
+      () => {
+        const [table, type] = [keyTable(), pick(["REAL", "INTEGER", "TEXT", "NUMERIC"])];
+        return { sql: `INSERT OR IGNORE INTO ${table}(k, v) VALUES (CAST(? AS ${type}), ?)`, args: [castKey(type), v()] };
+      },
       // 主キーの NULL は断ると決めてあるので、サブクエリが行を返さないときは ifnull で値を入れる (上の vk と同じ理由)。
       () => ({ sql: "INSERT INTO tv(id, t, u, n) VALUES (?, (SELECT r FROM tv WHERE id = ?), (SELECT r FROM tv WHERE id = ?), (SELECT 3.0))", args: [BigInt(++id), BigInt(1 + n(Math.max(id - 1, 1))), BigInt(1 + n(Math.max(id - 1, 1)))] }),
       () => ({ sql: "SELECT id, typeof(i), i, typeof(r), r, typeof(n), n, typeof(t), t, typeof(u), u FROM tv WHERE id = ?", args: [BigInt(1 + n(Math.max(id, 1)))] }),

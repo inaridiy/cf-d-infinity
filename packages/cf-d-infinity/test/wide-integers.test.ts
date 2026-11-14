@@ -40,6 +40,8 @@ describe("integers beyond 2^53", () => {
       // TEXT の列に入る大きな整数も、Worker を通ると丸まる (Codex の 2 回目の見直し、指摘 4)。
       "INSERT INTO t(id, v) SELECT 20, 9007199254740993",
       "INSERT INTO t(id, v) VALUES (21, (SELECT 9007199254740995))",
+      // 計画が計算するキーの式。REAL の 1e20 を INTEGER にすると 2^63 - 1 になる (test/typed-diff.test.ts の seed 79、81、157 が作った形)。
+      "INSERT INTO t(id, v) VALUES (CAST(1e20 AS INTEGER), 'g')",
       "SELECT CAST(id AS TEXT) AS id, v FROM t ORDER BY v",
       "TXN",
       "SELECT CAST(id AS TEXT) AS id, v FROM t WHERE v IN ('e', 'f')",
@@ -70,7 +72,7 @@ describe("integers beyond 2^53", () => {
       });
     }
     // 断るかどうかも、シャードの数で変わらない。2026-11-13 の持ち主の決定で、2^53 を超える整数の保存は断る (計画書の K1)。
-    expect(refusedOn[1]).toEqual(expect.arrayContaining([statements[0], statements[2], statements[3], statements[4], statements[5], "TXN"]));
+    expect(refusedOn[1]).toEqual(expect.arrayContaining([statements[0], statements[2], statements[3], statements[4], statements[5], statements[6], "TXN"]));
     expect(refusedOn[2]).toEqual(refusedOn[1]);
     expect(refusedOn[4]).toEqual(refusedOn[1]);
   });
