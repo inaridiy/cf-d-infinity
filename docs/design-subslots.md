@@ -343,6 +343,11 @@ T の時点では行があった。
 `test/move-timestamp.test.ts` が確かめているのは、書き込みの時刻の側だけである。
 走らせて確かめてはいないので、計画書の不変条件 8 に割り当て、先に `test/open/` に再現を置く。
 
+(2026-11-14 の追記) 再現で確かめ、床を先に入れた。子は、起動のときに `__incoming` の終えた行を読み戻し、その範囲のキーを `T < m` で読む要求を、到着の記録があってもなくても `ReadTooOld` で断る (`src/shard/kernel.ts` の `assertOwned`。全表の読みも同じ)。
+時計の再開は床の `m` も数える。
+再現は `test/old-read-of-emptied-group.test.ts`、戻すスイッチは `noRangeFloor`、モデルは M5b の `m5b_green_floor` である。
+`__arrived` の行は、まだ消していない (到着の確かめも残してある)。消すのは、段 2 で piece ごとの記録に替えるときである。
+
 ### 増設の判断
 
 `planSplit` は、親の最も広い範囲が 2 slot 以上なら、今と同じく slot の範囲を半分にする。
