@@ -40,7 +40,7 @@ const SHARD = [
   "autoIgnoresUniqueIntents", "ddlIgnoresIntents", "childKeepsOldSchema", "noSchemaRecheck", "noWriteSetLimit", "noRealtimeBump",
   "anchorNoAbsorb", "skipReadOnlyPrepare", "refreshNoBump", "predicateProtected", "ignoreIntentsInValidation", "readerTimeoutPass",
   "hlcNoCeiling", "rowwiseUndo", "pushAfterDecide", "applyAfterMoved", "triggerCapture", "dropIntentsOnMove", "servePastMove",
-  "ignoreFence", "staleWideRead", "finishWithoutClock", "ignoreTableLock", "publishWithoutClock", "validateFromT", "trustLocks",
+  "ignoreFence", "staleWideRead", "finishWithoutClock", "noRangeFloor", "ignoreTableLock", "publishWithoutClock", "validateFromT", "trustLocks",
   "phase2BeforeSync", "dropNoLowWater", "gcUndone", "flushPastIntents", "unchangedIgnoresIntents", "commitIgnoresDigest", "prepareKeepsFirst",
   "lockedReadAtT", "dmlAtT", "dmlSkipsClock", "woundPrepared", "prepareWaits",
   // Meta が読むスイッチ (同じ Faults にある)

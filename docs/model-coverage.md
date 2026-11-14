@@ -10,10 +10,10 @@ Test references are `packages/cf-d-infinity/test/<file>.test.ts:<line>` or a tes
 counterexample.
 
 Categories:
-- A: the implementation has the guard, and a deterministic replay exists (71 rows; every row with a guard).
-  Of these, 49 also have a fault switch, and the replay checks that the switch produces the violation. 16 have no switch,
-  and 6 have a switch whose replay runs only the fixed code; for those 22 the replay checks the fixed code on the
-  model's ordering, not that removing the guard breaks it. (Recounted from this table on 2026-11-13.)
+- A: the implementation has the guard, and a deterministic replay exists (74 rows; every row with a guard).
+  Of these, 51 also have a fault switch, and the replay checks that the switch produces the violation. 17 have no switch,
+  and 6 have a switch whose replay runs only the fixed code; for those 23 the replay checks the fixed code on the
+  model's ordering, not that removing the guard breaks it. (Recounted from this table on 2026-11-13; the three M5b range-floor rows were added on 2026-11-14.)
 - D: a design alternative the implementation never had or no longer has, or a variant another mechanism already covers; no switch needed (13 rows, M16 and M17 included).
 
 | module | flaw modelled | fault switch | deterministic replay | cat |
@@ -35,6 +35,9 @@ Categories:
 | m5b_red_p2_window | phase 2 applied at parent while the pull reply is in flight | applyAfterMoved | migration:170 | A |
 | m5b_red_intents | pull does not carry intents | dropIntentsOnMove | migration:182 | A |
 | m5b_red_range | finishing a move does not pass the parent clock to the child | finishWithoutClock | move-timestamp:54 | A |
+| m5b_red_emptied | child answers "no rows" at an old read time for a group the parent emptied before the move (no range floor) | noRangeFloor | old-read-of-emptied-group ("put back (m5b_red_emptied): without the range floor ..."; added 2026-11-14) | A |
+| m5b_red_floor_volatile | the range floor is forgotten when the child restarts | none (the floor is read back from `__incoming` at boot) | old-read-of-emptied-group ("is refused after the child restarted, too (m5b_red_floor_volatile) ..."; fixed) | A |
+| m5b_red_floor_no_clock | the floor is kept but the parent's clock is not handed over when the move finishes | finishWithoutClock | move-timestamp:54 (the clock hand-over; the model's emptied-group ordering is not replayed) | A |
 | m6_red_dirty | dirty reported only on intent write | none | none | D |
 | m6_red_resolved | flush at HLC instead of resolved ts | flushPastIntents | analytics ("the analytics flush stops below unresolved intents (m6_red_resolved)"; added 2026-11-12). The analytics path is not wired into the deployed Worker | A |
 | m6_red_skew | clock skew plus report delay exceeds MARGIN | none | none | D |

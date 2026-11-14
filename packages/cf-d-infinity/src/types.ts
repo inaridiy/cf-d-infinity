@@ -456,6 +456,11 @@ export interface Faults {
   staleWideRead?: boolean;
   /** 範囲を受け取り終えるとき、渡した側の時計を受け取らない (2026-11 までの挙動。モデル m5b_red_range)。 */
   finishWithoutClock?: boolean;
+  /**
+   * 受け取り終えた範囲の床を見ない (2026-11-14 までの挙動。モデル m5b_red_emptied)。渡した側が移動の前に空にしたグループを、
+   * 受け取った側が、移動より前の読みの時刻でも「行なし」と答える。
+   */
+  noRangeFloor?: boolean;
   /** index を作っている最中の表への書き込みを、シャードが断らない (モデル m12_red_no_lock)。 */
   ignoreTableLock?: boolean;
   /** index を公開する版を適用するとき、その版が運ぶ時刻まで時計を進めない (モデル m12_clock_red_no_clock)。 */

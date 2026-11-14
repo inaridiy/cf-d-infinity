@@ -570,6 +570,15 @@ export class ShardKernel {
   /** 子：到着済みグループとその m。 */
   private arrived = new Map<string, Ts>();
   private maxArrived: Ts = 0;
+  /**
+   * 範囲の床。受け取り終えた範囲と、そのとき渡した側から受け取った時刻 m である (__incoming の、終えた行)。
+   * m は、渡した側が fence の後に発行した時刻で、渡した側がその範囲に確定したどの書き込みよりも大きい。このシャードは、範囲の
+   * m より前の状態を持っていない。行のあったグループは到着の記録 (arrived) が同じことを守るが、渡した側が移動の前に空にした
+   * グループは運ばれず、到着の記録がない。だから、範囲ごとに m を残し、その範囲のキーを T < m で読む要求を断る
+   * (specs/m5b_live_migration.qnt の RANGE_FLOOR)。
+   */
+  private floors: (Interval & { m: Ts })[] = [];
+  private maxFloor: Ts = 0;
   /** 行ロック。メモリだけに置く。消えても検証が F 以降の変更を見るので安全である。 */
   private locks = new Map<string, RowLock>();
   private waiters = new Map<string, Waiter[]>();
@@ -630,6 +639,10 @@ export class ShardKernel {
     this.fenced = b.exec(`SELECT lo AS start, hi AS "end", "to", done FROM __fenced`) as unknown as FencedRange[];
     // 受け取り終えた範囲は、メモリに載せない。載せると、移動の途中として扱われる。
     this.incoming = b.exec(`SELECT lo AS start, hi AS "end", from_id FROM __incoming WHERE done = 0`) as unknown as IncomingRange[];
+    // 受け取り終えた範囲は、床として読み戻す。再起動で忘れると、床のない実装と同じになる (モデル m5b_red_floor_volatile)。
+    for (const r of b.exec(`SELECT lo, hi, m FROM __incoming WHERE done = 1`)) {
+      this.raiseFloor({ start: r.lo as number, end: r.hi as number }, (r.m as Ts | null) ?? 0);
+    }
     for (const r of b.exec(`SELECT g, m, dest, acked FROM __moved`)) {
       this.moved.set(r.g as string, { m: r.m as Ts, to: r.dest as string, acked: r.acked === 1 });
     }
@@ -657,7 +670,7 @@ export class ShardKernel {
     // 引数に展開しない。移動したグループが十数万あると、引数の数の上限を超えて、このシャードが起動できなくなる。
     let maxMoved = 0;
     for (const x of this.moved.values()) if (x.m > maxMoved) maxMoved = x.m;
-    const resume = Math.max(this.faults.hlcNoCeiling ? 0 : this.ceiling, this.maxCommit, maxPrepare, maxMoved, this.maxArrived);
+    const resume = Math.max(this.faults.hlcNoCeiling ? 0 : this.ceiling, this.maxCommit, maxPrepare, maxMoved, this.maxArrived, this.maxFloor);
     this.hlc = new Hlc(resume);
   }
 
@@ -819,8 +832,25 @@ export class ShardKernel {
   private fencedIn(area: Interval): FencedRange | undefined {
     return this.fenced.find((f) => overlaps(f, area));
   }
+  /** 欠陥のスイッチで、範囲の床を見ない。servePastMove は、到着の記録の確かめと一緒に、床の確かめも外す。 */
+  private pastFloor(): boolean {
+    return Boolean(this.faults.servePastMove || this.faults.noRangeFloor);
+  }
   private incomingIn(area: Interval): IncomingRange | undefined {
     return this.incoming.find((f) => overlaps(f, area));
+  }
+  /** 区間に掛かる範囲の床のうち、いちばん大きい m。掛かる床がなければ 0。 */
+  private floorIn(area: Interval): Ts {
+    let m = 0;
+    for (const f of this.floors) if (f.m > m && overlaps(f, area)) m = f.m;
+    return m;
+  }
+  /** 範囲の床を上げる。同じ範囲の床がもうあれば、大きい方の m を残す。 */
+  private raiseFloor(range: Interval, m: Ts): void {
+    const known = this.floors.find((f) => sameInterval(f, range));
+    if (known) known.m = Math.max(known.m, m);
+    else this.floors.push({ ...range, m });
+    this.maxFloor = Math.max(this.maxFloor, m);
   }
   /**
    * 所有を確かめる対象。書く行、範囲の順に並べる。この順は、sksOf の順と同じである。
@@ -869,6 +899,9 @@ export class ShardKernel {
       if (this.incomingIn(area) && !this.arrived.has(sk)) throw new ConflictError(`group not arrived: ${sk}`);
       const m = this.arrived.get(sk);
       if (m !== undefined && T !== null && T < m && !this.faults.servePastMove) throw new ReadTooOld(`moved at ${m}`);
+      // 範囲の床。受け取り終えた範囲のキーは、到着の記録があってもなくても、T < m では答えない。
+      const floor = this.pastFloor() ? 0 : this.floorIn(area);
+      if (T !== null && T < floor) throw new ReadTooOld(`moved at ${floor}`);
     }
     const wide = spans.filter(isWideSpan);
     if (wide.length > 0) {
@@ -887,6 +920,8 @@ export class ShardKernel {
       // 全表の読みは親と子の両方に行く。移動の途中は片方のグループが飛行中で、欠落が起こり得る。
       if (this.incoming.length > 0 || this.fenced.some((f) => !f.done)) throw new Migrating();
       if (T !== null && T < this.maxArrived && !this.faults.servePastMove) throw new ReadTooOld(`moved at ${this.maxArrived}`);
+      // 行を 1 つも運ばなかった移動では、到着の記録がなく、maxArrived は 0 のままである。範囲の床は、その移動も覚えている。
+      if (T !== null && T < this.maxFloor && !this.pastFloor()) throw new ReadTooOld(`moved at ${this.maxFloor}`);
     }
   }
 
@@ -1025,10 +1060,14 @@ export class ShardKernel {
     // 答え済みの読みが、後から書き込みの後になる (モデル M5b の noWriteBelowRead)。
     if (!this.faults.finishWithoutClock) this.observe(req.m);
     // 記録は消さずに、終えた印と、渡した側から受け取った時刻を残す。メモリからは外すので、移動の途中ではなくなる。
-    // 残した記録を読むもの (受け取った範囲の床、受け取った範囲の外の要求を断る確かめ) は、後の段で足す
-    // (docs/design-subslots.md の「drain と finishMove」)。
+    // 残した記録が、範囲の床である。もう終えた範囲にもう一度届いたら、大きい方の m を残す。
+    // 受け取った範囲の外の要求を断る確かめは、後の段で足す (docs/design-subslots.md の「drain と finishMove」)。
     this.b.exec(`UPDATE __incoming SET done = 1, m = ? WHERE lo = ? AND hi = ? AND done = 0`, req.m, req.start, req.end);
+    this.b.exec(`UPDATE __incoming SET m = ? WHERE lo = ? AND hi = ? AND done = 1 AND (m IS NULL OR m < ?)`, req.m, req.start, req.end, req.m);
     this.incoming = this.incoming.filter((x) => !sameInterval(x, req));
+    // 受け取り始めていない範囲には、記録がない。床は、記録のある範囲にだけ置く (置いても、再起動で消える)。
+    const recorded = this.b.exec(`SELECT 1 FROM __incoming WHERE lo = ? AND hi = ? AND done = 1 LIMIT 1`, req.start, req.end).length > 0;
+    if (recorded) this.raiseFloor(intervalOf(req), req.m);
   }
 
   health(_req: Record<string, never>): ShardHealth {

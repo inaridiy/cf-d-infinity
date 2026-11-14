@@ -213,6 +213,11 @@ that had no rows is never copied, so when the move finishes the parent hands its
 range. Without that the child could commit a row at a timestamp below one at which the parent had already answered
 "no such row", and that read would end up after a write it did not see.
 
+The child keeps that last timestamp with the range (the *range floor*) and refuses, with a retryable error, any read
+or validation of a key in the range at an earlier time. It has no history of the range from before the move: a group
+the parent emptied before the fence is not copied either, and without the floor the child would answer "no rows" for
+it at a time when the rows still existed.
+
 Ownership moves before the data does, which sheds load from a hot parent immediately instead of making it also pay
 for a bulk copy first. A Worker whose range table predates the split is told so: a request for a moved shard key, and
 a whole-table read that still believes the parent owns the moved slots, both get `NotOwner`, and the Worker refetches

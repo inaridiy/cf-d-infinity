@@ -45,7 +45,8 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 移動の単位は piece で、グループ `g` の行のうち、token が fence の区間に入り、位置が区間 `(after, up_to]` に入るものである。
 いまのコードは、形式だけを持つ (設計書の段 1)。
 作る範囲はどれも両端が slot の境目 (65,536 の倍数) にあり、piece はどれもグループの全体 (`after` も `up_to` も `null`) である。
-受け取り終えた `__incoming` の行は、まだ何にも使っていない。
+受け取り終えた `__incoming` の行は、範囲の床である。シャードは、起動のときに読み戻し、その範囲のキーを `m` より前の時刻で読む要求を断る
+(`src/shard/kernel.ts` の `assertOwned`)。受け取った範囲の外の要求を断る確かめには、まだ使っていない。
 
 ## Meta (`DinfMeta`)
 
