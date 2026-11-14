@@ -142,3 +142,39 @@ describe("value types against SQLite through Hrana", () => {
     });
   }
 });
+
+// ==== ここから: 結果の型を保った比較 (docs/design-values.md の「足す検査」の 2。値の作り直しの段 0) ====
+//
+// 上の比較 (show) は、結果の BigInt を数にしてから比べるので、結果の INTEGER と REAL の違いを見ない。このブロックは、上の生成器と
+// 比較には手を入れずに、次の 2 つを足す。部品は test/typed-diff-harness.ts にある。
+// - 上の台本 (script) を、結果の INTEGER (BigInt) と REAL (数) を区別する比較でも流す。いまの D∞ が SQLite と違うと文書に
+//   書いてある 2 点 (整数の値の REAL を `integer` で返す、計算した 2^53 を超える整数を丸めて返す) だけは、段 3 まで緩める。
+// - 上の生成器が作らない値と文を、2 つ目の生成器 (script2) で流す。2^53 を超える整数と NUL を含む文字列は、いまは通らないので、
+//   test/open/typed-diff-wide.test.ts が同じ生成器で流す。
+import { runTyped, script2, SCHEMA2 } from "./typed-diff-harness";
+
+describe("value types against SQLite through Hrana, keeping INTEGER and REAL apart in the results", () => {
+  const defaults = [1, 2, 3, 4, 5, 6, 7, 8];
+  const relaxed = { runs: 0, integralRealAsInteger: 0 };
+  for (const seed of seedsOr(defaults)) {
+    it(`the scripts above, compared with types, seed ${seed}`, async () => {
+      const r = await runTyped(SCHEMA, script(seed, 40), 1 + (seed % 4));
+      relaxed.runs++;
+      relaxed.integralRealAsInteger += r.relaxed.integralRealAsInteger;
+      expect(r.problems.slice(0, 5)).toEqual([]);
+    });
+  }
+  it("relaxes a difference that does occur today (an integral REAL comes back as an integer)", () => {
+    // 緩めている違いが、いまは本当に起きていることを見る。起きていなければ、緩める条件は何も確かめていない。
+    // 段 3 で緩めるのをやめるときに、この試験も消す。seed を選んで流したときは、数えた実行が足りないので見ない。
+    if (relaxed.runs < defaults.length) return;
+    expect(relaxed.integralRealAsInteger).toBeGreaterThan(0);
+  });
+  for (const seed of seedsOr(defaults)) {
+    it(`RETURNING, random(), WITH, repeated column names and 100 columns, seed ${seed}`, async () => {
+      const r = await runTyped(SCHEMA2, script2(seed, 60), 1 + (seed % 4));
+      expect(r.problems.slice(0, 5)).toEqual([]);
+    });
+  }
+});
+// ==== ここまで: 結果の型を保った比較 ====

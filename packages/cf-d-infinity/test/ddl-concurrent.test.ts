@@ -29,15 +29,16 @@ import { encode } from "../src/shard/rows";
 import type { ShardCore } from "../src/shard/core";
 import type { Faults } from "../src/types";
 import {
-  ACCT, SIDE, checkIndexReads, duplicates, extraViolations, hold, holdFinalize, indexAgreement, misplacedRows, rawRows,
-  runScenario, schemaVersions, stuckWork, tenantOn, touchAll, type Env, type Rec, type Report, type Scenario,
+  ACCT, SIDE, SIDE_GEN, SIDE_REORDERED, checkIndexReads, duplicates, extraViolations, hold, holdFinalize, indexAgreement, misplacedRows, rawRows,
+  runScenario, schemaVersions, sideImages, stuckWork, tenantOn, touchAll, type Env, type Rec, type Report, type Scenario,
 } from "./ddl-harness";
 
 // ---- 違反の分類 ----
 
 type Kind =
   | "history" | "indexReadsMissing" | "indexReadsExtra" | "ackedNotApplied" | "errors" | "errorsDropped" | "stuck" | "schema" | "misplaced"
-  | "missing" | "dangling" | "wrongRead" | "leftover" | "uniqueWithDuplicates" | "resurrected" | "lost" | "badExtra" | "splitRefusals";
+  | "missing" | "dangling" | "wrongRead" | "leftover" | "uniqueWithDuplicates" | "resurrected" | "lost" | "badExtra" | "splitRefusals"
+  | "staleImage" | "mangled";
 
 /** DROP した表を、確定済みの取引の後始末が参照して出る誤り。BUG-5 の症状である。 */
 const DROPPED = /no such table: (main\.)?(side|__gidx_)/;
@@ -64,6 +65,8 @@ function violations(r: Report): Record<Kind, string[]> {
     resurrected: r.side.resurrected,
     lost: r.side.lost,
     badExtra: r.badExtra,
+    staleImage: r.side.stale,
+    mangled: r.side.mangled,
   };
 }
 
@@ -203,6 +206,38 @@ const CASES = {
     },
     seeds: [1, 2, 3, 4, 5, 6, 900541, 903321], known: [], // 900541: 上と同じ。903321: 分割の途中の表を checkpoint が読んだ
   },
+  // 5. 同じ名前の表を、同じ数の列で、列の順序を変えて作り直す (docs/design-values.md の「列の順序と表定義の版」)。
+  // 行イメージを位置で持つようにすると、古い表定義で作った行イメージが新しい表に入ったとき、値が黙って別の列に入る。
+  // いまの行イメージは列名を持つので、値は正しい列に入る。それでも、古い表定義の行イメージが新しい表に入ったこと自体は、
+  // gen の既定値で見える (ddl-harness.ts の SIDE_GEN と sideImages)。
+  recreateReordered: {
+    s: {
+      side: true, sideDdl: SIDE_GEN, sideGen: 2, slowPhase2: true,
+      ddl: async (e: Env) => {
+        await e.at(0.3);
+        e.marks.dropIssued = e.tick();
+        await e.ddl("DROP TABLE side");
+        await e.ddl(SIDE_REORDERED());
+        e.marks.recreated = e.tick();
+      },
+    },
+    seeds: [1, 2, 3, 4, 5, 6], known: [],
+  },
+  // 移行の道具 (drizzle-kit) が表を作り直すときの 4 文。古い表の行は、写した時点のものが新しい表へ移る。
+  rebuildReordered: {
+    s: {
+      side: true, sideDdl: SIDE_GEN, sideGen: 2, slowPhase2: true,
+      ddl: async (e: Env) => {
+        await e.at(0.3);
+        await e.ddl(SIDE_REORDERED("__new_side"));
+        await e.ddl("INSERT INTO __new_side(tenant_id, id, n) SELECT tenant_id, id, n FROM side");
+        await e.ddl("DROP TABLE side");
+        await e.ddl("ALTER TABLE __new_side RENAME TO side");
+        e.marks.recreated = e.tick();
+      },
+    },
+    seeds: [1, 2, 3, 4, 5, 6], known: [],
+  },
 } satisfies Record<string, Case>;
 
 /** 同じ (scenario, seed) の実行は 1 回だけにする。seed ごとのテストと、seed をまたぐテストが共有する。 */
@@ -296,6 +331,19 @@ describe("4. DDL racing with shard splits", () => {
     expect(r.index.state).toBe(ok ? "public" : null);
     for (const l of r.ddlLog) expect(l).toMatch(/=> (ok|UNIQUE constraint failed.*)$/);
   });
+});
+
+describe("5. A table recreated with the same columns in another order, racing with transactions", () => {
+  // 作り直した表に入る行は、新しい表定義で作った行イメージだけである。古い表定義で計画した書き込みは、版の違いで断られるか、
+  // 取引ごと競合になる。expectOnly が、staleImage と mangled を含めて、どの種類の違反も許さない。
+  const recreated = (r: Report) => {
+    expect(r.ddlLog.every((l) => l.endsWith("=> ok")), r.ddlLog.join(" | ")).toBe(true);
+    expect(r.side.exists).toBe(true);
+    // 作り直した後の表に、行が書かれている。書かれていなければ、何も確かめていない。
+    expect(r.side.rows).toBeGreaterThan(0);
+  };
+  each("recreateReordered", "DROP TABLE, then CREATE TABLE with the columns reversed", recreated);
+  each("rebuildReordered", "CREATE, INSERT … SELECT, DROP and RENAME, as a migration tool rebuilds a table", recreated);
 });
 
 // ---- 既知の欠陥の台本 ----
@@ -729,6 +777,29 @@ describe("the checks are not vacuous", () => {
     expect(await duplicates(c)).toEqual([`v=7: ${A}/1,${B}/1`]);
     expect(await misplacedRows(c)).toEqual([`${A}/2 on s1`]);
     expect(await extraViolations(c)).toEqual([`${B}/1 extra=77 n=20`]);
+  });
+
+  it("side images check: detects an intent made under the old table definition that is applied to the recreated table", async () => {
+    // 表定義の版を適用する前に intent を決着させる守りを外す。古い表定義の行イメージが、作り直した表に入る。
+    // 行イメージが列名を持つ間は、値は正しい列に入るので、ほかの検査には掛からないことがある (確定の応答が DROP の後なら、
+    // resurrected にも掛からない)。gen の既定値で見分ける検査だけが、いつも気付く。
+    const s: Scenario = { ...CASES.recreateReordered.s, faults: { ddlIgnoresIntents: true } };
+    expect(await detects(s, (r) => r.side.stale.length > 0)).toBe(true);
+  }, 120_000);
+
+  it("side images: reports a row made under the old table definition, and a row whose values sit in the wrong columns", async () => {
+    const c = new SimCluster({ shards: 1 });
+    const db = new Db(c);
+    await db.ddl(SIDE_REORDERED());
+    await db.query("INSERT INTO side(tenant_id, id, n) VALUES (3, 1, 500)");
+    const attempted = new Set(["3/1/500", "4/2/600", "5/3/700"]);
+    expect(await sideImages(c, attempted, 2)).toEqual({ stale: [], mangled: [] });
+    // 古い表定義 (gen の既定値が 1) で作った行イメージが、列名で入った行。値は正しい列にある。
+    c.backends.get("s0")!.exec("INSERT INTO side(tenant_id, id, n, gen) VALUES (4, 2, 600, 1)");
+    expect(await sideImages(c, attempted, 2)).toEqual({ stale: ["4/2 n=600 gen=1"], mangled: [] });
+    // 古い列の順序 (tenant_id, id, n, gen) の値を、新しい列の順序 (gen, n, id, tenant_id) に位置で入れた行。値が別の列に入る。
+    c.backends.get("s0")!.exec("INSERT INTO side VALUES (5, 3, 700, 1)");
+    expect(await sideImages(c, attempted, 2)).toEqual({ stale: ["1/700 n=3 gen=5", "4/2 n=600 gen=1"], mangled: ["1/700 n=3 gen=5"] });
   });
 
   it("schema check: shards lag behind a version that was only recorded, and converge once a current request reaches them", async () => {

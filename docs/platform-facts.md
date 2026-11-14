@@ -120,6 +120,30 @@
 
 - PITR はローカルでは動かない。`getBookmarkForTime` と `onNextSessionRestoreBookmark` は「This Durable Object's storage back-end does not implement point-in-time recovery.」で失敗する (miniflare 4.20260730.0、2026-11-10)。`getCurrentBookmark` は 0 だけの値を返す。全シャード復元は本番でしか開発と検証ができない。
 
+### DO の SQLite と値の受け渡し (2026-11-14)
+
+workerd 1.20260730.1 (miniflare 4.20260730.0) の DO の SQLite で確かめた。
+`packages/cf-d-infinity/test/workerd-limits.test.ts` が、見たとおりの値を持っている。workerd を上げて値が変わると、その試験が落ちる。
+本番の Cloudflare では確かめていない。上の「SQL 制限」の行の公式の値と違うものは、本番でどちらになるかが分からない。
+
+| 項目 | 手元の workerd | 公式の表 |
+|---|---|---|
+| SQLite の版 | `sqlite_version()`、`sqlite_source_id()`、`PRAGMA compile_options` は使えない (許可されていない)。挙動は 3.47 のもの (`->>` の負の添字は使え、引数 2 つの `iif` は使えない)。workerd の実行ファイルは `3.47.0` と 2024-10-21 の source id の文字列を持つ | 記載なし |
+| 使える関数 | 許可の一覧で絞っている。`json_pretty` も `not authorized` で断られる | 記載なし |
+| 結果の列 | 100 まで。101 列は `too many columns in result set`。サブクエリと CTE の列の数にも掛かる | 100 列 / table |
+| SQL 関数の引数 | 127 個まで通る (SQLite の既定)。128 個は `too many arguments on function` | 32 |
+| 1 つの値、1 行の長さ | 2,200,000 バイト。超えると `string or blob too big`。行は見出しを含めて数える。`hex()` のように結果を作る関数は、上限ちょうどの長さの結果を作れないことがある | 8 MB (以前は 2 MB) |
+| 文の長さ | 100,000 バイト | 100 KB |
+| 束縛の変数 | 100 個 | 100 |
+| 式の木の深さ | 100。超えると `Expression tree is too large (maximum depth 100)`。SQLite の既定は 1,000。2 項の演算子で n 個の項をつなぐと深さは n になる | 記載なし |
+| JS の数の束縛 | すべて REAL。NaN は NULL、無限大はそのまま、-0.0 は符号を保つ | — |
+| BigInt の束縛 | できない (TypeError) | — |
+| INTEGER の読み | JS の数。2^53 を超える値は丸まる。INTEGER の 5 と REAL の 5.0 は区別できない | — |
+| TEXT の読み | NUL (U+0000) を含めて全部を返す。node:sqlite (Node 24.15) と sql.js 1.13.0 のドライバは、最初の NUL で切って返す | — |
+| 課金の行数 (`rowsRead`) | 文を CTE で包み、`FROM (SELECT * FROM cte LIMIT -1 OFFSET 0)` から読む形にしても、素の文と同じ | — |
+| `JSON.parse` の reviver | 3 つ目の引数の `context.source` で、数の元の文面を受け取れる | — |
+| BigInt の受け渡し | DO の RPC も、Service Binding の RPC (WorkerEntrypoint) も、BigInt を運ぶ。object や配列の中でも運ぶ | — |
+
 ## 本番で確かめたもの (2026-11-10)
 
 検証用の Worker と DO を一時的にデプロイして確かめた。確認後に削除した。

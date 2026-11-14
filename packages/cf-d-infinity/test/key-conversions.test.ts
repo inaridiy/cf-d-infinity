@@ -11,36 +11,11 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { Db } from "../src/client/db";
-import { storedAs } from "../src/keys";
+import { keyString, storedAs } from "../src/keys";
 import type { Affinity, Value } from "../src/types";
 import { isReal, realOf } from "../src/value";
-import { SimCluster } from "./sim";
-
-function prng(seed: number) {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 2 ** 32;
-  };
-}
-
-/** 変換を間違えやすい double。10 の冪、整数の値、15 桁と 17 桁の境、非正規化数の近く。 */
-function doubles(n: number, seed: number): number[] {
-  const r = prng(seed);
-  const out: number[] = [0.1, 0.5, 1.5, 5, 10, 100, 1e14, 1e15, 1e16, 1e-4, 1e-5, 123456789012345, 1234567890123456, 2 ** 53, 2 ** 63, 1e300, 5e-324, 0.30000000000000004];
-  for (let e = -30; e <= 30; e++) out.push(10 ** e, 3 * 10 ** e, -(10 ** e), 1.25 * 10 ** e);
-  for (let i = 0; i < n; i++) {
-    const e = Math.floor(r() * 60) - 30;
-    const kind = r();
-    if (kind < 0.3) out.push(Math.round(r() * 1e6) * 10 ** Math.max(0, e)); // 整数の値
-    else if (kind < 0.6) out.push(Number((r() * 10).toPrecision(1 + Math.floor(r() * 17))) * 10 ** e);
-    else out.push((r() - 0.5) * 10 ** e);
-  }
-  return out.filter((x) => Number.isFinite(x));
-}
+import { prng, SimCluster } from "./sim";
+import { doubles, EDGE_DOUBLES, INT64 } from "./value-corpus";
 
 describe("the Worker's value conversions agree with SQLite", () => {
   it("stores a value in a column of each affinity as SQLite does", () => {
@@ -126,4 +101,67 @@ describe("the Worker's value conversions agree with SQLite", () => {
       expect(bad.slice(0, 10)).toEqual([]);
     }
   }, 120000);
+});
+
+// ---- キーが等しいことと、SQLite が同じキーと見なすこと (docs/design-values.md の「キー文字列」、「足す検査」の 4) ----
+//
+// SQLite は INTEGER と REAL を正確に比べる。REAL の 2^53 と INTEGER の 2^53 は同じキーで、INTEGER の 2^53 + 1 は別のキーである。
+// キー文字列が等しいことと、型のない主キーで UNIQUE の違反になることが、2^53 と 2^63 の前後でも一致しなければならない。
+// 一致しなければ、同じ行が 2 つのシャードに入るか、別の行が同じ行として扱われる。
+
+/** 型のある値。BigInt は INTEGER、数は REAL。 */
+type Typed = bigint | number;
+const EDGE_VALUES: Typed[] = [...INT64, ...EDGE_DOUBLES, 5, 0.5, 0, 2 ** 53 - 1, -(2 ** 53) + 1, 2 ** 31, 2 ** 53 + 4, 2 ** 60 + 256];
+const shown = (v: Typed) => (typeof v === "bigint" ? `INTEGER ${v}` : `REAL ${v}`);
+
+/** 値の組のうち、型のない主キーで、片方の行がある表にもう片方を入れると UNIQUE の違反になる組。 */
+function collisions(values: Typed[]): Set<string> {
+  const lite = new DatabaseSync(":memory:");
+  lite.exec("CREATE TABLE u(k PRIMARY KEY)");
+  const insert = lite.prepare("INSERT INTO u VALUES (?)");
+  const out = new Set<string>();
+  for (let i = 0; i < values.length; i++) {
+    for (let j = i + 1; j < values.length; j++) {
+      lite.exec("DELETE FROM u");
+      insert.run(values[i]!);
+      try {
+        insert.run(values[j]!);
+      } catch (e) {
+        if (!/UNIQUE constraint failed/.test((e as Error).message)) throw e;
+        out.add(`${i},${j}`);
+      }
+    }
+  }
+  return out;
+}
+
+/** キーの関数 key が、値の組のそれぞれで、SQLite と同じ答えを出すか。key が undefined を返す値は、その関数が扱わない値である。 */
+function keyDisagreements(values: Typed[], key: (v: Typed) => string | undefined): { bad: string[]; equal: number } {
+  const same = collisions(values);
+  const bad: string[] = [];
+  let equal = 0;
+  for (let i = 0; i < values.length; i++) {
+    for (let j = i + 1; j < values.length; j++) {
+      const [a, b] = [key(values[i]!), key(values[j]!)];
+      if (a === undefined || b === undefined) continue;
+      if (a === b) equal++;
+      if ((a === b) !== same.has(`${i},${j}`)) bad.push(`${shown(values[i]!)} and ${shown(values[j]!)}: keys ${a} and ${b}, SQLite says ${same.has(`${i},${j}`) ? "the same key" : "different keys"}`);
+    }
+  }
+  return { bad, equal };
+}
+
+describe("a key string is equal exactly when SQLite takes two values for the same key", () => {
+  it("today's keyString, over the values that can be stored today", () => {
+    // いま保存できるのは、絶対値が 2^53 未満の INTEGER と、REAL である (2^53 以上の INTEGER は断る。計画書の K1)。
+    const today = (v: Typed): Value | undefined =>
+      typeof v === "number" ? realOf(v) : v > -(2n ** 53n) && v < 2n ** 53n ? Number(v) : undefined;
+    const r = keyDisagreements(EDGE_VALUES, (v) => {
+      const x = today(v);
+      return x === undefined ? undefined : keyString([x]);
+    });
+    expect(r.bad.slice(0, 10)).toEqual([]);
+    // 等しい組もある (INTEGER の 5 と REAL の 5.0 など)。なければ、「どれも違う」と答える関数でも通ってしまう。
+    expect(r.equal).toBeGreaterThan(3);
+  });
 });

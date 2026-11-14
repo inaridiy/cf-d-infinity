@@ -1,13 +1,14 @@
 # 値と行イメージの作り直しの設計
 
-状態：設計。実装はまだない。持ち主の判断が要ることを末尾に記した
+状態：設計。段 0 (検査) を実装した。段 1 から先はまだない。持ち主の判断と、段 0 の結果は末尾に記した
 作成日：2026-11-14
 前提：[storage-format.md](./storage-format.md)、[sql-language.md](./sql-language.md) の「値」、[design-subslots.md](./design-subslots.md)
 
 コードの行番号は `71eda05` (ブランチ `subslots`) のもので、`src/` と `test/` は `packages/cf-d-infinity/` の下を指す。
 今のコードの挙動についての記述は、コードを読んだ結果である。
 SQLite の挙動についての記述は、node:sqlite (SQLite 3.51.3) と sql.js 1.13.0 (SQLite 3.49.1) で小さなスクリプトを流して確かめた。
-workerd では何も流していない。vitest と TLC も流していない。
+workerd についての記述は、段 0 で、手元の workerd 1.20260730.1 (Miniflare 4.20260730.0) の DO の SQLite で流して確かめた (2026-11-14、`test/workerd-limits.test.ts`)。
+本番の Cloudflare では流していない。
 計測の数字は node:sqlite でのもので、変更の前後の比としてだけ読める。
 
 ## 結論
@@ -47,38 +48,60 @@ workerd では何も流していない。vitest と TLC も流していない。
 
 ## 確かめた事実
 
-| 事実 | node:sqlite 3.51.3 | sql.js 3.49.1 | workerd |
+| 事実 | node:sqlite 3.51.3 | sql.js 3.49.1 | 手元の workerd (DO の SQLite) |
 |---|---|---|---|
-| `quote()` は TEXT を最初の NUL で切る | 切る | 切る | 段 0 |
-| `'t' \|\| x` と `json_array` は NUL を保つ (`\u0000`) | 保つ | 保つ | 段 0 |
-| `(CAST(? AS INTEGER)+0)` に 10 進の文字列を束縛すると、±2^63 の端まで正確な INTEGER になる。型の親和性は持たない | 正確 | 正確 | 段 0 |
-| `'i' \|\| c` と `json_array(c)` は、64 ビットの整数を全桁書く | 書く | 書く | 段 0 |
+| `quote()` は TEXT を最初の NUL で切る | 切る | 切る | 切る |
+| `'t' \|\| x` と `json_array` は、値として NUL を保つ (`hex()` で見える。`json_array` は `\u0000` と書く) | 保つ | 保つ | 保つ |
+| ドライバは、結果の TEXT を NUL を含めて全部返す | 返さない。最初の NUL で切る | 返さない。最初の NUL で切る | 返す |
+| `(CAST(? AS INTEGER)+0)` に 10 進の文字列を束縛すると、±2^63 の端まで正確な INTEGER になる。型の親和性は持たない | 正確 | 正確 | 正確 |
+| `'i' \|\| c` と `json_array(c)` は、64 ビットの整数を全桁書く | 書く | 書く | 書く |
 | `json_array` の REAL は 15 桁に丸まる (`0.30000000000000004` が `0.3`) | 丸まる | 丸まる | (使わない) |
-| CTE の列を 2 回参照すると、`random()` が 2 回評価される | される | される | 段 0 |
-| `FROM (SELECT * FROM r LIMIT -1 OFFSET 0)` を挟むと 1 回になる。実行は co-routine で、中間の表は作らない | 1 回 | 1 回 | 段 0 |
-| AFTER trigger の `new.*` は、型の親和性を掛けた後の値で、採番した rowid が入っている | そう | そう | 段 0 |
-| INSERT の RETURNING で、整数を入れた REAL の列を `CASE ... ELSE c END` に通すと、ドライバには INTEGER として届く (`typeof` は `real`) | 届く | 届く | 段 0 |
+| `quote()` で書いた REAL を JS の `Number()` で読むと、元の double に戻る (double 20,285 個) | 戻る | 戻る | 戻る |
+| CTE の列を 2 回参照すると、`random()` が 2 回評価される | される | される | される |
+| `FROM (SELECT * FROM r LIMIT -1 OFFSET 0)` を挟むと 1 回になる。実行は co-routine で、中間の表は作らない | 1 回 | 1 回 | 1 回 |
+| AFTER trigger の `new.*` は、型の親和性を掛けた後の値で、採番した rowid が入っている | そう | そう | そう |
+| INSERT の RETURNING で、整数を入れた REAL の列を `CASE ... ELSE c END` に通すと、ドライバには INTEGER として届く (`typeof` は `real`) | 届く | 届く | JS の数の 5 として届く (DO のドライバは INTEGER と REAL を区別しない)。`'r' \|\| quote(c)` は `r5.0` を返す |
 | 文を用意するだけで (実行せずに)、結果の列名が取れる。RETURNING の列名も取れる | 取れる | 取れる | (Worker の sql.js だけが使う) |
-| INTEGER と REAL の等値は正確に比べる (`9007199254740993 = 9007199254740992.0` は偽) | 正確 | 正確 | 段 0 |
-| REAL を TEXT の列に入れた結果 (double 20,262 個) | 2 つは一致 | | 段 0 |
-| 文字列を NUMERIC と REAL の列に入れた結果 (141,852 個) | 2 つは一致 | | 段 0 |
-| BigInt を束縛する | INTEGER になる | TEXT になる | 束縛できない (計画書の未解決の問題 20) |
+| INTEGER と REAL の等値は正確に比べる (`9007199254740993 = 9007199254740992.0` は偽) | 正確 | 正確 | 正確 |
+| REAL を、型の親和性ごとの 5 つの列 (TEXT、NUMERIC、INTEGER、REAL、型なし) に入れた結果 (double 20,285 個) | 3 つとも一致 | | |
+| 文字列を、同じ 5 つの列に入れた結果 (113,390 個) | 3 つとも一致 | | |
+| BigInt を束縛する | INTEGER になる | TEXT になる | 束縛できない (TypeError になる。計画書の未解決の問題 20) |
+| JS の数を束縛する | REAL になる | 32 ビットに収まる整数の値は INTEGER、ほかは REAL | REAL になる。NaN は NULL になる |
 | INTEGER を読む | 既定は 2^53 を超えると例外。`setReadBigInts` で BigInt | `useBigInt` で BigInt | 丸めた `number` |
-| `JSON.parse` の reviver が元の文面 (`context.source`) を受け取る | Node 24.15 で受け取る | | 段 0 |
-| structured clone が BigInt を運ぶ | Node で運ぶ | | DO の RPC と Service Binding は段 0 |
+| `JSON.parse` の reviver が元の文面 (`context.source`) を受け取る | Node 24.15 で受け取る | | 受け取る |
+| structured clone が BigInt を運ぶ | Node で運ぶ | | DO の RPC も、Service Binding の RPC も運ぶ (object の中の BigInt も) |
+| SQLite の版 | 3.51.3 | 3.49.1 | `sqlite_version()` は呼べない (許可されていない関数)。挙動は 3.47 のもので、workerd の実行ファイルは `3.47.0` の文字列を持つ |
 
-workerd の列は、どれも段 0 で `test/workerd-limits.test.ts` に足して確かめる。
-1 つでも違えば、その行に頼る決定を見直してから先へ進む。
+workerd の列は、段 0 で `test/workerd-limits.test.ts` に足して確かめた。
+手元の workerd の結果で、本番の結果ではない。
+事実は見たとおりに試験に書いてあるので、workerd を上げて結果が変わると、その試験が落ちる。
+値の集まり (double と文字列) は `test/value-corpus.ts` が作る。
 
-次の 4 つは、確かめたことではなく、文書とコードからの推測である。
-この設計はどれにも頼っているので、同じく段 0 で workerd で確かめる。
+この設計が頼っていた事実のうち、違っていたのは 1 つで、workerd ではなく、node:sqlite と sql.js のドライバの側だった。
+どちらも、結果の TEXT を最初の NUL で切って返す (3 行目)。
+SQL の中の値は切れていないので、`hex()` や `json_array` を通せば全部が届く。
+この違いから、次のことが決まる。
 
-| 推測 | 根拠 | 頼っている決定 |
-|---|---|---|
-| DO の SQLite の列の上限 (100) は、結果の列の数にも掛かる | SQLite の文書は、列の上限が SELECT の結果の項にも掛かると書いている。DO で試してはいない | 型つきの読みが列を足さないこと。今の `imageList` は 100 列の表で列が 100 を超えるので、今も断られているはずである |
-| 1 つの値の長さの上限 | `src/shard-limits.ts` は 2 MB、`docs/platform-facts.md` は 8 MB (2026-11-09 の公式の表) と書いている | `'t' \|\| c` は値を 1 バイト長くし、`hex(c)` は 2 倍にする。上限いっぱいの TEXT を読めるか、行イメージの BLOB がどこまで入るかが、これで決まる |
-| 包んだ読みで、課金される読んだ行の数は変わらない | `EXPLAIN QUERY PLAN` が co-routine と答えたことだけである | 「費用」の節の課金の記述。`test/rowcost.test.ts` に読みの場合を足して数える |
-| -0.0 を束縛して読むと 0.0 になる | node:sqlite では `quote()` が `0.0` と書いた。sql.js は -0.0 を INTEGER の 0 として束縛した (`(CAST(? AS REAL)+0.0)` で包む場合に当たる) | -0.0 と 0.0 を区別しないという決定 |
+- Worker の SQLite (sql.js) から TEXT を素の列で読むと、NUL から後ろを失う。`storedValue` (段 1) は、変換した値をタプル (`json_array`) で読む。`useBigInt` の素の読みは使わない。
+- 「Worker の SQLite」の節の「`useBigInt` で読む。読んだ値はそのまま `Value` である」は、TEXT については成り立たない。段 3 で `ScratchDb` の `query` を作るときに、TEXT を正確に読む形を決める。候補は 2 つある。結果の行をタプルで読む形と、TEXT を `CAST(... AS BLOB)` で読んで UTF-8 として戻す形である (`CAST('t' || c AS BLOB)` が全部のバイトを返すことは、node:sqlite で確かめた)。
+- シミュレータ (node:sqlite) の型つきの読みは、`'t' || c` を NUL で切って受け取る。DO では切れない。DO にできることがシミュレータにできない向きの違いなので、欠陥が黙って通ることはないが、NUL を含む TEXT の試験はシミュレータで落ちる。これも段 3 で決める。シミュレータの `query` が TEXT を正確に読む形にするか、NUL を含む TEXT の検査を workerd に置くかである。
+- 今のコードも、この違いで NUL を含む TEXT を失う (`test/open/nul-in-text.test.ts`)。シャードが答える文は全部を返し、Worker の SQLite が答える文は切って返す。INSERT … SELECT は、切れた値を保存する。シミュレータの検査は、シャードの側も基準の側も node:sqlite なので、どちらも切れて同じになり、見えなかった。
+
+次の 4 つは、文書とコードからの推測だった。
+この設計はどれにも頼っているので、同じく段 0 で workerd で確かめた。
+
+| 推測 | 根拠 | 頼っている決定 | 段 0 の結果 (手元の workerd) |
+|---|---|---|---|
+| DO の SQLite の列の上限 (100) は、結果の列の数にも掛かる | SQLite の文書は、列の上限が SELECT の結果の項にも掛かると書いている | 型つきの読みが列を足さないこと。今の `imageList` は 100 列の表で列が 100 を超えるので、今も断られているはずである | 合っていた。101 列の結果は `too many columns in result set` で断られる。サブクエリと CTE の列の数にも掛かる。PRIMARY KEY のない 100 列の表の `SELECT rowid, *` も断られる。型つきの読みに包んだ 100 列の結果は読める |
+| 1 つの値の長さの上限 | `src/shard-limits.ts` は 2 MB、`docs/platform-facts.md` は 8 MB (2026-11-09 の公式の表) と書いている | `'t' \|\| c` は値を 1 バイト長くし、`hex(c)` は 2 倍にする。上限いっぱいの TEXT を読めるか、行イメージの BLOB がどこまで入るかが、これで決まる | どちらとも違った。手元の workerd は、値も行も 2,200,000 バイトまでである。行には見出しが入るので、表に入る TEXT はそれより数バイト短く、`'t'` を付けても読める。タプルにしても収まるが、JSON が文字を逃がす (引用符は 2 バイトになる) と収まらない行がある。`hex(c)` は 1,099,999 バイトの BLOB までである。素の BLOB は上限まで読める。本番の上限は確かめていない |
+| 包んだ読みで、課金される読んだ行の数は変わらない | `EXPLAIN QUERY PLAN` が co-routine と答えたことだけである | 「費用」の節の課金の記述 | 合っていた。走査、主キーの 1 行、index、ORDER BY と LIMIT、集約、結合、窓関数、複合 SELECT、DISTINCT の 10 個の文で、包んだ文の `rowsRead` は素の文と同じだった。D∞ を通した数 (`test/rowcost.test.ts`) は、包む実装が入る段 3 で足す |
+| -0.0 を束縛して読むと 0.0 になる | node:sqlite では `quote()` が `0.0` と書いた。sql.js は -0.0 を INTEGER の 0 として束縛した (`(CAST(? AS REAL)+0.0)` で包む場合に当たる) | -0.0 と 0.0 を区別しないという決定 | 違った。DO のドライバは符号を保って束縛し、式の結果と型のない列からは -0 を返す。REAL の列は、整数の値を整数として持つので、符号を落とす。文字にする関数 (`quote()`、`\|\|`、`printf`) は、どれも `0.0` と書く。決定は変えない。SQL の中から符号は見えず、行イメージを通った行は 0.0 になる。経路で変わり得るのは、ドライバが返す JS の数の符号だけである |
+
+表になかった事実が 3 つ見つかった。
+
+- SQL 関数の引数は、手元の workerd では 127 個まで通る (SQLite の既定)。公式の表は 32 個と書いている。本番が 32 で断るかは、手元では確かめられない。タプルの式は、どちらでも通るように、32 個ずつの入れ子のままにする。
+- 式の木の深さは 100 までである (SQLite の既定は 1,000。公式の表にない)。2 項の演算子で n 個の項をつなぐと、深さは n になる。D∞ が作る式のうち、列ごとの条件を OR や AND でつなぐものは、列の数だけ深くなる。今のコードは、97 列から 99 列の表に 1 行も書けない (`test/open/wide-table-expression-depth.test.ts`)。node:sqlite は上限を変えられないので、シミュレータでは見えない。
+- `sqlite_version()`、`sqlite_source_id()`、`PRAGMA compile_options` は、DO では使えない (使える関数を許可の一覧で絞っている)。版を記録する手段は、挙動から見当を付けることだけである。
 
 ## 値の型と符号
 
@@ -93,6 +116,8 @@ export type Value = null | bigint | number | string | Uint8Array;
 `number` は REAL で、整数の値でも REAL である。
 入口は、範囲の外の `bigint` を断り、NaN を NULL にする (SQLite が NaN を NULL として束縛するのと同じ)。
 -0.0 は 0.0 と区別しない (`quote()` が `0.0` と書く。今も JSON を通ると区別を失う)。
+SQL の中から符号は見えない (`quote()`、`||`、`printf` のどれも `0.0` と書く)。
+DO のドライバは、式の結果と型のない列の -0.0 を、符号を保った JS の数で返す。行イメージを通った行は 0.0 になるので、ドライバが返す数の符号は経路で変わり得る (「確かめた事実」の節)。
 
 D∞ の内部の表 (`__meta`、`__log_g*`、`__intents` など) が持つ整数は、時刻、版、token、カウンタで、どれも 2^53 に収まる。
 内部の表の読み書きは、今の規則のまま `number` で行う。
@@ -150,6 +175,7 @@ type Tuple = (string | null)[];   // JSON の中の要素の並び
 
 SQL では `json_array(要素, ...)` で作る。
 列が 32 を超える表では、32 個ずつの `json_array` を `json_array` で包み、JS が 1 段だけ平らにする。
+32 は公式の表の上限である。手元の workerd は 127 個まで受け付けたが、本番が 32 で断るかは確かめられないので、32 に合わせる。
 要素は文字列か `null` なので、平らにしてよいかは迷わない。
 入れ子は SQL から JS へ渡す間だけの形で、保存する形はいつも平らな配列である。
 
@@ -288,10 +314,11 @@ DO にできないことをシミュレータができると、正確な読み�
 - `exec` などの内部の入口は、今と同じく BigInt で読んで `number` に丸める (`lossy`、`:149`)。
 - `number` は REAL として束縛し、`bigint` がドライバに届いたら投げる (DO は束縛できない)。
 - `query` は、ドライバが INTEGER を返したら試験を落とす。型つきの読みの形の文は、INTEGER を文字列で返すので、INTEGER がドライバから数として出てくるのは、包み忘れた文だけである。範囲の検査 (`test/setup.ts`) と同じく、どのシミュレータの試験にも掛かる。
-- 結果の列が 100 を超える文を断る (`checkDoLimits`、`:22`)。今は模倣していない。
+- 結果の列が 100 を超える文を断る。段 0 で入れた (`test/sim.ts` の `DO_MAX_RESULT_COLUMNS`)。見るのは文の結果の列だけで、サブクエリと CTE の列の数は見ない。
 
-関数の引数の上限 (32) は、node:sqlite では模倣できない。
+関数の引数の上限 (32) と、式の木の深さの上限 (100) は、node:sqlite では模倣できない。
 タプルの式を作る関数の単体の試験 (どの関数の呼び出しも引数が 32 以下) と、workerd での 100 列の表の試験で見る。
+node:sqlite のドライバが TEXT を NUL で切って返すことも、DO と違う (「確かめた事実」の節)。
 
 SQLite との突き合わせの基準 (試験の中の `DatabaseSync`) は、BigInt を INTEGER、`number` を REAL として束縛し、`setReadBigInts` で読む。
 `Value` と同じ規則なので、結果を型ごと比べられる。
@@ -400,9 +427,10 @@ REAL の 2^53 と INTEGER の 2^53 は同じキーで、INTEGER の 2^53 + 1 は
 戻した値は `WHERE 主キー IS ?` に束縛する。
 INTEGER の引数は、REAL で入っている同じ値の行にも当たる (確かめた)。
 
-`context.source` は、Node 24 にある。workerd にあるかは段 0 で確かめる。
-なければ、2^53 以上の整数だけを `{"$i":"数字"}` と書く形に替える。
-どちらの形にするかは、行の置き場所に効き、公開の後は変えられないので、段 1 の前に決める。
+`context.source` は、Node 24 にも、手元の workerd にもある (段 0 で確かめた。`test/workerd-limits.test.ts`)。
+キー文字列の整数は、桁数に関わらず 10 進の数字で書くと決まった。
+なかった場合の案 (2^53 以上の整数だけを `{"$i":"数字"}` と書く) は採らない。
+どちらの形にするかは、行の置き場所に効き、公開の後は変えられない。
 
 ### 型の親和性の変換
 
@@ -420,7 +448,8 @@ Worker は、文の中の値から行の置き場所を決めるために、「�
 | INTEGER を TEXT へ | 10 進の文字列 |
 | ほか (文字列を数の列へ、2^53 以上の INTEGER と REAL のあいだ、REAL を TEXT へ) | Worker の SQLite に入れて読む |
 
-最後の行は、親和性ごとの列を持つ 1 行の表に `INSERT OR REPLACE ... RETURNING` で入れ、`useBigInt` で読む (RETURNING が返す値と、入れた後に読んだ値が同じであることを確かめた)。
+最後の行は、親和性ごとの列を持つ 1 行の表に `INSERT OR REPLACE ... RETURNING` で入れ、入った値をタプルで読む (RETURNING が返す値と、入れた後に読んだ値が同じであることを確かめた)。
+素の列を `useBigInt` で読むことはしない。sql.js のドライバは TEXT を最初の NUL で切って返すので、NUL を含む文字列が数の列に入ったとき (文字列のまま残る) に、キーが切れる。
 `CAST` は使わない。`CAST('abc' AS INTEGER)` は 0 で、列の親和性は `'abc'` を TEXT のまま残す。
 数に読める文字列の文法 (`' 12 '`、`'1e3'`、`'0x10'`、`'9223372036854775808'`) を、JS で写すのをやめられる。
 
@@ -444,9 +473,9 @@ node:sqlite 3.51.3 と sql.js 3.49.1 は、上の「確かめた事実」の cor
 DO の SQLite は確かめていない。
 規則は次のとおりにする。
 
-- REAL を TEXT にする変換は、今と同じく `undefined` を返す。
-- 文字列を REAL にする変換は、段 0 で workerd の結果が sql.js と一致すれば使う (今は JS の `Number()` で写して使っている)。一致しなければ、これも `undefined` にする。
-- corpus は `test/workerd-limits.test.ts` と `scripts/cloudflare-check.sh` で流し続け、DO の SQLite の版が上がって食い違ったら見つける。
+- REAL を TEXT にする変換は、今と同じく `undefined` を返す。段 0 の corpus (double 20,285 個) では、3 つのエンジン (3.47、3.49.1、3.51.3) が 1 件も食い違わなかった。それでも、書式は版で変わったことがあるので、絞り込みには使わない。
+- 文字列を REAL にする変換は、使う。段 0 で、手元の workerd の結果が sql.js と一致した (文字列 113,390 個を 5 つの列に入れて、1 件も食い違わなかった)。今は JS の `Number()` で写して使っている。
+- corpus は `test/workerd-limits.test.ts` で流し続け、DO の SQLite の版が上がって食い違ったら見つける。本番の DO の SQLite では流していない。`scripts/cloudflare-check.sh` が流すのは `test/workerd.test.ts` だけなので、本番で流すには、そこへ足す必要がある (段 3 までに決める)。
 
 型の名前から親和性を決める関数 (`affinityOf`、`src/sql/cst.ts:146`) は、5 つの規則のままで残す。
 数の literal の読み (`constant`、`:164`) は、整数の literal を `bigint` にする。
@@ -506,6 +535,8 @@ UPDATE の変更前の行は、今と同じく、先に主キーで読む。
 - 全表の走査を、型つきの読みの形に包んだ文
 - 行を入れ直す文 (`insertRow`)。束縛の変数が 100 を超えないこと
 
+どの文も、式の木の深さが 100 に収まることも確かめる (主キーの列を AND でつなぐ条件は、主キーの列の数だけ深くなる)。
+今の確かめは深さを見ないので、97 列から 99 列の表が `CREATE TABLE` を通り、1 行も書けない (`test/open/wide-table-expression-depth.test.ts`)。
 確かめを落とすと、長い列名の広い表が `CREATE TABLE` を通り、後でシャードが trigger を作れずに止まる。
 断るかどうかは表定義だけで決まる (規則 4)。
 
@@ -678,7 +709,7 @@ Worker が集める走査と `exportRows` は、型のない列の `typeof` を�
 
 ### 段ごとの危険
 
-- 段 1：キー文字列の数の書き方が、公開の後は変えられない形式になる。`context.source` が workerd になければ、形を決め直す。
+- 段 1：キー文字列の数の書き方が、公開の後は変えられない形式になる。`context.source` は手元の workerd にあったので、整数は桁のまま書く。本番の workerd では確かめていない (V8 の機能なので、同じ版の workerd なら同じはずである)。
 - 段 2：シミュレータの seed は同じ実行になるはずだが、移動の 1 通の大きさが変わるので、分割を含む控えの seed は別の実行になり得る。
 - 段 3：`number` を INTEGER のつもりで `query` に渡す誤りは、型の検査で見つからない。INTEGER の列に入ると SQLite が整数に戻すので、検査でも見えにくい。見えるのは、TEXT の列と型のない列である。`typed-diff` の型のない列と、採番を `bigint` にする型で受ける。
 - 段 3：DO の SQLite の関数の引数、列、値の長さの上限は、シミュレータが模倣しないか、今回足す。workerd での試験を省くと、本番でだけ落ちる。
@@ -701,4 +732,41 @@ Worker が集める走査と `exportRows` は、型のない列の `typeof` を�
 4. 自動で振る id は 2^53 未満のままにする。
 5. 行イメージに表定義の版を持たせない。
 6. 段 0 と段 1 は、今始める (`core.ts` に触らない)。
+
+## 段 0 の結果 (2026-11-14)
+
+検査を書き、workerd の事実を確かめた。`src/` は変えていない。
+workerd の事実は「確かめた事実」の節に書いた。
+
+### キー文字列の整数の書き方
+
+手元の workerd の `JSON.parse` の reviver は、`context.source` を受け取った。
+持ち主の判断の 3 のとおり、整数は桁をそのまま書く。印 `{"$i":…}` は使わない。
+
+### 書いた検査
+
+| 検査 | 場所 | いまの結果 |
+|---|---|---|
+| 1 | `test/open/int64.test.ts` | 19 の場面を、シャード 1、2、4 と、実行 3 通りで流す。場面ごとに新しいクラスタと基準を使い、最初の食い違いで止めて、食い違い方を分ける。±(2^53 - 1) に収まる値では、どの場面も通る (D1 互換の API に BigInt を渡す場面を除く)。64 ビットの値では、19 の場面のどれもが、最初の大きな値で食い違う。断るのが 17、保存していない値を丸めて返すのが 1、D1 互換の API が BigInt を受け取れないのが 1 である。文書にある決まりで説明できない食い違いはなく、食い違い方は置き場所と経路で変わらない |
+| 2 | `test/typed-diff.test.ts` の末尾のブロック、`test/typed-diff-harness.ts` | 元の台本を、結果の INTEGER と REAL を区別して比べる。緩めるのは、文書にある 2 点だけである (整数の値の REAL を `integer` で返す、計算した 2^53 を超える整数を丸めて返す)。元の生成器には手を入れず、足す値と文は 2 つ目の生成器に置いた。どちらも通る。2^53 を超える整数と NUL を含む文字列は、同じ生成器に指定を付けて `test/open/typed-diff-wide.test.ts` が流す (いまは落ちる) |
+| 3 | 段 1 で書く | |
+| 4 | `test/key-conversions.test.ts` | 今の `keyString` が等しいことと、型のない主キーで UNIQUE の違反になることが、いま保存できる値で一致する。新しい `keyString` と `storedValue` の分は、段 1 で足す |
+| 5 | 書いていない | 3 つとも、確かめる相手が段 2 か段 3 でできる。`query` は段 3 で足す入口である。捕捉でまとめた `after` は、今は本体から読み直しているので、比べる相手がない (段 2)。タプルは段 2 までない。シミュレータの節の 4 つ目 (結果の列が 100 を超える文を断る) は入れた |
+| 6 | `test/workerd-limits.test.ts`、`test/workerd-probe.ts` | 「確かめた事実」の節のとおり。100 列の表の捕捉と読みは、タプルの式を作る関数が要るので、段 1 で足す。`test/rowcost.test.ts` の、D∞ を通した読みの行数は、包む実装が入る段 3 で足す |
+| 7 | `test/ddl-concurrent.test.ts` の 5、`test/ddl-harness.ts` | 2 つの形 (DROP して CREATE する形と、移行の道具が流す 4 文) で通る。作り直す表に、作業負荷が書かない列 `gen` を置き、既定値を表定義ごとに変えた。作り直した表に古い既定値の行があれば、古い表定義で作った行イメージが新しい表に入っている。行イメージが列名を持つ今でも見える。intent を決着させる守りを外す (`ddlIgnoresIntents`) と、この検査が気付く |
+
+### 見つかった今の欠陥
+
+直していない。
+どれも `test/open/` に、正しい振る舞いを期待する再現がある。
+
+1. NUL を含む TEXT が、Worker の SQLite を通ると最初の NUL で切れる。答えが経路で変わり、INSERT … SELECT は切れた値を保存する (`test/open/nul-in-text.test.ts`)。
+2. 97 列から 99 列の表は、`CREATE TABLE` を通るのに、DO では 1 行も書けない。式の木の深さが 100 を超える (`test/open/wide-table-expression-depth.test.ts`)。
+3. 型のない列が 50 以上ある表は、`CREATE TABLE` を通るのに、DO では読むことも書くこともできない。結果の列が 100 を超える (`test/open/untyped-columns-result-limit.test.ts`)。
+4. 取引の中の、複数のシャードを読む文が、読んだ後に 2 つ以上のシャードで行が変わっていると、スナップショットを読み続けずに `read too old` で失敗する (`test/open/snapshot-read-after-two-shards-changed.test.ts`)。
+5. D1 互換の API に BigInt を渡すと、値が小さくても、内部の誤り「Do not know how to serialize a BigInt」で失敗する。段 3 で BigInt を INTEGER として受け取るようになる (`test/open/int64.test.ts` が見ている)。
+
+2 と 3 は、シミュレータが DO の上限を模していなかったために、シミュレータの試験では通っていた。
+3 の上限は段 0 でシミュレータに入れた。2 の上限 (式の木の深さ) は node:sqlite では模倣できないので、workerd の試験でしか見えない。
+1 は、node:sqlite のドライバも TEXT を NUL で切るので、シミュレータでは見えない。
 

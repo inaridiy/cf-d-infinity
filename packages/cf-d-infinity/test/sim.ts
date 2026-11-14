@@ -19,6 +19,15 @@ export const DO_COMPOUND_SELECT_LIMIT = 5;
 export const DO_MAX_SQL_BYTES = 100_000;
 export const DO_MAX_BOUND_PARAMS = 100;
 export const DO_MAX_VALUE_BYTES = 2_000_000;
+/**
+ * DO の SQLite は、結果の列を 100 までに制限している (表の列の上限と同じ値。test/workerd-limits.test.ts が workerd で確かめている)。
+ * node:sqlite は 2,000 列まで受け付ける。ここで模さないと、101 列を返す文がシミュレータでだけ通る。
+ * 本物は、サブクエリと CTE の列の数にも同じ上限を掛ける。ここで見るのは、文の結果の列だけである。
+ */
+export const DO_MAX_RESULT_COLUMNS = 100;
+function checkDoColumns(count: number): void {
+  if (count > DO_MAX_RESULT_COLUMNS) throw new Error("too many columns in result set: SQLITE_ERROR");
+}
 function checkDoLimits(sql: string, params: Value[] = []): void {
   // 本物の DO は複合 SELECT の項を数える。シャードの側の確かめ (src/shard-limits.ts) と同じ数え方にする。引用符の中の識別子まで
   // 数えると、本物では通る文をここだけが断る (検査の誤り。2026-11-13)。
@@ -164,6 +173,7 @@ export class SqliteBackend implements Backend {
     checkDoLimits(b.sql, b.params);
     const st = this.db.prepare(b.sql);
     const p = b.params as never[];
+    checkDoColumns(st.columns().length);
     if (st.columns().length === 0) return (st.run(...p), []);
     const names = restoreColumns(st.columns().map((c) => c.name), b.columns);
     st.setReturnArrays(true);
@@ -177,6 +187,7 @@ export class SqliteBackend implements Backend {
     const st = this.db.prepare(b.sql);
     const p = b.params as never[];
     const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
+    checkDoColumns(columns.length);
     if (columns.length === 0) {
       st.run(...p);
       return { columns, rows: [] };
@@ -193,6 +204,7 @@ export class SqliteBackend implements Backend {
     const st = this.db.prepare(b.sql);
     const p = b.params as never[];
     const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
+    checkDoColumns(columns.length);
     if (columns.length === 0) {
       st.run(...p);
       return { columns, values: [] };
