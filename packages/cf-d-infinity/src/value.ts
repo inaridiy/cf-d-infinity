@@ -212,3 +212,189 @@ export function fromTyped(v: Value, t: unknown, where = "the statement"): Value 
   if (t === "integer" && typeof v === "number" && !Number.isSafeInteger(v)) throw wideIntegerError(where);
   return v;
 }
+
+// ---- 要素とタプル (docs/design-values.md の「値の型と符号」。値の作り直しの段 1) ----
+//
+// 段 2 から、行イメージ (src/shard/rows.ts) がタプルを使う。結果の列の要素の式 (selectElemSql、returningElemSql) は、段 3 で
+// 型つきの読みが使い始める。
+//
+// 値 1 つを、JSON にもドライバの結果にも置ける形にしたものを「要素」と呼ぶ。先頭の 1 文字が格納の型で、後ろがその値である。
+// INTEGER は 10 進の数字 (`i9223372036854775807`)、TEXT はその文字列 (`tabc`)、REAL は quote() の文字列 (`r5.0`)、
+// BLOB は 16 進 (`b00FF`)、NULL は null。SQL の式でも JS でも同じ形に作れるので、DO の SQLite が INTEGER を丸めた数で返しても、
+// 64 ビットの整数を失わない。行を、表定義の列の順に並べた要素の配列にしたものが「タプル」である。
+
+/**
+ * 作り直しの後の値。JS の型が SQLite の格納の型である。bigint は INTEGER、number は REAL (整数の値でも REAL)。
+ * 段 3 で `Value` (src/types.ts) がこの形になり、この型は要らなくなる。
+ */
+export type TypedValue = null | bigint | number | string | Uint8Array;
+
+/** 要素。値 1 つを文字列にしたもの。NULL は null。 */
+export type Elem = string | null;
+
+/** タプル。表定義の列の順に並べた要素。列名は持たない。 */
+export type Tuple = Elem[];
+
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+const upperHex = (b: Uint8Array) => {
+  let s = "";
+  for (const x of b) s += (x < 16 ? "0" : "") + x.toString(16).toUpperCase();
+  return s;
+};
+const fromHex = (s: string) => {
+  if (s.length % 2 !== 0 || /[^0-9A-Fa-f]/.test(s)) throw new Error(`not an element: the BLOB ${s.slice(0, 20)} is not hexadecimal`);
+  const out = new Uint8Array(s.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(s.slice(2 * i, 2 * i + 2), 16);
+  return out;
+};
+
+/**
+ * REAL を、SQLite が REAL の literal として読む文字列にする。JS の最短の表記に、小数点も指数もなければ `.0` を足す。
+ * 無限大は、quote() と同じ `9.0e+999` にする。SQL が作る要素 (quote() の表記) とは文字が違うことがあるが、どちらも
+ * `Number()` で同じ double に戻る。-0.0 は 0.0 と区別しない (quote() も `0.0` と書く)。
+ */
+function realText(x: number): string {
+  if (x === Infinity) return "9.0e+999";
+  if (x === -Infinity) return "-9.0e+999";
+  const s = String(x === 0 ? 0 : x);
+  return /[.e]/.test(s) ? s : `${s}.0`;
+}
+
+/** 値を要素にする。NaN は、SQLite が NULL として束縛するので、NULL にする。 */
+export function encodeElem(v: TypedValue): Elem {
+  if (v === null) return null;
+  if (typeof v === "bigint") {
+    if (v < INT64_MIN || v > INT64_MAX) throw new RangeError(`the integer ${v} does not fit in 64 bits`);
+    return `i${v}`;
+  }
+  if (typeof v === "number") return Number.isNaN(v) ? null : `r${realText(v)}`;
+  if (typeof v === "string") return `t${v}`;
+  return `b${upperHex(v)}`;
+}
+
+/**
+ * 要素を値に戻す。型つきの読みの結果の列も、これで読む。そこでは、REAL と BLOB がドライバの値のまま届く
+ * (JS の数は REAL、BLOB は BLOB)。印のない文字列は要素ではないので、投げる。包み忘れた文の結果を、黙って TEXT として読まない。
+ */
+export function decodeElem(e: Elem | number | Uint8Array | ArrayBuffer): TypedValue {
+  if (e === null) return null;
+  if (typeof e === "number") return e;
+  if (typeof e !== "string") return e instanceof Uint8Array ? e : new Uint8Array(e);
+  const rest = e.slice(1);
+  switch (e[0]) {
+    case "i":
+      // BigInt() は、空の文字列を 0 に、16 進や前後の空白のある文字列も数に読む。要素の INTEGER は 10 進の数字だけである。
+      if (!INTEGER_TEXT.test(rest)) break;
+      return BigInt(rest);
+    case "t": return rest;
+    case "r": {
+      // quote() は、元の double に戻せる桁数で書く。JS の Number() は正確に丸めるので、同じ double になる
+      // (test/workerd-limits.test.ts が、3 つのエンジンで 2 万個の double を確かめている)。`9.0e+999` は Infinity になる。
+      // Number() は、空の文字列を 0 に、16 進や前後の空白のある文字列も数に読む。要素の REAL は 10 進の小数か指数の表記だけである。
+      if (!REAL_TEXT.test(rest)) break;
+      return Number(rest);
+    }
+    case "b": return fromHex(rest);
+  }
+  throw new Error(`not an element: ${JSON.stringify(e.slice(0, 20))}`);
+}
+const INTEGER_TEXT = /^-?[0-9]+$/;
+const REAL_TEXT = /^-?[0-9]+(\.[0-9]+)?(e[+-]?[0-9]+)?$/;
+
+// 要素を作る SQL の式。c は列の参照である (`"c0"`、`new."a"`)。式の中で 2 回以上参照するので、評価のたびに値が変わる式
+// (`random()` など) を渡してはならない。そういう式は、呼ぶ側が `FROM (SELECT e AS "x" LIMIT -1 OFFSET 0)` で 1 回の評価に
+// 固めてから、その列を渡す (設計書の「シャードからの読み」と「利用者の RETURNING」)。
+
+/**
+ * 結果の列 (SELECT) の要素の式。INTEGER と TEXT に印を付け、REAL と BLOB は素のまま返す。ドライバが返す JS の型は 4 つ
+ * (null、数、文字列、BLOB) なので、INTEGER と TEXT を印つきの文字列にすれば、残りは JS の型で見分けられる。
+ * node:sqlite と sql.js のドライバは、結果の TEXT を最初の NUL で切って返す (DO のドライバは切らない)。この式の結果を
+ * その 2 つから読むと、NUL を含む TEXT が切れる。その 2 つからは、タプル (JSON) で読む。
+ */
+export const selectElemSql = (c: string): string =>
+  `CASE typeof(${c}) WHEN 'integer' THEN 'i'||${c} WHEN 'text' THEN 't'||${c} ELSE ${c} END`;
+
+/**
+ * 結果の列 (RETURNING) の要素の式。REAL にも印を付ける。INSERT の RETURNING で、整数を入れた REAL の列を素のまま返すと、
+ * ドライバには INTEGER の 5 として届く (typeof は real と答える)。`'r' || quote(c)` は `r5.0` を返す。
+ */
+export const returningElemSql = (c: string): string =>
+  `CASE typeof(${c}) WHEN 'integer' THEN 'i'||${c} WHEN 'text' THEN 't'||${c} WHEN 'real' THEN 'r'||quote(${c}) ELSE ${c} END`;
+
+/**
+ * JSON の中 (タプル) の要素の式。印は typeof の先頭の 1 文字である。NULL は `'n' || NULL` で NULL になる。
+ * REAL は quote() で書く (json_array は REAL を 15 桁に丸める)。TEXT は印を前に付けてそのまま運ぶ (quote() は TEXT を最初の NUL で切る)。
+ */
+export const jsonElemSql = (c: string): string =>
+  `substr(typeof(${c}),1,1) || CASE typeof(${c}) WHEN 'real' THEN quote(${c}) WHEN 'blob' THEN hex(${c}) ELSE ${c} END`;
+
+/**
+ * SQL 関数の引数の上限。DO の SQLite の公式の表の値である。手元の workerd は 127 個まで受け付けるが (test/workerd-limits.test.ts)、
+ * 本番が 32 で断るかは確かめられないので、公式の値に合わせる。
+ */
+export const MAX_FUNCTION_ARGS = 32;
+
+/**
+ * タプルを作る SQL の式。cols は、表定義の列の順に並べた列の参照である。
+ * 列が 32 を超えると、32 個ずつの json_array を json_array で包む。読む側 (parseTuple) が 1 段だけ平らにする。
+ * 入れ子は SQL から JS へ渡す間だけの形で、保存する形はいつも平らな配列である。
+ */
+export function tupleSql(cols: string[]): string {
+  const array = (items: string[]) => `json_array(${items.join(", ")})`;
+  if (cols.length <= MAX_FUNCTION_ARGS) return array(cols.map(jsonElemSql));
+  // 入れ子は 1 段だけにする。表の列の上限は 100 なので、足りる。
+  if (cols.length > MAX_FUNCTION_ARGS * MAX_FUNCTION_ARGS) throw new Error(`a tuple of ${cols.length} elements has too many columns`);
+  const chunks: string[] = [];
+  for (let i = 0; i < cols.length; i += MAX_FUNCTION_ARGS) chunks.push(array(cols.slice(i, i + MAX_FUNCTION_ARGS).map(jsonElemSql)));
+  return array(chunks);
+}
+
+/**
+ * SQL が作ったタプルの JSON を読む。tupleSql の入れ子を 1 段だけ平らにする。
+ * 要素は文字列か null なので、配列が混ざっていれば入れ子である。それ以外の形は、タプルではないので投げる。
+ */
+export function parseTuple(json: string): Tuple {
+  const x: unknown = JSON.parse(json);
+  if (!Array.isArray(x)) throw new Error(`not a tuple: ${json.slice(0, 40)}`);
+  const isElem = (e: unknown): e is Elem => e === null || typeof e === "string";
+  const out: Tuple = [];
+  for (const item of x as unknown[]) {
+    if (isElem(item)) out.push(item);
+    else if (Array.isArray(item) && item.every(isElem)) out.push(...(item as Elem[]));
+    else throw new Error(`not a tuple: ${json.slice(0, 40)}`);
+  }
+  return out;
+}
+
+/** 値の並びをタプルにする。 */
+export const encodeTuple = (values: TypedValue[]): Tuple => values.map(encodeElem);
+
+/** タプルを値の並びに戻す。 */
+export const decodeTuple = (t: Tuple): TypedValue[] => t.map(decodeElem);
+
+/**
+ * 型のある値を、今の `Value` にする (typedOf の逆。値の作り直しの段 2 の橋)。行イメージのタプルを値に戻すときは、どれもここを通す。
+ * bigint は INTEGER なので、JS の数にする。number は REAL なので、整数の値なら印を付ける。
+ * 絶対値が 2^53 以上の INTEGER は、今の Value では正確に持てないので、K1 と同じ誤りにする (where は誤りに書く場所、表の名前)。
+ * 段 3 で `Value` が型のある値になると、この橋は要らなくなる。
+ */
+export function fromTypedValue(v: TypedValue, where: string): Value {
+  if (typeof v === "bigint") {
+    if (v > MAX_EXACT || v < -MAX_EXACT) throw wideIntegerError(where);
+    return Number(v);
+  }
+  if (typeof v === "number") return realOf(v);
+  return v;
+}
+const MAX_EXACT = BigInt(Number.MAX_SAFE_INTEGER);
+
+/**
+ * 今の `Value` を、型のある値にする。今の決まりでは、64 ビットに収まる整数の JS の数は INTEGER、印つきの値 (`Real`) と
+ * ほかの数は REAL である。段 3 で `Value` が型のある値になると、この橋は要らなくなる。
+ */
+export function typedOf(v: Value): TypedValue {
+  if (isReal(v)) return v.real;
+  if (typeof v === "number") return isIntegerValue(v) ? BigInt(v) : v;
+  return v;
+}

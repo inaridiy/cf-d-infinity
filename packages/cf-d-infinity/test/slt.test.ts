@@ -8,6 +8,10 @@ import { Db } from "../src/client/db";
 const FILES = ["select1", "select2", "select3", "select4", "select5"];
 const LIMIT = process.env.SLT_LIMIT ? Number(process.env.SLT_LIMIT) : 150;
 const have = existsSync("test/slt/select1.test");
+// 1 ファイルの制限時間。scripts/check.sh は全件を流し、select5 は 4 シャードで、静かな計算機でも 430 秒ほどかかる。
+// 2026-11-14 に、ほかの重い作業 (TLC など) と同じ時に流すと、main でも 600 秒を超えた。答えの比較ではなく計算機の混み具合で落ちるので、
+// 余裕を持たせる。止まった実行を見つける役は、これで足りる。
+const TIMEOUT = 1_800_000;
 
 const oracle = (): Engine => {
   const db = new DatabaseSync(":memory:");
@@ -42,12 +46,12 @@ describe.skipIf(!have)("sqllogictest", () => {
       const r = await runSlt(`test/slt/${f}.test`, oracle(), { limit: LIMIT });
       summary(`oracle ${f}`, r);
       expect(r.failed).toBe(0);
-    }, 600000);
+    }, TIMEOUT);
     it(`${f} on 4 shards`, async () => {
       const r = await runSlt(`test/slt/${f}.test`, ours(4), { limit: LIMIT });
       summary(`shards ${f}`, r);
       expect(r.failed).toBe(0);
       expect(r.statementFailures).toBe(0);
-    }, 600000);
+    }, TIMEOUT);
   }
 });

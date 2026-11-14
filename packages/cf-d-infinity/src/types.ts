@@ -1,6 +1,7 @@
 // 分散プロトコルの共有型。docs/design.md の用語に対応する。
 export type Ts = number;
-import type { Real } from "./value";
+import type { Interval } from "./routing";
+import type { Real, Tuple } from "./value";
 
 /** SQLite の値。整数の JS の数は INTEGER、整数でない JS の数は REAL、整数の値の REAL は Real (src/value.ts)。 */
 export type Value = string | number | null | Uint8Array | Real;
@@ -60,13 +61,16 @@ export interface TableDef {
 
 export type Affinity = "INTEGER" | "REAL" | "NUMERIC" | "TEXT" | "BLOB";
 
-/** 1 行の変更。before/after はその行全体のイメージで、null は不在を表す。 */
+/**
+ * 1 行の変更。before/after はその行全体のイメージで、null は不在を表す。イメージは、表定義の列の順に並べた要素のタプル
+ * (src/value.ts) で、列名は持たない。PRIMARY KEY のない表は、先頭に rowid を置く (src/shard/rows.ts の imageColumns)。
+ */
 export interface Change {
   table: string;
-  pk: string; // pk 値の JSON
-  sk: string; // shard key 値の JSON
-  before: Row | null;
-  after: Row | null;
+  pk: string; // pk 値のキー文字列
+  sk: string; // shard key 値のキー文字列
+  before: Tuple | null;
+  after: Tuple | null;
   /** 悲観的な DML がこの行を読んだ時刻 F。検証はここから c までを見る。 */
   since?: Ts;
 }
@@ -85,13 +89,15 @@ export type Span = (
   /** 悲観的な DML の読み。T ではなくこの時刻から検証する。 */
   since?: Ts;
   /**
-   * 読み手の範囲表で、宛先のシャードが持つスロットの範囲 [start, end) である。
-   * shard key を絞らない span に付ける。
+   * 読み手の範囲表で、宛先のシャードが持つ範囲である。token の区間の組で表す (src/routing.ts の Interval)。
+   * いまは、shard key を絞らない span に付ける。
    * span が覆うのは、表のうちこの範囲に載る行である。
    * 範囲表が古いと、その一部はすでに別のシャードへ移っている。
    * シャードは手放した範囲と重なれば NotOwner を返し、読み手に範囲表を取り直させる。
+   * 区間の境目を shard key のブロックの中に置くようになると、shard key で絞る span にも付ける
+   * (docs/design-subslots.md の「宛先と claim」)。
    */
-  slots?: [number, number][];
+  claim?: Interval[];
 };
 
 /** shard key を絞らない span。そのシャードの表全体を覆う。 */
@@ -236,33 +242,40 @@ export interface ShardApi {
    * from は、取引がその範囲を読んだ時刻である。読みの要求が時刻を運ぶので、このシャードは from を見ている。
    */
   unchanged(req: { spans: Span[]; from: Ts; schema: number }): Promise<{ ok: boolean; reason?: string }>;
-  /** groups は移動先への転送で使う。未到着ならそのグループを先に引き取る。 */
-  finalize(req: { txn: string; c: Ts; groups?: string[] }): Promise<void>;
-  abort(req: { txn: string; groups?: string[] }): Promise<void>;
+  /** pieces は移動先への転送で使う。未到着ならその piece を先に引き取る。 */
+  finalize(req: { txn: string; c: Ts; pieces?: Piece[] }): Promise<void>;
+  abort(req: { txn: string; pieces?: Piece[] }): Promise<void>;
   queryTxn(req: { txn: string; pushTo: Ts }): Promise<TxnStatus>;
   status(req: { txn: string }): Promise<TxnStatus>;
   flush(req: { upTo?: Ts }): Promise<FlushRes>;
+  // 範囲の移動の要求は、範囲を token の区間 (Interval) で運ぶ。
+  // いまのシャードは、両端が slot の境目にある区間の移動だけを受ける (ShardCore の wholeSlotsOnly)。
   /** 子が受け入れの準備をする。親の fence より先に呼ぶ。 */
   /** 範囲を受け取る準備をする。子の表定義の版を返す。親は、fence の前にその版まで追いつく。 */
   /** 子が範囲を受け取り始める。slot は Meta が分割に渡した枠で、子は Meta に枠を示し、Meta が返す版で受け取り始める。 */
-  beginIncoming(req: { start: number; end: number; from: string; slot: string }): Promise<{ schema: number }>;
+  beginIncoming(req: Interval & { from: string; slot: string }): Promise<{ schema: number }>;
   /** 親がスロットの受理を止める。以後は NotOwner を返す。 */
   /** 親が範囲を送り出し始める。slot は分割の枠で、子が受け取り始めていなければ断る。 */
-  fence(req: { start: number; end: number; to: string; schema?: number; slot: string }): Promise<void>;
+  fence(req: Interval & { to: string; schema?: number; slot: string }): Promise<void>;
   /** 終わっていない範囲の移動。増設をやり直すとき、同じ範囲を続けるのに使う。 */
-  moves(req: Record<string, never>): Promise<{ outgoing: { start: number; end: number; to: string }[]; incoming: { start: number; end: number; from: string }[] }>;
-  listGroups(req: { start: number; end: number; limit: number; cursor?: GroupCursor | null }): Promise<{ groups: string[]; cursor: GroupCursor | null }>;
-  pull(req: { groups: string[]; to: string; maxBytes: number }): Promise<GroupPayload[]>;
-  ack(req: { groups: string[] }): Promise<void>;
+  moves(req: Record<string, never>): Promise<{ outgoing: (Interval & { to: string })[]; incoming: (Interval & { from: string })[] }>;
+  /** 範囲にあるグループを列挙する。列挙するのはグループで、piece ではない。 */
+  listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null }): Promise<{ groups: string[]; cursor: GroupCursor | null }>;
+  /**
+   * 区間 [start, end) の fence から、piece を子へ渡す。want は、グループごとに、子が欲しい piece を位置で指す。
+   * いまは、どの piece もグループの全体なので、子は `{ g, from: null }` だけを送る。
+   */
+  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number }): Promise<PiecePayload[]>;
+  ack(req: { pieces: Piece[] }): Promise<void>;
   /** 子が背景で全グループを引き取る。 */
-  drain(req: { start: number; end: number }): Promise<{ groups: number; rows: number; bytes: number }>;
+  drain(req: Interval): Promise<{ groups: number; rows: number; bytes: number }>;
   /**
    * 範囲を渡し終えた印を付ける。返す m は、このシャードがその範囲について発行した、どの時刻よりも大きい。
    * 受け取る側の finishIncoming に渡す。
    */
-  finishMove(req: { start: number; end: number }): Promise<{ m: Ts }>;
+  finishMove(req: Interval): Promise<{ m: Ts }>;
   /** 範囲を受け取り終えた印を付ける。時計を m まで進めてから、届かなかったグループ (渡す側に行がなかった) を受け持ち始める。 */
-  finishIncoming(req: { start: number; end: number; m: Ts }): Promise<void>;
+  finishIncoming(req: Interval & { m: Ts }): Promise<void>;
   metrics(req: Record<string, never>): Promise<ShardMetrics>;
   /** このシャードが健全かを運用者に見せるための状態。 */
   health(req: Record<string, never>): Promise<ShardHealth>;
@@ -285,14 +298,37 @@ export interface MetaApi {
   ddlSince(version: number): Promise<{ version: number; ddl: string[] }>;
 }
 
-/** 移動する 1 グループ分のデータ。同じ shard key の値を持つ全表の行と未解決の intent である。 */
-export interface GroupPayload {
+/**
+ * グループの中の位置。(表の名前, 主キーのキー文字列) で、表の名前の順、表の中は主キーの順に並ぶ。null は端を表す
+ * (after では先頭、upTo では末尾)。保存するときは JSON の文字列にする (端は `null`。src/shard/core.ts の posKey)。
+ */
+export type Pos = [table: string, pk: string] | null;
+
+/**
+ * 移動の単位 (docs/design-subslots.md の「piece の切り方」)。グループ g の行のうち、token が fence の区間 range に入り、位置が
+ * after より後のものである。位置の区間の終わり (upTo) は、渡す側が最初の pull で決めて記録する。(g, range, after) で 1 つに決まる。
+ * 1 通に収まるグループは、after も upTo も null の piece 1 つになる。いまは、どの piece もこの形である。
+ */
+export interface Piece {
   g: string;
+  /** この piece を切り出した fence の、token の区間。受け取る側では、受け取った範囲の区間である。 */
+  range: Interval;
+  after: Pos;
+}
+
+/** 子が欲しい piece。from は、子がそのグループで揃えた位置の続き (null は先頭から)。at は、要求が名指しした行の位置である。 */
+export type PieceWant = { g: string; from: Pos } | { g: string; at: Pos };
+
+/** 移動する 1 piece 分のデータ。区間 (after, upTo] にある全表の行と未解決の intent である。 */
+export interface PiecePayload extends Piece {
+  upTo: Pos;
+  /** 渡す側がこの piece を手放した時刻。受け取る側は、時計をここまで進める。 */
   m: Ts;
-  rows: { table: string; row: Row }[];
+  /** 行は、変更と同じくタプルで運ぶ。 */
+  rows: { table: string; row: Tuple }[];
   intents: Row[];
   /** 送り出した親の表定義の版。行はこの版の形をしている。 */
-  schema?: number;
+  schema: number;
 }
 
 /**
@@ -424,6 +460,11 @@ export interface Faults {
   staleWideRead?: boolean;
   /** 範囲を受け取り終えるとき、渡した側の時計を受け取らない (2026-11 までの挙動。モデル m5b_red_range)。 */
   finishWithoutClock?: boolean;
+  /**
+   * 受け取り終えた範囲の床を見ない (2026-11-14 までの挙動。モデル m5b_red_emptied)。渡した側が移動の前に空にしたグループを、
+   * 受け取った側が、移動より前の読みの時刻でも「行なし」と答える。
+   */
+  noRangeFloor?: boolean;
   /** index を作っている最中の表への書き込みを、シャードが断らない (モデル m12_red_no_lock)。 */
   ignoreTableLock?: boolean;
   /** index を公開する版を適用するとき、その版が運ぶ時刻まで時計を進めない (モデル m12_clock_red_no_clock)。 */
@@ -477,8 +518,13 @@ export class ReadTooOld extends Error {
 // 版 2 (2026-11-13): 値の表現を変えた (整数の値の REAL の印 `{ real }`、INTEGER と REAL の束縛。src/value.ts)。版 1 の要求の数は
 // 意味が違うので、受け付けない。値の表現を変えたのに版を上げ忘れていた (Codex の指摘 C5)。test/protocol.test.ts が、
 // 値の表現の見本の指紋を版ごとに持ち、表現が変わったのに版が同じなら落ちる。
-export const PROTOCOL_VERSION = 2;
-export const MIN_PROTOCOL_VERSION = 2;
+// 版 3 (2026-11-14): 配置を token の区間にした (docs/design-subslots.md の段 1)。範囲の単位が slot の番号 (4,096 個) から token に
+// なり、span の slots を claim (token の区間の組) に替え、pull、ack、finalize、abort がグループの名前ではなく piece を運ぶ。
+// 版 2 の要求は、範囲の数の意味も、移動の要求の形も違うので、受け付けない。
+// 版 4 (2026-11-14): 行イメージを、列名つきの object から、表定義の列の順のタプルにした (docs/design-values.md の段 2)。
+// Change の before と after、PiecePayload の rows、取引が溜める変更の形が変わる。版 3 の要求の行イメージは読めないので、受け付けない。
+export const PROTOCOL_VERSION = 4;
+export const MIN_PROTOCOL_VERSION = 4;
 
 export class VersionSkew extends Error {
   readonly retryable = true;
@@ -548,10 +594,14 @@ export function utf8Length(s: string): number {
  * Durable Object に保存しているデータの形式の版 (docs/storage-format.md)。内部の表の形や意味を、互換でない形で変えるときに上げる。
  * 新しいコードが書いた DO を古いコードが開くと、黙って壊すおそれがある。版が新しすぎれば起動を拒否する。
  * 上げるときは、古い版から 1 つずつ進める移行を STORAGE_MIGRATIONS に足し、古い版の材料を test/fixtures/storage/ に残す。
+ *
+ * 版 2 (2026-11-14): 行イメージをタプルにし、捕捉を共有の __cap(seq, tbl, old, new) にした (docs/design-values.md の段 2)。
+ * __intents.change と __log_g*.blob の行イメージ、Meta の __ddl が記録する捕捉の trigger の文、__cap の形が変わる。
+ * 最初の公開の前なので、版 1 からの移行は書かない (持ち主の決定、2026-11-14)。版 1 のデータは、移行がないと言って起動を拒否する。
  */
-export const STORAGE_FORMAT = 1;
+export const STORAGE_FORMAT = 2;
 
-/** 版 n の保存データを版 n + 1 にする移行。鍵は n である。Early 版 (1) の前の形式は持たない (公開前は後方互換を持たない)。 */
+/** 版 n の保存データを版 n + 1 にする移行。鍵は n である。最初の公開の前の形式は持たない (公開前は後方互換を持たない)。 */
 const STORAGE_MIGRATIONS: Record<number, (b: Backend) => void> = {};
 
 /** 保存形式の版を確かめる。初めて開く DO には現在の版を書く。古い版なら、移行を順に流す。 */

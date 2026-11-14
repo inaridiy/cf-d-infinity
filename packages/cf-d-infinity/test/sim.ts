@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Db, type ClientFaults, type Cluster } from "../src/client/db";
 import { MetaCore, type SplitMove, type SplitSlot } from "../src/meta";
-import { shardsOf } from "../src/routing";
+import { shardsOf, type Interval } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
 import { ShardCore, type SpanEscape } from "../src/shard/core";
@@ -19,6 +19,15 @@ export const DO_COMPOUND_SELECT_LIMIT = 5;
 export const DO_MAX_SQL_BYTES = 100_000;
 export const DO_MAX_BOUND_PARAMS = 100;
 export const DO_MAX_VALUE_BYTES = 2_000_000;
+/**
+ * DO の SQLite は、結果の列を 100 までに制限している (表の列の上限と同じ値。test/workerd-limits.test.ts が workerd で確かめている)。
+ * node:sqlite は 2,000 列まで受け付ける。ここで模さないと、101 列を返す文がシミュレータでだけ通る。
+ * 本物は、サブクエリと CTE の列の数にも同じ上限を掛ける。ここで見るのは、文の結果の列だけである。
+ */
+export const DO_MAX_RESULT_COLUMNS = 100;
+function checkDoColumns(count: number): void {
+  if (count > DO_MAX_RESULT_COLUMNS) throw new Error("too many columns in result set: SQLITE_ERROR");
+}
 function checkDoLimits(sql: string, params: Value[] = []): void {
   // 本物の DO は複合 SELECT の項を数える。シャードの側の確かめ (src/shard-limits.ts) と同じ数え方にする。引用符の中の識別子まで
   // 数えると、本物では通る文をここだけが断る (検査の誤り。2026-11-13)。
@@ -164,6 +173,7 @@ export class SqliteBackend implements Backend {
     checkDoLimits(b.sql, b.params);
     const st = this.db.prepare(b.sql);
     const p = b.params as never[];
+    checkDoColumns(st.columns().length);
     if (st.columns().length === 0) return (st.run(...p), []);
     const names = restoreColumns(st.columns().map((c) => c.name), b.columns);
     st.setReturnArrays(true);
@@ -177,6 +187,7 @@ export class SqliteBackend implements Backend {
     const st = this.db.prepare(b.sql);
     const p = b.params as never[];
     const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
+    checkDoColumns(columns.length);
     if (columns.length === 0) {
       st.run(...p);
       return { columns, rows: [] };
@@ -193,6 +204,7 @@ export class SqliteBackend implements Backend {
     const st = this.db.prepare(b.sql);
     const p = b.params as never[];
     const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
+    checkDoColumns(columns.length);
     if (columns.length === 0) {
       st.run(...p);
       return { columns, values: [] };
@@ -312,6 +324,11 @@ export interface SimOptions {
   recentMax?: number;
   /** 範囲の検査 (ShardDeps.spanEscape) を切る。既定では掛ける。 */
   noSpanCheck?: boolean;
+  /**
+   * 行イメージの検査 (src/shard/rows.ts の imageChecks。捕捉の変更後の行と本体の行、タプルの長さと表定義) を、このクラスタを作った
+   * 試験の間だけ切る。守りを外して古い欠陥を再現する試験が使う。既定では掛ける。
+   */
+  noImageCheck?: boolean;
   /** 仮想の実行環境の seed。同じ seed なら同じ実行になる。 */
   seed?: number;
   /** index を既存の行から作る間の、書き込み禁止の期限と、その上限 (ms)。既定は meta.ts の INDEX_LEASE_MS と INDEX_BUILD_MAX_MS。 */
@@ -327,6 +344,13 @@ export interface SimOptions {
 /** Worker と DO の間の RPC だけをシミュレートしたクラスタ。ShardCore は本物を動かす。 */
 /** このプロセスの全クラスタで見つかった、範囲の外の行に依存する文。test/setup.ts が試験ごとに確かめて空にする。 */
 export const allSpanEscapes: SpanEscape[] = [];
+/**
+ * RPC_TRACE=<ディレクトリ> のとき、このプロセスで作ったクラスタの網。test/setup.ts が試験ごとに、RPC の送り元、宛先、種類の列を
+ * 書き出して空にする。中身は書かない。変更の前後で、同じ seed の実行の RPC の列が同じかを比べるのに使う。
+ */
+export const tracedNets: SimNet[] = [];
+/** 行イメージの検査を、いまの試験の間だけ止めているか (SimOptions の noImageCheck)。test/setup.ts が試験ごとに戻す。 */
+export const imageCheckOff = { now: false };
 
 export class SimCluster implements Cluster {
   /** 起動時のシャード。増設後の一覧は catalog の routing を見る。 */
@@ -362,6 +386,8 @@ export class SimCluster implements Cluster {
     const injected = injectedFault();
     if (injected?.side === "shard") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
     this.clientFaults = injected?.side === "client" ? { ...o.clientFaults, [injected.name]: true } : o.clientFaults;
+    if (process.env.RPC_TRACE) tracedNets.push(this.net);
+    if (o.noImageCheck) imageCheckOff.now = true;
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
     this.runtime = this.virtual ?? systemRuntime;
     this.shardIds = o.stored ? [...o.stored.shards.keys()] : Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
@@ -532,7 +558,7 @@ export class SimCluster implements Cluster {
   applyDdl(sql: string, basedOn?: number) {
     return this.meta.applyDdl(sql, basedOn);
   }
-  switchRange(move: { start: number; end: number; to: string; from?: string }) {
+  switchRange(move: Interval & { to: string; from?: string }) {
     return this.meta.switchRange(move);
   }
   publishIndex(table: string, name: string, version: number, at: Ts) {
@@ -560,7 +586,7 @@ export class SimCluster implements Cluster {
    * 試験が分割の段を自分で進めるための、分割の枠。Autoscaler の split と同じく、全シャードに最新の版を適用させてから取る。
    * 返る id を、beginIncoming と fence に渡す。
    */
-  async reserveSplit(parent: string, child: string, range: { start: number; end: number }): Promise<SplitSlot> {
+  async reserveSplit(parent: string, child: string, range: Interval): Promise<SplitSlot> {
     const cat = await this.catalog();
     for (const id of shardsOf(cat.routing)) await this.shard(id).syncSchema({ version: cat.version });
     return this.meta.beginSplit({ parent, child, ...range }, cat.version);

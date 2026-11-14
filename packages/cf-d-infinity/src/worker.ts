@@ -5,7 +5,7 @@ import { exportPage, importRows, type ExportCursor } from "./transfer";
 export { importRows, type ExportCursor };
 import { collectMetrics, decide, DEFAULTS, healthProblems, needsFollowUp, nextShardNumber, split, splitsToResume, type AutoscalerState, type Thresholds } from "./autoscaler";
 import { MetaCore, type Catalog, type SplitMove } from "./meta";
-import { planSplit, shardsOf } from "./routing";
+import { planSplit, shardsOf, type Interval } from "./routing";
 import { ShardCore } from "./shard/core";
 import { batonSealer, handlePipeline, serveHranaSocket, type BatonSeal, type PipelineReq } from "./client/hrana";
 import { setSqlWasm } from "./sql/scratch";
@@ -240,7 +240,7 @@ export class DinfMeta extends DurableObject<Env> {
   revokeDdl(version: number, reason: string) {
     return this.core.revokeDdl(version, reason);
   }
-  switchRange(move: { start: number; end: number; to: string; from?: string }) {
+  switchRange(move: Interval & { to: string; from?: string }) {
     return this.core.switchRange(move);
   }
   publishIndex(table: string, name: string, version: number, at: number) {
@@ -281,7 +281,7 @@ export class DinfMeta extends DurableObject<Env> {
 interface SplitJob {
   parent: string;
   child: string;
-  range: { start: number; end: number };
+  range: Interval;
 }
 
 interface ScaleEvent {

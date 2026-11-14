@@ -106,9 +106,8 @@ All of it lives in `wrangler.jsonc`, or in `cloudflare.config.ts` if you use the
 
 ## License
 
-MIT. This package bundles [sql.js](https://github.com/sql-js/sql.js) (MIT) and depends on
-[`sql-parser-cst`](https://github.com/nene/sql-parser-cst), which is **GPL-2.0-or-later**: a Worker bundle built from this
-package is a combined work covered by the GPL, and distributing such a bundle requires complying with it. See `NOTICE`.
+MIT. This package bundles [sql.js](https://github.com/sql-js/sql.js) (MIT), which contains SQLite (public domain); see
+`NOTICE`. It has no runtime dependencies: the SQL parser is its own code.
 
 Documentation, design notes, benchmarks and the verification story are in the
 [repository](https://github.com/inaridiy/cf-d-infinity).

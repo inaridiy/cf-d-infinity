@@ -127,7 +127,7 @@ D1 との差は変更ログの 1 行で、これは過去時点の読み取り�
 
 分析の経路 (DuckDB、R2、Container) は、目標の OLTP に必須ではない。
 scatter の階層化、semijoin、本番でのスループットの追加計測も後にする。
-Serializable の既定、行ロック、merge を作らないこと、4,096 スロットの固定は変えない。
+Serializable の既定、行ロック、merge を作らないこと、スロットの数の固定は変えない (数は、2026-11-14 に配置を token の区間にしたときに、4,096 個から 65,536 個にした。[design-subslots.md](./design-subslots.md))。
 
 ## 増えすぎの検証についての訂正
 
@@ -157,7 +157,7 @@ Serializable の既定、行ロック、merge を作らないこと、4,096 ス�
 | 本番での黒箱検査 (障害、増設、版上げのデプロイを混ぜる) | 済。異常 0 件 ([benchmarks.md](./benchmarks.md)) |
 | 黒箱検査器の検出力 | 済。合成の異常 7 種と、シミュレータの欠陥スイッチ 3 種を検出する |
 | 3 取引の M9 | 全探索は深さ 16 まで。ランダム探索 約 300 万本 (最長 33 手) で違反なし |
-| ライセンス | MIT。パーサ (`sql-parser-cst`、GPL) は束ねずに依存として参照するので、npm の配布物は MIT のままである |
+| ライセンス | MIT。実行時の依存はない。パーサは 2026-11-14 に GPL の `sql-parser-cst` から自前のものに入れ替えた。束ねるのは sql.js (MIT) だけである |
 | 名前 | `cf-d-infinity` (表示名は D∞) に決定。利用者の Worker に入る名前は `DINF_` と `Dinf` で始める |
 | npm パッケージ | `cf-d-infinity` と `create-cf-d-infinity` を `npm pack` まで確認。公開は未 |
 | リポジトリの公開 | 未。git の初期化から |

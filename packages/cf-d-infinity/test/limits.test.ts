@@ -3,7 +3,7 @@
 import { describe, expect, it } from "vitest";
 import { split } from "../src/autoscaler";
 import { Db } from "../src/client/db";
-import { ownerOf } from "../src/routing";
+import { REGION_TOKENS, ownerOf } from "../src/routing";
 import { GROUP_MAX_BYTES } from "../src/shard/core";
 import { MAX_WRITE_SET_BYTES } from "../src/types";
 import { quiescentProblems } from "./invariants";
@@ -168,17 +168,17 @@ describe("a shard split", () => {
     const c = new SimCluster({ shards: 1 });
     await c.client().ddl(DOCS);
     const { routing } = await c.catalog();
-    const range = { start: 0, end: 4096 };
+    const range = { start: 0, end: REGION_TOKENS };
     void routing;
     const rows = Math.ceil(GROUP_MAX_BYTES / 900_000) + 1;
     for (let i = 1; i <= rows; i++) await new Db(c).query("INSERT INTO docs VALUES (7, ?, ?)", [i, text(900_000)]);
-    await expect(c.shard("s0").pull({ groups: [JSON.stringify([7])], to: "s1", maxBytes: 1_000_000 }).catch(async (e: Error) => {
+    await expect(c.shard("s0").pull({ ...range, want: [{ g: JSON.stringify([7]), from: null }], to: "s1", maxBytes: 1_000_000 }).catch(async (e: Error) => {
       // fence していない範囲の pull は別の理由で断られるので、fence してから試す。
       if (!/unfenced/.test(e.message)) throw e;
       const slot = await c.reserveSplit("s0", "s1", range);
       await c.shard("s1").beginIncoming({ ...range, from: "s0", slot: slot.id });
       await c.shard("s0").fence({ ...range, to: "s1", slot: slot.id });
-      return c.shard("s0").pull({ groups: [JSON.stringify([7])], to: "s1", maxBytes: 1_000_000 });
+      return c.shard("s0").pull({ ...range, want: [{ g: JSON.stringify([7]), from: null }], to: "s1", maxBytes: 1_000_000 });
     })).rejects.toThrow(/group too large to move: shard key \[7\]/);
   }, 60000);
 });

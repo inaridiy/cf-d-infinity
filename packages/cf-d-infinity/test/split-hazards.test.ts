@@ -67,7 +67,7 @@ describe("a split that is interrupted or repeated", () => {
     // シャードに直接頼んでも通らない。
     // 枠を示さない fence も、枠のある別の子への fence も通らない。
     await expect(c.shard("s0").fence({ ...range, to: "s2", slot: "none" })).rejects.toThrow(/split slot/);
-    await expect(c.shard("s0").pull({ groups: ["[1]"], to: "s2", maxBytes: 1000 })).rejects.toThrow();
+    await expect(c.shard("s0").pull({ ...range, want: [{ g: "[1]", from: null }], to: "s2", maxBytes: 1000 })).rejects.toThrow();
     await expect(c.switchRange({ ...range, to: "s2", from: "s9" })).rejects.toThrow(/owned by s0, not by s9/);
     // 1 つ目の増設をやり直すまで、その範囲は読めない (親は fence 済みで、範囲表はまだ親を指している)。行は失われていない。
     expect(await outcome(split(c, "s0", "s1", { range }))).toBe("ok");

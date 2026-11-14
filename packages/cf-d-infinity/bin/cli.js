@@ -318,7 +318,11 @@ async function status(opts) {
   if (opts.json) console.log(JSON.stringify(s, null, 2));
   else {
     const slots = new Map();
-    for (const r of s.routing.ranges) slots.set(r.shard, [...(slots.get(r.shard) ?? []), `${r.start}-${r.end - 1}`]);
+    // 範囲表の区間は token (slot × 65536 + subslot) である。両端が slot の境目にある区間は、slot の番号で出す。
+    const SUBSLOTS = 65536;
+    const range = (r) => (r.start % SUBSLOTS === 0 && r.end % SUBSLOTS === 0
+      ? `${r.start / SUBSLOTS}-${r.end / SUBSLOTS - 1}` : `tokens ${r.start}-${r.end - 1}`);
+    for (const r of s.routing.ranges) slots.set(r.shard, [...(slots.get(r.shard) ?? []), range(r)]);
     const health = new Map(s.health.map((h) => [h.id, h]));
     console.log(`${s.shards.length} shards, schema version ${s.schema}, routing version ${s.routing.version}`);
     console.log(table(["shard", "slots", "size", "waiting", "unapplied", "moving"], s.shards.map((id) => {

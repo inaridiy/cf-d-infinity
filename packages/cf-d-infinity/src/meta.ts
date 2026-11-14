@@ -2,7 +2,7 @@ import { SqlError, checkStorageFormat, type Backend, type Faults, type TableDef,
 import { parseDdl, publishBuild, type IndexInfo, type ParsedDdl, type SchemaView } from "./sql/ddl";
 import { systemRuntime, type Runtime } from "./runtime";
 import { CAPTURE_TABLES } from "./shard/rows";
-import { applyMove, initialRouting, type Routing } from "./routing";
+import { applyMove, checkInterval, contains, initialRouting, overlaps, rangeText, sameInterval, type Interval, type Routing } from "./routing";
 
 export interface DdlEntry extends ParsedDdl {
   version: number;
@@ -62,18 +62,26 @@ export class SchemaBusy extends Error {
  * 枠を取った直後は期限がある。分割を進める側が、子が受け取り始める前に止まっても、枠が残らないようにするためである。
  * 子が受け取り始めると (startSplit)、期限を外す。分割は取り消せないので、進める側 (Autoscaler) が再開して終える。
  */
-export interface SplitSlot {
+export interface SplitSlot extends Interval {
   id: string;
   parent: string;
   child: string;
-  start: number;
-  end: number;
   /** 分割の版。子はこの版で受け取り始め、親はこの版まで追いついてから fence する。 */
   version: number;
   started: boolean;
   until: number;
 }
+/** 分割の同一性。親、子、移す区間 (token) で決まる。 */
 export type SplitMove = Pick<SplitSlot, "parent" | "child" | "start" | "end">;
+const sameSplit = (a: SplitMove, b: SplitMove): boolean => a.parent === b.parent && a.child === b.child && sameInterval(a, b);
+/** 区間の形を確かめる。おかしな区間を、範囲表や枠に書かない。 */
+function assertInterval(x: Interval): void {
+  try {
+    checkInterval(x);
+  } catch (e) {
+    throw new SqlError((e as Error).message);
+  }
+}
 
 /** 表への書き込みを止めている作業の名前。誤りの文に使う。 */
 function describe(e: DdlEntry): string {
@@ -140,16 +148,17 @@ export class MetaCore {
     return first;
   }
 
-  /** 範囲表を切り替える。これが増設の線形化点である。 */
-  async switchRange(move: { start: number; end: number; to: string; from?: string }): Promise<Routing> {
+  /** 範囲表を切り替える。これが増設の線形化点である。移すのは token の区間で、区間の境目は、どの token にも置ける。 */
+  async switchRange(move: Interval & { to: string; from?: string }): Promise<Routing> {
+    assertInterval(move);
     const current = this.routing();
-    const done = current.ranges.some((x) => x.shard === move.to && x.start <= move.start && x.end >= move.end);
+    const done = current.ranges.some((x) => x.shard === move.to && contains(x, move));
     if (done) return current; // 増設の手順はやり直せるので、切り替えも冪等にする。
     // 範囲の持ち主が、呼び出し側の思っている親でなければ断る。別の増設が先に切り替えていると、その子が持つ行を
     // 範囲表が指さなくなる。
-    const owners = [...new Set(current.ranges.filter((x) => x.start < move.end && move.start < x.end).map((x) => x.shard))];
+    const owners = [...new Set(current.ranges.filter((x) => overlaps(x, move)).map((x) => x.shard))];
     if (move.from !== undefined && !(owners.length === 1 && owners[0] === move.from)) {
-      throw new SqlError(`slots [${move.start}, ${move.end}) are owned by ${owners.join(", ")}, not by ${move.from}`);
+      throw new SqlError(`${rangeText(move)} are owned by ${owners.join(", ")}, not by ${move.from}`);
     }
     const next = applyMove(current, move);
     this.b.exec(`INSERT INTO __routing(version, body) VALUES (?, ?)`, next.version, JSON.stringify(next));
@@ -216,13 +225,17 @@ export class MetaCore {
   async beginSplit(move: SplitMove, basedOn: number): Promise<SplitSlot> {
     this.expire();
     const list = this.splitSlots();
-    const same = list.find((x) => x.parent === move.parent && x.child === move.child && x.start === move.start && x.end === move.end);
+    const same = list.find((x) => sameSplit(x, move));
     if (same) return same;
     const cat = this.current();
     if (basedOn !== cat.version) throw new SchemaMoved(cat.version);
     const h = this.holders();
     if (h.exclusive) throw new SchemaBusy(describe(h.exclusive));
-    const slot: SplitSlot = { id: `split:${move.parent}:${move.child}:${move.start}:${move.end}`, ...move, version: cat.version, started: false, until: this.rt.now() + this.leaseMs };
+    assertInterval(move);
+    const slot: SplitSlot = {
+      id: `split:${move.parent}:${move.child}:${move.start}:${move.end}`,
+      parent: move.parent, child: move.child, start: move.start, end: move.end, version: cat.version, started: false, until: this.rt.now() + this.leaseMs,
+    };
     this.setSplitSlots([...list, slot]);
     return slot;
   }
@@ -234,7 +247,7 @@ export class MetaCore {
     const slot = list.find((x) => x.id === id);
     // 欠陥のスイッチ: 枠が期限で消えていても断らず、いまの版で受け取り始めさせる。枠のないまま分割が進み、DDL が記録される。
     if (!slot && this.faults.startWithoutSlot) return { version: this.current().version };
-    if (!slot || slot.parent !== move.parent || slot.child !== move.child || slot.start !== move.start || slot.end !== move.end) {
+    if (!slot || !sameSplit(slot, move)) {
       throw new SqlError(`split ${id}: no such split slot (it expired before the child started, or it is for another range)`);
     }
     if (!slot.started) this.setSplitSlots(list.map((x) => (x.id === id ? { ...x, started: true } : x)));
@@ -245,7 +258,7 @@ export class MetaCore {
   async checkSplit(id: string, move: SplitMove): Promise<void> {
     if (this.faults.fenceWithoutSlot) return;
     const slot = this.splitSlots().find((x) => x.id === id);
-    if (!slot?.started || slot.parent !== move.parent || slot.child !== move.child || slot.start !== move.start || slot.end !== move.end) {
+    if (!slot?.started || !sameSplit(slot, move)) {
       throw new SqlError(`split ${id}: the split slot is not held, or the child has not started receiving`);
     }
   }

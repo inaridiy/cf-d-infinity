@@ -73,5 +73,13 @@ describe.skipIf(!process.env.ROWCOST)("billed rows per operation", () => {
       { sql: "UPDATE b SET n = n - 1 WHERE tenant_id = ? AND id = 1", params: [(i % 100) + 1] },
       { sql: "UPDATE b SET n = n + 1 WHERE tenant_id = ? AND id = 1", params: [(i % 100) + 101] }] }));
     await measure("insert with global unique index", (i) => sql("INSERT INTO u(tenant_id,id,email) VALUES (?,1,?)", [i + 1, `u${i}@x`]));
+    // 主キーで 1 行に絞れない UPDATE は、RETURNING ではなく trigger で捕捉する。下書きの実行を巻き戻しても、捕捉が書いた行は課金される。
+    // 1 行を変える文の捕捉が書くのは、共有の __cap の 1 行と __cap_on の 1 行である (docs/design-values.md の「費用」。段 1 までは、
+    // 写しの表 __capv_<表> にも 1 行書いた)。テナント 101 から 140 は、行が 1 つずつである (上の INSERT は 1 から 40 に 2 つ目の行を
+    // 足した)。下書きの UPDATE とその中の __cap への INSERT は、どちらも "UPDATE b" に数えられる。下書き 2 行、本体の適用 1 行、
+    // __cap_on 1 行、変更ログ 1 行で 5 行になる (段 1 は 6 行。2026-11-14、手元の workerd)。
+    const captured = await measure("update one row by shard key, captured by the trigger", (i) =>
+      sql("UPDATE b SET n = n + 1 WHERE tenant_id = ? AND n >= 0", [(i % 40) + 101]));
+    expect(captured, "rows billed by the trigger capture, the body and the log").toBeLessThanOrEqual(5);
   }, 300000);
 });

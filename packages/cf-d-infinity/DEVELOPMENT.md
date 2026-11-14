@@ -14,7 +14,7 @@ await db.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)");
 await db.execute({ sql: "INSERT INTO users(name) VALUES (?)", args: ["alice"] });
 ```
 
-シャードの本体 `src/shard/core.ts` は DO に依存しないので、同じコードが node:sqlite (`test/sim.ts`) と workerd (`src/worker.ts`) の両方で動く。
+シャードの本体 (`src/shard/kernel.ts` と `src/shard/core.ts`) は DO に依存しないので、同じコードが node:sqlite (`test/sim.ts`) と workerd (`src/worker.ts`) の両方で動く。
 SQLite との差分は [docs/sql-language.md](../../docs/sql-language.md) にある。
 
 ## 動かす
@@ -141,7 +141,9 @@ intent が残っていないこと、確定した取引が全部適用済みで�
 sql.js は `lib/cloudflare.js` に束ねる。
 sql.js の Node 向けの分岐が `fs`、`path`、`crypto` を参照するので、束ねずに出すと利用者の `wrangler.jsonc` に `alias` が要るからである。
 `src/sql-wasm.wasm` は sql.js 1.13.0 の `dist/sql-wasm.wasm` の写しで、ビルドが一致を検査する。
-`sql-parser-cst` (GPL-2.0-or-later) は束ねず、依存として参照する。束ねると配布物そのものが GPL の結合著作物になる。
+実行時の依存はない。
+SQL のパーサは自前である (`src/sql/lexer.ts`、`parser.ts`、`printer.ts`)。
+2026-11-14 までは `sql-parser-cst` (GPL-2.0-or-later) を依存として参照していて、D∞ を組み込んだ Worker は GPL の結合著作物になっていた。
 
 利用者の Worker に入る名前には、衝突を避けるために接頭辞を付けている。
 binding と変数は `DINF_`、クラスは `Dinf` で始まる。
@@ -185,19 +187,23 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 
 | パス | 内容 |
 |---|---|
-| `src/shard/core.ts` | シャードのプロトコル (rollback-read、検証、anchor 2PC、回復、ライブ移動)。要求の入口は、待つ段 (表定義の適用、グループの到着、intent の決着、行ロック) の後、`enter` を通って同期区間に入る。待ちの後の確かめ直し (表定義の版、範囲の持ち主) は `enter` にだけあり、文の実行と検証は `enter` が返す印を受け取る |
-| `src/shard/rows.ts` | 行の適用と set-based undo |
+| `src/shard/kernel.ts` | シャードの核。状態を読み書きするのは、ここだけである (rollback-read、検証、anchor 2PC、回復、ライブ移動)。同期で、async の関数を持たない (`test/determinism.test.ts` が確かめる)。要求は、同期の 1 歩 (`xxxStep`) で処理する。1 歩は、frame (待ちをまたいで残るデータ) を見て、終えるか、待ちたいこと (Effect) を返す。待ちの後の確かめ直し (表定義の版、範囲の持ち主) は `enter` にだけあり、文の実行と検証は `enter` が返す印を受け取る。印は frame に入れられないので、待ちの後へ持ち越せない |
+| `src/shard/core.ts` | シャードの殻 (`ShardCore`)。核の 1 歩を呼び、返った待ち (相手のシャード、Meta、保存先の確定、行ロック、タイマー) を実行して、同じ 1 歩を先頭から呼び直す。状態は持たない (待ちの合流のための Promise だけを持つ) |
+| `src/shard/step.ts` | 核と殻の間の型 (Effect、Step、Fork) |
+| `src/shard/rows.ts` | 行イメージ (表定義の列の順のタプル) の読み書き、行の適用と set-based undo、変更の捕捉 (共有の `__cap` に書く trigger) |
 | `src/client/db.ts` | Worker 側の入口。OCC の取引、経路決定、scatter |
 | `src/client/d1.ts` | D1 互換 API |
 | `src/client/hrana.ts` | Hrana over HTTP と WebSocket、baton の署名 |
 | `src/sql/plan.ts` | 文の実行場所の決定、条件の押し下げ |
 | `src/sql/ddl.ts` | DDL の解釈、index の配置 |
 | `src/sql/scratch.ts` | Worker の中の SQLite (sql.js) |
-| `src/sql/cst.ts` | パーサのラッパー |
+| `src/sql/lexer.ts`、`parser.ts`、`printer.ts` | SQLite の方言の字句解析、構文解析、文面への出し直し |
+| `src/sql/cst.ts` | 構文木の入口。解析の前の書き換え、引数の束縛、定数の読み取り |
 | `src/meta.ts` | 表定義、DDL 履歴、範囲表、index の作成と書き込み禁止の期限、保守の操作の枠 |
-| `src/value.ts` | 値の格納の型 (INTEGER と REAL)。束縛の関数 `bindTyped` (DO、シミュレータ、Worker の SQLite の 3 つの Backend が通す) |
-| `src/keys.ts` | キー文字列を作る関数 (`keyString` と、trigger の中の `keySql`)。SQLite の型の親和性を写す `storedAs` |
-| `src/routing.ts` | 4,096 スロットの範囲表 |
+| `src/value.ts` | 値の格納の型 (INTEGER と REAL)。束縛の関数 `bindTyped` (DO、シミュレータ、Worker の SQLite の 3 つの Backend が通す)。行イメージの要素とタプル (`tupleSql`、`decodeElem`) と、要素を今の値に戻す橋 `fromTypedValue` |
+| `src/keys.ts` | キー文字列を作る関数 (`keyString`) と読み戻す関数 (`keyValues`、`keyParams`)。SQLite の型の親和性を写す `storedAs` |
+| `src/sql/depth.ts` | 式の木の深さの見積もり (DO の SQLite の上限は 100)。表を作るときに、D∞ が作る文を確かめる |
+| `src/routing.ts` | 範囲表と、行の置き場所の計算。置き場所は token (region、65,536 個の slot、その中の 65,536 個の subslot を並べた 40 ビットの整数) で、範囲表は token の区間をシャードに対応させる。いまの区間は、どれも両端が slot の境目にある ([docs/design-subslots.md](../../docs/design-subslots.md) の段 1) |
 | `src/autoscaler.ts` | 増設の判断と手順 |
 | `src/analytics.ts` | 変更ログの収集と watermark |
 | `src/worker.ts` | 本番の入口。DO への配線、認証、HTTP と WebSocket、Cron |
@@ -217,11 +223,16 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `test/compat.test.ts` | 本物の SQLite との差分テスト (手書き) |
 | `test/fuzz.test.ts` | 本物の SQLite との差分テスト (乱数) |
 | `test/slt.test.ts`、`test/slt-more.test.ts` | SQLite の sqllogictest |
+| `test/parser.test.ts` | パーサ。受け付けるかどうかを本物の SQLite の構文の判定と比べる。計画の組み立てが読む木の形の見本、文面への出し直し |
+| `test/contextual-words.test.ts` | 場所で読み方の変わる語 (結合の語、関数の引数の `ALL`、空の `IN ()`、CR)。結果と列名を本物の SQLite と比べる。基準経路だけの実行でも流す |
+| `test/parser-oracle.test.ts` | 入れ替える前のパーサ (`sql-parser-cst`、GPL) との突き合わせ。依存には入れていないので、`npm install --no-save sql-parser-cst@0.33.1` で入れたときだけ動く。`PARSER_CORPUS=<dir>` で試験の全部が解析した文を書き出し、`PARSER_ORACLE_CORPUS=<dir>` で読む |
 | `test/prod.test.ts` | 本番の Worker への確認。`PROD_URL` があるときだけ動く |
 | `test/counterexamples.test.ts` | 設計レビューと形式モデルの反例。欠陥スイッチを入れると壊れ、外すと直ることを確かめる |
 | `test/history.test.ts` | ランダムな並行実行が commit 時刻順の直列実行と一致すること (時計のずれ、遅延、再起動あり)。チェッカが欠陥を検出できることも確かめる |
 | `test/rollback-read.test.ts` | どの過去時点も正確に再構成できること |
 | `test/migration.test.ts` | ライブ移動、`m5b` の反例、Autoscaler の判断 |
+| `test/routing.test.ts` | 範囲表。前の 4,096 個の slot の境目で動かすかぎり、token にする前の範囲表と同じ持ち主になること。区間の移動を乱択で重ねても、どの token にも持ち主がちょうど 1 つあること。行の置き場所の値 |
+| `test/placement-formats.test.ts` | token の区間にした後の形式。Meta の範囲表と分割の枠、シャードの移動の記録、piece を運ぶ要求の形と、まだ扱えない形 (ブロックを途中で切る移動、グループの一部の piece) を断ること |
 | `test/workerd.test.ts` | 本物の workerd と DO の SQLite での結合テスト |
 | `test/ddl-concurrent.test.ts`、`test/ddl-harness.ts` | 取引と並行する DDL。index の作成、UNIQUE、DROP、列の追加、分割との競合を乱数の作業負荷で回し、index と表の一致、確定した書き込みの残存、表定義の収束を見る。見つかった欠陥の再現も含む |
 | `test/limits.test.ts` | シャード側の上限。結果の行数とバイト数、取引の大きさ、グループの列挙と大きさ |
@@ -234,7 +245,7 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `test/contention.test.ts` | 競合時の取引の失敗率。`CONTENTION=1` のときだけ動く |
 | `test/gc.test.ts` | 変更ログと取引記録の GC。窓の外を必要とする読みが黙って間違えないこと、古い COMMIT の拒否 |
 | `test/rowcost.test.ts` | 1 操作あたりの課金行数を workerd で数え、上限を検査する。`ROWCOST=1` のときだけ動く |
-| `test/protocol.test.ts` | 新旧コードが混在するときの版の検査 |
+| `test/protocol.test.ts` | 新旧コードが混在するときの版の検査。値の表現と、範囲の移動が運ぶ形の見本の指紋を、版ごとに持つ |
 | `test/elle.test.ts` | 黒箱の検査器が既知の異常 (G0、G1a、G1c、G2、消失、順序の矛盾) を検出すること |
 | `test/elle-sim.test.ts` | 黒箱検査をシミュレータで回す。欠陥スイッチを入れた実装で異常を検出すること |
 | `test/bench-build.test.ts` | 計測用の構成。障害注入を挟んだ負荷と黒箱検査 |

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { logRows, ORDERS, REFERENCE_ONLY, SimCluster, USERS } from "./sim";
-import { slotOf } from "../src/routing";
+import { REGION_TOKENS, slotOf } from "../src/routing";
 
 async function setup(opts = {}) {
   const c = new SimCluster(opts);
@@ -11,7 +11,7 @@ async function setup(opts = {}) {
 }
 /** 別シャードに載る tenant を 2 つ探す。 */
 function twoTenants(c: SimCluster): [number, number] {
-  const s = (t: number) => Math.floor((slotOf(JSON.stringify([t])) * c.shardIds.length) / 4096);
+  const s = (t: number) => Math.floor((slotOf(JSON.stringify([t])) * c.shardIds.length) / REGION_TOKENS);
   for (let b = 2; ; b++) if (s(b) !== s(1)) return [1, b];
 }
 
@@ -73,7 +73,7 @@ describe("writes go through SQLite itself, not through the parser", () => {
     await db.query("INSERT OR REPLACE INTO p(tenant_id,id,code) VALUES (1,2,'a')");
     await c.settle();
     expect((await db.query("SELECT id FROM p WHERE tenant_id = 1")).rows).toEqual([{ id: 2 }]);
-    const log = logRows(c.backends.get(c.shardIds[Math.floor((slotOf("[1]") * c.shardIds.length) / 4096)]!)!).slice(-1);
+    const log = logRows(c.backends.get(c.shardIds[Math.floor((slotOf("[1]") * c.shardIds.length) / REGION_TOKENS)]!)!).slice(-1);
     const logged = JSON.parse(log[0]!.blob as string) as { pk: string; after: unknown }[];
     expect(logged.map((l) => [l.pk, l.after === null])).toEqual(expect.arrayContaining([["[1,1]", true], ["[1,2]", false]]));
   });

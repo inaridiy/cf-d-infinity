@@ -10,11 +10,23 @@ Test references are `packages/cf-d-infinity/test/<file>.test.ts:<line>` or a tes
 counterexample.
 
 Categories:
-- A: the implementation has the guard, and a deterministic replay exists (71 rows; every row with a guard).
-  Of these, 49 also have a fault switch, and the replay checks that the switch produces the violation. 16 have no switch,
-  and 6 have a switch whose replay runs only the fixed code; for those 22 the replay checks the fixed code on the
-  model's ordering, not that removing the guard breaks it. (Recounted from this table on 2026-11-13.)
+- A: the implementation has the guard, and a deterministic replay exists (74 rows; every row with a guard).
+  Of these, 51 also have a fault switch, and the replay checks that the switch produces the violation. 17 have no switch,
+  and 6 have a switch whose replay runs only the fixed code; for those 23 the replay checks the fixed code on the
+  model's ordering, not that removing the guard breaks it. (Recounted from this table on 2026-11-13; the three M5b range-floor rows were added on 2026-11-14.)
 - D: a design alternative the implementation never had or no longer has, or a variant another mechanism already covers; no switch needed (13 rows, M16 and M17 included).
+- P: models for a mechanism that is designed but not in the code yet, so there is no guard to switch off. M18
+  (`specs/m18_subslot_split.qnt`), M19 (`m19_claim_resplit.qnt`) and M20 (`m20_unique_piecewise.qnt`) model moving one
+  tenant in pieces, stages 2 to 4 of [design-subslots.md](./design-subslots.md). Their 16 red modules get rows, switches
+  and replays together with the implementation: `m18_red_partial_answer`, `m18_red_child_partial`,
+  `m18_red_answer_held`, `m18_red_piece_without_clock`, `m18_red_write_by_slot`, `m18_red_intents_by_group`,
+  `m19_red_stale_map`, `m19_red_mixed_t`, `m19_red_gap`, `m19_red_forget_map`, `m19_red_piece_without_clock`,
+  `m19_live_red_child_waits`, `m20_red_piecewise`, `m20_red_late_intent`, `m20_red_child_early`,
+  `m20_red_child_reads_parent_per_piece`.
+  M21 (`m21_catalog_epoch.qnt`) models one epoch log in Meta in place of today's separate schema versions, write
+  bans and split slot ([design-catalog-epoch.md](./design-catalog-epoch.md)). Its 31 red modules (the `red` lines of
+  the M21 section of `specs/check.sh`) get rows when the design is implemented. Many of them restate a red of M11 to
+  M15 that already has a row here; those rows move to M21 when M12, M14 and M15 are retired.
 
 | module | flaw modelled | fault switch | deterministic replay | cat |
 |---|---|---|---|---|
@@ -35,6 +47,9 @@ Categories:
 | m5b_red_p2_window | phase 2 applied at parent while the pull reply is in flight | applyAfterMoved | migration:170 | A |
 | m5b_red_intents | pull does not carry intents | dropIntentsOnMove | migration:182 | A |
 | m5b_red_range | finishing a move does not pass the parent clock to the child | finishWithoutClock | move-timestamp:54 | A |
+| m5b_red_emptied | child answers "no rows" at an old read time for a group the parent emptied before the move (no range floor) | noRangeFloor | old-read-of-emptied-group ("put back (m5b_red_emptied): without the range floor ..."; added 2026-11-14) | A |
+| m5b_red_floor_volatile | the range floor is forgotten when the child restarts | none (the floor is read back from `__incoming` at boot) | old-read-of-emptied-group ("is refused after the child restarted, too (m5b_red_floor_volatile) ..."; fixed) | A |
+| m5b_red_floor_no_clock | the floor is kept but the parent's clock is not handed over when the move finishes | finishWithoutClock | move-timestamp:54 (the clock hand-over; the model's emptied-group ordering is not replayed) | A |
 | m6_red_dirty | dirty reported only on intent write | none | none | D |
 | m6_red_resolved | flush at HLC instead of resolved ts | flushPastIntents | analytics ("the analytics flush stops below unresolved intents (m6_red_resolved)"; added 2026-11-12). The analytics path is not wired into the deployed Worker | A |
 | m6_red_skew | clock skew plus report delay exceeds MARGIN | none | none | D |
@@ -64,7 +79,7 @@ Categories:
 | m11_impl_backfill | BUG-2: row changes between backfill read and write | ignoreTableLock | unique-index-build:109; ddl-concurrent:368 | A |
 | m11_impl_chunk | BUG-1: same-shard duplicate overwritten in backfill | none | ddl-concurrent:334 (fixed) | A |
 | m11_impl_drop | BUG-5: committed intent applied to recreated table | ddlIgnoresIntents | review-regressions:181; ddl-concurrent:495 | A |
-| m11_red_no_reject | shard accepts stale-version requests | none (check at core.ts:347) | migration:234 (fixed, guard-only) | A |
+| m11_red_no_reject | shard accepts stale-version requests | none (check in `schemaStep`, src/shard/kernel.ts) | migration:234 (fixed, guard-only) | A |
 | m11_red_early_public | index public before backfill finishes | publishBeforeBackfill (added 2026-11-12; publishes before any entry is written, as in the model's trace) | unique-index-build ("a UNIQUE index that spans shards is published after the existing rows are indexed (m11_red_early_public)"; added 2026-11-12) | A |
 | m11_red_no_write_only | writes skip a write-only index | none | none | D |
 | m11_red_no_sync | DDL returns before all shards applied it | none (stub at ddl-concurrent:687, seed sweep) | migration:247 (fixed) | A |

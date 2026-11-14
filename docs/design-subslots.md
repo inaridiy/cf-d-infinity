@@ -1,6 +1,6 @@
 # subslot による配置の 2 段化の設計
 
-状態：設計の案。実装はまだない。モデルは M18 (`specs/m18_subslot_split.qnt`) にある
+状態：設計。持ち主の判断を末尾に記した (2026-11-14)。同じ日に、形式を token の区間に改めた (「結論」と「形式」の節)。段 1 (形式と配線) は実装した。段 2 から先の実装はまだない。モデルは M18 (`specs/m18_subslot_split.qnt`) にある
 作成日：2026-11-14
 前提：[scaling.md](./scaling.md)、[storage-format.md](./storage-format.md)、[specs/README.md](../specs/README.md) の M5b、M15、M18
 
@@ -12,13 +12,14 @@
 
 `SHARD KEY` 句をなくした後に残る 2 つの崖 (16 MB を超えるグループは運べない、1 つのテナントは 1 つのシャードを超えられない) を、配置の 2 段目で解く。
 slot は今までどおり `hash(shard key)` で、これに `subslot = hash(主キーの全体) mod 65536` を足す。
+2 つを並べた整数を行の token と呼び、範囲表は token の区間をシャードに対応させる。
 
 | 要素 | 決定 |
 |---|---|
-| 行の subslot | `hashKey(主キーのキー文字列)` の下位 16 ビット。行ごとに保存するものはない |
-| 範囲表 | 項目に subslot の範囲 `sub` を足す。省いた項目は slot の全体を持つ |
-| span の claim | shard key で絞る span と全表の span が、宛先のシャードの (slot の範囲, subslot の範囲) を運ぶ |
-| piece | (グループ, fence の subslot の範囲, 主キーの順の区間)。M18 の piece を、主キーの順でさらに切る |
+| 行の token | `region × 2^32 + slot × 2^16 + subslot` の 40 ビットの整数。region はいまは 0。slot は `hashKey(shard key のキー文字列)` の上位 16 ビット (65,536 個。今までは 4,096 個)、subslot は `hashKey(主キーのキー文字列)` の下位 16 ビット。行ごとに保存するものはない |
+| 範囲表 | token の半開区間 `[start, end)` をシャードに対応させる。同じ shard key の行は連続した 65,536 個の token (その slot のブロック) に載り、区間の境目をブロックの中に置くと、その shard key の行が 2 つのシャードに分かれる |
+| span の claim | shard key で絞る span と全表の span が、宛先のシャードが持つ token の区間を運ぶ |
+| piece | (グループ, fence の token の区間, 主キーの順の区間)。M18 の piece を、主キーの順でさらに切る |
 | 答えの絞り込み | 行を絞らない。claim の外の行を持っている間は、断る |
 | 分かれた slot の文 | 1 シャードで答えられない文は、基準経路で実行する |
 | 段 | 4 段。形式、piece 単位の移動、分かれた slot の経路、slot を割る移動 |
@@ -27,20 +28,41 @@ slot は今までどおり `hash(shard key)` で、これに `subslot = hash(主
 piece の境目を subslot の部分範囲ではなく主キーの順の区間にすることと、答えを絞らずに断ることである。
 理由と、M18 が何を保証し続けるかは、それぞれの節に書く。
 
+形式は、初めは (slot の範囲, subslot の範囲) の長方形で書いた。
+2026-11-14 の設計の見直しで、1 本の token の区間に改めた。
+置き場所は同じである。
+長方形の案が作るのは、幅 1 の slot を subslot の範囲で切った項目だけで、それは「slot のブロックの中に境目を置いた区間」としてそのまま書ける。
+区間にすると、範囲表の項目、claim、fence、piece の範囲が、どれも同じ 1 種類の物 (半開区間) になり、長方形を切り分ける規則も、slot の全体を表す 2 通りの書き方を揃える規則も要らなくなる。
+token の上位 8 ビットを region として空けてあるので、行ごとに置く地域を決める拡張を、形式を変えずに足せる。
+slot は、token の桁に合わせて 4,096 個から 65,536 個に細かくした。
+前の slot 1 つは、いまの slot 16 個にちょうど当たるので、前の slot の境目は、どれも今の slot の境目でもある。
+この文書の「形式」より後ろの節は、長方形の言葉のまま残してある。
+「slot を subslot の範囲で割る」は「区間の境目を、その slot のブロックの中に置く」ことで、`sub` は「fence や claim の区間のうち、その slot のブロックに重なる部分」のことである。
+
 持ち主の判断が要ることが 4 つあり、末尾にまとめた。
 
 ## 形式
 
-### 行の subslot
+### 行の token
 
-`src/routing.ts` に `SUBSLOTS = 65536` と `subslotOf(pk) = hashKey(pk) & 0xffff` を足す。
+`src/routing.ts` に、行の token を足す。
+
+    token = region × 2^32 + slot × 2^16 + subslot
+
+- region は、いまは 0 である。行ごとに置く地域を決める拡張のために 8 ビットを空けてあり、実装はしない。
+- slot は `hashKey(sk)` の上位 16 ビットである (`SLOTS = 65536`)。今までは上位 12 ビット (4,096 個) だった。
+- subslot は `subslotOf(pk) = hashKey(pk) & 0xffff` である (`SUBSLOTS = 65536`)。
+
+token は 40 ビットで、JS の安全な整数に収まる。ビット演算は 32 ビットで切れるので、掛け算と足し算で作る。
 `pk` は主キーのキー文字列で、`encodeKey` (`src/shard/rows.ts:134`) が作り、`Change.pk` と `__intents.pk` が持っている。
 表の名前は混ぜない。
+同じ shard key の行は、連続した 65,536 個の token に載る。これを、その slot のブロックと呼ぶ (`blockOf(sk)`)。
+`slotOf(sk)` は、ブロックの最初の token を返す。区間の境目とそのまま比べられる。
 
-slot は hash の上位 12 ビット (`src/routing.ts:32`)、subslot は下位 16 ビットを使う。
-主キーが 1 列の表、主キーのない表 (`pk = ["rowid"]`)、index の表 `__gidx_*` (`src/sql/ddl.ts:102`) では、主キーの文字列と shard key の文字列が同じなので、2 段とも 1 つの 32 ビットの hash から取ることになる。
+主キーが 1 列の表、主キーのない表 (`pk = ["rowid"]`)、index の表 `__gidx_*` (`src/sql/ddl.ts:102`) では、主キーの文字列と shard key の文字列が同じなので、slot も subslot も 1 つの 32 ビットの hash から取ることになる。
 ビットが重ならず、`hashKey` の最後の攪拌が全ビットを混ぜるので、slot を固定しても subslot は偏らない。
-連番の整数キー 200 万個で、slot ごとの subslot の分布を 1 度だけ確かめた (偏りなし。スクリプトはリポジトリに入れていない)。
+slot が上位 12 ビットだったときに、連番の整数キー 200 万個で、slot ごとの subslot の分布を 1 度だけ確かめた (偏りなし。スクリプトはリポジトリに入れていない)。
+`test/routing.test.ts` は、slot を 16 個の束にまとめて、束ごとに subslot が片側に寄らないことを確かめる。
 
 行ごとに保存するものは足さずに済む。
 ただし、`hashKey` は JS の関数で、Durable Object の SQL の API には関数を足す入口がない (`docs/platform-facts.md` に足して確かめる)。
@@ -50,51 +72,57 @@ slot は hash の上位 12 ビット (`src/routing.ts:32`)、subslot は下位 1
 ### 範囲表
 
 ```ts
-interface SlotRange { start: number; end: number; shard: string; sub?: [number, number] }  // sub は [含む, 含まない)
-type Rect = [start: number, end: number, lo: number, hi: number];
+interface Interval { start: number; end: number }          // token の半開区間 [start, end)
+interface RangeEntry extends Interval { shard: string }
 ```
 
-項目の全体は、4,096 × 65,536 の平面を重なりなく覆う。
-形式は任意の長方形を許すが、`planSplit` が作る `sub` つきの項目は幅 1 の slot だけである。
-`sub` のない項目は今の JSON のままなので、`__routing` の既存の行は読める。
+項目の全体は、region 0 の token `[0, 2^32)` を重なりなく覆う。
+形式は、境目をどの token にも置ける。
+`planSplit` が slot のブロックの中に境目を置くのは、「増設の判断」の節の場合だけで、段 4 までは slot の境目 (65,536 の倍数) にだけ置く。
+最初の範囲表は、65,536 個の slot をシャードの数で等分する。シャードの数が 4,096 を割り切れば、境目は今までと同じ位置になる。
+最初の公開の前なので、`__routing` の既存の行との互換は持たない。
 
 | 関数 (`src/routing.ts`) | 変更 |
 |---|---|
-| `ownerOf(r, sk, pk)` | 点 (`slotOf(sk)`, `subslotOf(pk)`) を持つシャード |
-| `ownersOf(r, sk)` | `slotOf(sk)` を持つ項目の全部 (ふつうは 1 つ) |
-| `regionsOf(r, shard)` | `rangesOf` (`:55`) の置き換え。`Rect[]` を返す |
-| `applyMove(r, move)` | `move` が `sub` を持てる。重なる項目を長方形に切り分ける |
-| `planSplit(r, parent, hint?)` | `{ start, end, sub? }` を返す (「増設の判断」の節) |
+| `tokenOf(sk, pk)`、`blockOf(sk)` | 行の token と、shard key のブロック |
+| `ownerOf(r, sk, pk)` | `tokenOf(sk, pk)` を含む区間のシャード。`pk` を省くと、ブロックの全体を持つシャードを返し、ブロックが分かれていれば投げる (段 3 までの呼び出しと、試験のため) |
+| `ownersOf(r, sk)` | `blockOf(sk)` に重なる区間のシャードの全部 (ふつうは 1 つ) |
+| `regionsOf(r, shard)` | `rangesOf` (`:55`) の置き換え。`Interval[]` を返す |
+| `applyMove(r, move)` | 重なる項目を切り分ける。今と同じ規則で、単位が token になる |
+| `planSplit(r, parent, hint?)` | `{ start, end }` を返す (「増設の判断」の節) |
 
-Meta は、`switchRange` (`src/meta.ts:144`) の持ち主の確認を長方形で行い、分割の枠 (`SplitSlot`、`beginSplit` から `checkSplit`、`:216` から `:249`) の同一性に `sub` を入れる。
+Meta は、`switchRange` (`src/meta.ts:144`) の持ち主の確認を区間の重なりで行う。
+分割の枠 (`SplitSlot`、`beginSplit` から `checkSplit`、`:216` から `:249`) の同一性は、今と同じ (親, 子, `start`, `end`) である。
 
 ### シャードの記録
 
 | 表 (`src/shard/core.ts:245` から `:249`) | 今 | 変更後 |
 |---|---|---|
-| `__fenced` | `(start, end, to, done)` | `sub_lo`、`sub_hi` を足す |
-| `__incoming` | `(start, end, from_id)` | `sub_lo`、`sub_hi`、`done`、`m` を足す。受け取り終えても消さない |
-| `__moved` | `(g, m, dest, acked)` | `(g, sub_lo, after, up_to, m, dest, acked)`。主キーは `(g, sub_lo, after)` |
-| `__moved_txn` | `(txn, g, dest)` | `(txn, g, sub_lo, after, dest)` |
-| `__arrived` | `(g, m)` | `(g, sub_lo, after, up_to, m)` |
+| `__fenced` | `(start, end, to, done)` | `(lo, hi, to, done)`。token の区間 `[lo, hi)` |
+| `__incoming` | `(start, end, from_id)` | `(lo, hi, from_id, done, m)`。受け取り終えても消さない |
+| `__moved` | `(g, m, dest, acked)` | `(g, lo, hi, after, up_to, m, dest, acked)`。主キーは `(g, lo, after)` |
+| `__moved_txn` | `(txn, g, dest)` | `(txn, g, lo, after, dest)` |
+| `__arrived` | `(g, m)` | `(g, lo, hi, after, up_to, m)` |
+
+piece の記録の `lo`、`hi` は、その piece を切り出した fence の区間である。fence は重ならないので、`(g, lo, after)` で piece が 1 つに決まる。
+`after` と `up_to` は位置で、JSON の文字列で書く。端は `null` の 4 文字である (主キーの列なので、SQL の NULL にはしない)。
 
 `__intents`、`Change`、変更ログは変えない。
 intent の subslot は `pk` から計算できる。
 
 ### 通信
 
-- `Span.slots` (`src/types.ts:94`) を `Span.claim?: Rect[]` に替える。
+- `Span.slots` (`src/types.ts:94`) を `Span.claim?: Interval[]` に替える。
 - `GroupPayload` (`:289`) を `PiecePayload` に替える (次の節)。
-- `pull`、`ack`、`finalize` と `abort` の `groups` (`:240` から `:256`) は、グループの名前ではなく piece を運ぶ。
-- `beginIncoming`、`fence`、`moves`、`drain`、`finishMove`、`finishIncoming` は `sub` を運ぶ。
-- `listGroups` は `sub` を受け取る。列挙するのは今もグループで、`GroupCursor` (`:302`) の形は変えない。
+- `pull`、`ack`、`finalize` と `abort` の `groups` (`:240` から `:256`) は、グループの名前ではなく piece を運ぶ。`ack`、`finalize`、`abort` が運ぶのは piece の名前 `{ g, range, after }` である。
+- `beginIncoming`、`fence`、`moves`、`drain`、`finishMove`、`finishIncoming`、`listGroups` の範囲は、形は今の `{ start, end }` のままで、token の区間になる。列挙するのは今もグループで、`GroupCursor` (`:302`) の形は変えない。
 - `PROTOCOL_VERSION` を 3 にする (`:480`)。
 
 ### `docs/storage-format.md` で変わる行
 
-- 「行の置き場所」に `subslotOf(pk)` を足す (固定)。
+- 「行の置き場所」を token にする (固定)。
 - シャードの `__fenced`、`__incoming`、`__moved`、`__moved_txn`、`__arrived` の形。
-- Meta の `__routing` の説明 ((slot の範囲, subslot の範囲) からシャードへ)。
+- Meta の `__routing` の説明 (token の区間からシャードへ)。
 - 通信の `PROTOCOL_VERSION`。この行は今 1 と書いてあるが、コードは 2 である。
 - `__gidx_<index>` の中身は変わらない。
 
@@ -114,7 +142,7 @@ M18 の piece は (グループ, subslot の範囲) である。
 | C | 主キーの順の区間 | 読むのは運ぶ行だけ (slot を subslot で割る移動では、約 2 倍)。境目の比較が要る |
 
 C を選ぶ。
-**piece** は (グループ `g`, fence の subslot の範囲 `sub`, 位置の区間 `(after, upTo]`) で、`g` の行のうち、subslot が `sub` に入り、位置が区間に入るものである。
+**piece** は (グループ `g`, fence の token の区間 `range`, 位置の区間 `(after, upTo]`) で、`g` の行のうち、token が `range` に入り、位置が区間に入るものである。
 **位置** は (表の名前, 主キーのキー文字列) で、表の名前の順、表の中は主キーの順に並ぶ。
 `null` は端を表す。
 1 通に収まるグループは `(null, null]` の piece 1 つになり、今の移動の単位と同じである。
@@ -122,7 +150,7 @@ C を選ぶ。
 ```ts
 type Pos = [table: string, pk: string] | null;
 interface PiecePayload {
-  g: string; sub: [number, number]; after: Pos; upTo: Pos;
+  g: string; range: Interval; after: Pos; upTo: Pos;
   m: Ts; rows: { table: string; row: Row }[]; intents: Row[]; schema: number;
 }
 ```
@@ -131,7 +159,7 @@ interface PiecePayload {
 M18 が覆い続ける範囲は、次のとおりである。
 M18 の piece は番号で、モデルは piece が subslot で連続していることを使っていない。
 1 つの fence の piece の全部が M18 の「移る piece」に、`sub` の外の行が「残る piece」に当たる。
-claim は subslot の範囲で、1 つの fence の `sub` に重なれば、その fence の piece の全部を含むものとして扱う (広く取る側である)。
+claim は token の区間で、1 つの fence の区間に重なれば、その fence の piece の全部を含むものとして扱う (広く取る側である)。
 これは M18 の claim (piece の集合) の特別な場合で、`m18_green_chunks` は任意の分け方で安全を確かめている (取引 X と読みの時刻を入れた場合の根拠は、ランダム探索だけである)。
 覆われないのは、境目を pull のときに決めることである (M18 の「モデルにないもの」。「移動」の節で扱う)。
 
@@ -152,9 +180,9 @@ JS で SQLite の規則を写すことはしない (`src/keys.ts:37` に、写�
 
 | span | 宛先 | claim |
 |---|---|---|
-| 1 行 (`rowSpan`) | `ownerOf(routing, sk, pk)` | 付けない。点は主キーから決まる |
-| shard key で絞る (`groupSpan`、`sks` のある `scanSpans`) | `ownersOf(routing, sk)` の全部 | そのシャードが持つ、`slotOf(sk)` の subslot の範囲 |
-| 全表 (`tableSpan`、`sk` のない条件) | 全シャード | そのシャードの `Rect` の全部 |
+| 1 行 (`rowSpan`) | `ownerOf(routing, sk, pk)` | 付けない。token は主キーから決まる |
+| shard key で絞る (`groupSpan`、`sks` のある `scanSpans`) | `ownersOf(routing, sk)` の全部 | そのシャードが持つ区間のうち、`blockOf(sk)` に重なる部分 |
+| 全表 (`tableSpan`、`sk` のない条件) | 全シャード | そのシャードの区間の全部 (`regionsOf`) |
 
 文をそのまま 1 つのシャードへ送る経路 (`shardRead`、`Txn.write`、`autoWrite`。`:336`、`:810`、`:2128`) は、文の span の全部がそのシャード 1 つに決まるときだけ使う。
 shard key で絞る span の slot に持ち主が 2 つ以上あれば、`NeedsReference` (`:175`) を投げ、`runPlanned` (`:202`) が基準経路で計画し直す。
@@ -197,7 +225,7 @@ slot を割るのは、そのテナントが 1 つのシャードを超えたと
 ### 所有の確かめ
 
 `Rows.writes` (`src/shard/core.ts:148`) に `table` と `pk` を足す。
-`fencedRange(sk)` と `incomingRange(sk)` (`:543`、`:547`) は、点 (`slotOf(sk)`, `subslotOf(pk)`) か claim の `Rect` で引く。
+`fencedRange(sk)` と `incomingRange(sk)` (`:543`、`:547`) は、token `tokenOf(sk, pk)` か、区間 (ブロック `blockOf(sk)`、claim) で引く。
 `assertOwned` (`:571`) の規則は次のとおりである。
 
 | 対象 | 渡した側 | 受け取る側 |
@@ -206,7 +234,7 @@ slot を割るのは、そのテナントが 1 つのシャードを超えたと
 | shard key で絞る span | claim が fence に重なれば `NotOwner`。同じ slot に終わっていない fence があり、`g` を渡し終えていなければ `Migrating` | claim が受け取り中の範囲に重なり、`g` の piece が揃っていなければ pull する。期限を過ぎたら `Migrating`。`T` がどれかの `m` より小さければ `ReadTooOld` |
 | 全表の span | claim が fence に重なれば `NotOwner`。移動の途中なら `Migrating` (今と同じ) | 今と同じ |
 
-claim のない shard key の span は、subslot の全体を claim したものとして扱う。
+claim のない shard key の span は、ブロックの全体を claim したものとして扱う。
 受け取った範囲の記録を持つシャード (分割で生まれたシャード) は、記録した範囲の外の点と、外にはみ出す claim も `NotOwner` で断る。
 今のシャードは、fence した範囲と受け取り中の範囲しか知らないので、subslot で割った slot の残りの半分の行が届いても受けてしまう。
 範囲の記録を消さずに残す (「drain と finishMove」の節) ので、この確かめができる。
@@ -245,12 +273,12 @@ piece は m を運び、`receive` (`:830`) が piece ごとに時計を進める
 
 ### piece の pull
 
-子は `pull({ want: [{ g, from } | { g, at }], to, start, end, sub, maxBytes })` を送る。
+子は `pull({ want: [{ g, from } | { g, at }], to, start, end, maxBytes })` を送る。`start` と `end` は fence の区間である。
 `from` は子がそのグループで揃えた位置の続きで、`at` は要求が名指しした行の位置である。
 親は、1 つの同期区間で次を行う。
 
 1. その位置を含む piece がもうあれば、同じ `m` と同じ境目で行を読み直して返す。
-2. なければ、行を位置の順に読み (`subslot` が `sub` の外の行は飛ばす)、`maxBytes` に達したところで切る。グループの終わりか、次の渡してある piece に達したら、そこを `upTo` にする。`at` の場合は、その位置の直前の行 (なければ、手前の渡してある piece の終わりか、先頭) を `after` にする。
+2. なければ、行を位置の順に読み (token が fence の区間の外の行は飛ばす)、`maxBytes` に達したところで切る。グループの終わりか、次の渡してある piece に達したら、そこを `upTo` にする。`at` の場合は、その位置の直前の行 (なければ、手前の渡してある piece の終わりか、先頭) を `after` にする。
 3. 区間の intent を選び、`m` を発行して、`__moved` と `__moved_txn` に書く。
 
 `m` と境目を同じ区間で決めて記録するので、再送は同じ piece を返す。
@@ -315,6 +343,11 @@ T の時点では行があった。
 `test/move-timestamp.test.ts` が確かめているのは、書き込みの時刻の側だけである。
 走らせて確かめてはいないので、計画書の不変条件 8 に割り当て、先に `test/open/` に再現を置く。
 
+(2026-11-14 の追記) 再現で確かめ、床を先に入れた。子は、起動のときに `__incoming` の終えた行を読み戻し、その範囲のキーを `T < m` で読む要求を、到着の記録があってもなくても `ReadTooOld` で断る (`src/shard/kernel.ts` の `assertOwned`。全表の読みも同じ)。
+時計の再開は床の `m` も数える。
+再現は `test/old-read-of-emptied-group.test.ts`、戻すスイッチは `noRangeFloor`、モデルは M5b の `m5b_green_floor` である。
+`__arrived` の行は、まだ消していない (到着の確かめも残してある)。消すのは、段 2 で piece ごとの記録に替えるときである。
+
 ### 増設の判断
 
 `planSplit` は、親の最も広い範囲が 2 slot 以上なら、今と同じく slot の範囲を半分にする。
@@ -329,7 +362,7 @@ slot を subslot で割るのは、次の 2 つの場合である。
 その割合が低ければ、今までどおり通知にする。
 閾値は実測で決める。
 
-分割の手順 (`split`、`src/autoscaler.ts:138`) は `sub` を運ぶだけで、段は変わらない。
+分割の手順 (`split`、`src/autoscaler.ts:138`) は、範囲 (token の区間) を運ぶだけで、段は変わらない。
 子は新しいシャードに限る (今と同じ)。
 
 ## 2PC、index、エクスポート
@@ -366,7 +399,7 @@ piece ごとの適用には、「書き込みが続く間の大きなグルー�
 
 | 段 | 中身 | 落ちてから通る検査 | 規模 |
 |---|---|---|---|
-| 1 | 形式と配線。範囲表の `sub`、`subslotOf`、`Span.claim`、記録の表の形、`PiecePayload`。項目は slot の全体だけで、piece はいつも `(null, null]` | 挙動を変えない段なので、落ちる検査はない。代わりに次を確かめる。(a) `history` と `replay` の同じ seed で、RPC の列 (宛先とメソッド) が変更の前後で同じ。(b) 欠陥の表 (`scripts/fault-table.mjs`) の移動のスイッチの行が変わらない。(c) `applyMove` を乱択で重ねても、どの点にも持ち主がちょうど 1 つある。(d) 作り直した材料で `test/upgrade.test.ts` が通る | 約 600 行、2 から 3 日 |
+| 1 | 形式と配線。行の token、範囲表の token の区間、`Span.claim`、記録の表の形、`PiecePayload`。区間の境目は slot の境目だけで、piece はいつも `(null, null]` | slot を細かくするほかに挙動を変えない段なので、落ちる検査はない。代わりに次を確かめる。(a) `history` と `replay` の同じ seed で、RPC の列 (宛先とメソッド) が変更の前後で同じ。slot を細かくしたので、シャードの数が 4,096 を割り切らないクラスタと、半端な幅の分割では、境目が前の slot 1 つ未満だけ動く。境目を前の slot に合わせた版で、同じになることを確かめる。(b) 欠陥の表 (`scripts/fault-table.mjs`) の移動のスイッチの行が変わらない。(c) `applyMove` を乱択で重ねても、どの token にも持ち主がちょうど 1 つある。(d) 作り直した材料で `test/upgrade.test.ts` が通る | 約 600 行、2 から 3 日 |
 | 2 | piece 単位の移動。`pull`、`receive`、`ack`、`drain`、`assertOwned`、範囲の床 | 先に、今のコードで、1 通で運べる大きさの上限 (`GROUP_MAX_BYTES`) を `ShardDeps` から小さくできるようにし、`replay` に分割を足す (今は 3 シャード固定、`test/replay.test.ts:193`)。上限を小さくすると、`history`、`elle-sim`、`replay` の分割が「group too large to move」で止まる。段 2 の後は、同じ seed で、どのグループも数個の piece に分かれて運ばれ、検査が通る。`replay` の表は `UNIQUE (tenant_id, code)` を持つ (`test/replay.test.ts:18`) ので、piece ごとの適用と UNIQUE の形にも届くはずである | 約 1,100 行、5 から 7 日。先に、M18 に行のない piece を足し、UNIQUE と piece の適用のモデルを書く |
 | 3 | 分かれた slot の経路。`withClaims`、`ownersOf`、プランナ、`NeedsReference`。移動はまだ slot の全体だけ | `SimOptions` (`test/sim.ts:295`) に、最初の範囲表で全部の slot を subslot で 2 つのシャードに分ける指定を足す。SQLite と突き合わせる検査 (`slt`、`fuzz`、`typed-diff`、`unique-conflicts`、`replay`) をその置き方で流す。段 3 の前は、テナントに絞った文が片方のシャードの行しか返さない。本番では、段 4 まで `sub` つきの項目はできない | 約 700 行、3 から 4 日 |
 | 4 | slot を subslot で割る移動と `planSplit`。`listGroups` の `sub`、受け取った範囲の外を断る確かめ。既存の行への UNIQUE index の突き合わせ | `history`、`elle-sim`、`replay` の分割が、slot の分割と subslot の分割を乱択で選ぶ。M18 の `splitTenantTest` と、`halfArrivedTest` のうち claim の分け直しを除いた部分を、実コードで再生する。段 3 の置き方で見つかる UNIQUE index の重複は、段 3 で `test/open/` に置き、ここで通す | 約 900 行、5 から 7 日。UNIQUE index のモデルが先 |
@@ -396,7 +429,7 @@ M18 の赤と、欠陥のスイッチ (`Faults`、`src/types.ts:372`) の対応�
 
 - 移動の途中のテナントの読みを通す仕組み (Worker が claim を piece で分け直す)。M18 は安全だけを確かめていて、Worker が分け方を知る手順と活性はモデルにない。モデルが先である。
 - 分かれた slot への、条件つきの UPDATE と DELETE をシャードごとに実行する最適化と、複数行の INSERT の span を 1 行ずつに狭める規則。範囲の検査に通してから足す。
-- 幅が 2 slot 以上の `sub` つきの項目、既存のシャードへの移動、シャードの併合。形式は許すが、作らない。
+- 両端がどちらもブロックの中にある区間 (2 つの slot を途中で切る)、既存のシャードへの移動、シャードの併合。形式は許すが、作らない。
 - 主キーの前半だけで subslot を決める指定 (たとえば、テナントの中の利用者ごとに行を集める)。
 - pull の並列化。
 
@@ -407,7 +440,7 @@ M18 の赤と、欠陥のスイッチ (`Faults`、`src/types.ts:372`) の対応�
 | 行のない piece | 範囲の床 (`__incoming` の `m`)。M18 に `finishRange` を足してから実装する |
 | 2 つ目のグループ | piece の記録はグループごと。shard key の span の規則もグループごとで、同じ slot の小さなテナントは、1 回の pull で両側が答えられるようになる |
 | テナントの読みを含む取引の検証 | `enter` が、確定のときにも claim を確かめ直す |
-| 子の再分割、範囲表の版が 3 つ以上 | fence と claim は長方形の重なりで判定する。受け取り中のシャードは fence しない (今と同じ)。`test/migration.test.ts` の連鎖の試験を、subslot の分割で増やす |
+| 子の再分割、範囲表の版が 3 つ以上 | fence と claim は区間の重なりで判定する。受け取り中のシャードは fence しない (今と同じ)。`test/migration.test.ts` の連鎖の試験を、subslot の分割で増やす |
 | ack で控えを消す | ack は piece の区間と `sub` で行と intent を消す |
 | piece の境目、16 MB を超える 1 行 | 境目は最初の pull で m と一緒に記録する。1 行は 1 MB 以下である |
 | 活性 | 確かめていない。大きなテナントの移動の間の失敗は、上に数字で書いた |
@@ -415,7 +448,17 @@ M18 の赤と、欠陥のスイッチ (`Faults`、`src/types.ts:372`) の対応�
 
 M18 が扱っていない UNIQUE は、piece ごとの適用を「書き込みが続く間の大きなグループ」の節に、書き込みの検査と既存の行への index を「2PC、index、エクスポート」の節に書いた。
 
-## 持ち主の判断が要ること
+## 持ち主の判断 (2026-11-14 に決まった)
+
+1. 4 段をすべて、最初の公開 (Early 版) の前に入れる。
+2. piece の境目は、主キーの順の区間にする (案 C)。
+3. 大きなテナントの移動の間に、主キーを名指ししない文が失敗するのは認めない。claim を piece で分け直す仕組みを、モデルと実装の両方で、段 2 の前に入れる。
+4. 1 つの slot を割るのは、そのシャードの容量 (10 GB) に近づいたときだけにする。分かれたテナントで、結合などの入力が集める予算を超えて断るのは、資源の上限として文書に書く。集める量を減らす仕組み (semijoin、段を分けた集め方) は、その次にする。
+5. 既存の行への `CREATE UNIQUE INDEX` の突き合わせ (分かれたテナント) は、モデルを書いてから段 4 で入れる。
+
+以下は、決める前に挙げた問いである。
+
+## 持ち主の判断が要ること (決める前の問い)
 
 1. piece の境目を主キーの順の区間にすること (案 C)。subslot の部分範囲にこだわるなら、案 B の課金を受け入れることになる。
 2. 分かれたテナントで、結合などの入力が集める予算を超えると断ること。この案は、資源の上限として文書に書いて認める側である。割らなければ、そのテナントはシャードの容量 (10 GB、`scaling.md`) で止まる。認めなければ、段 4 (slot を割る) は、基準経路の予算を広げる仕組み (階層的な fan-out、semijoin) の後になる。

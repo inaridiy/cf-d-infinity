@@ -9,7 +9,7 @@ import { bindParams, constant, ident, render, text, walk, type Node, type Params
 import { keyString, storedAs } from "../keys";
 import { fromTyped, isReal, typedScalarSql } from "../value";
 import { SHARD_LIMITS, withinShardLimits } from "../shard-limits";
-import { isInternalName } from "./ddl";
+import { assertPlainCreateTable, isInternalName } from "./ddl";
 
 export type Route =
   | { by: "sk"; sks: string[] }
@@ -332,7 +332,10 @@ function equalities(conj: Node[], ref: Ref, col: string, s: Scope, values: Value
         }
       }
     }
-    if (op === "IN" && c.right?.type === "paren_expr" && c.right.expr?.type === "list_expr") {
+    // 空の並び (`col IN ()`) は、値の集まりとして扱わない。扱うと、shard key の値が 0 個に固定されて、どのシャードも読まない走査に
+    // なる。集約を分けて押し下げる計画は、シャードごとの 1 行を合成するので、行が 1 つも届かないと `count(*)` が NULL になる。
+    // 条件はそのまま全シャードへ押し下げ、各シャードの SQLite が偽にする。
+    if (op === "IN" && c.right?.type === "paren_expr" && c.right.expr?.type === "list_expr" && c.right.expr.items.length > 0) {
       const hit = colOf(c.left, s);
       if (hit?.ref === ref && hit.col === col) {
         const vs = c.right.expr.items.map((x: Node) => constant(x, values));
@@ -1000,10 +1003,9 @@ export const SCHEMA_STATEMENTS: ReadonlySet<string> = new Set([
 export async function planStatement(stmt: Node, input: Params, cat: Catalog, ctx: PlanContext): Promise<Plan> {
   const values = bindParams(stmt, input);
   if (SCHEMA_STATEMENTS.has(stmt.type)) {
-    // 表の作成と行の挿入を 1 文で行うと、途中で失敗したときの後始末が要る。CREATE TABLE と INSERT ... SELECT に分けて書ける。
-    if (stmt.type === "create_table_stmt" && clause(stmt, "as_clause")) {
-      throw new SqlError("unsupported: CREATE TABLE ... AS SELECT; create the table, then INSERT ... SELECT");
-    }
+    // 文の形だけで断る CREATE TABLE (仮想表、CREATE TABLE ... AS SELECT) は、ここで断る。DDL の入口 (Db.ddl) は、開いている取引を
+    // 確定してから文を解釈するので、そこまで行くと、断る文が取引を確定してしまう。断る条件と文言は ddl.ts の 1 か所にある。
+    if (stmt.type === "create_table_stmt") assertPlainCreateTable(stmt);
     return { kind: "ddl", sql: text(stmt) };
   }
   switch (stmt.type) {

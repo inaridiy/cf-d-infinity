@@ -107,7 +107,9 @@ describe("a transaction that rebuilds a table another connection writes to", () 
 // 書いて確定する (anchor は別のシャードで、行のシャードへの phase 2 は届かないまま、intent が残る)。作り直す取引が DROP する。
 describe("the guard settles intents before it checks for changes (m14_red_no_drain)", () => {
   const scenario = async (faults: Faults = {}) => {
-    const c = new SimCluster({ shards: 2, faults });
+    // 守りを両方外すと、古い表定義で作った intent が、新しい表に当てはめられる。行イメージの長さの確かめ (test/setup.ts) は、
+    // それを見つける。ここでは反例そのものを確かめるので、その確かめを切る。
+    const c = new SimCluster({ shards: 2, faults, noImageCheck: faults.ddlIgnoresIntents === true });
     await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)");
     await new Db(c).ddl("CREATE TABLE u(id INTEGER PRIMARY KEY, v INTEGER)");
     const { routing } = await c.catalog();

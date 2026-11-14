@@ -28,7 +28,7 @@ describe("the storage format version", () => {
     await new Db(c).query("INSERT INTO users(tenant_id,id,n) VALUES (1,1,0)");
     const b = c.backends.get("s0")!;
     b.exec(`UPDATE __meta SET v = ? WHERE k = 'format'`, STORAGE_FORMAT + 1);
-    expect(() => c.restart("s0")).toThrow(/storage format too new: this shard was written by a newer cf-d-infinity \(format 2\)/);
+    expect(() => c.restart("s0")).toThrow(`storage format too new: this shard was written by a newer cf-d-infinity (format ${STORAGE_FORMAT + 1})`);
     // 断った後も、印は新しいままである。古いコードが書き戻していない。(再起動で元の接続は使えなくなるので、SQLite を直接読む。)
     expect(b.db.prepare(`SELECT v FROM __meta WHERE k = 'format'`).all().map((r) => ({ ...r }))).toEqual([{ v: STORAGE_FORMAT + 1 }]);
 
@@ -36,6 +36,16 @@ describe("the storage format version", () => {
     new MetaCore(meta);
     meta.exec(`UPDATE __meta SET v = 99 WHERE k = 'format'`);
     expect(() => new MetaCore(meta)).toThrow(/storage format too new: this schema object/);
+  });
+
+  it("refuses data of an older format that has no migration, instead of misreading it", async () => {
+    // 版 1 (行イメージが列名つきの object だった形式) からの移行は書かない (最初の公開の前は後方互換を持たない。src/types.ts)。
+    // 版 1 のデータを開くと、移行がないと言って起動を拒否する。黙って開くと、古い行イメージと捕捉の trigger を読み違える。
+    const c = new SimCluster({ shards: 1 });
+    await c.client().ddl(USERS);
+    const b = c.backends.get("s0")!;
+    b.exec(`UPDATE __meta SET v = 1 WHERE k = 'format'`);
+    expect(() => c.restart("s0")).toThrow(`storage format 1 of this shard has no migration to format 2`);
   });
 
   it("is added to data written before the version existed", () => {

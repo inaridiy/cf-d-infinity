@@ -7,9 +7,11 @@
 // 材料を足すのは、保存の形式の版 (STORAGE_FORMAT) を上げたときだけである。新しい版の材料を書くには:
 //   WRITE_STORAGE_FIXTURE=1 npx vitest run test/upgrade.test.ts --project sim
 // 公開した版の材料は書き換えない。書き換えると、利用者のデータを開けることを確かめられなくなる。
-// 最初の公開 (npm への本物のリリース) の前は、版 1 の保存形式も自由に変えてよい (持ち主の決定、2026-11-13)。形式を変えたら、
-// 材料を作り直す:
+// 最初の公開 (npm への本物のリリース) の前は、保存形式も自由に変えてよく、後方互換を持たない (持ち主の決定、2026-11-13)。形式を
+// 変えたら、材料を作り直す:
 //   REWRITE_STORAGE_FIXTURE=1 WRITE_STORAGE_FIXTURE=1 npx vitest run test/upgrade.test.ts --project sim
+// 古い版のデータを新しいコードが黙って読み違える変更なら、版を上げ、移行を書かずに古い版の材料を消す。古い版のデータは、移行が
+// ないと言って起動を拒否する。版 2 (2026-11-14、行イメージのタプル) は、版 1 の材料を消して作った。
 // 最初の公開の後は、REWRITE_STORAGE_FIXTURE を使わず、版を上げて移行を書く。
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";

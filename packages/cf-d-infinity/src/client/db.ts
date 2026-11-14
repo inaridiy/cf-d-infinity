@@ -2,15 +2,16 @@ import type {
   Change, CommitRes, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
 } from "../types";
 import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, utf8Length } from "../types";
-import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, imageList, q, scanList, typedValues } from "../shard/rows";
+import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, imageAt, imageStatements, joinTerms, pkValues, q, scanList, tupleOfRow, typedValues } from "../shard/rows";
+import type { Tuple } from "../value";
 import type { Catalog, SplitMove, SplitSlot } from "../meta";
-import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
+import { hashKey, ownerOf, regionsOf, shardsOf, type Interval, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import { ident, parseStatements, text, type Node, type Params } from "../sql/cst";
 import { keyString } from "../keys";
 import { fromTyped } from "../value";
 import { sha256Text } from "../sha256";
-import { SHARD_LIMITS, isShardLimit, withinShardLimits } from "../shard-limits";
+import { SHARD_LIMITS, builtLimitOf, isShardLimit, withinShardLimits } from "../shard-limits";
 import { scanSql, untypedOf, SCHEMA_STATEMENTS, findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
 import { parseDdl } from "../sql/ddl";
 import { openScratch, ScratchDb, type Compiled } from "../sql/scratch";
@@ -38,7 +39,7 @@ export interface Cluster {
   /** 版を取り消す。取り消す版を返す。取り消せなければ null。 */
   revokeDdl(version: number, reason: string): Promise<number | null>;
   allocate(table: string, n: number, min?: number): Promise<number>;
-  switchRange(move: { start: number; end: number; to: string; from?: string }): Promise<Routing>;
+  switchRange(move: Interval & { to: string; from?: string }): Promise<Routing>;
   /** 実時間、待ち、乱数、識別子の出どころ。なければ実物を使う。シミュレータのクラスタは、seed から決まる実装を持つ。 */
   runtime?: Runtime;
   /** このクラスタへつなぐ Db の、基準経路だけで実行する指定の既定。試験が使う。 */
@@ -275,14 +276,16 @@ function groupByShard(routing: Routing, sks: string[]): Target[] {
 }
 
 /**
- * shard key を絞らない span に、この範囲表で宛先のシャードが持つスロットの範囲を付ける。
+ * shard key を絞らない span に、この範囲表で宛先のシャードが持つ範囲 (claim) を付ける。
  * 全表の読みは範囲表の全シャードへ送るが、範囲表が古いと、分割で生まれたシャードには送らない。
  * 親は自分に残った行だけを答えるので、範囲を付けないと、子へ移った行が黙って欠ける。
+ * shard key で絞る span には、まだ付けない。区間の境目を shard key のブロックの中に置くようになったら、付ける
+ * (docs/design-subslots.md の「宛先と claim」)。
  */
-function withSlots(routing: Routing, shard: string, spans: Span[]): Span[] {
+function withClaims(routing: Routing, shard: string, spans: Span[]): Span[] {
   if (!spans.some(isWideSpan)) return spans;
-  const slots = rangesOf(routing, shard);
-  return spans.map((s) => (isWideSpan(s) ? { ...s, slots } : s));
+  const claim = regionsOf(routing, shard);
+  return spans.map((s) => (isWideSpan(s) ? { ...s, claim } : s));
 }
 
 /** 1 回の読み取りで Worker へ集める行の上限。メモリからの推定で、本番で調整する。 */
@@ -309,7 +312,7 @@ class ReadScope {
   protected record(_shard: string, _spans: Span[]): void {}
 
   async call(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "overlay">): Promise<ExecRes> {
-    const spans = withSlots(this.cat.routing, shard, req.spans);
+    const spans = withClaims(this.cat.routing, shard, req.spans);
     const full: ExecReq = {
       ...req, spans, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), fresh: this.wantsFresh, realtime: this.realtime,
     };
@@ -757,7 +760,7 @@ export class Txn extends ReadScope {
   private async dml(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "overlay">): Promise<ExecRes> {
     if (!this.pessimistic) return this.call(shard, req);
     this.lockOwner ??= { txn: this.txnId, start: this.db.startStamp() };
-    const spans = withSlots(this.cat.routing, shard, req.spans);
+    const spans = withClaims(this.cat.routing, shard, req.spans);
     const res = await this.db.shardOf(shard).exec({
       ...req, spans, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), lock: this.lockOwner,
     }).catch(rerouted);
@@ -876,7 +879,11 @@ export class Txn extends ReadScope {
         // 変更を捕捉するための表を作る前に確かめる。作った後では、文が見る表定義に、その表が混ざる。
         if (w.reads(p.sql).metadata) throw new SqlError(METADATA_IN_WRITE);
         for (const ddl of CAPTURE_TABLES) w.exec(ddl);
-        for (const d of p.tables) for (const ddl of captureDdl(d)) w.exec(ddl);
+        // 捕捉の trigger は、Worker の SQLite を作った表定義 (this.cat) で作る。計画の表定義 (p.tables) は、計画した後に取引が
+        // 新しい版で始まると古い。古い版の trigger は列の少ないタプルを書き、新しい列の値を落とす (REPLACE が入れ直した行の既定値など)。
+        // 行イメージが列名を持っていた間は、変更後の行を本体から読み直していたので、見えなかった (test/setup.ts の行イメージの検査が
+        // 基準経路だけの実行の test/ddl-concurrent.test.ts で見つけた)。
+        for (const d of p.tables) for (const ddl of captureDdl(catalog(d.name))) w.exec(ddl);
         w.exec(`PRAGMA recursive_triggers = ON`);
         w.exec(`INSERT INTO __cap_on VALUES (1)`);
         const r = w.raw(p.sql, ...p.params);
@@ -893,7 +900,8 @@ export class Txn extends ReadScope {
         for (const c of changes) {
           this.buffer(ownerOf(this.cat.routing, c.sk), c);
           const def = catalog(c.table);
-          const id = def.rowidAlias ? c.after?.[def.rowidAlias] : def.implicitRowid ? c.after?.rowid : undefined;
+          const idColumn = def.rowidAlias ?? (def.implicitRowid ? "rowid" : null);
+          const id = idColumn !== null && c.after ? imageAt(def, c.after, idColumn) : undefined;
           if (typeof id === "number") this.db.planContext(this.cat).sawId(def.name, id);
         }
         // 同じ値の行は全部ここにあり、SQLite が一意性を確かめ終えている。index の項目は、確かめ直さずに書く。
@@ -920,25 +928,25 @@ export class Txn extends ReadScope {
       const key = `${def.name}\0${sk}`;
       const g = wanted.get(key) ?? { def, sk, conds: [] };
       wanted.set(key, g);
-      g.conds.push({ sql: `(${cols.map((c) => `${q(def.name)}.${q(c)} ${op} ?`).join(" AND ")})`, params: vals });
+      g.conds.push({ sql: `(${joinTerms(cols.map((c) => `${q(def.name)}.${q(c)} ${op} ?`), "AND")})`, params: vals });
     };
     for (const c of changes) {
       if (!c.after) continue;
       const def = catalog(c.table);
       // 主キー。新しく現れた主キーに、行が既にあるか。
-      if (c.before === null && !have.has(`${def.name}\0${c.pk}`)) want(def, c.sk, def.pk, decode<Value[]>(c.pk), "IS");
+      if (c.before === null && !have.has(`${def.name}\0${c.pk}`)) want(def, c.sk, def.pk, pkValues(c.pk), "IS");
       // シャード内の UNIQUE。shard key を含むので、同じ値の行は同じ shard key の値の中にある。`=` は列の照合順序で比べる。
       for (const cols of def.uniques) {
-        const vals = cols.map((col) => c.after![col] ?? null);
+        const vals = cols.map((col) => imageAt(def, c.after!, col));
         if (vals.some((v) => v === null)) continue;
-        if (c.before && cols.every((col) => keyString([c.before![col] ?? null]) === keyString([c.after![col] ?? null]))) continue;
+        if (c.before && cols.every((col, i) => keyString([imageAt(def, c.before!, col)]) === keyString([vals[i]!]))) continue;
         want(def, c.sk, cols, vals, "=");
       }
       // シャードをまたぐ UNIQUE。index の表を引き、同じ値を持つ行の主キーと場所を知ってから、その行を読む。
       for (const ix of def.globalIndexes) {
-        const keyOf = (r: Row | null): string | null => {
+        const keyOf = (r: Tuple | null): string | null => {
           if (!r) return null;
-          const vals = ix.columns.map((col) => r[col] ?? null);
+          const vals = ix.columns.map((col) => imageAt(def, r, col));
           return vals.some((v) => v === null) ? null : keyString(vals);
         };
         const k = keyOf(c.after);
@@ -951,7 +959,7 @@ export class Txn extends ReadScope {
           spans: [rowSpan(ix.table, keyString([k]), sk)],
         });
         for (const [pk, at] of hit.values) {
-          if (!have.has(`${def.name}\0${pk as string}`)) want(def, at as string, def.pk, decode<Value[]>(pk as string), "IS");
+          if (!have.has(`${def.name}\0${pk as string}`)) want(def, at as string, def.pk, pkValues(pk as string), "IS");
         }
       }
     }
@@ -962,7 +970,8 @@ export class Txn extends ReadScope {
     for (const g of wanted.values()) {
       let batch: typeof g.conds = [];
       const scanOf = (conds: typeof g.conds): Scan => {
-        const where = conds.map((x) => x.sql).join(" OR ");
+        // 問いの数だけ OR でつなぐと、式の木が問いの数だけ深くなる (DO の SQLite の上限は 100)。釣り合った木に組む。
+        const where = joinTerms(conds.map((x) => x.sql), "OR");
         const params = conds.flatMap((x) => x.params);
         return { table: g.def, sql: `SELECT ${scanList(g.def)} FROM ${q(g.def.name)} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, typed: untypedOf(g.def) };
       };
@@ -977,7 +986,7 @@ export class Txn extends ReadScope {
       if (batch.length > 0) batches.push({ def: g.def, sk: g.sk, conds: batch });
     }
     for (const g of batches) {
-      const where = g.conds.map((x) => x.sql).join(" OR ");
+      const where = joinTerms(g.conds.map((x) => x.sql), "OR");
       const params = g.conds.flatMap((x) => x.params);
       const scan: Scan = { table: g.def, sql: `SELECT ${scanList(g.def)} FROM ${q(g.def.name)} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, typed: untypedOf(g.def) };
       const { columns, rows } = await this.scan(scan);
@@ -1068,9 +1077,9 @@ export class Txn extends ReadScope {
     for (const c of changes) {
       const def = this.cat.tables[c.table];
       for (const ix of def?.globalIndexes ?? []) {
-        const keyOf = (r: Row | null): string | null => {
+        const keyOf = (r: Tuple | null): string | null => {
           if (!r) return null;
-          const vals = ix.columns.map((col) => r[col] ?? null);
+          const vals = ix.columns.map((col) => imageAt(def!, r, col));
           return vals.some((v) => v === null) ? null : keyString(vals);
         };
         const oldK = keyOf(c.before);
@@ -1104,8 +1113,9 @@ export class Txn extends ReadScope {
   indexWrite(ix: GlobalIndexDef, row: Row, remove: boolean): void {
     const def = this.cat.tables[ix.table]!;
     const key = encodeKey(def, row);
+    const image = tupleOfRow(def, row);
     this.buffer(ownerOf(this.cat.routing, key.sk), {
-      table: ix.table, ...key, before: remove ? row : null, after: remove ? null : row,
+      table: ix.table, ...key, before: remove ? image : null, after: remove ? null : image,
     });
   }
 
@@ -1342,11 +1352,17 @@ export class Db {
    */
   private async assertReplays(sql: string, cat: Catalog): Promise<void> {
     const parsed = parseDdl(sql, cat);
-    // 基準経路は、条件を押し下げられなければ表を丸ごと読む (scanOf)。その走査と、行イメージを読む文は、作りとして DO の SQLite の
-    // 上限に収まらなければならない。収まらない表 (極端に長い列名など) は、表定義で断る (src/shard-limits.ts、計画書の不変条件 13)。
+    // 基準経路は、条件を押し下げられなければ表を丸ごと読む (scanOf)。その走査と、シャードが行イメージを読み書きする文
+    // (捕捉の trigger、主キーとグループの読み、行を入れ直す文。src/shard/rows.ts の imageStatements) は、作りとして DO の SQLite の
+    // 上限 (文の長さ、束縛の変数の数、式の木の深さ) に収まらなければならない。収まらない表 (極端に長い列名、多すぎる列など) は、
+    // 表定義で断る (src/shard-limits.ts の builtLimitOf、計画書の不変条件 13)。断るかどうかは表定義だけで決まる。
+    // 確かめを落とすと、表は CREATE TABLE を通り、後でシャードが trigger を作れないか、1 行も書けない
+    // (test/wide-table-expression-depth.test.ts)。
     for (const def of parsed.defs ?? []) {
-      if (!withinShardLimits(scanSql(fullScan(def)), []) || !withinShardLimits(`SELECT ${imageList(def)} FROM ${q(def.name)} WHERE ${def.pk.map((c) => `${q(c)} IS ?`).join(" AND ")}`, def.pk.map(() => 0))) {
-        throw new SqlError(`unsupported: the table ${def.name} is too wide for a shard to scan within Durable Object SQLite limits; use fewer or shorter column names`);
+      const statements = [{ sql: scanSql(fullScan(def)), params: [] as Value[] }, ...imageStatements(def)];
+      const over = statements.map((s) => builtLimitOf(s.sql, s.params)).find((x) => x !== null);
+      if (over) {
+        throw new SqlError(`unsupported: the table ${def.name} is too wide for a shard to scan and capture its rows within Durable Object SQLite limits (${over}); use fewer or shorter column names`);
       }
     }
     // 既存の行から作る index の文は、公開のときに再生する。ここで確かめておく。
@@ -1596,7 +1612,7 @@ export class Db {
     for (const shard of shardsOf(cat.routing)) {
       const res = await this.shardOf(shard).exec({
         sql: `SELECT 1 x FROM ${q(def.name)} GROUP BY ${list} HAVING count(*) > 1 LIMIT 1`,
-        params: [], spans: withSlots(cat.routing, shard, [tableSpan(def.name)]), schema: cat.version,
+        params: [], spans: withClaims(cat.routing, shard, [tableSpan(def.name)]), schema: cat.version,
       });
       if (res.error !== undefined) throw new SqlError(res.error);
       if (res.values.length) throw new SqlError(`UNIQUE constraint failed: ${def.name} has duplicate values`);
@@ -1718,7 +1734,7 @@ export class Db {
     for (;;) {
       const res = await this.shardOf(shard).exec({
         sql: `SELECT ${cols} FROM ${q(def.name)} ${after ? `WHERE (${pkCols}) > (${def.pk.map(() => "?").join(", ")})` : ""} ORDER BY ${pkCols} LIMIT ${BUILD_PAGE}`,
-        params: after ?? [], spans: withSlots(cat.routing, shard, [tableSpan(def.name)]), schema,
+        params: after ?? [], spans: withClaims(cat.routing, shard, [tableSpan(def.name)]), schema,
       });
       if (res.error !== undefined) throw new SqlError(res.error);
       // 欠陥のスイッチ scanSkipsEmpty: 行のないシャードは、読まなかったのと同じく、その時計を公開の時刻に入れない。

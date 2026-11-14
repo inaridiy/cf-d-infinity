@@ -10,6 +10,7 @@ import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 // @ts-expect-error -- JavaScript のモジュール
 import { workerBundle } from "../scripts/esbuild-options.mjs";
+import { STORAGE_FORMAT } from "../src/types";
 
 const run = promisify(execFile);
 const CLI = resolve("bin/cli.js");
@@ -173,12 +174,13 @@ describe("the cf-d-infinity command", () => {
     const r = await cli(["status", ...to]);
     expect(r.code).toBe(0);
     expect(r.stdout.split("\n")[1]).toMatch(/^shard\s+slots\s+size\s+waiting\s+unapplied\s+moving$/);
-    expect(r.stdout).toMatch(/shard-0\s+0-1023\s+\d+ kB\s+0\s+0\s+-/);
+    // 4 シャードで始めたクラスタの shard-0 は、テナントのスロット 65,536 個のうち最初の 4 分の 1 を持つ (src/routing.ts)。
+    expect(r.stdout).toMatch(/shard-0\s+0-16383\s+\d+ kB\s+0\s+0\s+-/);
     expect(r.stdout).toContain("No problems found.");
     const json = JSON.parse((await cli(["status", "--json", ...to])).stdout);
     expect(json.problems).toEqual([]);
     expect(json.health).toHaveLength(4);
-    expect(json.health[0]).toMatchObject({ format: 1, intents: 0, unapplied: 0, redriveErrors: [] });
+    expect(json.health[0]).toMatchObject({ format: STORAGE_FORMAT, intents: 0, unapplied: 0, redriveErrors: [] });
   });
 
   it("exports schema and rows as SQL, and imports them into an empty database with the same contents", async () => {

@@ -23,5 +23,6 @@ real data.
 
 ## Dependencies
 
-The Worker bundle includes `sql-parser-cst` and sql.js (SQLite compiled to WebAssembly). Vulnerabilities in those
-projects should be reported to them; tell us too if this project needs to pin or patch.
+The Worker bundle includes one third-party package, sql.js (SQLite compiled to WebAssembly). Vulnerabilities in it
+should be reported to that project; tell us too if this project needs to pin or patch. The SQL parser is this
+project's own code (`packages/cf-d-infinity/src/sql/`), so a parser flaw is a flaw here.

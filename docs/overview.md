@@ -24,6 +24,11 @@ This is the English summary of how D∞ (`cf-d-infinity`) works. The full design
 - **A shard is one Durable Object holding ordinary SQLite tables.** User tables are stored as they were declared,
   with no hidden columns, and hold only the latest committed version of each row. The shard therefore runs pushed-down
   SQL, including joins and aggregates, with SQLite's own planner and executor.
+- **Inside a shard, only synchronous code touches the state.** A Durable Object runs one piece of JavaScript at a
+  time, so a synchronous function is atomic. The shard's kernel (`src/shard/kernel.ts`) has no `await`. A request is a
+  step: it validates the schema version and the ownership of the rows it touches, and then either finishes or returns
+  what it has to wait for (a peer shard, Meta, storage, a row lock). A small shell (`src/shard/core.ts`) performs the
+  wait and calls the same step again from the top, so a check made before a wait is never relied on after it.
 - **Replication is not implemented here.** A Durable Object's storage layer already replicates each commit to
   followers and confirms it on a quorum, so there is no Raft in this codebase.
 - **Nothing sits on the hot path of every request.** There is no central timestamp oracle and no coordinator
@@ -33,8 +38,10 @@ This is the English summary of how D∞ (`cf-d-infinity`) works. The full design
 
 ## Placing rows
 
-There are 4,096 hash slots. A row's slot is `hash(shard key)`, and the range table in `DinfMeta` maps slot ranges to
-shards. The shard key is the first primary-key column (`rowid` for a table without one); D∞ adds no syntax to SQLite to choose it.
+There are 65,536 hash slots. A row's slot is `hash(shard key)`, and the range table in `DinfMeta` maps slot ranges to
+shards. (The range table is kept in tokens: a row's token is its slot followed by 16 bits of the hash of its whole
+primary key, so that a later version can put a boundary inside one slot and spread one shard key value over two
+shards. Today every boundary is a slot boundary; see [design-subslots.md](./design-subslots.md).) The shard key is the first primary-key column (`rowid` for a table without one); D∞ adds no syntax to SQLite to choose it.
 Rows with the same shard key value live on the same shard across tables, so a tenant's `users` and `orders` are
 colocated and a typical transaction touches one shard.
 
@@ -211,6 +218,11 @@ that had no rows is never copied, so when the move finishes the parent hands its
 range. Without that the child could commit a row at a timestamp below one at which the parent had already answered
 "no such row", and that read would end up after a write it did not see.
 
+The child keeps that last timestamp with the range (the *range floor*) and refuses, with a retryable error, any read
+or validation of a key in the range at an earlier time. It has no history of the range from before the move: a group
+the parent emptied before the fence is not copied either, and without the floor the child would answer "no rows" for
+it at a time when the rows still existed.
+
 Ownership moves before the data does, which sheds load from a hot parent immediately instead of making it also pay
 for a bulk copy first. A Worker whose range table predates the split is told so: a request for a moved shard key, and
 a whole-table read that still believes the parent owns the moved slots, both get `NotOwner`, and the Worker refetches
@@ -223,11 +235,15 @@ The checks are layered. Each one catches what the layer before it cannot see.
 1. **Formal models.** Eighteen Quint models cover the risky protocol parts: commit and snapshot reads, read refresh, 2PC
    recovery, HLC across restarts, split fencing and live migration, row locks, garbage collection of transaction
    records, schema changes under concurrent transactions, building a cross-shard `UNIQUE` index, schema changes inside
-   transactions, table rebuilds, the ordering of schema changes and splits, `UNIQUE` across pending writes, and a transaction id reused by two continuations. TLC explores them exhaustively on small
-   instances. Each model has variants with a known bug put back, and the checker must find every one.
+   transactions, table rebuilds, the ordering of schema changes and splits, `UNIQUE` across pending writes, and a
+   transaction id reused by two continuations. Four more (M18 to M21) model mechanisms the code does not have yet:
+   moving one tenant in pieces, re-splitting a read while pieces move, `UNIQUE` while a group moves piece by piece,
+   and one epoch log in place of the catalog's separate versions and write bans.
+   TLC explores them exhaustively on small instances. Each model has variants with a known bug put back, and the checker
+   must find every one.
 2. **Counterexamples replayed against the code.** A model only checks the design. For each bug variant that the
    implementation guards against, a deterministic simulator test drives the model's counterexample against the real
-   code. For most of them (49 of 71) a fault switch also puts the same bug back into the code, and the test checks that
+   code. For most of them (51 of 74) a fault switch also puts the same bug back into the code, and the test checks that
    the switch produces the violation; the others replay the ordering on the fixed code only. Without the replays, a rare
    ordering is left to a random seed that may never produce it. The [coverage table](./model-coverage.md) maps every
    variant to its switch and replay.

@@ -82,7 +82,7 @@ describe("live split", () => {
     await c.shard("s0").fence({ ...range, to: "s2", slot: slot.id });
     await c.switchRange({ ...range, to: "s2" });
     // 親は m を確定したが、応答が子に届かなかった。
-    await c.shard("s0").pull({ groups: [JSON.stringify([t])], to: "s2", maxBytes: 1_000_000 });
+    await c.shard("s0").pull({ ...range, want: [{ g: JSON.stringify([t]), from: null }], to: "s2", maxBytes: 1_000_000 });
     await c.shard("s2").drain(range);
     const { m } = await c.shard("s0").finishMove(range);
     await c.shard("s2").finishIncoming({ ...range, m });
@@ -161,7 +161,7 @@ describe("counterexamples from m5b_live_migration", () => {
     await c.shard("s0").fence({ ...range, to: "s2", slot: slot.id });
     await c.switchRange({ ...range, to: "s2" });
     // 親は応答を返したが子の処理はまだで、グループは飛行中である。
-    const inFlight = await c.shard("s0").pull({ groups: [JSON.stringify([t])], to: "s2", maxBytes: 1_000_000 });
+    const inFlight = await c.shard("s0").pull({ ...range, want: [{ g: JSON.stringify([t]), from: null }], to: "s2", maxBytes: 1_000_000 });
     const receive = () => (c.cores.get("s2") as unknown as { receive(p: unknown): Promise<void> }).receive(inFlight);
     // arrivedFirst: グループが子に着き終わってから、親に phase 2 が届く (m5b_red_p2)。そうでなければ、飛行中に届く (m5b_red_p2_window)。
     if (arrivedFirst) await receive();

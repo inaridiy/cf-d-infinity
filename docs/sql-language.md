@@ -59,14 +59,14 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 
 | 項目 | 理由 |
 |---|---|
-| TEMP 表、`ATTACH`、仮想表 (FTS5 など) | DO の SQLite が許可しない、または Worker の SQLite に含まれない |
+| TEMP 表、`ATTACH`、仮想表 (`CREATE VIRTUAL TABLE`。FTS5 など) | DO の SQLite が許可しない、または Worker の SQLite に含まれない。TEMP 表と仮想表は `unsupported:` で断る |
 | trigger、生成列、`CREATE TABLE ... AS SELECT` | 検査が足りないので断る。エラーは `unsupported:` で始まる |
 | `ALTER TABLE` の `RENAME COLUMN` と `DROP COLUMN` | 同上 |
-| 主キー、shard key、shard key を含まない UNIQUE の列の、BINARY 以外の照合順序 | 同上。行と行き先のシャードを値で決めるので、照合順序で等しい値を同じ行として扱えない |
+| 主キー、shard key、shard key を含まない UNIQUE の列の、BINARY 以外の照合順序 | 同上。行と行き先のシャードを値で決めるので、照合順序で等しい値を同じ行として扱えない。列の定義に書いても (`a TEXT COLLATE NOCASE PRIMARY KEY`)、表の制約に書いても (`PRIMARY KEY (a COLLATE NOCASE)`) 同じである。`COLLATE BINARY` と書いたものは通る |
 | 主キーの列に NULL のある行 | 断る。SQLite は INTEGER でない主キーに NULL をいくつでも入れられるが、行を主キーの値で名指しするので区別できない。`INTEGER PRIMARY KEY` に NULL を渡すと rowid が入るのは SQLite と同じである |
 | 書き込みの文の中の `sqlite_master` と PRAGMA の関数 (`pragma_table_info(...)` など) | 断る。読みの文の中なら、利用者の表定義について答える (シャードの内部の表は見えない) |
 | shard key を含まない、UNIQUE の部分 index と式の index | 断る (`unsupported:`)。シャードをまたぐ UNIQUE の index の表は、列の値だけで項目を作るからである |
-| 名前が `$` か `__dinf_` で始まる列、`__dinf_` で始まる表 | 断る (`unsupported:`)。行イメージの JSON の印 (`{"$b": ...}`) と、Worker が文に足す列の別名に使う。同じ名前の列があると、行を印と取り違える |
+| 名前が `__dinf_` で始まる列と表 | 断る (`unsupported:`)。Worker とシャードが文に足す列の別名に使う。同じ名前の列があると、足した列が利用者の列を上書きする。`$` で始まる列名は、行イメージが列名を持たなくなったので使える (2026-11-14) |
 
 ### DO の SQLite の制限
 
@@ -90,7 +90,6 @@ DO の SQLite には、文の長さ (100 KB)、束縛の変数 (100 個)、複�
 | 引数の型 | 差分はない。Hrana は要求に書いた型のまま束縛する (`integer` は INTEGER、`float` は REAL。sqld と同じ。@libsql/client は JS の数を `float`、BigInt と真偽値を `integer` で送る)。D1 互換の API と Service Binding は、整数の JS の数を INTEGER、ほかの数を REAL として束縛する (D1 と同じ)。DO の SQLite は JS の数を REAL として束縛するので、D∞ が文の中の引数を `(CAST(? AS INTEGER)+0)` に包んで、型を保つ。値は、どの経路で答えても、分割で運んでも、型を変えない |
 | 結果の数の型 | 整数の値の REAL (5.0 など) は、Hrana の `integer` で返す。DO の SQLite は、読み出しで INTEGER と REAL を区別しないからである。sqld は `float` で返す。`typeof()` は SQLite と同じ値を返す。REAL の無限大は、Hrana が JSON で運べないので、クライアントの誤りになる (sqld も同じ) |
 | 暗黙の rowid と `INTEGER PRIMARY KEY` の採番 | 一意で増えるが連続しない。削除された番号は再利用しない。接続を跨ぐと順序も保証しない |
-| 列名 | `x IN ()` は書き換えるので、別名のない列名が変わる |
 
 ### 制約
 
@@ -234,7 +233,15 @@ session にまとめた呼び出しが本番で別に課金されないことは
 ## パーサの役割
 
 文の意味は SQLite が解釈するので、Worker のパーサは経路の決定にしか使わない。
-パーサは `sql-parser-cst` で、SQLite が識別子として許す語の予約を外し、読めない構文 (`IN ()` など) は解析の前に書き換えている。
+パーサは自前で (`src/sql/parser.ts`)、SQLite の文法 (parse.y) に合わせてある。
+受け付けるかどうかは、文の一覧を本物の SQLite の構文の判定と比べて確かめている (`test/parser.test.ts`)。
+構文の誤りは、SQLite と同じ形の文言 (`near "x": syntax error`、`incomplete input`、`unrecognized token: "x"`) で断る。
+文面は、解析の前に書き換えない。
+結合の語 (`left`、`right`、`full`、`inner`、`outer`、`cross`、`natural`) は、SQLite と同じ場所で名前として読む: 表、列、index、CTE、`AS` の後ろの別名では名前になり、AS のない別名、型の名前、照合順序の名前、DEFAULT の後ろでは名前にならない (`FROM a LEFT JOIN b` の LEFT は結合の語である)。
+関数の引数の `ALL` (`count(ALL x)`) と、空の並びの `x IN ()` も、そのまま読む。
+別名のない結果の列名は、SQLite と同じく、式の文面である (`left + 1`、`count(ALL x)`、`x IN ()`)。
+2026-11-14 までは、この 3 つと CR を、解析の前に文面を書き換えて読んでいた。語の間に注釈があると見誤り (`a LEFT /* c */ JOIN b` が内部結合になった)、列名も SQLite と違っていた。
+結果と列名を SQLite と比べる試験は `test/contextual-words.test.ts` にある。
 
 手書きの解析が表の参照を見落とすと、空の表として黙って誤った結果を返す。
 そこで Worker の SQLite では、実行の前に `EXPLAIN` で本物のプランナが開く表を確かめ、足りない表を読み足している。

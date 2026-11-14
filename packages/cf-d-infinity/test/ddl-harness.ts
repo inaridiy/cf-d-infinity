@@ -8,6 +8,7 @@ import { Db, type Txn } from "../src/client/db";
 import { split } from "../src/autoscaler";
 import { ownerOf, planSplit, shardsOf } from "../src/routing";
 import { decode, encode } from "../src/shard/rows";
+import { decodeElem } from "../src/value";
 import type { Change, Faults, Row } from "../src/types";
 
 export function prng(seed: number) {
@@ -26,6 +27,18 @@ export const ACCT = `CREATE TABLE acct(
   PRIMARY KEY (tenant_id, id))`;
 export const SIDE = `CREATE TABLE side(
   tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, id))`;
+/**
+ * side を、列の順序を変えて作り直す場面の表定義 (docs/design-values.md の「列の順序と表定義の版」)。列の数は同じで、順序が逆である。
+ * gen は作業負荷が書かない列で、既定値が表定義ごとに違う。作り直した表に gen = 1 の行があれば、その行イメージは古い表定義で
+ * 作られ、新しい表に当てはめられた。行イメージが列名を持つ間は、その行の値は正しい列に入る。位置で持つようになると、
+ * tenant_id と n が入れ替わる。
+ */
+export const SIDE_GEN = `CREATE TABLE side(
+  tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER NOT NULL, gen INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (tenant_id, id))`;
+export const SIDE_REORDERED = (name = "side") => `CREATE TABLE ${name}(
+  gen INTEGER NOT NULL DEFAULT 2, n INTEGER NOT NULL, id INTEGER NOT NULL, tenant_id INTEGER NOT NULL,
   PRIMARY KEY (tenant_id, id))`;
 export const INDEX = "acct_v";
 
@@ -221,6 +234,21 @@ export async function extraViolations(c: SimCluster, written?: Map<string, Set<n
     .map(({ row }) => `${row.tenant_id}/${row.id} extra=${row.extra} n=${row.n}`);
 }
 
+/**
+ * side の行が、作ったときと違う表定義に当てはめられた跡。
+ * mangled: (tenant_id, id, n) が、作業負荷が書こうとしたどの行とも合わない行。値が別の列に入ると、こうなる。
+ * stale: gen が、いまの表定義の既定値 (gen) と違う行。古い表定義で作った行イメージが、作り直した表に入った。
+ * attempted は、作業負荷が書こうとした行の `tenant_id/id/n` である。
+ */
+export async function sideImages(c: SimCluster, attempted: Set<string>, gen?: number): Promise<{ stale: string[]; mangled: string[] }> {
+  const rows = (await c.catalog()).tables.side ? await rawRows(c, "side") : [];
+  const text = (row: Row) => `${row.tenant_id}/${row.id} n=${row.n}${row.gen === undefined ? "" : ` gen=${row.gen}`}`;
+  return {
+    stale: gen === undefined ? [] : rows.filter(({ row }) => row.gen !== gen).map(({ row }) => text(row)).sort(),
+    mangled: rows.filter(({ row }) => !attempted.has(`${row.tenant_id}/${row.id}/${row.n}`)).map(({ row }) => text(row)).sort(),
+  };
+}
+
 /** v の値で引いた読み取り。keys は見えた行のキーである。 */
 export interface VRead { v: number; keys: string[] }
 export interface Rec extends TxRecord {
@@ -295,6 +323,10 @@ export interface Scenario {
   values?: "small" | "dup" | "dupTenant";
   /** 取引が side 表にも 1 行入れる。 */
   side?: boolean;
+  /** side の最初の表定義。既定は SIDE。 */
+  sideDdl?: string;
+  /** 実行の後の side の表定義の、gen の既定値。指定すると、gen がこれと違う行を stale として報告する。 */
+  sideGen?: number;
   /** 作業負荷の前に実行する DDL。 */
   before?: string[];
   /** 作業負荷と並行に走らせる DDL の台本。 */
@@ -341,6 +373,12 @@ export interface Report {
     resurrected: string[];
     /** 作り直しの完了後に確定したのに、表にない行。 */
     lost: string[];
+    /** 古い表定義で作った行イメージが、作り直した表に入った行 (sideImages)。 */
+    stale: string[];
+    /** 作業負荷が書こうとしたどの行とも合わない行 (sideImages)。 */
+    mangled: string[];
+    /** 実行の後の行の数。 */
+    rows: number;
   };
   /** ADD COLUMN の後で extra が既定値でも書いた値でもない行。 */
   badExtra: string[];
@@ -387,7 +425,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   const client = () => new Db(c, { idPrefix: `s${seed}c${nextClient++}` });
   const admin = client();
   await admin.ddl(ACCT);
-  if (s.side) await admin.ddl(SIDE);
+  if (s.side) await admin.ddl(s.sideDdl ?? SIDE);
 
   const clients = s.clients ?? 6;
   const ops = s.ops ?? 40;
@@ -448,6 +486,8 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   /** 成功を返した acct への書き込み。n は書き込みごとに一意である。 */
   const acked: { key: string; n: number; v: number | null; ts?: number; name: string }[] = [];
   const sideAcks: SideAck[] = [];
+  /** side へ書こうとした行の `tenant_id/id/n`。確定したかどうかは問わない。 */
+  const sideAttempts = new Set<string>();
   let seq = 0;
   let sideId = 0;
   let commits = 0;
@@ -543,7 +583,9 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
     // side の行は b の tenant に置く。2 シャードの取引では anchor でない参加者に載りやすい。
     const side = env.useSide && rnd() < 0.7 ? { t: b.t, id: ++sideId, n } : undefined;
     const withSide = async (tx: Q) => {
-      if (side) await tx.query("INSERT INTO side(tenant_id, id, n) VALUES (?, ?, ?)", [side.t, side.id, side.n]);
+      if (!side) return;
+      sideAttempts.add(`${side.t}/${side.id}/${side.n}`);
+      await tx.query("INSERT INTO side(tenant_id, id, n) VALUES (?, ?, ?)", [side.t, side.id, side.n]);
     };
     const bodies: Record<string, Plan["body"]> = {
       read: async (tx, reads) => {
@@ -712,10 +754,13 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
 
   // 成功を返した書き込みの commit 時刻を、変更ログから引く。autocommit の一部は時刻を返さないからである。
   const logged = new Map<number, number>();
+  const nAt = (cat.tables.acct?.columns ?? ["tenant_id", "id", "v", "n"]).indexOf("n");
   for (const b of c.backends.values()) {
     for (const r of logRows(b)) {
       for (const ch of decode<Change[]>(r.blob as string)) {
-        if (ch.table === "acct" && ch.after && typeof ch.after.n === "number") logged.set(ch.after.n, r.commit_ts as number);
+        // 行イメージは acct の列の順のタプルである。n の位置は、表定義が変わっても同じである (列は末尾にだけ足す)。
+        const n = ch.table === "acct" && ch.after ? decodeElem(ch.after[nAt] ?? null) : null;
+        if (typeof n === "bigint") logged.set(Number(n), r.commit_ts as number);
       }
     }
   }
@@ -751,6 +796,8 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   const dropIssued = env.marks.dropIssued ?? Infinity;
   const recreated = env.marks.recreated ?? (s.side && env.marks.dropIssued === undefined ? 0 : Infinity);
   const side = {
+    ...(await sideImages(c, sideAttempts, s.sideGen)),
+    rows: sideRows.length,
     exists: sideExists,
     resurrected: sideExists ? sideAcks.filter((a) => a.acked < dropIssued && sideRows.includes(a.n)).map((a) => `side ${a.t}/${a.id}`) : [],
     lost: sideExists ? sideAcks.filter((a) => a.begun > recreated && !sideRows.includes(a.n)).map((a) => `side ${a.t}/${a.id}`) : [],

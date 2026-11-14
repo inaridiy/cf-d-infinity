@@ -2,9 +2,10 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { keyString } from "../src/keys";
+import { SUBSLOTS, type Interval } from "../src/routing";
 import { encode } from "../src/shard/rows";
-import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew } from "../src/types";
-import { realOf } from "../src/value";
+import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type Piece, type PiecePayload, type PieceWant, type Span } from "../src/types";
+import { encodeTuple, realOf, typedOf } from "../src/value";
 
 /**
  * 値の表現の見本。Worker と DO の間を、要求の引数、行イメージ、キー文字列として行き来する。どれかの表現が変わったら、
@@ -12,15 +13,39 @@ import { realOf } from "../src/value";
  */
 function wireSample(): string {
   const values = [5, realOf(5), 0.5, realOf(-0), "5", "", null, new Uint8Array([0, 255]), Number.POSITIVE_INFINITY, 2 ** 53 - 1];
-  const change = { table: "t", pk: keyString([1]), sk: keyString(["a"]), before: null, after: Object.fromEntries(values.map((v, i) => [`c${i}`, v])) };
+  // 行イメージは、表定義の列の順のタプルである (版 4 から)。
+  const change = { table: "t", pk: keyString([1]), sk: keyString(["a"]), before: null, after: encodeTuple(values.map(typedOf)) };
   return [
     JSON.stringify(values, (_k, x) => (x instanceof Uint8Array ? { u8: [...x] } : typeof x === "number" && !Number.isFinite(x) ? String(x) : x)),
     encode(change),
     keyString(values),
+    moveSample(),
   ].join("\n");
 }
+
+/**
+ * 範囲の移動と、所有の確かめが運ぶ形の見本 (版 3 から)。読む範囲の claim、範囲 (token の区間)、piece の名前、子が欲しい piece、
+ * 運ぶデータである。型を付けてあるので、src/types.ts の形を変えると、ここが型の検査を通らなくなる。
+ * 見本を直すと指紋が変わるので、版を上げることになる。
+ */
+function moveSample(): string {
+  const g = keyString(["a"]);
+  const at: [string, string] = ["t", keyString([1])];
+  // slot の境目に揃った範囲と、ブロックの中で切った範囲。
+  const range = { start: 32768 * SUBSLOTS, end: 65536 * SUBSLOTS } satisfies Interval;
+  const part = { start: 7 * SUBSLOTS + 32768, end: 8 * SUBSLOTS } satisfies Interval;
+  const span = { kind: "table", table: "t", claim: [range, part] } satisfies Span;
+  const piece = { g, range, after: null } satisfies Piece;
+  const want = [{ g, from: null }, { g, at }] satisfies PieceWant[];
+  const payload = { g, range: part, after: null, upTo: at, m: 1024, rows: [{ table: "t", row: ["i1", null, "tx"] }], intents: [], schema: 3 } satisfies PiecePayload;
+  return JSON.stringify([span, range, part, piece, want, payload]);
+}
+
+/** 版ごとの、見本の指紋。古い版の値は、その版のときの見本のもので、いまの見本からは作れない。 */
 const WIRE: Record<number, string> = {
   2: "51cd756d252c0541",
+  3: "9dadba1e69298e9c",
+  4: "dfb952441f2824e0",
 };
 
 describe("protocol version", () => {

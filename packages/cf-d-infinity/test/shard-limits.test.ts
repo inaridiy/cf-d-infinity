@@ -198,11 +198,14 @@ describe("the shard limits are measured on the statement the shard runs", () => 
 
   it("runs an INSERT whose text is just under the limit, although capturing its rows lengthens it (Codex review 2, finding 7)", async () => {
     // 64 列の表。RETURNING で行を読む捕捉は、列ごとに typeof と 2^53 の確かめを足すので、文が数 KB 長くなる。
+    // 型のない列は 32 個にする。捕捉が読む列は、表の 66 列、型のない列ごとの typeof、2^53 の確かめの 1 列で、合わせて 99 列になる。
+    // DO の SQLite は結果の列を 100 までに制限している。64 列とも型のない表は、DO では 1 行も書けない
+    // (test/open/untyped-columns-result-limit.test.ts。シミュレータが結果の列の上限を模すようになって分かった。2026-11-14)。
     const cols = Array.from({ length: 64 }, (_v, i) => `c${i}`);
     for (const shards of [1, 2]) {
       for (const pad of [400, 1500, 4000, 9000]) {
         const db = new Db(new SimCluster({ shards }));
-        await db.ddl(`CREATE TABLE w(id INTEGER PRIMARY KEY, ${cols.map((c) => `${c}`).join(", ")}, body TEXT)`);
+        await db.ddl(`CREATE TABLE w(id INTEGER PRIMARY KEY, ${cols.map((c, i) => (i < 32 ? c : `${c} INTEGER`)).join(", ")}, body TEXT)`);
         const body = "b".repeat(100_000 - pad - 64 * 3 - 200);
         const sql = `INSERT INTO w(id, ${cols.join(", ")}, body) VALUES (1, ${cols.map(() => "1").join(", ")}, '${body}')`;
         const r = await db.transaction((tx) => tx.query(sql)).then(() => "ok", (e: Error) => `error ${e.message.slice(0, 60)}`);

@@ -48,5 +48,3 @@ FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
 COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-This package depends on, but does not include, sql-parser-cst (GPL-2.0-or-later). A Worker bundle built from this
-package contains sql-parser-cst and is a combined work covered by the GPL; if you distribute such a bundle, comply with it.

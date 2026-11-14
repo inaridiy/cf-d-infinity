@@ -93,10 +93,10 @@ describe("a shard that moved many groups away", () => {
   it("still starts", async () => {
     const c = new SimCluster({ shards: 1 });
     await c.client().ddl(USERS);
-    // 分割で 15 万グループを送り出した後の状態を、表へ直接作る。
+    // 分割で 15 万グループを送り出した後の状態を、表へ直接作る。どの記録も、グループの全体を 1 つで運んだ piece である。
     c.backends.get("s0")!.exec(
       `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 150000)
-       INSERT INTO __moved(g, m, dest, acked) SELECT '[' || i || ']', 1000 + i, 's9', 1 FROM n`,
+       INSERT INTO __moved(g, lo, hi, "after", up_to, m, dest, acked) SELECT '[' || i || ']', 0, 65536, 'null', 'null', 1000 + i, 's9', 1 FROM n`,
     );
     expect(() => c.restart("s0")).not.toThrow();
     expect((await new Db(c).query("SELECT count(*) AS n FROM users")).rows).toEqual([{ n: 0 }]);
