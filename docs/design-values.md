@@ -29,7 +29,7 @@ workerd についての記述は、段 0 で、手元の workerd 1.20260730.1 (M
 | 消えるもの | K1 の拒否、`Real`、`fromTyped`、`typedScalarSql`、`typedRow`、`typedValues`、`imageList`、`__dinf_wide`、`__dinf_typeof_<i>`、`hasWideInteger`、`keySql`、`storedAs`、列名の予約 (`$` と `__dinf_`) |
 | 段 | 5 段。検査、符号とキー、行イメージと捕捉、値の型と型つきの読み、入口と書き出し |
 
-刷新案 (`.agents/execplans/evidence/2026-11-14-clean-slate-architecture.md` の 1) から変えた点が 4 つある。
+刷新の提案 (2026-11-14 の、作り直しの 5 つの案。リポジトリには置いていない) の 1 から変えた点が 4 つある。
 
 - 刷新案は、`quote()` が 5 つの格納の型を「無損失かつ一意に」文字列にすると書いている。TEXT については成り立たない。`quote('a' || char(0) || 'b')` は `'a'` を返し、NUL から後ろを落とす (2 つのエンジンで確かめた)。そこで `quote()` は REAL にだけ使い、TEXT は印を前に付けてそのまま運ぶ。
 - `json_array(quote(c1), ...)` は、列が 33 以上の表で、DO の SQLite の関数の引数の上限 (32、`docs/platform-facts.md`) に当たる。32 個ずつの入れ子にする。
