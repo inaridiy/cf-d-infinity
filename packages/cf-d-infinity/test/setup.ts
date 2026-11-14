@@ -1,10 +1,25 @@
 // どの試験にも掛かる検査。シミュレータのシャードが実行した文のうち、宣言した範囲 (span) の外の行に依存したものがあれば、
 // その試験を失敗にする。範囲の外の行は、intent の決着も commit の検証も受けないので、取引の検証が成り立たない。
 // 文の形ごとに範囲の作り方を確かめる代わりに、実行された文のすべてをこれで確かめる。
+import { appendFileSync, mkdirSync } from "node:fs";
 import { afterEach, beforeAll, beforeEach, expect } from "vitest";
 import { spanFaults } from "../src/client/spans";
+import { parseObserver } from "../src/sql/cst";
 import { openScratch } from "../src/sql/scratch";
 import { allSpanEscapes, injectedFault } from "./sim";
+
+// PARSER_CORPUS=<ディレクトリ> を付けて流すと、試験が解析に渡した文を、プロセスごとの 1 行 1 文の JSON のファイルに書き出す。
+// パーサの突き合わせ (test/parser-oracle.test.ts) が、これを文の集まりとして読む。同じ文は、プロセスの中で 1 度だけ書く。
+if (process.env.PARSER_CORPUS && !parseObserver.seen) {
+  const dir = process.env.PARSER_CORPUS;
+  mkdirSync(dir, { recursive: true });
+  const seen = new Set<string>();
+  parseObserver.seen = (source) => {
+    if (seen.has(source)) return;
+    seen.add(source);
+    appendFileSync(`${dir}/${process.pid}.jsonl`, `${JSON.stringify(source)}\n`);
+  };
+}
 
 // Worker の SQLite (sql.js) の初期化は、本物の非同期の入出力である。試験の途中で初めて起きると、仮想の実行環境の
 // 出来事との前後が実行ごとに変わる。先に済ませておく。

@@ -1,32 +1,20 @@
-// sql-parser-cst の薄いラッパー。文の意味は解釈せず、経路の決定に要る情報だけを取り出す。
-import { parse, show } from "sql-parser-cst";
+// 構文木の入口。文の意味は解釈せず、経路の決定に要る情報だけを取り出す。
+// 解析は自前のパーサ (parser.ts)、文面への出し直しは printer.ts が行う。
 import type { Affinity, Value } from "../types";
-import { SqlError } from "../types";
 import { isReal, realOf } from "../value";
+import { parseSql, type Node } from "./parser";
+import { print } from "./printer";
 
-// 公開 API にない内部の予約語表を直接直す。
-import { sqliteKeywords } from "sql-parser-cst/lib/keywords/sqlite.keywords.js";
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type Node = any;
+export type { Node };
 
 /**
- * SQLite が識別子として許す語。パーサは多くを予約語として拒否するので外す。
- * 列名の plan や action のように普通のスキーマで使われる語が通らないと、置き換えの障害になる。
- * 一覧は SQLite の parse.y の %fallback ID である。
- */
-const FALLBACK_ID = `ABORT ACTION AFTER ALWAYS ANALYZE ASC ATTACH BEFORE BEGIN BY CASCADE CAST COLUMN CONFLICT
-  CURRENT CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP DATABASE DEFERRED DESC DETACH DO EACH END EXCLUDE
-  EXCLUSIVE EXPLAIN FAIL FILTER FIRST FOLLOWING FOR GENERATED GLOB GROUPS IF IGNORE IMMEDIATE INITIALLY
-  INSTEAD KEY LAST LIKE MATCH MATERIALIZED NO NULLS OF OFFSET OTHERS OVER PARTITION PLAN PRAGMA
-  PRECEDING QUERY RAISE RANGE RECURSIVE REGEXP REINDEX RELEASE RENAME REPLACE RESTRICT ROLLBACK ROW ROWS
-  SAVEPOINT TEMP TEMPORARY TIES TRIGGER UNBOUNDED VACUUM VIEW VIRTUAL WINDOW WITH WITHOUT`.split(/\s+/);
-for (const k of FALLBACK_ID) delete (sqliteKeywords as Record<string, boolean>)[k];
-
-/**
- * 結合の語 (LEFT など) は SQLite では識別子にも使えるが、パーサの予約語から外すと
- * `a LEFT JOIN b` の LEFT が別名に読まれて内部結合に化ける。そこで予約語のまま残し、
- * 後ろに結合が続かないものだけを引用符で囲む。
+ * 結合の語 (LEFT など) は SQLite では識別子にも使えるが、識別子として読むと `a LEFT JOIN b` の LEFT が別名に読まれて
+ * 内部結合に化ける。そこでパーサは予約語として扱い (parser.ts の RESERVED)、後ろに結合が続かないものだけを、
+ * 解析の前に引用符で囲む。
+ *
+ * 後ろに続くかどうかは文面で見るので、間に注釈があると見誤る: `a LEFT /* c *\/ JOIN b` の LEFT を引用符で囲み、
+ * 内部結合にしてしまう (未解決。test/open/join-word-before-comment.test.ts)。この書き換えは前のパーサ (sql-parser-cst) の
+ * 頃からのものである。パーサが結合の語を SQLite と同じ位置で識別子として読めば、書き換えは要らなくなる。
  */
 const JOIN_WORD = /^(LEFT|RIGHT|FULL|INNER|OUTER|CROSS|NATURAL)$/i;
 const FOLLOWS_JOIN = /^\s*(JOIN|OUTER|INNER|CROSS|LEFT|RIGHT|FULL)\b/i;
@@ -51,12 +39,12 @@ function preprocess(sql: string): string {
       while (j < sql.length && /[A-Za-z0-9_$]/.test(sql[j]!)) j++;
       const word = sql.slice(i, j);
       if (/^ALL$/i.test(word) && /\(\s*$/.test(out)) {
-        i = j; // `COUNT(ALL x)` の ALL は既定と同じ意味で、パーサが読めない
+        i = j; // `COUNT(ALL x)` の ALL は既定と同じ意味なので、落とす
         continue;
       }
       const empty = /^IN$/i.test(word) ? /^\s*\(\s*\)/.exec(sql.slice(j)) : null;
       if (empty) {
-        // `x IN ()` は SQLite の拡張で、パーサが読めない。常に偽の同じ意味の式へ置き換える。
+        // `x IN ()` は SQLite の拡張である。常に偽の同じ意味の式へ置き換える。パーサは空の並びを読まない (parser.ts の inOperand)。
         out += "IN (SELECT 1 WHERE 0)";
         i = j + empty[0].length;
         continue;
@@ -64,33 +52,28 @@ function preprocess(sql: string): string {
       out += JOIN_WORD.test(word) && !FOLLOWS_JOIN.test(sql.slice(j)) ? `"${word}"` : word;
       i = j;
     } else {
-      out += ch === "\r" ? " " : ch; // パーサは CR を空白として読めない
+      out += ch === "\r" ? " " : ch; // CR は空白に揃える
       i++;
     }
   }
   return out;
 }
 
-const OPTIONS = {
-  dialect: "sqlite",
-  includeRange: true,
-  includeComments: true,
-  includeNewlines: true,
-  includeSpaces: true,
-  paramTypes: ["?", "?nr", ":name", "@name", "$name"],
-} as const;
-
 export type Params = Value[] | Record<string, Value>;
 
+/**
+ * 試験が、解析に渡った文をすべて見るための口。本番では誰も入れない。
+ * パーサを入れ替えるときの突き合わせ (test/parser-oracle.test.ts) は、試験の全部が解析した文を、ここから集めて使う。
+ */
+export const parseObserver: { seen?: (source: string) => void } = {};
+
 export function parseStatements(source: string): Node[] {
-  try {
-    return (parse(preprocess(source), OPTIONS as never).statements as Node[]).filter((s) => s.type !== "empty");
-  } catch (e) {
-    throw new SqlError(`near syntax error: ${e instanceof Error ? e.message.split("\n")[0] : e}`);
-  }
+  parseObserver.seen?.(source);
+  return parseSql(preprocess(source));
 }
 
-export const text = (n: Node): string => show(n).trim();
+/** 節の文面。節の外側の空白と注釈は付かない。 */
+export const text = (n: Node): string => print(n);
 
 export function walk(n: Node, f: (x: Node) => void): void {
   if (!n || typeof n !== "object") return;
@@ -179,7 +162,7 @@ export function affinityOf(type: string | null): Affinity {
 function numberLiteral(text: string, value: number): Value {
   if (/^0x/i.test(text)) return value;
   if (/[.eE]/.test(text)) return realOf(value);
-  const big = BigInt(text);
+  const big = BigInt(text.replaceAll("_", ""));
   return big > 2n ** 63n - 1n ? realOf(value) : value;
 }
 
