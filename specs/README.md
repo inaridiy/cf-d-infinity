@@ -566,3 +566,79 @@ invariant は 4 つである。
 | ID は取引の ID、どちらも確かめない (2026-11-12 より前) | `m17_red_impl` | 続き 1 が確定し、続き 2 の prepare は ok と答えられ、COMMIT も確定と聞く |
 | ID は取引の ID、参加者だけが確かめる | `m17_red_prepare_only` | anchor は、同じ ID の決着があると参加者に prepare を送らずに結果を返すので、続き 2 は確定と聞く |
 | ID は取引の ID、anchor だけが確かめる | `m17_red_commit_only` | 続き 2 の intent が先に参加者に置かれ、続き 1 の確定がそれを適用する |
+
+### M18 `m18_subslot_split.qnt` — 1 つの shard key の行を、複数のシャードに分けて持つ
+
+2026-11-14 に書いた。実装より先に書いたモデルで、対応する実装はまだない。同じ日に `SHARD KEY` 句をなくし、shard key は主キーの最初の列に決まった。同じ shard key の行 (グループ) は 1 通の応答で運ぶ (`pull`、`GROUP_MAX_BYTES` = 16 MB) ので、16 MB を超えるグループは移せず、その分割は終わらない。1 つのテナントは、1 つのシャードより大きくなれない。句があった間は、`SHARD KEY (tenant_id, id)` と書いて、行ごとに別のグループにできた。
+
+設計は、配置を 2 段にする。slot = hash(主キーの最初の列) mod 4096 は今までどおりで、テナントの行は既定で 1 つのシャードに集まる。これに subslot = hash(主キーの全体) mod 65536 を足し、範囲表は (slot の範囲, subslot の範囲) をシャードに対応させる。移動の単位は piece = (グループ, subslot の範囲) で、1 通の応答に収まる大きさにする。1 つの slot を subslot の範囲で分けると、1 つのテナントの行が複数のシャードに分かれる。それでも文は、1 つの SQLite が全部の行を持つときと同じ答えを返さなければならない。
+
+モデルは、親 P、子 C、テナント 1 つである。piece 1 は subslot の下の範囲にあって P に残り、piece 2 は上の範囲にあって C へ移る。slot は 2 つのシャードのものになる。移動の手順は M5b の green と同じで、fence、範囲表の切り替え、piece ごとの pull (応答の喪失と再送)、時刻 m の持ち運びからなる。親は m を決めた piece を答えず、子は T < m の読みを断る。Worker のキャッシュは変数にしない。要求ごとに、それまでに知り得た範囲表の版のどれかを選ぶので、古い版を持つ Worker が何台いてもよい。版 0 は slot の全体が P、版 1 は下の範囲が P で上の範囲が C である。書き込みは、piece ごとの blind write (Worker は主キーを知っているので、piece で宛先を決める) と、piece 1 と piece 2 に intent を置く取引 X である。X は anchor が c を決めた時点で確定し、phase 2 は piece ごとに、moved 表で決めた持ち主へ届く。
+
+読みは 2 種類ある。主キーの読みは、M5b と同じく piece の持ち主が答える。テナントの読み (`WHERE tenant_id = ?`) では、Worker は shard key しか知らない。自分の版の範囲表でその slot を持つシャードの全部に、時刻 T と、そのシャードが持つはずの subslot の範囲 (以下 claim) を送り、揃った答えを合わせる。版 0 の Worker は P だけに送る。版 1 の Worker には P と C が別々の時点に答え、その間にほかの出来事が入る。片方に断られた読みは捨てる。
+
+`tenantSplitSafe` は次の 5 つである。M5b の 5 つを piece に読み替えた。
+
+- `singleOwner`: 受理した書き込みは、piece の持ち主だけにある。子は届いた piece の行だけを持ち、親が手放した piece の控えに、手放した時刻以後の行がない。
+- `readConsistent`: 答えた読みは、T 時点の真の行の集合と一致する。テナントの読みでは、どの piece も、ちょうど 1 つのシャードが答える (抜けも重なりもない)。
+- `noLostWrite`: piece の持ち主の行は、確定した書き込みの全部である (決着して未適用の intent を除く)。
+- `intentNotLost`: intent は、その piece の持ち主にある。
+- `noWriteBelowRead`: 答えた読みの時刻以下の時刻で、同じ piece への書き込みが確定しない。
+
+決めた設計は、次の条件の上に立つ。1 つ外すと反例が出る。上の 3 つが、シャードがテナントの読みに答えるときの規則である。
+
+| 条件 (定数) | 外したインスタンス | 反例 |
+|---|---|---|
+| 親は、claim に手放した piece (m を決めた piece) が 1 つでもあれば断る (`REFUSE_STALE`) | `m18_red_partial_answer` | piece 2 が C へ移る。版 0 の Worker のテナントの読みに、P が piece 1 だけを答える。Worker は P の答えを全部だと思うので、piece 2 の行がどこからも返らない |
+| 子は、claim の piece が全部届いていて、T がどの piece の m よりも小さくないときだけ答える (`CHILD_WAITS_CLAIM`) | `m18_red_child_partial` | 上の範囲の piece 2 だけが届く。版 1 の Worker の読みに、C は piece 2 だけを、P は piece 1 だけを答える。まだ P にある piece 3 の行が返らない |
+| 答える行を claim で絞る (`ANSWER_BY_CLAIM`) | `m18_red_answer_held` | piece 2 が C へ移る。P は、子の ack が届くまで、その行を控えとして持っている。版 1 の Worker の読みに、C が piece 2 を答え、P が piece 1 と控えの piece 2 を答える。piece 2 の行が 2 度返る |
+| piece は時刻 m を運び、子は時計を m まで進める (`CARRY_CLOCK`) | `m18_red_piece_without_clock` | P が piece 2 を T で答える。piece 2 が C へ移り、C の時計は進まない。C が piece 2 への書き込みを T 以下の時刻で受理する。答えた読みが、後から書き込みの後になる |
+| 書き込みの宛先と持ち主の確認を piece で決める (`WRITE_BY_PIECE`) | `m18_red_write_by_slot` | P が piece 2 の m を決めた後で、版 0 の Worker の piece 2 への書き込みを受理する。飛んでいる応答には入っていないので、C はその行を持たない。C が piece 1 への書き込みを受理する形もある |
+| pull は、その piece の intent だけを運ぶ (`INTENTS_BY_PIECE`) | `m18_red_intents_by_group` | X が piece 1 に intent を置く。piece 2 の pull が shard key の intent を全部運び、P に残る piece 1 の intent が C へ行く |
+
+`m18_red_write_by_slot` と `m18_red_piece_without_clock` には、決定的な run が 2 本ずつある (親の側と子の側、blind write と取引 X)。
+
+16 MB を超えるテナントでは、上の範囲が何通もの応答に分かれて移る。`m18_green_chunks` は piece を 3 つにし、piece 2 と piece 3 が別々に移る。範囲表のとおりの claim では、移動の途中、テナントの読みはどちらの版でも揃わない。版 0 の claim は P が断り、版 1 の claim は、C が残りの piece を受け取るまで断る。主キーの読みと書きは、届いた piece について通る。このインスタンスでは、Worker が piece を P と C に好きに分けて claim にする (`ANY_CLAIM`)。どう分けても `tenantSplitSafe` は破れない。規則はシャードの側だけで閉じていて、Worker の分け方に頼らない。ただし、全部を調べたのはこのインスタンスだけで、取引 X がなく、読みの時刻も覚えない (`noWriteBelowRead` は確かめていない)。X と読みの時刻を入れた場合は、下のランダム探索だけが根拠である。分け方が実際の持ち主と合えば (P に、残る piece とまだ手放していない piece)、移動の途中でも読みは揃う (`witnessReadWhileMoving`)。モデルの P は、fence の後でも、まだ m を決めていない piece の読みに答える (M5b と同じ)。いまの実装は、fence した範囲の要求を全部断るので、移動の途中の読みを通すなら、そこも変えることになる。
+
+| インスタンス | invariant | 定数 | 到達状態数 (distinct) | 深さ | 結果 |
+|---|---|---|---|---|---|
+| `m18_green` | `tenantSplitSafe` | piece 2 つ (1 つが移る)、blind write 2 件、取引 X、tick 1、T 0..3 | 1,444,786 (生成 1,534 万) | 17 | No violation |
+| `m18_green_clock` | `tenantSplitSafe` | 同上で T 0..2、答えた読みの時刻を覚える | 1,708,337 (生成 1,583 万) | 17 | No violation |
+| `m18_green_chunks` | `tenantSplitSafe` | piece 3 つ (2 つが別々に移る)、blind write 3 件、取引 X なし、tick 1、T 0..3、claim の分け方は任意 | 1,643,242 (生成 1,771 万) | 17 | No violation |
+| `m18_red_partial_answer` / `_child_partial` / `_answer_held` | `readConsistent` | 条件を 1 つ外す | 反例 | 反例は 4 / 5 / 6 状態 | 反例 |
+| `m18_red_piece_without_clock` | `noWriteBelowRead` | 同上 (`m18_green_clock` から) | 反例 | 反例は 7 状態 | 反例 |
+| `m18_red_write_by_slot` | `singleOwner` / `noLostWrite` | 同上 | 反例 | 反例は 5 / 6 状態 | 反例 |
+| `m18_red_intents_by_group` | `intentNotLost` | 同上 | 反例 | 反例は 5 状態 | 反例 |
+
+`noWriteBelowRead` を確かめているのは `m18_green_clock` だけである。読みの時刻を覚えないインスタンスでは、この不変条件は破れようがない。状態数は、8 worker、heap 2.5 GB で測った。ほかの試験と同時に走らせて、green は 1 本 3 分ほどである。
+`m18_red_child_partial` で TLC が見つける最短の反例は、上の表の形ではない。何も移っていないうちに、Worker が全部の piece を C の claim にし、C が何も返さずに答える。表の形は、決定的な run に固定してある。
+
+TLC には大きすぎる定数は、ランダム探索で補った。`m18_green_wide` は、piece 3 つ、blind write 3 件、取引 X、読みの時刻を覚える、claim の分け方は任意、tick 2、T 0..6 である。`quint run --main=m18_green_wide --invariant=tenantSplitSafe --max-steps=40 --max-samples=1000000` で 100 万本の経路 (各 40 手) を調べ、違反はなかった (約 10 分)。これは抜き取りで、全探索ではない。同じ定数で条件を 1 つずつ外すと、6 つとも 1 秒以内に反例が出た (1 回だけ確かめた。外したインスタンスはファイルに残していない)。`check.sh` には含めない。
+
+witness は 5 つである。`witnessSplitWritten` は、piece 2 が移った後で、C が piece 2 への書き込みを、P が piece 1 への書き込みを受理する。`witnessTenantReadBoth` は、テナントの読みに両方のシャードが答え、合わせた答えが、分割の後に両側で確定した行を含む。`witnessIntentMovedThenApplied` は、P で prepare した piece 2 の intent が子へ移り、子で適用される。`witnessHalfArrived` と `witnessReadWhileMoving` は `m18_green_chunks` のもので、上の範囲の piece が 1 つだけ届いた状態と、その状態で揃うテナントの読みである。
+
+モデルが実装に求めること。
+
+- テナントの読み (shard key の span) の要求は、Worker の範囲表でそのシャードが持つ (slot の範囲, subslot の範囲) を運ぶ。いまの実装は、全表の span に slot の範囲を付けている (`assertOwned` の `s.slots`)。これを subslot の範囲まで広げ、shard key の span にも付ける。全表の読みは、claim が全部の slot に広がるだけで、同じ規則になる。
+- 親は、その範囲に、m を決めた piece が 1 つでも重なれば `NotOwner` を返す。残った行だけを答えない。
+- 子は、その範囲の piece が全部届くまで答えない (pull するか、`Migrating` を返す)。届いた後は、T がどれかの piece の m より小さければ `ReadTooOld` を返す。子は、親にどの piece があるかを知らない。「全部届いた」と言えるのは、親に列挙させた後か、範囲の移動が終わった後である。
+- 答える行は、要求の範囲で絞る。行の subslot は主キーから計算する。親は、手放した piece の行を ack まで持っているので、絞らなければ子の答えと重なる。
+- 書き込み、prepare、phase 2 の持ち主の確認 (`fencedRange`、`moved`、`arrived`、`__moved_txn`) は、shard key ではなく piece で引く。
+- `pull` と `ack` は、intent を shard key (`WHERE sk = ?`) ではなく piece で選ぶ。
+- piece は m を運び、子は受け取るときに時計を m まで進める (いまの `receive` と同じ)。
+
+範囲表のとおりの claim だけを使うと、大きいテナントは、移動の間、主キーを指定しない文が通らない。通すには、Worker が claim を piece の単位で分け直せる必要がある (たとえば、断る応答に、手放した範囲か届いた範囲を載せる)。その仕組みはモデルにない。モデルが示したのは、分け直しても安全であることだけである。
+
+M5b の `singleOwner` は、破れようがない。M5b の blind write はグループごとに 1 件なので、「子が受理したグループを、後から親が受理する」が起きる余地がない。M18 では、受理された行がどのシャードにあるかを直接見る形にし、`m18_red_write_by_slot` で破れることを確かめた。M5b は直していない。
+
+モデルにないもの。
+
+- 行のない piece。pull されないので、範囲の移動が終わるときに子が到着なしで受け持ち、親の時計を受け取る (M5b の `finishRange`)。piece でも同じ形のはずだが、確かめていない。
+- 2 つ目のグループ。slot を subslot で分けると、その slot にあるテナントが全部分かれる。移動は piece ごとなので、モデルの piece を別のグループのものと読めば同じである。
+- テナントの読みを含む取引の検証。commit のとき、読んだ範囲を T から確かめ直す。読みと同じ claim の確認が要るはずである。書き込みは blind write だけを扱う (M5b と同じ)。
+- 子の再分割、範囲表の版が 3 つ以上ある場合、シャードの併合。
+- 親が控えの行を消す ack。モデルの親は控えを持ち続ける。
+- piece の境界の決め方 (再送で同じ m を返すには、親が最初の pull で境界を決めて記録する必要がある) と、16 MB を超える 1 行。
+- 活性。断られた読みが、範囲表を取り直した後で必ず通ることは確かめていない。
+- 取引 X は、piece 1 と piece 2 に 1 行ずつ書く 1 件である。piece が 3 つのインスタンスには X がない。
+
