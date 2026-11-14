@@ -861,3 +861,133 @@ witness は 4 つである。`witnessCrossAppliedThenMoved` は、2 つの piece
 - 移動が終わった後も分かれたままのテナント (subslot で割った slot)。そこでの UNIQUE の値の書き込みは、設計の文書の「同じ値の行を持ち主の全部から読む 2PC」で、M1 の検証に頼る。
 - 適用の中の順序。SQLite は UNIQUE を行ごとに確かめるので、値の入れ替えは、消してから入れる順でしか適用できない。モデルの適用は、M16 と同じく、終わった状態だけを見る。
 
+
+### M21 `m21_catalog_epoch.qnt` — Meta の版と排他を、1 本の epoch の列と 2 相の遷移にまとめる
+
+2026-11-14 に書いた。
+実装より先に書いたモデルで、対応する実装はまだない。
+設計は [docs/design-catalog-epoch.md](../docs/design-catalog-epoch.md) にある。
+
+いまの Meta は、5 つの版と排他を別々に持っている。
+DDL の版と事後の取り消し、シャードをまたぐ UNIQUE の index を作る間の書き込み禁止 (M12)、DROP の前の書き込み禁止 (M14)、分割と DDL の枠 (M15)、範囲表の版である。
+モデルは、これを追記だけの列 1 本に置き換える。
+記録は `prepare`、`commit`、`abort` (表定義の遷移) と `start`、`end` (範囲の移動) の 5 種類で、シャードは列を先頭から順に適用する。
+要求は、Worker のスナップショットの epoch と、その中で表定義が最後に変わった epoch の 2 つを運ぶ。
+シャードは後者が自分のものと等しいことを確かめ、所有は自分のスナップショットで引く。
+
+場面は 4 つの操作で、定数で選ぶ: `BUILD` (シャードをまたぐ UNIQUE の index を作る)、`CHECK` (行で失敗し得る DDL)、`DROP`、`SPLIT` (行 1 の区間を P から C へ移す)。
+行は 2 個 (行 1 はシャード P、行 2 はシャード Q) で、取引は 1 行の値を書き換える (計画、受け付け、確定の 3 段)。
+時刻はモデルの本体にない。
+公開の時刻と DROP の前の確かめが比べる時刻は、M12 と M14 から写した小さなモデル (`m21_clock_*`、`m21_guard_*`) で確かめる。
+
+不変条件は、M11 から M15 のものを写したものと、この設計で新しく要るものである。
+
+| 不変条件 | 元 |
+|---|---|
+| `indexMatches`、`noWriteWhileFenced`、`notRelied` | M12 (M11 の `indexComplete`、`noDangling`、`uniqueSafe` を含む) |
+| `oneExit` | M12 と M14 |
+| `noLostAfterReturn`、`noResurrect` | M11 の `noLostWrite` と `noResurrect` |
+| `guardHolds` | M14 の `noLostWrite` |
+| `pinned` | M13 の `pinned` |
+| `servable` | M15 の `servable` と、未解決の問題 17 |
+| `moveKeepsWrites`、`readConsistent`、`sameShape` | M5b の `noLostWrite` と `readConsistent`、不変条件 4 の「運ぶ行の形」 |
+| `commitApplies` | 新しい。記録した `commit` は、どのシャードでも適用できる (事後の取り消しの代わり) |
+| `noServeBelowAck` | 新しい。シャードは、自分が ok と答えた `prepare` より古い表定義の計画を受けない |
+| `pinnedSurvives` | 新しい。表定義が同じで、自分が持ち主である要求を、epoch が古いという理由で断らない |
+
+`epochSafe` は、これらすべての論理積である。
+`epochSafeCommitOnly` は `noServeBelowAck` を除いたもので、表定義の epoch を `commit` だけで進める別の案 (設計の文書の持ち主の判断 6) を確かめる。
+
+設計の条件は定数で、赤はそれを 1 つずつ外す。
+2026-11-14 に、TLC (heap 2.5 GB、4 workers) で全部を流した。
+green、red、witness の 72 個と、`run` の試験 38 個が、期待どおりだった (緑は違反なし、赤と witness は違反あり)。
+`HEAVY=1` のときだけ流す 3 個 (`m21_green_split_build`。移動と index の作成の組み合わせ) は、流していない。
+
+| 種類 | インスタンス | invariant | 到達状態数 (distinct) | 確かめること |
+|---|---|---|---|---|
+| green | `m21_green_build` | `epochSafe` | 250,067 | 行のある表に、シャードをまたぐ UNIQUE の index を作る。取引 2 件が、どの epoch のスナップショットでも計画する |
+| green | `m21_green_check` | `epochSafe` | 196,451 | 行で失敗し得る DDL。各シャードが、書き込みを止めた表で試してから確定する (事後の取り消しの代わり) |
+| green | `m21_green_ddl2` | `epochSafe` | 426,927 | 同時に出された 2 つの DDL。表定義の遷移は 1 つずつ開く |
+| green | `m21_green_drop` | `epochSafe` | 543,298 | 取引が読んだ表の DROP。copy の後の書き込みがあれば取り消す |
+| green | `m21_green_split` | `epochSafe` | 169,545 | 移動と DDL。分割を進める側は、start の後ならいつ止まってもよい |
+| green | `m21_green_split_txns` | `epochSafe` | 75,003 | 移動の前後のスナップショットの取引 2 件。動かない行の取引は、分割の記録を適用したシャードでも通る |
+| green | `m21_check_no_reject` | `commitApplies` | 664,285 | 外しても破れない: CHECK の場面では、版の確認がなくても、記録された commit を適用できる (この不変条件に限る。版の確認を外してよい、ではない) |
+| green | `m21_alt_commit_only_build` | `epochSafeCommitOnly` | 333,772 | 別の案: 表定義の epoch を commit だけで進める (prepare と abort では進めない)。noServeBelowAck を除いて成り立つ |
+| green | `m21_alt_commit_only_check` | `epochSafeCommitOnly` | 264,349 |  |
+| red | `m21_red_online` | `indexMatches` | 212,818 | 2026-11 までの設計 (作りながら書く)。他人の項目を消す (m12_red_online) |
+| red | `m21_red_online` | `notRelied` | 278 |  |
+| red | `m21_red_no_fence` | `indexMatches` | 168,356 | 書き込みを止めない (m12_red_no_lock、m11_impl_backfill) |
+| red | `m21_red_visible` | `notRelied` | 252 | 作っている最中の index を計画が使う (m12_red_visible) |
+| red | `m21_red_no_drain` | `noWriteWhileFenced` | 8,234 | intent を持ったまま表定義の記録を適用する (m12_red_no_drain、m11_impl_inflight) |
+| red | `m21_red_stale` | `indexMatches` | 188,279 | 古い表定義の計画を断らない (m12_red_stale、m11_red_no_reject) |
+| red | `m21_red_stale` | `noServeBelowAck` | 43,667 |  |
+| red | `m21_red_two_exits` | `oneExit` | 56,791 | 取り消された後に commit が通る (m12_red_two_exits) |
+| red | `m21_red_two_exits` | `indexMatches` | 60,892 |  |
+| red | `m21_red_repin` | `indexMatches` | 492,673 | 取引が、計画し直さずに新しい表定義の epoch を名乗る (m12_red_repin、m13_red_repin) |
+| red | `m21_red_repin` | `pinned` | 69,598 |  |
+| red | `m21_red_scan_early` | `indexMatches` | 79,429 | prepare を適用する前のシャードの行を読んで埋める (m12_red_scan_early) |
+| red | `m21_red_scan_early` | `noServeBelowAck` | 3,004 |  |
+| red | `m21_red_no_recheck` | `indexMatches` | 461,592 | 待ちの後で版を確かめ直さない (m11_impl_wait)。ok と答えた prepare より古い計画を受ける |
+| red | `m21_red_no_recheck` | `noServeBelowAck` | 127,918 |  |
+| red | `m21_red_early_commit` | `indexMatches` | 332 | 全シャードの ok を待たずに commit を記録する (m11_red_early_public) |
+| red | `m21_red_trial_no_fence` | `commitApplies` | 185,767 | 試適用の間、書き込みを止めない |
+| red | `m21_red_trial_missing_ack` | `commitApplies` | 5,637 | 全シャードの ok を待たずに commit を記録する |
+| red | `m21_red_trial_early` | `commitApplies` | 191,856 | prepare を適用する前のシャードが、試適用に ok と答える |
+| red | `m21_red_trial_no_drain` | `commitApplies` | 200,311 | intent を持ったまま prepare を適用する |
+| red | `m21_red_drop_no_fence` | `guardHolds` | 66,933 | 確かめるが、書き込みを止めない (m14_red_no_lock) |
+| red | `m21_red_drop_no_check` | `guardHolds` | 39,310 | 書き込みは止めるが、確かめない (m14_red_no_check) |
+| red | `m21_red_drop_check_early` | `guardHolds` | 31,178 | prepare を適用する前に確かめる (m14_red_check_early) |
+| red | `m21_red_drop_no_drain` | `guardHolds` | 59,721 | intent を決着させずに適用する (m14_red_no_drain) |
+| red | `m21_red_drop_no_drain` | `noResurrect` | 48,460 | 同上。DROP を適用したシャードに、書き込みが適用される (m11_impl_drop) |
+| red | `m21_red_drop_untied` | `guardHolds` | 79,082 | 期限切れで禁止が解けた後に、DROP の commit が通る (m14_red_untied) |
+| red | `m21_red_drop_missing_ack` | `noLostAfterReturn` | 1,112 | 全シャードが prepare を適用する前に、DDL が完了を返す (m11_red_no_sync) |
+| red | `m21_red_two_open` | `commitApplies` | 115,667 | 表定義の遷移を 2 つ開く: index を作っている間に、同じ表の DROP が確定する |
+| red | `m21_red_ddl_during_move` | `servable` | 626 | 移動が開いている間に、表定義の遷移を開く (m15_red_no_slot) |
+| red | `m21_red_move_during_ddl` | `servable` | 2,780 | 表定義の遷移が開いている間に、移動を開く (m15_red_no_based_on の後継) |
+| red | `m21_red_end_early` | `servable` | 2,952 | 子が受け取り終える前に end を記録する (m15_red_early_release) |
+| red | `m21_red_pull_unfenced` | `moveKeepsWrites` | 1,154 | pull が start の epoch を運ばない: 親が、fence の前に行を渡す |
+| red | `m21_red_pull_unfenced` | `readConsistent` | 1,483 |  |
+| red | `m21_red_pull_unfenced` | `sameShape` | 2,763 |  |
+| red | `m21_red_fence_first` | `servable` | 63 | いまの実装: 親の fence が、範囲表の切り替えより先の別の手である (未解決の問題 17) |
+| red | `m21_red_owner_unchecked` | `moveKeepsWrites` | 1,635 | シャードが、所有を自分のスナップショットで引かない |
+| red | `m21_red_owner_unchecked` | `readConsistent` | 2,927 |  |
+| red | `m21_red_strict_epoch` | `pinnedSurvives` | 143 | シャードが、epoch が等しいことを求める: 分割が、動いていない行の取引を巻き込む |
+| witness | `m21_green_build` | `witnessPublicThenWrite` | 248,455 |  |
+| witness | `m21_green_build` | `witnessAbortedOnDuplicate` | 6,281 |  |
+| witness | `m21_green_build` | `witnessRefusedByFence` | 4,341 |  |
+| witness | `m21_green_build` | `witnessLiftedAfterStall` | 98,032 | 進める側が止まった後、Meta が取り消し、その後の書き込みが通る |
+| witness | `m21_green_check` | `witnessTrialRejectedThenWrite` | 88,010 | 試適用が通らずに取り消され、その後の書き込みが通る (逆操作の文なしで) |
+| witness | `m21_green_check` | `witnessCheckCommittedThenWrite` | 175,638 |  |
+| witness | `m21_green_ddl2` | `witnessBothCommitted` | 294,508 |  |
+| witness | `m21_green_ddl2` | `witnessBuildAfterRejectedCheck` | 195,024 |  |
+| witness | `m21_green_drop` | `witnessDroppedAfterWrites` | 472,040 |  |
+| witness | `m21_green_drop` | `witnessGuardRefused` | 131,604 |  |
+| witness | `m21_green_split` | `witnessServedWhileDriverDead` | 4,859 | 進める側が止まっていても、子への書き込みが通る (end の前) |
+| witness | `m21_green_split` | `witnessEndedDriverDead` | 2,900 |  |
+| witness | `m21_green_split` | `witnessDdlAfterMove` | 129,917 |  |
+| witness | `m21_green_split` | `witnessMoveAfterDdl` | 30,819 |  |
+| witness | `m21_green_split` | `witnessParentAnswersUncut` | 206 | 親が、start を適用した後で、まだ渡していない行の読みに答える (M19) |
+| witness | `m21_green_split_txns` | `witnessPinnedSurvives` | 533 | 分割より前のスナップショットの取引が、分割の記録を適用したシャードで通る |
+| witness | `m21_alt_commit_only_check` | `witnessOldPlanAfterAbort` | 53,064 | 別の案で、prepare より前の計画が、取り消しの後で、計画し直さずに通る |
+| green | `m21_green_split_build` | `epochSafe` | (HEAVY=1 のときだけ) | 行を埋める処理は、移動が閉じた後なら子の行を読む |
+| witness | `m21_green_split_build` | `witnessBuildAfterMove` | (HEAVY=1 のときだけ) | 移動が閉じた後で index が公開され、項目は子が持つ行を指す |
+| witness | `m21_green_split_build` | `witnessMoveAfterBuild` | (HEAVY=1 のときだけ) | index が公開された後で行が動き、子への書き込みが index を保守する |
+| green | `m21_clock_green` | `commitIsAPoint` | 1,788 |  |
+| red | `m21_clock_red_no_clock` | `commitIsAPoint` | 1,162 | commit が時刻を運ばない (m12_clock_red_no_clock) |
+| red | `m21_clock_red_skip_empty` | `commitIsAPoint` | 1,085 | 行のないシャードを読まない (m12_clock_red_skip_empty) |
+| witness | `m21_clock_green` | `witnessAwareOnSlowShard` | 1,103 |  |
+| green | `m21_guard_green` | `guardSafe` | 92,634 |  |
+| red | `m21_guard_red_commit_ts` | `noLostWrite` | 34,104 | copy の確定の時刻と比べる (m14_red_commit_ts) |
+| witness | `m21_guard_green` | `witnessDroppedAfterWrites` | 16,246 |  |
+| witness | `m21_guard_green` | `witnessRefusedByCheck` | 6,712 |  |
+
+確かめていないこと。
+
+- 移動の中身。行は 1 つで、1 手で運ばれる。応答の喪失、piece、claim の分け直しは、M5b、M18、M19 が扱う。
+- 取引の中の DDL の順序 (M13)、2PC の取引 (M11)。M21 の取引は 1 シャードである。
+- 同じ名前の表の作り直し (DROP の後の CREATE)。
+- 活性。禁止が必ず解けることは、時相の性質としては確かめていない。進める側が止まった後で禁止が解ける経路があること (`witnessLiftedAfterStall`) だけを確かめた。
+- 2 つ以上の移動と、移動どうしの条件。
+
+実装が入った時点で、M12、M14、M15 は M21 が置き換える。
+M11 と M13 は残す。

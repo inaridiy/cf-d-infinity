@@ -236,8 +236,9 @@ The checks are layered. Each one catches what the layer before it cannot see.
    recovery, HLC across restarts, split fencing and live migration, row locks, garbage collection of transaction
    records, schema changes under concurrent transactions, building a cross-shard `UNIQUE` index, schema changes inside
    transactions, table rebuilds, the ordering of schema changes and splits, `UNIQUE` across pending writes, and a
-   transaction id reused by two continuations. Three more (M18 to M20) model a mechanism the code does not have yet:
-   moving one tenant in pieces, re-splitting a read while pieces move, and `UNIQUE` while a group moves piece by piece.
+   transaction id reused by two continuations. Four more (M18 to M21) model mechanisms the code does not have yet:
+   moving one tenant in pieces, re-splitting a read while pieces move, `UNIQUE` while a group moves piece by piece,
+   and one epoch log in place of the catalog's separate versions and write bans.
    TLC explores them exhaustively on small instances. Each model has variants with a known bug put back, and the checker
    must find every one.
 2. **Counterexamples replayed against the code.** A model only checks the design. For each bug variant that the

@@ -23,6 +23,10 @@ Categories:
   `m19_red_stale_map`, `m19_red_mixed_t`, `m19_red_gap`, `m19_red_forget_map`, `m19_red_piece_without_clock`,
   `m19_live_red_child_waits`, `m20_red_piecewise`, `m20_red_late_intent`, `m20_red_child_early`,
   `m20_red_child_reads_parent_per_piece`.
+  M21 (`m21_catalog_epoch.qnt`) models one epoch log in Meta in place of today's separate schema versions, write
+  bans and split slot ([design-catalog-epoch.md](./design-catalog-epoch.md)). Its 31 red modules (the `red` lines of
+  the M21 section of `specs/check.sh`) get rows when the design is implemented. Many of them restate a red of M11 to
+  M15 that already has a row here; those rows move to M21 when M12, M14 and M15 are retired.
 
 | module | flaw modelled | fault switch | deterministic replay | cat |
 |---|---|---|---|---|
