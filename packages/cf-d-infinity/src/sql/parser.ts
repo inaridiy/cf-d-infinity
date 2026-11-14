@@ -25,6 +25,7 @@ const RESERVED = new Set(`ADD ALL ALTER AND AS AUTOINCREMENT BETWEEN CASE CHECK 
 const JOIN_WORDS = new Set(["NATURAL", "LEFT", "RIGHT", "FULL", "OUTER", "INNER", "CROSS"]);
 const CONFLICT_ACTIONS = new Set(["ROLLBACK", "ABORT", "FAIL", "IGNORE", "REPLACE"]);
 const LIKE_WORDS = new Set(["LIKE", "GLOB", "REGEXP", "MATCH"]);
+const WINDOW_CLAUSE_START = new Set(["PARTITION", "ORDER", "ROWS", "RANGE", "GROUPS"]);
 /** 列の定義で、型の名前を終わらせる語 (列の制約の先頭)。 */
 const COLUMN_CONSTRAINT_START = new Set(["CONSTRAINT", "PRIMARY", "NOT", "NULL", "UNIQUE", "CHECK", "DEFAULT", "COLLATE", "REFERENCES", "GENERATED", "AS"]);
 
@@ -420,11 +421,8 @@ class Parser {
 
   private windowDefinition(): Node {
     const start = this.t.start;
-    const clauseStart = (k: number): boolean =>
-      this.isOp(")", k) || (this.isKw("PARTITION", k) && this.isKw("BY", k + 1)) || (this.isKw("ORDER", k) && this.isKw("BY", k + 1))
-      || this.isKw("ROWS", k) || this.isKw("RANGE", k) || this.isKw("GROUPS", k);
-    // 先頭の名前は、元にする window の名前である。句の先頭の語と同じ名前でも、後ろに句が続けば名前として読む。
-    const baseWindowName = this.isName() && (!clauseStart(0) || clauseStart(1)) && !this.isKw("ORDER") ? this.identifier() : undefined;
+    // 先頭の名前は、元にする window の名前である。句の先頭の語 (PARTITION、ORDER、ROWS、RANGE、GROUPS) は、名前として読まない。
+    const baseWindowName = this.isName() && !WINDOW_CLAUSE_START.has(this.t.upper) ? this.identifier() : undefined;
     let partitionBy: Node | undefined;
     if (this.isKw("PARTITION")) {
       const s = this.t.start;
@@ -454,7 +452,7 @@ class Parser {
 
   private frameBound(): Node {
     const s = this.t.start;
-    if (this.isKw("CURRENT") && this.isKw("ROW", 1)) return this.node("frame_bound_current_row", s, { currentRowKw: this.kws("CURRENT", "ROW") });
+    if (this.isKw("CURRENT")) return this.node("frame_bound_current_row", s, { currentRowKw: this.kws("CURRENT", "ROW") });
     const expr = this.isKw("UNBOUNDED") ? this.node("frame_unbounded", s, { unboundedKw: this.kw() }) : this.expr();
     if (this.isKw("PRECEDING")) return this.node("frame_bound_preceding", s, { expr, precedingKw: this.kw() });
     return this.node("frame_bound_following", s, { expr, followingKw: this.kw("FOLLOWING") });
@@ -637,7 +635,7 @@ class Parser {
   private withClause(): Node {
     const s = this.t.start;
     const withKw = this.kw("WITH");
-    const recursiveKw = this.isKw("RECURSIVE") && this.isName(1) ? this.kw() : undefined;
+    const recursiveKw = this.kwIf("RECURSIVE");
     const tables = this.list(() => {
       const cs = this.t.start;
       const table = this.identifier();
@@ -812,11 +810,11 @@ class Parser {
   // ---- 表定義 ----
 
   private ifNotExists(): Node[] | undefined {
-    return this.isKw("IF") && this.isKw("NOT", 1) ? this.kws("IF", "NOT", "EXISTS") : undefined;
+    return this.isKw("IF") ? this.kws("IF", "NOT", "EXISTS") : undefined;
   }
 
   private ifExists(): Node[] | undefined {
-    return this.isKw("IF") && this.isKw("EXISTS", 1) ? this.kws("IF", "EXISTS") : undefined;
+    return this.isKw("IF") ? this.kws("IF", "EXISTS") : undefined;
   }
 
   private create(): Node {
@@ -1042,18 +1040,19 @@ class Parser {
       default:
         return this.fail();
     }
-    // 外部キーの後ろの DEFERRABLE と INITIALLY。
+    // 外部キーの後ろの `[NOT] DEFERRABLE [INITIALLY DEFERRED | IMMEDIATE]`。列の制約では、繰り返し書ける。
+    // 外部キーの句は、シャードへ送る文から外す (ddl.ts)。ここで SQLite より緩く読むと、SQLite が断る文が表定義の履歴に残る。
     const modifiers: Node[] = [];
     if (constraint.type === "references_specification" || constraint.type === "constraint_foreign_key") {
-      for (;;) {
-        const ms = this.t.start;
-        if (this.isKw("NOT") && this.isKw("DEFERRABLE", 1)) modifiers.push(this.node("constraint_modifier", ms, { kw: this.kws("NOT", "DEFERRABLE") }));
-        else if (this.isKw("DEFERRABLE")) modifiers.push(this.node("constraint_modifier", ms, { kw: this.kw() }));
-        else if (this.isKw("INITIALLY")) {
+      while (this.isKw("DEFERRABLE") || (this.isKw("NOT") && this.isKw("DEFERRABLE", 1))) {
+        modifiers.push(this.node("constraint_modifier", this.t.start, { kw: this.isKw("NOT") ? this.kws("NOT", "DEFERRABLE") : this.kw() }));
+        if (this.isKw("INITIALLY")) {
+          const ms = this.t.start;
           const k = this.kw();
           if (!this.isKw("DEFERRED") && !this.isKw("IMMEDIATE")) this.fail();
           modifiers.push(this.node("constraint_modifier", ms, { kw: [k, this.kw()] }));
-        } else break;
+        }
+        if (table) break;
       }
     }
     const out = name || modifiers.length ? this.node("constraint", start, { name, constraint, modifiers }) : constraint;
@@ -1090,9 +1089,9 @@ class Parser {
         else if (this.isKw("CASCADE") || this.isKw("RESTRICT")) actionKw = this.kw();
         else return this.fail();
         options.push(this.node("referential_action", os, { onKw, eventKw, actionKw }));
-      } else if (this.isKw("MATCH") && (this.at(1).kind === "word" || this.at(1).kind === "quoted")) {
+      } else if (this.isKw("MATCH")) {
         // MATCH の後ろは名前なら何でもよい (SQLite は読んで捨てる)。FULL は結合の語なので、引用符で囲まれて届く (cst.ts)。
-        options.push(this.node("referential_match", os, { matchKw: this.kw(), typeKw: this.at(0).kind === "word" ? this.kw() : this.identifier() }));
+        options.push(this.node("referential_match", os, { matchKw: this.kw(), typeKw: this.identifier() }));
       } else break;
     }
     return columns ? this.node("references_specification", s, { referencesKw, table, columns, options }) : this.node("references_specification", s, { referencesKw, table, options });
@@ -1133,18 +1132,18 @@ class Parser {
       const renameKw = this.kw();
       if (this.isKw("TO")) action = this.node("alter_action_rename", s, { renameKw: [renameKw, this.kw()], newName: this.identifier() });
       else {
-        const columnKw = this.isKw("COLUMN") && this.isName(1) && !this.isKw("TO", 1) ? this.kw() : undefined;
+        const columnKw = this.kwIf("COLUMN");
         action = this.node("alter_action_rename_column", s, {
           renameKw: columnKw ? [renameKw, columnKw] : renameKw, oldName: this.identifier(), toKw: this.kw("TO"), newName: this.identifier(),
         });
       }
     } else if (this.isKw("ADD")) {
       const addKw = this.kw();
-      const columnKw = this.isKw("COLUMN") && this.isName(1) ? this.kw() : undefined;
+      const columnKw = this.kwIf("COLUMN");
       action = this.node("alter_action_add_column", s, { addKw: columnKw ? [addKw, columnKw] : addKw, column: this.columnDefinition() });
     } else {
       const dropKw = this.kw("DROP");
-      const columnKw = this.isKw("COLUMN") && this.isName(1) ? this.kw() : undefined;
+      const columnKw = this.kwIf("COLUMN");
       action = this.node("alter_action_drop_column", s, { dropKw: columnKw ? [dropKw, columnKw] : dropKw, column: this.identifier() });
     }
     const actions: Node = { type: "list_expr", items: [action], range: [action.range[0], action.range[1]] };
@@ -1209,6 +1208,7 @@ class Parser {
       case "EXPLAIN": {
         const explainKw = this.kw();
         const queryPlanKw = this.isKw("QUERY") ? this.kws("QUERY", "PLAN") : undefined;
+        if (this.isKw("EXPLAIN")) this.fail();
         return this.node("explain_stmt", start, { explainKw, queryPlanKw, statement: this.statement() });
       }
       case "ANALYZE": {
@@ -1229,12 +1229,12 @@ class Parser {
       }
       case "ATTACH": {
         const attachKw = this.kw();
-        const databaseKw = this.isKw("DATABASE") && !this.isKw("AS", 1) ? this.kw() : undefined;
+        const databaseKw = this.kwIf("DATABASE");
         return this.node("attach_database_stmt", start, { attachKw, databaseKw, file: this.expr(), asKw: this.kw("AS"), schema: this.identifier() });
       }
       case "DETACH": {
         const detachKw = this.kw();
-        const databaseKw = this.isKw("DATABASE") && this.isName(1) ? this.kw() : undefined;
+        const databaseKw = this.kwIf("DATABASE");
         return this.node("detach_database_stmt", start, { detachKw, databaseKw, schema: this.identifier() });
       }
       case "BEGIN": {
@@ -1251,7 +1251,7 @@ class Parser {
         if (!this.isKw("TO")) return this.node("rollback_transaction_stmt", start, { rollbackKw, transactionKw });
         const s = this.t.start;
         const toKw = this.kw();
-        const savepointKw = this.isKw("SAVEPOINT") && this.isName(1) ? this.kw() : undefined;
+        const savepointKw = this.kwIf("SAVEPOINT");
         const savepoint = this.node("rollback_to_savepoint", s, { toKw, savepointKw, savepoint: this.identifier() });
         return this.node("rollback_transaction_stmt", start, { rollbackKw, transactionKw, savepoint });
       }
@@ -1259,7 +1259,7 @@ class Parser {
         return this.node("savepoint_stmt", start, { savepointKw: this.kw(), savepoint: this.identifier() });
       case "RELEASE": {
         const releaseKw = this.kw();
-        const savepointKw = this.isKw("SAVEPOINT") && this.isName(1) ? this.kw() : undefined;
+        const savepointKw = this.kwIf("SAVEPOINT");
         return this.node("release_savepoint_stmt", start, { releaseKw, savepointKw, savepoint: this.identifier() });
       }
       default:

@@ -9,6 +9,8 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { bindParams, constant, parseStatements, render, text, walk, type Node } from "../src/sql/cst";
 import { parseDdl } from "../src/sql/ddl";
+import { tokenize } from "../src/sql/lexer";
+import { SqlError } from "../src/types";
 import { diff } from "./diff";
 import { randomExpression, splitStatements, sqliteAccepts } from "./parser-oracle";
 import { STATEMENTS } from "./parser-statements";
@@ -170,6 +172,16 @@ const KNOWN_DIFFERENCES: string[] = [
   "refuses: CREATE TABLE t (a INT, UNIQUE (a COLLATE NOCASE DESC))",
 ];
 
+/** パーサが通して SQLite が断る文のうち、分かっているもの (KNOWN_DIFFERENCES の accepts と同じ理由)。壊した文の試験が使う。 */
+const KNOWN_LAX = [
+  // UPDATE と DELETE の ORDER BY と LIMIT (SQLite の組み込みの指定)。
+  /^(WITH\b.*)?(UPDATE|DELETE)\b[^]*\b(ORDER\s+BY|LIMIT)\b/i,
+  // 解析の前に引用符で囲んだ結合の語 (cst.ts の preprocess)。
+  /"(LEFT|RIGHT|FULL|INNER|OUTER|CROSS|NATURAL)"/i,
+  // INSERT ... SELECT ... FROM t ON CONFLICT。SQLite は ON を結合の条件として読んで断る (WHERE true を挟めと文書にある)。
+  /^INSERT\b[^]*\bSELECT\b[^]*\bON\s+CONFLICT\b/i,
+];
+
 describe("the SQL parser", () => {
   describe("accepting and refusing", () => {
     it("agrees with SQLite on every statement of the list, except the listed ones", () => {
@@ -251,6 +263,50 @@ describe("the SQL parser", () => {
       expect(refuses("INSERT INTO t x VALUES (1)")).toBe('near "x": syntax error');
       expect(refuses("CREATE TABLE t (a INT) nonsense")).toBe('near "nonsense": syntax error');
       expect(refuses("UPDATE t SET a = 1 WHERE b = 2 3")).toBe('near "3": syntax error');
+    });
+
+    it("takes damaged statements without failing in any other way, and accepts none that SQLite refuses", () => {
+      // 一覧の文のトークンを 1 つ消す、重ねる、隣と入れ替える。パーサは、文を読むか SqlError で断るかのどちらかで、ほかの例外を投げない。
+      // パーサが通した文は、SQLite も通す。通さないと、文を作り直す経路 (INSERT、CREATE TABLE) が、誤った文を正しい文にして実行する。
+      const crashes: string[] = [];
+      const lax: string[] = [];
+      const seen = new Set<string>();
+      let damaged = 0;
+      for (const source of STATEMENTS) {
+        let texts: string[];
+        try {
+          texts = tokenize(source).filter((t) => t.kind !== "eof").map((t) => t.text);
+        } catch {
+          continue;
+        }
+        for (let i = 0; i < texts.length; i++) {
+          for (const parts of [
+            [...texts.slice(0, i), ...texts.slice(i + 1)],
+            [...texts.slice(0, i + 1), texts[i]!, ...texts.slice(i + 1)],
+            i + 1 < texts.length ? [...texts.slice(0, i), texts[i + 1]!, texts[i]!, ...texts.slice(i + 2)] : [],
+          ]) {
+            const m = parts.join(" ");
+            if (parts.length === 0 || seen.has(m)) continue;
+            seen.add(m);
+            damaged++;
+            let stmts: Node[];
+            try {
+              stmts = parseStatements(m);
+            } catch (e) {
+              if (!(e instanceof SqlError)) crashes.push(`${String(e)}: ${m}`);
+              continue;
+            }
+            for (const st of stmts) {
+              const t = text(st);
+              if (sqliteAccepts(t) || KNOWN_LAX.some((re) => re.test(t))) continue;
+              lax.push(t);
+            }
+          }
+        }
+      }
+      expect(damaged).toBeGreaterThan(30000);
+      expect(crashes).toEqual([]);
+      expect(lax).toEqual([]);
     });
 
     it("reads a CREATE TRIGGER as one statement, with the semicolons of its body", () => {
