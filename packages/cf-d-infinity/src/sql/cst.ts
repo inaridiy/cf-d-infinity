@@ -7,58 +7,6 @@ import { print } from "./printer";
 
 export type { Node };
 
-/**
- * 結合の語 (LEFT など) は SQLite では識別子にも使えるが、識別子として読むと `a LEFT JOIN b` の LEFT が別名に読まれて
- * 内部結合に化ける。そこでパーサは予約語として扱い (parser.ts の RESERVED)、後ろに結合が続かないものだけを、
- * 解析の前に引用符で囲む。
- *
- * 後ろに続くかどうかは文面で見るので、間に注釈があると見誤る: `a LEFT /* c *\/ JOIN b` の LEFT を引用符で囲み、
- * 内部結合にしてしまう (未解決。test/open/join-word-before-comment.test.ts)。この書き換えは前のパーサ (sql-parser-cst) の
- * 頃からのものである。パーサが結合の語を SQLite と同じ位置で識別子として読めば、書き換えは要らなくなる。
- */
-const JOIN_WORD = /^(LEFT|RIGHT|FULL|INNER|OUTER|CROSS|NATURAL)$/i;
-const FOLLOWS_JOIN = /^\s*(JOIN|OUTER|INNER|CROSS|LEFT|RIGHT|FULL)\b/i;
-
-function preprocess(sql: string): string {
-  let out = "";
-  for (let i = 0; i < sql.length; ) {
-    const ch = sql[i]!;
-    if (ch === "'" || ch === '"' || ch === "`" || ch === "[") {
-      const close = ch === "[" ? "]" : ch;
-      let j = i + 1;
-      while (j < sql.length && (sql[j] !== close || (close !== "]" && sql[j + 1] === close && ++j))) j++;
-      out += sql.slice(i, j + 1);
-      i = j + 1;
-    } else if (sql.startsWith("--", i) || sql.startsWith("/*", i)) {
-      const end = sql.startsWith("--", i) ? sql.indexOf("\n", i) : sql.indexOf("*/", i) + 1;
-      const stop = end <= 0 ? sql.length : end + 1;
-      out += sql.slice(i, stop);
-      i = stop;
-    } else if (/[A-Za-z_]/.test(ch)) {
-      let j = i;
-      while (j < sql.length && /[A-Za-z0-9_$]/.test(sql[j]!)) j++;
-      const word = sql.slice(i, j);
-      if (/^ALL$/i.test(word) && /\(\s*$/.test(out)) {
-        i = j; // `COUNT(ALL x)` の ALL は既定と同じ意味なので、落とす
-        continue;
-      }
-      const empty = /^IN$/i.test(word) ? /^\s*\(\s*\)/.exec(sql.slice(j)) : null;
-      if (empty) {
-        // `x IN ()` は SQLite の拡張である。常に偽の同じ意味の式へ置き換える。パーサは空の並びを読まない (parser.ts の inOperand)。
-        out += "IN (SELECT 1 WHERE 0)";
-        i = j + empty[0].length;
-        continue;
-      }
-      out += JOIN_WORD.test(word) && !FOLLOWS_JOIN.test(sql.slice(j)) ? `"${word}"` : word;
-      i = j;
-    } else {
-      out += ch === "\r" ? " " : ch; // CR は空白に揃える
-      i++;
-    }
-  }
-  return out;
-}
-
 export type Params = Value[] | Record<string, Value>;
 
 /**
@@ -67,9 +15,15 @@ export type Params = Value[] | Record<string, Value>;
  */
 export const parseObserver: { seen?: (source: string) => void } = {};
 
+/**
+ * 文を解析する。文面は、書き換えずにそのままパーサへ渡す。
+ * 2026-11-14 までは、解析の前に文面を書き換えていた (結合の語を引用符で囲む、`x IN ()` をサブクエリにする、関数の引数の ALL を
+ * 落とす、CR を空白にする)。書き換えは字句を知らないので、語の間の注釈で見誤り、結果の列名も SQLite と違っていた。今はどれも
+ * パーサが SQLite と同じ場所で読む (parser.ts の JOIN_WORDS、inOperand、call)。
+ */
 export function parseStatements(source: string): Node[] {
   parseObserver.seen?.(source);
-  return parseSql(preprocess(source));
+  return parseSql(source);
 }
 
 /** 節の文面。節の外側の空白と注釈は付かない。 */

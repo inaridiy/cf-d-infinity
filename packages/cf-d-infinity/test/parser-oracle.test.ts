@@ -14,15 +14,21 @@
 //   2. 木の形 (節の種類と欄。range と空白は除く)、葉でない節の文面、引数の節の位置。
 //   3. 引数を束縛した結果 (値の並び、節の番号、束縛した後の文面)。
 //   4. DDL の解釈 (parseDdl) の結果。制約を外して出し直した文面も、ここで比べる。
-//   5. 空白と注釈をトークンの境目に差し込んだ文の、木と文面と DDL の解釈。
+//   5. 空白と注釈をトークンの境目に差し込んだ文の、木と文面と DDL の解釈。境目は 1 つも除かない。
 //   6. 出し直した文面を解析し直すと、同じ木になること。
 //   7. 乱数で作った式 (演算子の混ぜ方)。
 // 食い違いは種類ごとに数え、理由の分かっている種類 (EXPLAINED) のほかが 1 件でもあれば落ちる。
+//
+// 前の経路は、解析の前に文面を書き換えていた (test/parser-old.ts の preprocess: 後ろに結合が続かない結合の語を引用符で囲む、
+// `x IN ()` をサブクエリにする、関数の引数の ALL を落とす、CR を空白にする)。今の経路は書き換えず、パーサが SQLite と同じ場所で読む。
+// 書き換えが文面を変える文は、木が違って当たり前なので、今のパーサにも書き換えた後の文面を読ませて、前のパーサと比べる
+// (パーサどうしの比較)。こうすると、書き換えの違いの陰に、ほかの違いが隠れない。書き換えずに読んだ結果は、ここでは、
+// 受け付けるかどうかを SQLite と比べ、注釈を差し込んでも木が変わらないことを確かめる。答えと列名が SQLite と同じであることは、
+// test/contextual-words.test.ts が確かめる。
 // 今のパーサが SQLite と同じであることは、前のパーサを使わずに test/parser.test.ts が確かめる。
 import { existsSync, readdirSync } from "node:fs";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import * as now from "../src/sql/cst";
-import { tokenize } from "../src/sql/lexer";
 import { SCHEMA_STATEMENTS } from "../src/sql/plan";
 import {
   bound, corpusDir, diffTrees, loadOld, outcome, randomExpression, sltStatements, splitStatements, sqliteAccepts, stripAllTrivia, stripEdgeTrivia, stubSchema, withTrivia,
@@ -64,6 +70,7 @@ const EXPLAINED: Record<string, string> = {
   "shape: precedence of comparison operators (< <= > >= bind tighter than = in SQLite)": "SQLite の優先順位に従う",
   "trivia: old rejects": "空白か注釈を差し込むと、前のパーサが読めなくなる文。今は読む",
   "ddl: a comment next to the type of an INTEGER PRIMARY KEY column": "前は rowid の別名と見なさず、主キーを省いた INSERT が失敗した。今は別名と見なす",
+  "rewrite: text the old path changed before parsing": "結合の語の名前、空の IN の並び、関数の引数の ALL、CR。今は書き換えずにパーサが読む。前のパーサとは、書き換えた後の文面で比べる",
 };
 
 const SAMPLES = Number(process.env.PARSER_ORACLE_SAMPLES ?? 8);
@@ -143,15 +150,35 @@ function explainShape(source: string, detail: string, sameTokens: boolean): stri
   return null;
 }
 
+/**
+ * 前の経路が書き換える文を、今のパーサが書き換えずに読んだ結果。受け付けるかどうかは、SQLite と同じでなければならない。
+ * 分かっている違い (test/parser.test.ts の KNOWN_DIFFERENCES) のうち、ここで除くのは、UPDATE と DELETE の ORDER BY と LIMIT だけである。
+ */
+function checkUnrewritten(source: string, rewritten: string): void {
+  note("rewrite: text the old path changed before parsing", source);
+  const pieces = splitStatements(source);
+  const sqliteOk = pieces !== null && pieces.every(sqliteAccepts);
+  const ours = tryParse(now, source) !== null;
+  // 書き換えた後の文面も断るなら、断る理由は、書き換えが受け持っていた語の読み方ではない (型のない `CAST(x AS)` など)。
+  // その文は、前のパーサとの比較 (check) が、書き換えた後の文面で分類する。
+  if (!ours && tryParse(now, rewritten) === null) return;
+  // 分かっている違い: UPDATE と DELETE の ORDER BY と LIMIT は、SQLite では組み込みの指定があるときだけの構文である。
+  const knownLax = pieces !== null && pieces.some((p) => /^(WITH\b.*)?(UPDATE|DELETE)\b[^]*\b(ORDER\s+BY|LIMIT)\b/i.test(p));
+  if (ours !== sqliteOk && !(ours && knownLax)) note(ours ? "rewrite: accepted without the rewrite, SQLite rejects" : "rewrite: rejected without the rewrite, SQLite accepts", source, outcome(() => now.parseStatements(source)));
+}
+
 function check(source: string, o: NonNullable<typeof old>, opts: { texts: boolean; trivia: boolean; strict?: boolean }): void {
   sources++;
   const a = tryParse(o, source);
-  const b = tryParse(now, source);
+  // 今のパーサには、前の経路の書き換えの後の文面を読ませる (ファイルの先頭の説明)。
+  const rewritten = o.rewrite(source);
+  if (rewritten !== source) checkUnrewritten(source, rewritten);
+  const b = tryParse(now, rewritten);
   if (!a || !b) {
-    const pieces = b ? b.map((s) => now.text(s)) : a ? a.map((s) => stripEdgeTrivia(o.text(s))) : splitStatements(source);
+    const pieces = b ? b.map((s) => now.text(s)) : a ? a.map((s) => stripEdgeTrivia(o.text(s))) : splitStatements(rewritten);
     const sqliteOk = pieces !== null && pieces.every(sqliteAccepts);
     if (!a && !b) note(sqliteOk ? "accepts: neither, SQLite accepts" : "accepts: both reject", source);
-    else if (a) note(sqliteOk ? "accepts: old only, SQLite accepts" : "accepts: old only, SQLite rejects", source, outcome(() => now.parseStatements(source)));
+    else if (a) note(sqliteOk ? "accepts: old only, SQLite accepts" : "accepts: old only, SQLite rejects", source, outcome(() => now.parseStatements(rewritten)));
     else note(sqliteOk ? "accepts: new only, SQLite accepts" : "accepts: new only, SQLite rejects", source);
     if (!b) return;
   }
@@ -182,20 +209,20 @@ function check(source: string, o: NonNullable<typeof old>, opts: { texts: boolea
       if (x !== y) note(explainDdl(source, x, y) ?? "ddl", source, firstDifference(x, y));
     }
     for (const named of [false, true]) {
-      const [x, y] = named ? [tryParse(o, source)![i], tryParse(now, source)![i]] : [a[i], stmt];
+      const [x, y] = named ? [tryParse(o, source)![i], tryParse(now, rewritten)![i]] : [a[i], stmt];
       const bx = outcome(() => bound(o, x, named));
       const by = outcome(() => bound(now, y, named));
       if (bx !== by) note("bind", source, firstDifference(bx, by));
     }
   }
   if (!opts.trivia || !a) return;
-  // 空白と注釈を差し込む。前処理 (cst.ts の preprocess) が文面で見分けている場所には差し込まない: 結合の語の直後、ALL の前後、
-  // IN の後ろの空の括弧。そこに注釈を挟むと前処理の結果が変わる (今のパーサとは関わりのない、前からの欠陥。test/open/ に再現がある)。
-  const toks = splitTokens(source);
-  if (!toks) return;
-  const fresh = tryParse(now, source)!;
+  // 空白と注釈を、トークンの境目の全部に差し込む。今のパーサは、差し込む前と同じ木に読まなければならない。前の経路の書き換えは、
+  // 結合の語の直後、ALL の前後、IN の後ろの空の括弧を文面で見分けていたので、そこに注釈があると読み方が変わった
+  // (`a LEFT /* c */ JOIN b` が内部結合になった。test/join-word-before-comment.test.ts)。今は、その境目にも差し込む。
+  const fresh = tryParse(now, source);
+  if (!fresh) return;
   for (const [vi2, insert] of [" /* c */ ", " -- c\n", "\n\t "].entries()) {
-    const variant = withTrivia(source, (k) => (toks.safe[k] ? insert : ""));
+    const variant = withTrivia(source, () => insert);
     if (variant === null) continue;
     variants++;
     const vb = tryParse(now, variant);
@@ -228,7 +255,14 @@ function check(source: string, o: NonNullable<typeof old>, opts: { texts: boolea
       note("trivia: old rejects", variant);
       continue;
     }
-    for (const [i, stmt] of vb.entries()) {
+    // 前のパーサとは、書き換えた後の文面で比べる。注釈のために前の経路が読み違える文 (結合の語の後ろの注釈) も、同じ文面を読むので
+    // 同じ木になる。
+    const vr = tryParse(now, o.rewrite(variant));
+    if (!vr || vr.length !== va.length) {
+      note("trivia: new rejects the rewritten text", variant, outcome(() => now.parseStatements(o.rewrite(variant))));
+      continue;
+    }
+    for (const [i, stmt] of vr.entries()) {
       const d = diffTrees(va[i], stmt, o, true);
       if (d.shape && !explainShape(source, d.shape, stripAllTrivia(o.text(va[i])) === stripAllTrivia(now.text(stmt)))) note("trivia: shape differs from old", variant, d.shape);
       if (d.text) note("trivia: text differs from old", variant, d.text);
@@ -242,27 +276,6 @@ function check(source: string, o: NonNullable<typeof old>, opts: { texts: boolea
       }
     }
   }
-}
-
-/** 空白と注釈を差し込んでよいトークンの境目。 */
-function splitTokens(source: string): { safe: boolean[] } | null {
-  let toks;
-  try {
-    toks = tokenize(source);
-  } catch {
-    return null;
-  }
-  const JOIN = /^(LEFT|RIGHT|FULL|INNER|OUTER|CROSS|NATURAL)$/;
-  const safe = toks.map((t, i) => {
-    const prev = toks[i - 1];
-    if (!prev) return true;
-    if (prev.kind === "word" && JOIN.test(prev.upper)) return false;
-    if (t.upper === "ALL" || prev.upper === "ALL") return false;
-    if (t.text === "(" && prev.upper === "IN") return false;
-    if (t.text === ")" && prev.text === "(") return false;
-    return true;
-  });
-  return { safe };
 }
 
 const corpusDirs = (process.env.PARSER_ORACLE_CORPUS ?? "").split(":").filter(Boolean);

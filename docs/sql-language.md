@@ -90,7 +90,6 @@ DO の SQLite には、文の長さ (100 KB)、束縛の変数 (100 個)、複�
 | 引数の型 | 差分はない。Hrana は要求に書いた型のまま束縛する (`integer` は INTEGER、`float` は REAL。sqld と同じ。@libsql/client は JS の数を `float`、BigInt と真偽値を `integer` で送る)。D1 互換の API と Service Binding は、整数の JS の数を INTEGER、ほかの数を REAL として束縛する (D1 と同じ)。DO の SQLite は JS の数を REAL として束縛するので、D∞ が文の中の引数を `(CAST(? AS INTEGER)+0)` に包んで、型を保つ。値は、どの経路で答えても、分割で運んでも、型を変えない |
 | 結果の数の型 | 整数の値の REAL (5.0 など) は、Hrana の `integer` で返す。DO の SQLite は、読み出しで INTEGER と REAL を区別しないからである。sqld は `float` で返す。`typeof()` は SQLite と同じ値を返す。REAL の無限大は、Hrana が JSON で運べないので、クライアントの誤りになる (sqld も同じ) |
 | 暗黙の rowid と `INTEGER PRIMARY KEY` の採番 | 一意で増えるが連続しない。削除された番号は再利用しない。接続を跨ぐと順序も保証しない |
-| 列名 | `x IN ()` は書き換えるので、別名のない列名が変わる |
 
 ### 制約
 
@@ -237,8 +236,12 @@ session にまとめた呼び出しが本番で別に課金されないことは
 パーサは自前で (`src/sql/parser.ts`)、SQLite の文法 (parse.y) に合わせてある。
 受け付けるかどうかは、文の一覧を本物の SQLite の構文の判定と比べて確かめている (`test/parser.test.ts`)。
 構文の誤りは、SQLite と同じ形の文言 (`near "x": syntax error`、`incomplete input`、`unrecognized token: "x"`) で断る。
-解析の前に、文面を 4 か所だけ書き換える: 識別子として使った結合の語 (`left` など) を引用符で囲む、関数の引数の `ALL` を落とす、`x IN ()` を常に偽のサブクエリにする、CR を空白にする。
-この書き換えは前のパーサ (`sql-parser-cst`) の頃からのもので、文面で見分けるので、語の間に注釈があると見誤る (`a LEFT /* c */ JOIN b` が内部結合になる。`test/open/join-word-before-comment.test.ts`)。
+文面は、解析の前に書き換えない。
+結合の語 (`left`、`right`、`full`、`inner`、`outer`、`cross`、`natural`) は、SQLite と同じ場所で名前として読む: 表、列、index、CTE、`AS` の後ろの別名では名前になり、AS のない別名、型の名前、照合順序の名前、DEFAULT の後ろでは名前にならない (`FROM a LEFT JOIN b` の LEFT は結合の語である)。
+関数の引数の `ALL` (`count(ALL x)`) と、空の並びの `x IN ()` も、そのまま読む。
+別名のない結果の列名は、SQLite と同じく、式の文面である (`left + 1`、`count(ALL x)`、`x IN ()`)。
+2026-11-14 までは、この 3 つと CR を、解析の前に文面を書き換えて読んでいた。語の間に注釈があると見誤り (`a LEFT /* c */ JOIN b` が内部結合になった)、列名も SQLite と違っていた。
+結果と列名を SQLite と比べる試験は `test/contextual-words.test.ts` にある。
 
 手書きの解析が表の参照を見落とすと、空の表として黙って誤った結果を返す。
 そこで Worker の SQLite では、実行の前に `EXPLAIN` で本物のプランナが開く表を確かめ、足りない表を読み足している。

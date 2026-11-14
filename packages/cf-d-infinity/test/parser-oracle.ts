@@ -14,11 +14,13 @@ import type { TableDef, Value } from "../src/types";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Node = any;
 export type Cst = Pick<typeof now, "parseStatements" | "text" | "walk" | "paramsIn" | "bindParams" | "ident">;
+/** 前の経路。解析の前に文面を書き換えていた (rewrite)。 */
+export type OldCst = Cst & { rewrite(source: string): string };
 
 /** 前のパーサ。sql-parser-cst が入っていなければ null。 */
-export async function loadOld(): Promise<Cst | null> {
+export async function loadOld(): Promise<OldCst | null> {
   try {
-    return (await import("./parser-old")) as unknown as Cst;
+    return (await import("./parser-old")) as unknown as OldCst;
   } catch {
     return null;
   }

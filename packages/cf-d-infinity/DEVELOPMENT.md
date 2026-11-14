@@ -223,6 +223,7 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `test/fuzz.test.ts` | 本物の SQLite との差分テスト (乱数) |
 | `test/slt.test.ts`、`test/slt-more.test.ts` | SQLite の sqllogictest |
 | `test/parser.test.ts` | パーサ。受け付けるかどうかを本物の SQLite の構文の判定と比べる。計画の組み立てが読む木の形の見本、文面への出し直し |
+| `test/contextual-words.test.ts` | 場所で読み方の変わる語 (結合の語、関数の引数の `ALL`、空の `IN ()`、CR)。結果と列名を本物の SQLite と比べる。基準経路だけの実行でも流す |
 | `test/parser-oracle.test.ts` | 入れ替える前のパーサ (`sql-parser-cst`、GPL) との突き合わせ。依存には入れていないので、`npm install --no-save sql-parser-cst@0.33.1` で入れたときだけ動く。`PARSER_CORPUS=<dir>` で試験の全部が解析した文を書き出し、`PARSER_ORACLE_CORPUS=<dir>` で読む |
 | `test/prod.test.ts` | 本番の Worker への確認。`PROD_URL` があるときだけ動く |
 | `test/counterexamples.test.ts` | 設計レビューと形式モデルの反例。欠陥スイッチを入れると壊れ、外すと直ることを確かめる |

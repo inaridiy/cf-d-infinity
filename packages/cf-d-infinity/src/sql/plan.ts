@@ -332,7 +332,10 @@ function equalities(conj: Node[], ref: Ref, col: string, s: Scope, values: Value
         }
       }
     }
-    if (op === "IN" && c.right?.type === "paren_expr" && c.right.expr?.type === "list_expr") {
+    // 空の並び (`col IN ()`) は、値の集まりとして扱わない。扱うと、shard key の値が 0 個に固定されて、どのシャードも読まない走査に
+    // なる。集約を分けて押し下げる計画は、シャードごとの 1 行を合成するので、行が 1 つも届かないと `count(*)` が NULL になる。
+    // 条件はそのまま全シャードへ押し下げ、各シャードの SQLite が偽にする。
+    if (op === "IN" && c.right?.type === "paren_expr" && c.right.expr?.type === "list_expr" && c.right.expr.items.length > 0) {
       const hit = colOf(c.left, s);
       if (hit?.ref === ref && hit.col === col) {
         const vs = c.right.expr.items.map((x: Node) => constant(x, values));

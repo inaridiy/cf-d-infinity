@@ -75,6 +75,12 @@ function preprocess(sql: string): string {
   return out;
 }
 
+/**
+ * 前の経路が、解析の前に文面に掛けていた書き換え。今の経路は書き換えない (src/sql/cst.ts)。
+ * 突き合わせ (test/parser-oracle.test.ts) は、今のパーサにもこの書き換えの後の文面を読ませて、前のパーサと比べる。
+ */
+export const rewrite = (source: string): string => preprocess(source);
+
 const OPTIONS = {
   dialect: "sqlite",
   includeRange: true,

@@ -154,16 +154,11 @@ const KNOWN_DIFFERENCES: string[] = [
   "accepts: UPDATE t SET a = 1 WHERE c = 1 ORDER BY b DESC LIMIT 1 OFFSET 2",
   "accepts: DELETE FROM t WHERE a = 1 ORDER BY b LIMIT 1",
   "accepts: DELETE FROM t ORDER BY b LIMIT 1 OFFSET 1",
-  // 結合の語は、後ろに結合が続かなければ、解析の前に引用符で囲む (cst.ts の preprocess)。SQLite が断る位置でも、識別子として通る。
-  "accepts: SELECT a FROM t left",
   // SQLite は名前に文字列の literal も読む。ここでは、別名と照合順序の名前でだけ読む。
   "refuses: SELECT a FROM 't'",
   "refuses: CREATE TABLE 't' ('a' INT)",
   // INDEXED は SQLite では識別子にも使える。ここでは予約語である。
   "refuses: SELECT indexed FROM t",
-  // 空の IN の並びと、関数の引数の ALL は、解析の前の書き換え (cst.ts の preprocess) が文面で見つけたときだけ読める。間に注釈があると読めない。
-  "refuses: SELECT a IN ( /* nothing */ ) FROM t",
-  "refuses: SELECT count( /* every */ ALL a) FROM t",
   // 表の制約は、SQLite では `,` なしでも続けて書ける。制約のない CONSTRAINT 名前 も書ける。どちらも読まない。
   "refuses: CREATE TABLE t (a, PRIMARY KEY (a) UNIQUE (a))",
   "refuses: CREATE TABLE t (a INT CONSTRAINT x)",
@@ -176,8 +171,6 @@ const KNOWN_DIFFERENCES: string[] = [
 const KNOWN_LAX = [
   // UPDATE と DELETE の ORDER BY と LIMIT (SQLite の組み込みの指定)。
   /^(WITH\b.*)?(UPDATE|DELETE)\b[^]*\b(ORDER\s+BY|LIMIT)\b/i,
-  // 解析の前に引用符で囲んだ結合の語 (cst.ts の preprocess)。
-  /"(LEFT|RIGHT|FULL|INNER|OUTER|CROSS|NATURAL)"/i,
   // INSERT ... SELECT ... FROM t ON CONFLICT。SQLite は ON を結合の条件として読んで断る (WHERE true を挟めと文書にある)。
   /^INSERT\b[^]*\bSELECT\b[^]*\bON\s+CONFLICT\b/i,
 ];
@@ -356,8 +349,9 @@ describe("the SQL parser", () => {
 
   describe("printing", () => {
     it("gives back each statement's own text, without the whitespace and comments around it", () => {
+      // 文の中の空白は、CR も含めて、書いたまま出す。SQLite は、結果の列名に式の文面をそのまま使う。
       const stmts = parseStatements("  /* a */ SELECT 1 /* b */ ; -- c\n SELECT /* inside */\r\n\t2 -- d\n;;\n");
-      expect(stmts.map(text)).toEqual(["SELECT 1", "SELECT /* inside */ \n\t2"]);
+      expect(stmts.map(text)).toEqual(["SELECT 1", "SELECT /* inside */\r\n\t2"]);
     });
 
     it("prints a part of a statement without the comments next to it", () => {
@@ -490,6 +484,62 @@ describe("the SQL parser", () => {
         "DROP TABLE t, u", "DELETE t", "INSERT t VALUES (1)", "UPDATE t x SET a = 1", "DELETE FROM t x WHERE a = 1", "SELECT CAST(a) FROM t", "SELECT cast FROM t", "SELECT x'0g'", "SELECT 0x",
         "CREATE TABLE t", "VALUES (1) ORDER BY 1", "SELECT count(DISTINCT *) FROM t", "CREATE TABLE t (a INT, PRIMARY KEY (a), b INT)",
       ]) expect(refuses(sql), sql).not.toBe("accepted");
+    });
+
+    it("reads a join word as a name or as a join by its place, not by the text after it", () => {
+      // 前は、解析の前に文面を書き換えて、後ろに JOIN などが続かない結合の語を引用符で囲んでいた (2026-11-14 に消した)。
+      // 後ろを空白だけ飛ばして見ていたので、間に注釈があると、結合の語を表の別名にした。
+      const join = (sql: string): string => {
+        const from = one(sql).clauses[1].expr;
+        return `${from.type} ${(Array.isArray(from.operator) ? from.operator : [from.operator]).map((k: Node) => k.name).join(" ")}, left ${from.left.type}`;
+      };
+      for (const sql of [
+        "SELECT * FROM p LEFT JOIN q", "SELECT * FROM p LEFT /* c */ JOIN q", "SELECT * FROM p LEFT -- c\n JOIN q", "SELECT * FROM p left\r\n\tjoin q", "SELECT * FROM p LEFT/**/JOIN q",
+      ]) expect(join(sql), sql).toBe("join_expr LEFT JOIN, left identifier");
+      expect(join("SELECT * FROM p NATURAL /* a */ LEFT /* b */ OUTER /* c */ JOIN q")).toBe("join_expr NATURAL LEFT OUTER JOIN, left identifier");
+      // 表の名前が結合の語でも、後ろの結合はそのまま読む。AS の後ろでは、結合の語も別名になる。
+      expect(join("SELECT * FROM left LEFT JOIN cross")).toBe("join_expr LEFT JOIN, left identifier");
+      expect(join("SELECT * FROM left JOIN cross")).toBe("join_expr JOIN, left identifier");
+      expect(join("SELECT * FROM p AS left LEFT JOIN q")).toBe("join_expr LEFT JOIN, left alias");
+      // 名前として読んだ結合の語は、書いたままの文面で出る。結果の列名が SQLite と同じになる (前は `"left" + 1`)。
+      expect(text(one("SELECT left + 1, p.full, natural FROM p WHERE right = 1 ORDER BY inner"))).toBe("SELECT left + 1, p.full, natural FROM p WHERE right = 1 ORDER BY inner");
+      expect(expr("left + 1")).toBe('("+" `left #1)');
+      // SQLite が結合の語を名前として読まない場所 (AS のない別名、型の名前、照合順序の名前、DEFAULT の後ろ) では、ここでも読まない。
+      expect(refuses("SELECT a FROM t left")).toBe("incomplete input");
+      expect(refuses("SELECT a FROM t left WHERE a = 1")).toBe('near "WHERE": syntax error');
+      expect(refuses("SELECT a left FROM t")).toBe('near "left": syntax error');
+      expect(refuses("SELECT * FROM (SELECT 1) cross")).toBe("incomplete input");
+      expect(refuses("CREATE TABLE t (a left)")).toBe('near "left": syntax error');
+      expect(refuses("CREATE TABLE t (a DEFAULT left)")).toBe('near "left": syntax error');
+      expect(refuses("CREATE TABLE t (a TEXT COLLATE left)")).toBe('near "left": syntax error');
+      expect(refuses("SELECT a COLLATE left FROM t")).toBe('near "left": syntax error');
+      expect(refuses("SELECT * FROM p natural left outer cross JOIN q")).toBe('near "cross": syntax error');
+    });
+
+    it("reads ALL in the arguments of a function, and an IN with an empty list, where SQLite reads them", () => {
+      // 前は、解析の前の書き換えが、`(` の直後の ALL を落とし、`IN ()` を常に偽のサブクエリに置き換えていた。
+      // ALL は木に残す。文面に出るので、結果の列名が SQLite と同じになる。
+      expect(expr("count(ALL a)")).toBe("func_call{args: (paren func_args{allKw: ALL, args: (list `a)}), name: `count}");
+      expect(expr("count( /* every */ all a)")).toBe("func_call{args: (paren func_args{allKw: all, args: (list `a)}), name: `count}");
+      expect(expr("count(ALL)")).toBe("func_call{args: (paren func_args{allKw: ALL, args: (list )}), name: `count}");
+      expect(text(one("SELECT count( /* every */ ALL a ), max(ALL a, 2) FROM t"))).toBe("SELECT count( /* every */ ALL a ), max(ALL a, 2) FROM t");
+      // ALL を書けるのは、式の中の関数の呼び出しの、引数の先頭だけである。
+      for (const sql of [
+        "SELECT count(ALL *) FROM t", "SELECT count(ALL DISTINCT a) FROM t", "SELECT count(DISTINCT ALL a) FROM t", "SELECT count(ALL ALL a) FROM t", "SELECT count(a, ALL b) FROM t",
+        "SELECT (ALL a) FROM t", "SELECT a FROM t WHERE a IN (ALL 1)", "SELECT * FROM json_each(ALL '[1]')", "SELECT a FROM t WHERE a IN f(ALL 1)", "SELECT * FROM json_each(DISTINCT '[1]')",
+      ]) {
+        expect(refuses(sql), sql).toMatch(/syntax error/);
+        expect(sqliteAccepts(sql), sql).toBe(false);
+      }
+      // 空の並びは、空の並びとして読む。括弧の中の注釈は、文面に残る。
+      expect(expr("a IN ()")).toBe("(IN `a (paren (list )))");
+      expect(expr("a NOT IN ( /* nothing */ )")).toBe("([NOT IN] `a (paren (list )))");
+      expect(text(one("SELECT a IN ( /* nothing */ ), (a, b) not in () FROM t"))).toBe("SELECT a IN ( /* nothing */ ), (a, b) not in () FROM t");
+      // 空にできるのは、IN の右辺の並びだけである。
+      for (const sql of ["SELECT ()", "SELECT a IN (()) FROM t", "SELECT a FROM t WHERE a = ()", "INSERT INTO t VALUES ()"]) {
+        expect(refuses(sql), sql).toMatch(/syntax error/);
+        expect(sqliteAccepts(sql), sql).toBe(false);
+      }
     });
 
     it("keeps the arguments of a virtual table module as text", () => {

@@ -14,14 +14,24 @@ import { tokenize, unquote, type Token } from "./lexer";
 export type Node = any;
 
 /**
- * 識別子に使えない語。SQLite の予約語から、parse.y の %fallback ID (識別子としても読める語) を除いたものに、
- * 結合の語 (LEFT など) と INDEXED を加えたものである。結合の語を識別子に使った文は、解析の前に引用符で囲む (cst.ts)。
+ * 識別子に使えない語。SQLite の予約語から、parse.y の %fallback ID (識別子としても読める語) と結合の語を除いたものに、
+ * INDEXED を加えたものである。
  */
-const RESERVED = new Set(`ADD ALL ALTER AND AS AUTOINCREMENT BETWEEN CASE CHECK COLLATE COMMIT CONSTRAINT CREATE CROSS DEFAULT
-  DEFERRABLE DELETE DISTINCT DROP ELSE ESCAPE EXCEPT EXISTS FOREIGN FROM FULL GROUP HAVING IN INDEX INDEXED INNER INSERT
-  INTERSECT INTO IS ISNULL JOIN LEFT LIMIT NATURAL NOT NOTHING NOTNULL NULL ON OR ORDER OUTER PRIMARY REFERENCES RETURNING
-  RIGHT SELECT SET TABLE THEN TO TRANSACTION UNION UNIQUE UPDATE USING VALUES WHEN WHERE`.split(/\s+/));
+const RESERVED = new Set(`ADD ALL ALTER AND AS AUTOINCREMENT BETWEEN CASE CHECK COLLATE COMMIT CONSTRAINT CREATE DEFAULT
+  DEFERRABLE DELETE DISTINCT DROP ELSE ESCAPE EXCEPT EXISTS FOREIGN FROM GROUP HAVING IN INDEX INDEXED INSERT
+  INTERSECT INTO IS ISNULL JOIN LIMIT NOT NOTHING NOTNULL NULL ON OR ORDER PRIMARY REFERENCES RETURNING
+  SELECT SET TABLE THEN TO TRANSACTION UNION UNIQUE UPDATE USING VALUES WHEN WHERE`.split(/\s+/));
 
+/**
+ * 結合の語。SQLite の文法 (parse.y) では 1 つのトークン JOIN_KW で、名前を書く場所のほとんど (表、列、index、CTE、関数、
+ * `AS` の後ろの別名。parse.y の nm) では識別子として読める。読めないのは、AS のない別名、型の名前、照合順序の名前、DEFAULT の
+ * 後ろの名前 (parse.y の ids と id) である。そこでは、語は識別子ではなく、次の句の始まりになる: `FROM a LEFT JOIN b` の LEFT は、
+ * a の別名ではなく結合の語である。識別子として読めるかどうかは、語の後ろの文面ではなく、語のある場所で決まる (isName と isId)。
+ *
+ * 2026-11-14 までは、解析の前に文面を書き換えて、後ろに JOIN などが続かない結合の語を引用符で囲んでいた。後ろを空白だけ飛ばして
+ * 見ていたので、`a LEFT /* c *\/ JOIN b` の LEFT を別名にして、外部結合を内部結合として実行した
+ * (test/join-word-before-comment.test.ts)。
+ */
 const JOIN_WORDS = new Set(["NATURAL", "LEFT", "RIGHT", "FULL", "OUTER", "INNER", "CROSS"]);
 const CONFLICT_ACTIONS = new Set(["ROLLBACK", "ABORT", "FAIL", "IGNORE", "REPLACE"]);
 const LIKE_WORDS = new Set(["LIKE", "GLOB", "REGEXP", "MATCH"]);
@@ -79,10 +89,16 @@ class Parser {
     return t.kind === "op" && t.text === op;
   }
 
-  /** 識別子として読めるトークンか。引用した識別子と、予約語でない語である。 */
+  /** 名前として読めるトークンか (parse.y の nm)。引用した識別子と、予約語でない語である。結合の語も名前になる。 */
   private isName(k = 0): boolean {
     const t = this.at(k);
     return t.kind === "quoted" || (t.kind === "word" && !RESERVED.has(t.upper));
+  }
+
+  /** 結合の語を除いた名前か (parse.y の ids と id)。AS のない別名、型の名前、照合順序の名前、DEFAULT の後ろの名前は、これである。 */
+  private isId(k = 0): boolean {
+    const t = this.at(k);
+    return this.isName(k) && !(t.kind === "word" && JOIN_WORDS.has(t.upper));
   }
 
   private leaf(type: string, tok: Token, fields: Record<string, unknown>): Node {
@@ -129,12 +145,18 @@ class Parser {
     return this.leaf("identifier", tok, { text: tok.text, name: tok.kind === "quoted" ? unquote(tok.text) : tok.text });
   }
 
-  /** 別名と照合順序の名前。識別子のほかに、文字列の literal も書ける (`SELECT a 'x'`)。 */
+  /** `AS` の後ろの別名。名前のほかに、文字列の literal も書ける (`SELECT a AS 'x'`)。 */
   private aliasName(): Node {
     const tok = this.t;
     if (tok.kind !== "string") return this.identifier();
     this.i++;
     return this.leaf("identifier", tok, { text: tok.text, name: unquote(tok.text) });
+  }
+
+  /** AS のない別名と、照合順序の名前。結合の語は書けない (isId)。文字列の literal は書ける (`SELECT a 'x'`)。 */
+  private idName(): Node {
+    if (this.t.kind !== "string" && !this.isId()) this.fail();
+    return this.aliasName();
   }
 
   /** `名前` か `スキーマ.名前`。parts は、`.` でつなげる名前の数の上限である。 */
@@ -202,7 +224,7 @@ class Parser {
         left = this.binary(left, this.kw(), this.expr(prec + 1));
       } else if (!not && word === "COLLATE") {
         if (PREC.collate < minPrec) return left;
-        left = this.binary(left, this.kw(), this.aliasName());
+        left = this.binary(left, this.kw(), this.idName());
       } else if (PREC.equality < minPrec) {
         return left;
       } else if (!not && word === "IS") {
@@ -259,11 +281,11 @@ class Parser {
   /** IN の右辺。括弧の中の並びかサブクエリ、表の名前、表を返す関数の呼び出し。 */
   private inOperand(): Node {
     if (this.isOp("(")) {
-      // 空の並び (`x IN ()`) は読まない。解析の前に、常に偽のサブクエリへ書き換えてある (cst.ts)。
-      return this.paren(() => (this.startsSelect() ? this.select() : this.list(() => this.expr())));
+      // 並びは空でもよい (`x IN ()` は常に偽、`x NOT IN ()` は常に真。SQLite の拡張)。
+      return this.paren(() => (this.startsSelect() ? this.select() : this.list(() => this.expr(), true)));
     }
     const name = this.qualifiedName();
-    return this.isOp("(") ? this.call(name) : name;
+    return this.isOp("(") ? this.call(name, false) : name;
   }
 
   private startsSelect(k = 0): boolean {
@@ -387,16 +409,21 @@ class Parser {
     return this.leaf("all_columns", star, {});
   }
 
-  /** 関数の呼び出しの、名前より後ろ。引数、FILTER、OVER。 */
-  private call(name: Node): Node {
+  /**
+   * 関数の呼び出しの、名前より後ろ。引数、FILTER、OVER。
+   * quantifier は、引数の先頭に DISTINCT か ALL を書けるか。書けるのは式の中の呼び出しだけで、FROM の表を返す関数と、
+   * IN の右辺の関数には書けない (parse.y の distinct)。ALL は既定と同じ意味で、木には allKw として残す (文面と結果の列名に出る)。
+   */
+  private call(name: Node, quantifier = true): Node {
     const args = this.paren(() => {
       const s = this.t.start;
-      const distinctKw = this.isKw("DISTINCT") ? this.kw() : undefined;
-      // `*` は、ただ 1 つの引数としてだけ書ける (`count(*)`)。
-      const list = !distinctKw && this.isOp("*") && this.isOp(")", 1) ? this.list(() => this.star()) : this.list(() => this.expr(), !distinctKw);
+      const distinctKw = quantifier && this.isKw("DISTINCT") ? this.kw() : undefined;
+      const allKw = quantifier && !distinctKw && this.isKw("ALL") ? this.kw() : undefined;
+      // `*` は、ただ 1 つの引数としてだけ書ける (`count(*)`)。DISTINCT と ALL の後ろには書けない。
+      const list = !distinctKw && !allKw && this.isOp("*") && this.isOp(")", 1) ? this.list(() => this.star()) : this.list(() => this.expr(), !distinctKw);
       // 集約の引数の並び順 (`group_concat(a ORDER BY b)`)。
       const orderBy = this.isKw("ORDER") ? this.orderBy() : undefined;
-      return this.node("func_args", s, { distinctKw, args: list, orderBy });
+      return this.node("func_args", s, { distinctKw, allKw, args: list, orderBy });
     });
     let filter: Node | undefined;
     let over: Node | undefined;
@@ -458,10 +485,10 @@ class Parser {
     return this.node("frame_bound_following", s, { expr, followingKw: this.kw("FOLLOWING") });
   }
 
-  /** 型の名前の語か。列の制約の先頭の語と、予約語は、型の名前にならない。 */
+  /** 型の名前の語か。列の制約の先頭の語、予約語、結合の語は、型の名前にならない。 */
   private isTypeWord(): boolean {
     const t = this.t;
-    return t.kind === "word" && !COLUMN_CONSTRAINT_START.has(t.upper) && !RESERVED.has(t.upper);
+    return t.kind === "word" && !COLUMN_CONSTRAINT_START.has(t.upper) && this.isId();
   }
 
   /**
@@ -574,11 +601,14 @@ class Parser {
     return this.aliased(this.expr(), true);
   }
 
-  /** `式 AS 別名`。implicit なら、AS のない `式 別名` も読む。 */
+  /**
+   * `式 AS 別名`。implicit なら、AS のない `式 別名` も読む。
+   * AS のない別名に、結合の語は書けない。`FROM a LEFT JOIN b` の LEFT は、ここで別名にならず、結合の語として残る (joinTree)。
+   */
   private aliased(expr: Node, implicit: boolean): Node {
     if (this.isKw("AS")) return this.node("alias", expr.range[0], { expr, asKw: this.kw(), alias: this.aliasName() });
-    if (implicit && (this.isName() || this.t.kind === "string") && !this.isWindowKw()) {
-      return this.node("alias", expr.range[0], { expr, alias: this.aliasName() });
+    if (implicit && (this.isId() || this.t.kind === "string") && !this.isWindowKw()) {
+      return this.node("alias", expr.range[0], { expr, alias: this.idName() });
     }
     return expr;
   }
@@ -682,7 +712,7 @@ class Parser {
     } else {
       source = this.qualifiedName();
       // 表を返す関数 (`json_each(x)`)。
-      if (this.isOp("(")) source = this.call(source);
+      if (this.isOp("(")) source = this.call(source, false);
     }
     return this.indexed(this.aliased(source, true));
   }
@@ -1021,7 +1051,7 @@ class Parser {
         break;
       case "COLLATE":
         if (table) this.fail();
-        constraint = this.node("constraint_collate", s, { collateKw: this.kw(), collation: this.aliasName() });
+        constraint = this.node("constraint_collate", s, { collateKw: this.kw(), collation: this.idName() });
         break;
       case "REFERENCES":
         if (table) this.fail();
@@ -1066,6 +1096,8 @@ class Parser {
     if (t.kind === "op" && t.text === "(") return this.paren(() => this.expr());
     if (t.kind === "number" || t.kind === "string" || t.kind === "blob") return this.primary();
     if (t.kind === "word" && (t.upper === "NULL" || t.upper === "TRUE" || t.upper === "FALSE" || /^CURRENT_(DATE|TIME|TIMESTAMP)$/.test(t.upper))) return this.primary();
+    // 結合の語は書けない (`DEFAULT left` は SQLite でも構文の誤り)。
+    if (!this.isId()) this.fail();
     return this.identifier();
   }
 
@@ -1090,7 +1122,7 @@ class Parser {
         else return this.fail();
         options.push(this.node("referential_action", os, { onKw, eventKw, actionKw }));
       } else if (this.isKw("MATCH")) {
-        // MATCH の後ろは名前なら何でもよい (SQLite は読んで捨てる)。FULL は結合の語なので、引用符で囲まれて届く (cst.ts)。
+        // MATCH の後ろは名前なら何でもよい (SQLite は読んで捨てる)。`MATCH FULL` の FULL も、ここでは名前である。
         options.push(this.node("referential_match", os, { matchKw: this.kw(), typeKw: this.identifier() }));
       } else break;
     }
