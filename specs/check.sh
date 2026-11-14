@@ -19,18 +19,32 @@ ok()   { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf '  FAIL %s\n' "$1"; }
 tlc_config=()
 if [ -n "${TLC_CONFIG:-}" ]; then tlc_config=(--tlc-config="$TLC_CONFIG"); fi
+# quint verify は、型の検査に Apalache のサーバを使い、既定では決まったポート (8822) に立てる。同じ計算機で 2 つの検査を
+# 同時に流すと、ポートを取り合ってサーバが立たず、検査が答えを出さないまま終わる (2026-11-14 に、red が 9 件「反例なし」と出た)。
+# この実行の間は、空いているポートを 1 つ選んで使う。
+port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+server=(--server-endpoint="localhost:$port")
+# verdict <出力>: TLC の答え。ok (違反なし)、violation (違反あり)、none (答えがない: 道具の誤り、メモリ不足など)。
+# 答えがないのに「反例なし」と出すと、モデルの誤りと道具の誤りの見分けがつかないので、分けて出す。
+verdict() {
+  if printf '%s\n' "$1" | grep -q '\[violation\]'; then echo violation
+  elif printf '%s\n' "$1" | grep -q '\[ok\] No violation found'; then echo ok
+  else echo none; fi
+}
 
 # verify_expect <expected: ok|violation> <file> <module> <invariant>
 verify_expect() {
   local expect=$1 file=$2 mod=$3 inv=$4 out
-  out=$(npx quint verify --backend=tlc ${tlc_config[@]+"${tlc_config[@]}"} --main="$mod" --invariant="$inv" "$file" 2>&1)
-  local states
+  out=$(npx quint verify --backend=tlc "${server[@]}" ${tlc_config[@]+"${tlc_config[@]}"} --main="$mod" --invariant="$inv" "$file" 2>&1)
+  local states got
   states=$(printf '%s\n' "$out" | grep -oE '[0-9,]+ distinct states found' | tail -1)
-  case "$expect" in
-    ok)
-      if printf '%s\n' "$out" | grep -q '\[ok\] No violation found'; then ok "green    $mod $inv ($states)"; else bad "green    $mod $inv"; printf '%s\n' "$out" | tail -5; fi ;;
-    violation)
-      if printf '%s\n' "$out" | grep -q '\[violation\]'; then ok "$5 $mod $inv ($states)"; else bad "$5 $mod $inv (no violation found)"; printf '%s\n' "$out" | tail -5; fi ;;
+  got=$(verdict "$out")
+  case "$expect:$got" in
+    ok:ok) ok "green    $mod $inv ($states)" ;;
+    ok:violation) bad "green    $mod $inv (violation found)"; printf '%s\n' "$out" | tail -5 ;;
+    violation:violation) ok "$5 $mod $inv ($states)" ;;
+    violation:ok) bad "$5 $mod $inv (no violation found)"; printf '%s\n' "$out" | tail -5 ;;
+    *) bad "${5:-green   } $mod $inv (no verdict: the checker did not finish)"; printf '%s\n' "$out" | tail -5 ;;
   esac
 }
 green()   { verify_expect ok "$@"; }
@@ -39,14 +53,16 @@ witness() { verify_expect violation "$@" "witness "; }
 # live_expect <expected: ok|violation> <file> <module> <temporal property>
 live_expect() {
   local expect=$1 file=$2 mod=$3 prop=$4 out
-  out=$(npx quint verify --backend=tlc ${tlc_config[@]+"${tlc_config[@]}"} --main="$mod" --temporal="$prop" "$file" 2>&1)
-  local states
+  out=$(npx quint verify --backend=tlc "${server[@]}" ${tlc_config[@]+"${tlc_config[@]}"} --main="$mod" --temporal="$prop" "$file" 2>&1)
+  local states got
   states=$(printf '%s\n' "$out" | grep -oE '[0-9,]+ distinct states found' | tail -1)
-  case "$expect" in
-    ok)
-      if printf '%s\n' "$out" | grep -q '\[ok\] No violation found'; then ok "live     $mod $prop ($states)"; else bad "live     $mod $prop"; printf '%s\n' "$out" | tail -5; fi ;;
-    violation)
-      if printf '%s\n' "$out" | grep -q '\[violation\]'; then ok "live red $mod $prop ($states)"; else bad "live red $mod $prop (no violation found)"; printf '%s\n' "$out" | tail -5; fi ;;
+  got=$(verdict "$out")
+  case "$expect:$got" in
+    ok:ok) ok "live     $mod $prop ($states)" ;;
+    ok:violation) bad "live     $mod $prop (violation found)"; printf '%s\n' "$out" | tail -5 ;;
+    violation:violation) ok "live red $mod $prop ($states)" ;;
+    violation:ok) bad "live red $mod $prop (no violation found)"; printf '%s\n' "$out" | tail -5 ;;
+    *) bad "live     $mod $prop (no verdict: the checker did not finish)"; printf '%s\n' "$out" | tail -5 ;;
   esac
 }
 live()     { live_expect ok "$@"; }
@@ -59,7 +75,7 @@ tests() {
 }
 inductive() {
   local file=$1 mod=$2 ind=$3 inv=$4 out
-  out=$(npx quint verify --main="$mod" --inductive-invariant="$ind" --invariant="$inv" "$file" 2>&1)
+  out=$(npx quint verify "${server[@]}" --main="$mod" --inductive-invariant="$ind" --invariant="$inv" "$file" 2>&1)
   if printf '%s\n' "$out" | grep -q '\[ok\] No violation found'; then ok "inductive $mod $ind => $inv"; else bad "inductive $mod $ind"; printf '%s\n' "$out" | grep -vE 'I@|protobuf|gencode' | tail -5; fi
 }
 
