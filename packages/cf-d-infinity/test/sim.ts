@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Db, type ClientFaults, type Cluster } from "../src/client/db";
 import { MetaCore, type SplitMove, type SplitSlot } from "../src/meta";
-import { shardsOf } from "../src/routing";
+import { shardsOf, type Interval } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
 import { ShardCore, type SpanEscape } from "../src/shard/core";
@@ -532,7 +532,7 @@ export class SimCluster implements Cluster {
   applyDdl(sql: string, basedOn?: number) {
     return this.meta.applyDdl(sql, basedOn);
   }
-  switchRange(move: { start: number; end: number; to: string; from?: string }) {
+  switchRange(move: Interval & { to: string; from?: string }) {
     return this.meta.switchRange(move);
   }
   publishIndex(table: string, name: string, version: number, at: Ts) {
@@ -560,7 +560,7 @@ export class SimCluster implements Cluster {
    * 試験が分割の段を自分で進めるための、分割の枠。Autoscaler の split と同じく、全シャードに最新の版を適用させてから取る。
    * 返る id を、beginIncoming と fence に渡す。
    */
-  async reserveSplit(parent: string, child: string, range: { start: number; end: number }): Promise<SplitSlot> {
+  async reserveSplit(parent: string, child: string, range: Interval): Promise<SplitSlot> {
     const cat = await this.catalog();
     for (const id of shardsOf(cat.routing)) await this.shard(id).syncSchema({ version: cat.version });
     return this.meta.beginSplit({ parent, child, ...range }, cat.version);

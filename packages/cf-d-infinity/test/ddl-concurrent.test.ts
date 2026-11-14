@@ -593,7 +593,7 @@ describe("a bug in whole-table reads that the same workload found (not specific 
    * 原因: 全表の span は shard key を持たないので、fence した範囲の検査 (ShardCore.assertOwned の NotOwner) に掛からない。
    *   親が全表の読みを断るのは移動の途中だけで (Migrating)、finishMove の後は自分に残った行を答える。
    *   子は W の範囲表にないので、誰にも読まれない。
-   * 修正: 全表の span に、読み手の範囲表で宛先のシャードが持つスロットの範囲を付ける (db.ts の withSlots)。
+   * 修正: 全表の span に、読み手の範囲表で宛先のシャードが持つ範囲 (claim。token の区間) を付ける (db.ts の withClaims)。
    *   親は、その範囲が手放した範囲と重なれば、移動の完了後も NotOwner を返す。
    */
   const staleScatter = async (faults: Faults) => {

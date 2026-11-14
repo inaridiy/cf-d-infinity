@@ -1,15 +1,16 @@
 import { Hlc, SECOND, physicalToTs, tsToPhysical } from "../hlc";
 import { SHARD_LIMITS, ShardLimit, shardLimitOf, withinShardLimits } from "../shard-limits";
 import type {
-  Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, GroupPayload, LockOwner, MetaApi,
-  Participant, PrepareReq, PrepareRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts, TxnStatus, Value,
+  Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, LockOwner, MetaApi,
+  Participant, Piece, PiecePayload, PieceWant, Pos, PrepareReq, PrepareRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts,
+  TxnStatus, Value,
 } from "../types";
 import {
   ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, TableLocked, checkStorageFormat, isWideSpan, spanCovers, utf8Length,
   unprotectedSpans,
 } from "../types";
-import type { DdlEntry } from "../meta";
-import { slotOf } from "../routing";
+import type { DdlEntry, SplitMove } from "../meta";
+import { blockOf, checkInterval, overlaps, rangeText, sameInterval, slotAligned, slotOf, tokenOf, type Interval } from "../routing";
 import { keyString } from "../keys";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import {
@@ -27,9 +28,9 @@ export interface ShardDeps {
     /** 適用できなかった版の取り消しを求める。取り消す版の番号か、取り消せなければ null が返る。 */
     revokeDdl(version: number, reason: string): Promise<number | null>;
     /** 分割の枠を示して、子が受け取り始める。分割の版が返る (meta.ts の startSplit)。 */
-    startSplit(id: string, move: { parent: string; child: string; start: number; end: number }): Promise<{ version: number }>;
+    startSplit(id: string, move: SplitMove): Promise<{ version: number }>;
     /** 分割の枠が生きていて、子が受け取り始めていることを確かめる (meta.ts の checkSplit)。 */
-    checkSplit(id: string, move: { parent: string; child: string; start: number; end: number }): Promise<void>;
+    checkSplit(id: string, move: SplitMove): Promise<void>;
   };
   /** 実時間、待ち、乱数の出どころ。指定しなければ実物を使う。シミュレータは seed から決まる実装を渡す。 */
   runtime?: Runtime;
@@ -102,8 +103,23 @@ interface InFlight {
   settle(): void;
 }
 
-interface FencedRange { start: number; end: number; to: string; done: number }
-interface IncomingRange { start: number; end: number; from_id: string }
+/** 送り出した範囲 (__fenced の行)。token の区間である。終えた後も残し、その範囲の要求を断り続ける。 */
+interface FencedRange extends Interval { to: string; done: number }
+/** 受け取り中の範囲 (__incoming の、終えていない行)。終えた行は表に残るが、メモリには載せない。 */
+interface IncomingRange extends Interval { from_id: string }
+/** 範囲の記録から、区間だけを取り出す。要求や応答には、これを載せる。 */
+const intervalOf = (x: Interval): Interval => ({ start: x.start, end: x.end });
+
+/**
+ * 位置を、記録の表 (__moved、__moved_txn、__arrived) の列に書く形にする。JSON の文字列で、端は `null` である。
+ * 主キーの列なので NULL にはしない (SQLite は、主キーの NULL を互いに別の値として扱う)。
+ */
+const posKey = (p: Pos): string => JSON.stringify(p);
+const posOf = (key: string): Pos => JSON.parse(key) as Pos;
+/** グループの全体を 1 つで運ぶ piece の区間の端。いまは、どの piece も、始まりも終わりもこれである。 */
+const END = posKey(null);
+/** 運んだデータから、piece の名前だけを取り出す。 */
+const pieceOf = (p: PiecePayload): Piece => ({ g: p.g, range: p.range, after: p.after });
 
 const ROLLBACK = Symbol("rollback");
 const FALLBACK = Symbol("fallback");
@@ -144,10 +160,10 @@ interface Plan {
   schema: number;
 }
 
-/** 同期区間が頼る行。読む範囲、書く行、読む時刻 (null は最新の状態) である。 */
+/** 同期区間が頼る行。読む範囲、書く行、読む時刻 (null は最新の状態) である。書く行は、主キーで token が決まる。 */
 interface Rows {
   spans: Span[];
-  writes: Pick<Change, "sk">[];
+  writes: Pick<Change, "table" | "pk" | "sk">[];
   at: Ts | null;
 }
 
@@ -207,6 +223,8 @@ export class ShardCore implements ShardApi {
   private inflight = new Map<string, InFlight>();
   private fenced: FencedRange[] = [];
   private incoming: IncomingRange[] = [];
+  // 送り出しと到着の記録は、表では piece ごと (g, lo, after) に持つ。いまは、どの piece もグループの全体 (位置の区間が端から端まで) で、
+  // fence はブロックを途中で切らないので、メモリではグループの名前で引く。
   /** 親：移動済みグループ。 */
   private moved = new Map<string, { m: Ts; to: string; acked: boolean }>();
   /** 子：到着済みグループとその m。 */
@@ -242,11 +260,20 @@ export class ShardCore implements ShardApi {
       tbl TEXT NOT NULL, pk TEXT NOT NULL, sk TEXT NOT NULL, txn TEXT NOT NULL, anchor TEXT NOT NULL,
       prepare_ts INTEGER NOT NULL, change TEXT NOT NULL, PRIMARY KEY(tbl, pk))`);
     for (const ddl of CAPTURE_TABLES) b.exec(ddl);
-    b.exec(`CREATE TABLE IF NOT EXISTS __fenced(start INTEGER, end INTEGER, "to" TEXT, done INTEGER NOT NULL DEFAULT 0)`);
-    b.exec(`CREATE TABLE IF NOT EXISTS __incoming(start INTEGER, end INTEGER, from_id TEXT)`);
-    b.exec(`CREATE TABLE IF NOT EXISTS __moved(g TEXT PRIMARY KEY, m INTEGER NOT NULL, dest TEXT NOT NULL, acked INTEGER NOT NULL DEFAULT 0)`);
-    b.exec(`CREATE TABLE IF NOT EXISTS __moved_txn(txn TEXT NOT NULL, g TEXT NOT NULL, dest TEXT NOT NULL, PRIMARY KEY(txn, g))`);
-    b.exec(`CREATE TABLE IF NOT EXISTS __arrived(g TEXT PRIMARY KEY, m INTEGER NOT NULL)`);
+    // 範囲の移動の記録 (docs/design-subslots.md の「シャードの記録」、docs/storage-format.md)。
+    // 範囲は token の区間 [lo, hi) である。
+    // piece は (グループ g, fence の区間 [lo, hi), 位置の区間 (after, up_to]) で、after と up_to は位置の JSON (端は 'null') である。
+    // fence は重ならないので、(g, lo, after) で 1 つに決まる。
+    // __incoming は、受け取り終えても消さず、done と、渡した側から受け取った時刻 m を残す。
+    b.exec(`CREATE TABLE IF NOT EXISTS __fenced(lo INTEGER NOT NULL, hi INTEGER NOT NULL, "to" TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)`);
+    b.exec(`CREATE TABLE IF NOT EXISTS __incoming(lo INTEGER NOT NULL, hi INTEGER NOT NULL, from_id TEXT NOT NULL,
+      done INTEGER NOT NULL DEFAULT 0, m INTEGER)`);
+    b.exec(`CREATE TABLE IF NOT EXISTS __moved(g TEXT NOT NULL, lo INTEGER NOT NULL, hi INTEGER NOT NULL, "after" TEXT NOT NULL, up_to TEXT NOT NULL,
+      m INTEGER NOT NULL, dest TEXT NOT NULL, acked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(g, lo, "after"))`);
+    b.exec(`CREATE TABLE IF NOT EXISTS __moved_txn(txn TEXT NOT NULL, g TEXT NOT NULL, lo INTEGER NOT NULL, "after" TEXT NOT NULL,
+      dest TEXT NOT NULL, PRIMARY KEY(txn, g, lo, "after"))`);
+    b.exec(`CREATE TABLE IF NOT EXISTS __arrived(g TEXT NOT NULL, lo INTEGER NOT NULL, hi INTEGER NOT NULL, "after" TEXT NOT NULL, up_to TEXT NOT NULL,
+      m INTEGER NOT NULL, PRIMARY KEY(g, lo, "after"))`);
     b.exec(`CREATE TABLE IF NOT EXISTS __txn(
       txn TEXT PRIMARY KEY, status TEXT NOT NULL, c INTEGER, participants TEXT, done INTEGER NOT NULL DEFAULT 0, at INTEGER)`);
     this.initStorage();
@@ -256,8 +283,9 @@ export class ShardCore implements ShardApi {
       if (!e.skipped) this.loadDefs(e);
     }
     this.schema = (b.exec(`SELECT max(version) v FROM __ddl`)[0]?.v as number) ?? 0;
-    this.fenced = b.exec(`SELECT * FROM __fenced`) as unknown as FencedRange[];
-    this.incoming = b.exec(`SELECT * FROM __incoming`) as unknown as IncomingRange[];
+    this.fenced = b.exec(`SELECT lo AS start, hi AS "end", "to", done FROM __fenced`) as unknown as FencedRange[];
+    // 受け取り終えた範囲は、メモリに載せない。載せると、移動の途中として扱われる。
+    this.incoming = b.exec(`SELECT lo AS start, hi AS "end", from_id FROM __incoming WHERE done = 0`) as unknown as IncomingRange[];
     for (const r of b.exec(`SELECT g, m, dest, acked FROM __moved`)) {
       this.moved.set(r.g as string, { m: r.m as Ts, to: r.dest as string, acked: r.acked === 1 });
     }
@@ -540,13 +568,45 @@ export class ShardCore implements ShardApi {
 
   // ---- 所有権 ----
 
-  private fencedRange(sk: string): FencedRange | undefined {
-    const slot = slotOf(sk);
-    return this.fenced.find((f) => slot >= f.start && slot < f.end);
+  // 所有は token の区間で引く。1 行 (書く行、主キーの span) は token 1 つで、shard key の span は、そのブロックの全体である。
+  // いまは、fence も受け取り中の範囲もブロックを途中で切らないので、同じ shard key の 1 行と全体は、同じ範囲に当たる。
+
+  /** 所有を確かめる対象の区間。pk を省くと、その shard key のブロックの全体である。 */
+  private areaOf(sk: string, pk?: string): Interval {
+    if (pk === undefined) return blockOf(sk);
+    const token = tokenOf(sk, pk);
+    return { start: token, end: token + 1 };
   }
-  private incomingRange(sk: string): IncomingRange | undefined {
-    const slot = slotOf(sk);
-    return this.incoming.find((f) => slot >= f.start && slot < f.end);
+  private fencedIn(area: Interval): FencedRange | undefined {
+    return this.fenced.find((f) => overlaps(f, area));
+  }
+  private incomingIn(area: Interval): IncomingRange | undefined {
+    return this.incoming.find((f) => overlaps(f, area));
+  }
+  /**
+   * 所有を確かめる対象。書く行、範囲の順に並べる。この順は、sksOf の順と同じである。
+   * 複数の対象が別々の理由で断られるとき、先に並んだものの理由が、要求の答えになる。
+   */
+  private areasOf(spans: Span[], writes: Pick<Change, "pk" | "sk">[]): { sk: string; area: Interval }[] {
+    const out = writes.map((w) => ({ sk: w.sk, area: this.areaOf(w.sk, w.pk) }));
+    for (const s of spans) {
+      if (s.kind === "pk") out.push({ sk: s.sk, area: this.areaOf(s.sk, s.pk) });
+      else if (s.kind === "sk" || (s.kind === "pred" && s.sk)) out.push({ sk: s.sk!, area: this.areaOf(s.sk!) });
+    }
+    return out;
+  }
+  /**
+   * 両端が slot の境目にない範囲を断る。ブロックを途中で切る移動は、形式 (範囲表、記録の表、要求) が扱えるだけで、
+   * シャードの手順 (グループの列挙、pull、ack) は、まだグループの全体を運ぶことを前提にしている。途中まで受けると、
+   * 同じ shard key の、範囲の外の行まで運んでしまうので、範囲の移動の入口で断る。
+   */
+  private wholeSlotsOnly(x: Interval): void {
+    try {
+      checkInterval(x);
+    } catch (e) {
+      throw new SqlError((e as Error).message);
+    }
+    if (!slotAligned(x)) throw new SqlError(`moving a part of a slot is not supported yet: ${rangeText(x)}`);
   }
   private sksOf(spans: Span[], writes: Pick<Change, "sk">[] = []): string[] {
     const out = new Set<string>(writes.map((w) => w.sk));
@@ -556,7 +616,7 @@ export class ShardCore implements ShardApi {
 
   /** await の前に呼ぶ。未着のグループを引き取る。 */
   private async ensureArrived(sks: string[]): Promise<void> {
-    const wanted = sks.filter((g) => this.incomingRange(g) && !this.arrived.has(g));
+    const wanted = sks.filter((g) => this.incomingIn(this.areaOf(g)) && !this.arrived.has(g));
     if (wanted.length) await this.pullGroups(wanted);
   }
 
@@ -569,23 +629,23 @@ export class ShardCore implements ShardApi {
    * そこで通っても、決着を待った後で enter がもう一度確かめる。
    */
   private assertOwned({ spans, writes, at: T }: Rows): void {
-    for (const sk of this.sksOf(spans, writes)) {
-      const f = this.fencedRange(sk);
+    for (const { sk, area } of this.areasOf(spans, writes)) {
+      const f = this.fencedIn(area);
       if (f && !this.faults.ignoreFence) throw new NotOwner(f.to);
-      if (this.incomingRange(sk) && !this.arrived.has(sk)) throw new ConflictError(`group not arrived: ${sk}`);
+      if (this.incomingIn(area) && !this.arrived.has(sk)) throw new ConflictError(`group not arrived: ${sk}`);
       const m = this.arrived.get(sk);
       if (m !== undefined && T !== null && T < m && !this.faults.servePastMove) throw new ReadTooOld(`moved at ${m}`);
     }
     const wide = spans.filter(isWideSpan);
     if (wide.length > 0) {
-      // 全表の span が覆うのは、読み手の範囲表でこのシャードが持つ範囲である。
+      // 全表の span が覆うのは、読み手の範囲表でこのシャードが持つ範囲 (claim) である。
       // その中に手放した範囲があれば、読み手の範囲表は古く、読み手は子を読まない。
       // 移動が終わった後も断り続ける。
       // 親が残りの行だけを答えると、子へ移った行はどのシャードからも返らない。
       if (!this.faults.ignoreFence && !this.faults.staleWideRead) {
         for (const s of wide) {
-          for (const [start, end] of s.slots ?? []) {
-            const f = this.fenced.find((x) => start < x.end && x.start < end);
+          for (const range of s.claim ?? []) {
+            const f = this.fencedIn(range);
             if (f) throw new NotOwner(f.to);
           }
         }
@@ -605,7 +665,8 @@ export class ShardCore implements ShardApi {
    * 待っている間に変わり得ることを、ここで確かめ直す。入口ごとに手で並べない。確かめるのは、引数に挙げたことである。
    *   schema: 要求の表定義が、まだ現行か。入口で確かめた後、行ロックや intent の決着を待っている間に DDL が適用されることがある。
    *     そのまま書くと、新しいグローバル index を保守しない古い計画が通ってしまう。
-   *   spans、writes、at: 読む範囲と書く行を、読む時刻でこのシャードが持っているか (assertOwned)。
+   *   spans、writes、at: 読む範囲と書く行を、読む時刻でこのシャードが持っているか (assertOwned)。所有は token の区間で
+   *     確かめる。1 行は token 1 つ、shard key の範囲はブロックの全体、全表の範囲は読み手の claim である。
    * 確かめるだけで、状態は変えない。時計を進める、数える、ロックを延ばすのは、呼び出し側が区間の中でする。
    */
   private enter(claim: Plan & Rows): Section<Check>;
@@ -631,48 +692,52 @@ export class ShardCore implements ShardApi {
     return this.incoming.length > 0 || this.fenced.some((f) => !f.done);
   }
 
-  async moves(_req: Record<string, never>): Promise<{ outgoing: { start: number; end: number; to: string }[]; incoming: { start: number; end: number; from: string }[] }> {
+  async moves(_req: Record<string, never>): Promise<{ outgoing: (Interval & { to: string })[]; incoming: (Interval & { from: string })[] }> {
     return {
       outgoing: this.fenced.filter((f) => !f.done).map((f) => ({ start: f.start, end: f.end, to: f.to })),
       incoming: this.incoming.map((x) => ({ start: x.start, end: x.end, from: x.from_id })),
     };
   }
 
-  async beginIncoming(req: { start: number; end: number; from: string; slot: string }): Promise<{ schema: number }> {
-    const same = () => this.incoming.some((x) => x.start === req.start && x.end === req.end && x.from_id === req.from);
+  async beginIncoming(req: Interval & { from: string; slot: string }): Promise<{ schema: number }> {
+    this.wholeSlotsOnly(req);
+    const range = intervalOf(req);
+    const same = () => this.incoming.some((x) => sameInterval(x, range) && x.from_id === req.from);
     if (same()) return { schema: this.schema };
     // Meta が分割に渡した枠を示す。枠がある間、Meta は新しい版を記録しない (specs/m15_maintenance_slot.qnt)。
     // 受け取り始める版は、枠を取ったときの Meta の版である。分割を進める側が先に読んだ版は使わない。間に記録された版を、
     // 親だけが先に適用していると、子が親より古い版で受け取り始め、子へ移った行を読めなくなる。
-    const { version } = await this.deps.meta.startSplit(req.slot, { parent: req.from, child: this.id, start: req.start, end: req.end });
+    const { version } = await this.deps.meta.startSplit(req.slot, { parent: req.from, child: this.id, ...range });
     await this.reachSchema(version);
     if (same()) return { schema: this.schema };
     // 重なる範囲を別の親から受け取ると、どちらの行が正しいのか決められない。送り出し中のシャードも子にしない。
-    const clash = this.incoming.find((x) => x.start < req.end && req.start < x.end);
-    if (clash) throw new SqlError(`shard ${this.id} is already receiving slots [${clash.start}, ${clash.end}) from ${clash.from_id}`);
+    const clash = this.incomingIn(range);
+    if (clash) throw new SqlError(`shard ${this.id} is already receiving ${rangeText(clash)} from ${clash.from_id}`);
     if (this.fenced.some((f) => !f.done)) throw new ConflictError(`shard ${this.id} is still handing a range over; it cannot receive one until that finishes`);
-    this.b.exec(`INSERT INTO __incoming(start, end, from_id) VALUES (?, ?, ?)`, req.start, req.end, req.from);
-    this.incoming.push({ start: req.start, end: req.end, from_id: req.from });
+    this.b.exec(`INSERT INTO __incoming(lo, hi, from_id) VALUES (?, ?, ?)`, range.start, range.end, req.from);
+    this.incoming.push({ ...range, from_id: req.from });
     await this.b.sync();
     return { schema: this.schema };
   }
 
-  async fence(req: { start: number; end: number; to: string; schema?: number; slot: string }): Promise<void> {
-    const same = () => this.fenced.some((x) => x.start === req.start && x.end === req.end && x.to === req.to);
+  async fence(req: Interval & { to: string; schema?: number; slot: string }): Promise<void> {
+    this.wholeSlotsOnly(req);
+    const range = intervalOf(req);
+    const same = () => this.fenced.some((x) => sameInterval(x, range) && x.to === req.to);
     if (same()) return;
     // 子の表定義の版まで追いついてから fence する。子が先の版にいると、親の古い形の行と intent を子が受け取れない。
     // 移動の間は、親も子も DDL を適用しない (applySchema)。
     // 親が先の版にいるなら、そのままでよい。子は、行を受け取るときに親の版まで追いつく。
-    await this.deps.meta.checkSplit(req.slot, { parent: this.id, child: req.to, start: req.start, end: req.end });
+    await this.deps.meta.checkSplit(req.slot, { parent: this.id, child: req.to, ...range });
     if (req.schema !== undefined) await this.reachSchema(req.schema);
     if (same()) return;
     // 同じ範囲を 2 つの子へ送り出すと、行が両方へ分かれ、範囲表はどちらか片方しか指さない。
-    const clash = this.fenced.find((x) => x.start < req.end && req.start < x.end);
-    if (clash) throw new SqlError(`slots [${clash.start}, ${clash.end}) of shard ${this.id} ${clash.done ? "were moved" : "are being moved"} to ${clash.to}`);
+    const clash = this.fencedIn(range);
+    if (clash) throw new SqlError(`${rangeText(clash)} of shard ${this.id} ${clash.done ? "were moved" : "are being moved"} to ${clash.to}`);
     // 受け取り中のシャードは、まだ届いていない行を持っていない。その範囲を送り出すと、届いていない行が取り残される。
     if (this.incoming.length > 0) throw new ConflictError(`shard ${this.id} is still receiving a range; it cannot be split until that finishes`);
-    this.b.exec(`INSERT INTO __fenced(start, end, "to") VALUES (?, ?, ?)`, req.start, req.end, req.to);
-    this.fenced.push({ start: req.start, end: req.end, to: req.to, done: 0 });
+    this.b.exec(`INSERT INTO __fenced(lo, hi, "to") VALUES (?, ?, ?)`, range.start, range.end, req.to);
+    this.fenced.push({ ...range, to: req.to, done: 0 });
     await this.b.sync();
   }
 
@@ -680,7 +745,9 @@ export class ShardCore implements ShardApi {
    * 範囲のグループを列挙する。fence の後に呼べば取り残しはない。
    * ack されていないグループは移動済みでも返す。子が受け取る前に落ちると応答が失われるからである。
    */
-  async listGroups(req: { start: number; end: number; limit: number; cursor?: GroupCursor | null }): Promise<{ groups: string[]; cursor: GroupCursor | null }> {
+  async listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null }): Promise<{ groups: string[]; cursor: GroupCursor | null }> {
+    // ブロックを途中で切る範囲では、範囲の中に行か intent を持つグループだけを挙げることになる。いまは、切らない範囲だけを受ける。
+    this.wholeSlotsOnly(req);
     const out: string[] = [];
     const seen = new Set<string>();
     const add = (g: string) => {
@@ -729,14 +796,23 @@ export class ShardCore implements ShardApi {
   }
 
   /**
-   * グループを子へ渡す。m を確定してから応答するので、再送しても同じ m になる。
+   * piece を子へ渡す。m を確定してから応答するので、再送しても同じ m になる。
    * 親は ack まで行を保持する。子が受け取る前に落ちても再送で取り戻せるからである。
+   *
+   * 要求は、区間 [start, end) で fence を名指しする。区間の境目をブロックの中に置くと、同じグループが別々の fence に
+   * 入り得るからである。
+   * いまは、どの piece もグループの全体である (区間は端から端まで)。1 通に収まらないグループを主キーの順の区間に切るのは、
+   * 後の段で足す (docs/design-subslots.md の「piece の pull」)。
    */
-  async pull(req: { groups: string[]; to: string; maxBytes: number }): Promise<GroupPayload[]> {
-    const out: GroupPayload[] = [];
+  async pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number }): Promise<PiecePayload[]> {
+    const fence = this.fenced.find((x) => sameInterval(x, req));
+    const out: PiecePayload[] = [];
     let bytes = 0;
-    for (const g of req.groups) {
-      const f = this.fencedRange(g);
+    for (const w of req.want) {
+      const g = w.g;
+      // 続きの位置からの要求は、グループを分けて運ぶようになってから受ける。
+      if ("from" in w && w.from !== null) throw new SqlError(`pull of group ${g} from a position: a group is still moved as one piece`);
+      const f = fence && overlaps(fence, blockOf(g)) ? fence : undefined;
       const known0 = this.moved.get(g);
       if (known0 && known0.to !== req.to) throw new NotOwner(known0.to);
       if (!f) throw new SqlError(`pull of unfenced group ${g}`);
@@ -759,13 +835,17 @@ export class ShardCore implements ShardApi {
         known = { m: this.issue(), to: req.to, acked: false };
         this.moved.set(g, known);
         this.b.tx(() => {
-          this.b.exec(`INSERT INTO __moved(g, m, dest) VALUES (?, ?, ?)`, g, known!.m, req.to);
+          this.b.exec(
+            `INSERT INTO __moved(g, lo, hi, "after", up_to, m, dest) VALUES (?, ?, ?, ?, ?, ?, ?)`, g, f.start, f.end, END, END, known!.m, req.to,
+          );
           for (const i of intents) {
-            this.b.exec(`INSERT OR IGNORE INTO __moved_txn(txn, g, dest) VALUES (?, ?, ?)`, i.txn as string, g, req.to);
+            this.b.exec(
+              `INSERT OR IGNORE INTO __moved_txn(txn, g, lo, "after", dest) VALUES (?, ?, ?, ?, ?)`, i.txn as string, g, f.start, END, req.to,
+            );
           }
         });
       }
-      out.push({ g, m: known.m, rows, intents, schema: this.schema });
+      out.push({ g, range: intervalOf(f), after: null, upTo: null, m: known.m, rows, intents, schema: this.schema });
     }
     await this.b.sync();
     return out;
@@ -790,27 +870,32 @@ export class ShardCore implements ShardApi {
   }
 
   private async fetchGroups(groups: string[]): Promise<void> {
-    const byParent = new Map<string, string[]>();
+    // pull は、渡す側の fence を範囲で名指しする。受け取り中の範囲ごとにまとめて送る。
+    const byRange = new Map<IncomingRange, string[]>();
     for (const g of groups) {
-      const from = this.incomingRange(g)!.from_id;
-      byParent.set(from, [...(byParent.get(from) ?? []), g]);
+      const range = this.incomingIn(this.areaOf(g))!;
+      byRange.set(range, [...(byRange.get(range) ?? []), g]);
     }
-    for (const [from, list] of byParent) {
+    for (const [range, list] of byRange) {
+      const from = range.from_id;
       let rest = list;
       while (rest.length) {
-        const payload = await this.deps.peer(from).pull({ groups: rest, to: this.id, maxBytes: 1_000_000 });
+        const payload = await this.deps.peer(from).pull({ ...intervalOf(range), want: rest.map((g) => ({ g, from: null })), to: this.id, maxBytes: 1_000_000 });
         await this.receive(payload);
-        void this.deps.peer(from).ack({ groups: payload.map((p) => p.g) }).catch(() => {});
+        void this.deps.peer(from).ack({ pieces: payload.map(pieceOf) }).catch(() => {});
         const got = new Set(payload.map((p) => p.g));
         rest = rest.filter((g) => !got.has(g));
       }
     }
   }
 
-  private async receive(payload: GroupPayload[]): Promise<void> {
+  private async receive(payload: PiecePayload[]): Promise<void> {
+    // グループの一部だけの piece は、まだ受け取れない。受け取ると、一部しか届いていないグループを「到着した」と記録してしまう。
+    const part = payload.find((p) => p.after !== null || p.upTo !== null);
+    if (part) throw new SqlError(`received a part of group ${part.g}: a group is still moved as one piece`);
     // 親の表定義の版まで追いついてから受け取る。子は増設の途中で生まれるので、DDL の「全シャードへの適用」から
     // 漏れることがある。古い版のままだと、届いた行と表の形が合わず、新しい index を保守しない古い計画の書き込みも通る。
-    const version = Math.max(0, ...payload.map((p) => p.schema ?? 0));
+    const version = Math.max(0, ...payload.map((p) => p.schema));
     if (!this.faults.childKeepsOldSchema) await this.reachSchema(version, true);
     const fresh = payload.filter((p) => !this.arrived.has(p.g));
     this.b.tx(() => {
@@ -822,7 +907,10 @@ export class ShardCore implements ShardApi {
             i.tbl ?? null, i.pk ?? null, i.sk ?? null, i.txn ?? null, i.anchor ?? null, i.prepare_ts ?? null, i.change ?? null,
           );
         }
-        this.b.exec(`INSERT OR IGNORE INTO __arrived(g, m) VALUES (?, ?)`, p.g, p.m);
+        this.b.exec(
+          `INSERT OR IGNORE INTO __arrived(g, lo, hi, "after", up_to, m) VALUES (?, ?, ?, ?, ?, ?)`,
+          p.g, p.range.start, p.range.end, posKey(p.after), posKey(p.upTo), p.m,
+        );
       }
     });
     // 到着の印は挿入と同じ同期区間で付ける。sync の待ちの間に、要求駆動の pull と背景の drain が
@@ -835,10 +923,12 @@ export class ShardCore implements ShardApi {
     await this.b.sync(); // 親が行を消すのは到着の確定後である。
   }
 
-  async ack(req: { groups: string[] }): Promise<void> {
+  async ack(req: { pieces: Piece[] }): Promise<void> {
     this.b.tx(() => {
-      for (const g of req.groups) {
-        const known = this.moved.get(g);
+      for (const p of req.pieces) {
+        const g = p.g;
+        // いまは、渡した piece はどれもグループの全体で、グループに 1 つである。記録もグループの名前で引く。
+        const known = p.after === null ? this.moved.get(g) : undefined;
         if (!known || known.acked) continue;
         for (const def of this.defs.values()) {
           for (const row of selectGroup(this.b, def, g)) deleteRow(this.b, def, encodeKey(def, row).pk);
@@ -850,10 +940,13 @@ export class ShardCore implements ShardApi {
     });
   }
 
-  async drain(req: { start: number; end: number }): Promise<{ groups: number; rows: number; bytes: number }> {
-    const range = this.incoming.find((x) => x.start === req.start && x.end === req.end);
+  async drain(req: Interval): Promise<{ groups: number; rows: number; bytes: number }> {
+    const range = this.incoming.find((x) => sameInterval(x, req));
     if (!range) return { groups: 0, rows: 0, bytes: 0 };
     const parent = this.deps.peer(range.from_id);
+    // 到着済みのグループの piece。いまは、グループの全体の 1 つである。
+    const interval = intervalOf(range);
+    const whole = (g: string): Piece => ({ g, range: interval, after: null });
     const total = { groups: 0, rows: 0, bytes: 0 };
     // 親のグループを先頭から順に列挙して運ぶ。最後まで行ったら、もう一度先頭から列挙して、取り残しがないことを確かめる。
     // ack 済みのグループは親から消えているので、2 周目は残る側のグループを読むだけである。
@@ -861,18 +954,18 @@ export class ShardCore implements ShardApi {
       let cursor: GroupCursor | null | undefined = undefined;
       let moved = 0;
       do {
-        const page: { groups: string[]; cursor: GroupCursor | null } = await parent.listGroups({ ...req, limit: 256, cursor });
+        const page: { groups: string[]; cursor: GroupCursor | null } = await parent.listGroups({ ...interval, limit: 256, cursor });
         cursor = page.cursor;
         // 受け取り済みで親に ack が届いていないグループは、ack だけを送り直す。
         const done = page.groups.filter((g) => this.arrived.has(g));
-        if (done.length) await parent.ack({ groups: done });
+        if (done.length) await parent.ack({ pieces: done.map(whole) });
         let rest = page.groups.filter((g) => !this.arrived.has(g));
         moved += page.groups.length;
         // pull は大きさの上限で途中までしか返さないことがある。残りを取り終えるまで繰り返す。
         while (rest.length) {
-          const payload = await parent.pull({ groups: rest, to: this.id, maxBytes: 1_000_000 });
+          const payload = await parent.pull({ ...interval, want: rest.map((g) => ({ g, from: null })), to: this.id, maxBytes: 1_000_000 });
           await this.receive(payload);
-          await parent.ack({ groups: payload.map((p) => p.g) });
+          await parent.ack({ pieces: payload.map(pieceOf) });
           total.groups += payload.length;
           for (const p of payload) {
             total.rows += p.rows.length;
@@ -887,21 +980,24 @@ export class ShardCore implements ShardApi {
     }
   }
 
-  async finishMove(req: { start: number; end: number }): Promise<{ m: Ts }> {
-    this.b.exec(`UPDATE __fenced SET done = 1 WHERE start = ? AND end = ?`, req.start, req.end);
-    for (const f of this.fenced) if (f.start === req.start && f.end === req.end) f.done = 1;
+  async finishMove(req: Interval): Promise<{ m: Ts }> {
+    this.b.exec(`UPDATE __fenced SET done = 1 WHERE lo = ? AND hi = ?`, req.start, req.end);
+    for (const f of this.fenced) if (sameInterval(f, req)) f.done = 1;
     // fence の後、このシャードは範囲の行について何も答えていない。いま発行する時刻は、範囲について答えたどの読みの時刻よりも、
     // 確定したどの書き込みの時刻よりも大きい。
     return { m: this.issue() };
   }
 
-  async finishIncoming(req: { start: number; end: number; m: Ts }): Promise<void> {
+  async finishIncoming(req: Interval & { m: Ts }): Promise<void> {
     // 行のあるグループは、pull が時刻を運び、時計はそこまで進んでいる (receive)。渡す側に行のなかったグループは運ばれないので、
     // 渡す側の時計を、ここで受け取る。受け取らないと、渡す側が「行はない」と答えた時刻より小さい時刻で、その行を書いてしまい、
     // 答え済みの読みが、後から書き込みの後になる (モデル M5b の noWriteBelowRead)。
     if (!this.faults.finishWithoutClock) this.observe(req.m);
-    this.b.exec(`DELETE FROM __incoming WHERE start = ? AND end = ?`, req.start, req.end);
-    this.incoming = this.incoming.filter((x) => !(x.start === req.start && x.end === req.end));
+    // 記録は消さずに、終えた印と、渡した側から受け取った時刻を残す。メモリからは外すので、移動の途中ではなくなる。
+    // 残した記録を読むもの (受け取った範囲の床、受け取った範囲の外の要求を断る確かめ) は、後の段で足す
+    // (docs/design-subslots.md の「drain と finishMove」)。
+    this.b.exec(`UPDATE __incoming SET done = 1, m = ? WHERE lo = ? AND hi = ? AND done = 0`, req.m, req.start, req.end);
+    this.incoming = this.incoming.filter((x) => !sameInterval(x, req));
   }
 
   async health(_req: Record<string, never>): Promise<ShardHealth> {
@@ -2055,17 +2151,24 @@ export class ShardCore implements ShardApi {
     return this.faults.applyAfterMoved ? rows : rows.filter((r) => !this.moved.has(r.sk));
   }
 
-  private forwards(txn: string): Map<string, string[]> {
-    const out = new Map<string, string[]>();
+  /** 取引の intent を運んだ piece を、転送先ごとに返す。 */
+  private forwards(txn: string): Map<string, Piece[]> {
+    const out = new Map<string, Piece[]>();
     if (this.faults.applyAfterMoved) return out;
-    for (const r of this.b.exec(`SELECT g, dest FROM __moved_txn WHERE txn = ?`, txn)) {
-      out.set(r.dest as string, [...(out.get(r.dest as string) ?? []), r.g as string]);
+    for (const r of this.b.exec(`SELECT g, lo, "after", dest FROM __moved_txn WHERE txn = ?`, txn)) {
+      const g = r.g as string;
+      // piece が運ぶ区間は、送り出した fence の区間である。fence は重ならず、記録は消さないので、区間の始まり lo から引ける。
+      const f = this.fenced.find((x) => x.start === r.lo);
+      if (!f) throw new SqlError(`group ${g} was moved to ${r.dest as string}, but shard ${this.id} has no record of the range it moved with`);
+      const piece: Piece = { g, range: intervalOf(f), after: posOf(r.after as string) };
+      out.set(r.dest as string, [...(out.get(r.dest as string) ?? []), piece]);
     }
     return out;
   }
 
-  async finalize(req: { txn: string; c: Ts; groups?: string[] }): Promise<void> {
-    if (req.groups) await this.ensureArrived(req.groups);
+  async finalize(req: { txn: string; c: Ts; pieces?: Piece[] }): Promise<void> {
+    // いまは、どの piece もグループの全体なので、到着はグループの名前で確かめる。
+    if (req.pieces) await this.ensureArrived(req.pieces.map((p) => p.g));
     this.observe(req.c);
     const rows = this.localIntents(req.txn);
     if (rows.length) {
@@ -2076,20 +2179,20 @@ export class ShardCore implements ShardApi {
     }
     this.releaseLocks(req.txn);
     for (const r of rows) this.wakeAll(this.lockKey(r.tbl, r.pk));
-    for (const [dest, groups] of this.forwards(req.txn)) {
-      await this.deps.peer(dest).finalize({ txn: req.txn, c: req.c, groups });
+    for (const [dest, pieces] of this.forwards(req.txn)) {
+      await this.deps.peer(dest).finalize({ txn: req.txn, c: req.c, pieces });
     }
   }
 
-  async abort(req: { txn: string; groups?: string[] }): Promise<void> {
-    if (req.groups) await this.ensureArrived(req.groups);
+  async abort(req: { txn: string; pieces?: Piece[] }): Promise<void> {
+    if (req.pieces) await this.ensureArrived(req.pieces.map((p) => p.g));
     this.releaseLocks(req.txn);
     for (const r of this.localIntents(req.txn)) {
       this.b.exec(`DELETE FROM __intents WHERE tbl = ? AND pk = ?`, r.tbl, r.pk);
       this.wakeAll(this.lockKey(r.tbl, r.pk));
     }
-    for (const [dest, groups] of this.forwards(req.txn)) {
-      await this.deps.peer(dest).abort({ txn: req.txn, groups });
+    for (const [dest, pieces] of this.forwards(req.txn)) {
+      await this.deps.peer(dest).abort({ txn: req.txn, pieces });
     }
   }
 
@@ -2151,7 +2254,7 @@ export class ShardCore implements ShardApi {
       const shards = JSON.parse(r.participants as string) as string[];
       await attempt(() => this.phase2(r.txn as string, r.c as Ts, shards.map((shard) => ({ shard }))));
     }
-    for (const r of this.incoming) await attempt(() => this.drain({ start: r.start, end: r.end }));
+    for (const r of this.incoming) await attempt(() => this.drain(intervalOf(r)));
     // 進行中の取引の intent には触れない。anchor がまだ決着を送っている最中かもしれないからである。
     const cutoff = physicalToTs(this.deps.clock.now() - ORPHAN_AGE_MS);
     const orphans = this.b.exec(`SELECT DISTINCT txn, anchor FROM __intents WHERE prepare_ts < ?`, cutoff) as unknown as Intent[];

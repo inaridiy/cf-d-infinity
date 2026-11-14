@@ -1,6 +1,6 @@
 import type { Cluster } from "./client/db";
-import { SchemaMoved, type SplitSlot } from "./meta";
-import { planSplit, shardsOf, type Routing } from "./routing";
+import { SchemaMoved, type SplitMove, type SplitSlot } from "./meta";
+import { contains, overlaps, planSplit, rangeText, sameInterval, shardsOf, type Interval, type Routing } from "./routing";
 import { sleep, systemRuntime } from "./runtime";
 import type { ShardHealth, ShardMetrics } from "./types";
 
@@ -114,11 +114,9 @@ export function healthProblems(shards: ShardHealth[]): string[] {
 /** intent がこれより長く残っていたら、決着が届いていないとみなす。再駆動は 5 秒ごとに試みる。 */
 const STUCK_INTENT_MS = 30_000;
 
-export interface SplitResult {
+export interface SplitResult extends Interval {
   parent: string;
   child: string;
-  start: number;
-  end: number;
   groups: number;
   rows: number;
   bytes: number;
@@ -134,10 +132,11 @@ export function nextShardNumber(routing: Routing, cluster: string, floor: number
 /**
  * 増設の手順。各段は冪等なので、途中で落ちても最初からやり直せる。
  * 子の受け入れ、親の fence、範囲表の切り替え、データの移動の順に進める。
+ * 移す範囲は token の区間である。いまは planSplit が slot の境目で切った区間だけを返し、シャードも、そういう区間の移動だけを受ける。
  */
 export async function split(
   cluster: Cluster, parent: string, child: string,
-  opts: { now?: () => number; range?: { start: number; end: number } } = {},
+  opts: { now?: () => number; range?: Interval } = {},
 ): Promise<SplitResult | null> {
   const rt = cluster.runtime ?? systemRuntime;
   const now = opts.now ?? (() => rt.now());
@@ -146,25 +145,26 @@ export async function split(
   // 元の範囲は親も子も「移動の途中」のまま残る。
   const [parentMoves, childMoves] = await Promise.all([cluster.shard(parent).moves({}), cluster.shard(child).moves({})]);
   const other = parentMoves.outgoing.find((m) => m.to !== child);
-  if (other) throw new Error(`split: ${parent} is already handing slots [${other.start}, ${other.end}) to ${other.to}`);
+  if (other) throw new Error(`split: ${parent} is already handing ${rangeText(other)} to ${other.to}`);
   if (parentMoves.incoming.length > 0) throw new Error(`split: ${parent} is still receiving a range; split it after that finishes`);
   const unfinished = parentMoves.outgoing[0] ?? childMoves.incoming.find((m) => m.from === parent);
-  if (unfinished && opts.range && (opts.range.start !== unfinished.start || opts.range.end !== unfinished.end)) {
-    throw new Error(`split: ${parent} has an unfinished move of slots [${unfinished.start}, ${unfinished.end}) to ${child}; finish it first`);
+  if (unfinished && opts.range && !sameInterval(opts.range, unfinished)) {
+    throw new Error(`split: ${parent} has an unfinished move of ${rangeText(unfinished)} to ${child}; finish it first`);
   }
-  const range = unfinished ? { start: unfinished.start, end: unfinished.end } : (opts.range ?? planSplit(cat.routing, parent));
-  if (!range) return null;
+  const chosen = unfinished ?? opts.range ?? planSplit(cat.routing, parent);
+  if (!chosen) return null;
+  const range: Interval = { start: chosen.start, end: chosen.end };
   // 別の範囲を持つ既存のシャードを子にすると、移動が完了しないまま範囲が止まる。
   // 同じ範囲の再開は、切り替え後の子が範囲を持っているので通す。
   const owned = cat.routing.ranges.filter((r) => r.shard === child);
-  if (owned.length > 0 && !owned.some((r) => r.start < range.end && range.start < r.end)) {
+  if (owned.length > 0 && !owned.some((r) => overlaps(r, range))) {
     throw new Error(`split: ${child} already owns other ranges`);
   }
   // 範囲表はもう子を指し、親にも子にも途中の移動がない。分割は終わっていて、枠だけが残っている (枠を返す前に止まった)。
   // 段をやり直すと、子が受け取りの記録をもう一度作ってしまうので、枠を返すだけにする。
-  const switched = cat.routing.ranges.some((r) => r.shard === child && r.start <= range.start && r.end >= range.end);
+  const switched = cat.routing.ranges.some((r) => r.shard === child && contains(r, range));
   if (!unfinished && switched) {
-    const left = (await cluster.splits()).find((x) => x.parent === parent && x.child === child && x.start === range.start && x.end === range.end);
+    const left = (await cluster.splits()).find((x) => x.parent === parent && x.child === child && sameInterval(x, range));
     if (left) await cluster.endSplit(left.id);
     // 終わった分割の再開は成功として返す (null は「割るものがない」の意味である)。運んだものはない。
     return { parent, child, ...range, groups: 0, rows: 0, bytes: 0, ms: 0 };
@@ -193,7 +193,7 @@ export function splitsToResume(slots: SplitSlot[], running: (child: string) => b
 export interface SplitJobLike {
   parent: string;
   child: string;
-  range: { start: number; end: number };
+  range: Interval;
 }
 
 /** 表定義の変更が、保守の操作の枠を持っている。分割は、それが終わってから始める。やり直してよい。 */
@@ -209,7 +209,7 @@ export class SplitBusy extends Error {
  * 版が進む。進んでいれば、もう一度適用させてから取る。こうして取った枠の間は、取り消しも入らない (m15_red_no_based_on)。
  * 表定義の変更 (index の作成など) が枠を持っていれば、SplitBusy を投げる。同じ範囲の枠がもうあれば、それを返す (再開)。
  */
-async function reserveSplit(cluster: Cluster, move: { parent: string; child: string; start: number; end: number }) {
+async function reserveSplit(cluster: Cluster, move: SplitMove) {
   const rt = cluster.runtime ?? systemRuntime;
   const cat = await cluster.catalog();
   // 最新の版は Meta が知っている。手元の表定義が古ければ、Meta が断るときに教える版まで、全シャードを進める。

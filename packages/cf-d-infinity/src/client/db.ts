@@ -4,7 +4,7 @@ import type {
 import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, utf8Length } from "../types";
 import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, imageList, q, scanList, typedValues } from "../shard/rows";
 import type { Catalog, SplitMove, SplitSlot } from "../meta";
-import { hashKey, ownerOf, rangesOf, shardsOf, type Routing } from "../routing";
+import { hashKey, ownerOf, regionsOf, shardsOf, type Interval, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import { ident, parseStatements, text, type Node, type Params } from "../sql/cst";
 import { keyString } from "../keys";
@@ -38,7 +38,7 @@ export interface Cluster {
   /** 版を取り消す。取り消す版を返す。取り消せなければ null。 */
   revokeDdl(version: number, reason: string): Promise<number | null>;
   allocate(table: string, n: number, min?: number): Promise<number>;
-  switchRange(move: { start: number; end: number; to: string; from?: string }): Promise<Routing>;
+  switchRange(move: Interval & { to: string; from?: string }): Promise<Routing>;
   /** 実時間、待ち、乱数、識別子の出どころ。なければ実物を使う。シミュレータのクラスタは、seed から決まる実装を持つ。 */
   runtime?: Runtime;
   /** このクラスタへつなぐ Db の、基準経路だけで実行する指定の既定。試験が使う。 */
@@ -275,14 +275,16 @@ function groupByShard(routing: Routing, sks: string[]): Target[] {
 }
 
 /**
- * shard key を絞らない span に、この範囲表で宛先のシャードが持つスロットの範囲を付ける。
+ * shard key を絞らない span に、この範囲表で宛先のシャードが持つ範囲 (claim) を付ける。
  * 全表の読みは範囲表の全シャードへ送るが、範囲表が古いと、分割で生まれたシャードには送らない。
  * 親は自分に残った行だけを答えるので、範囲を付けないと、子へ移った行が黙って欠ける。
+ * shard key で絞る span には、まだ付けない。区間の境目を shard key のブロックの中に置くようになったら、付ける
+ * (docs/design-subslots.md の「宛先と claim」)。
  */
-function withSlots(routing: Routing, shard: string, spans: Span[]): Span[] {
+function withClaims(routing: Routing, shard: string, spans: Span[]): Span[] {
   if (!spans.some(isWideSpan)) return spans;
-  const slots = rangesOf(routing, shard);
-  return spans.map((s) => (isWideSpan(s) ? { ...s, slots } : s));
+  const claim = regionsOf(routing, shard);
+  return spans.map((s) => (isWideSpan(s) ? { ...s, claim } : s));
 }
 
 /** 1 回の読み取りで Worker へ集める行の上限。メモリからの推定で、本番で調整する。 */
@@ -309,7 +311,7 @@ class ReadScope {
   protected record(_shard: string, _spans: Span[]): void {}
 
   async call(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "overlay">): Promise<ExecRes> {
-    const spans = withSlots(this.cat.routing, shard, req.spans);
+    const spans = withClaims(this.cat.routing, shard, req.spans);
     const full: ExecReq = {
       ...req, spans, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), fresh: this.wantsFresh, realtime: this.realtime,
     };
@@ -757,7 +759,7 @@ export class Txn extends ReadScope {
   private async dml(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "overlay">): Promise<ExecRes> {
     if (!this.pessimistic) return this.call(shard, req);
     this.lockOwner ??= { txn: this.txnId, start: this.db.startStamp() };
-    const spans = withSlots(this.cat.routing, shard, req.spans);
+    const spans = withClaims(this.cat.routing, shard, req.spans);
     const res = await this.db.shardOf(shard).exec({
       ...req, spans, T: this.T, minTs: this.db.token, schema: this.cat.version, overlay: this.overlay(shard), lock: this.lockOwner,
     }).catch(rerouted);
@@ -1596,7 +1598,7 @@ export class Db {
     for (const shard of shardsOf(cat.routing)) {
       const res = await this.shardOf(shard).exec({
         sql: `SELECT 1 x FROM ${q(def.name)} GROUP BY ${list} HAVING count(*) > 1 LIMIT 1`,
-        params: [], spans: withSlots(cat.routing, shard, [tableSpan(def.name)]), schema: cat.version,
+        params: [], spans: withClaims(cat.routing, shard, [tableSpan(def.name)]), schema: cat.version,
       });
       if (res.error !== undefined) throw new SqlError(res.error);
       if (res.values.length) throw new SqlError(`UNIQUE constraint failed: ${def.name} has duplicate values`);
@@ -1718,7 +1720,7 @@ export class Db {
     for (;;) {
       const res = await this.shardOf(shard).exec({
         sql: `SELECT ${cols} FROM ${q(def.name)} ${after ? `WHERE (${pkCols}) > (${def.pk.map(() => "?").join(", ")})` : ""} ORDER BY ${pkCols} LIMIT ${BUILD_PAGE}`,
-        params: after ?? [], spans: withSlots(cat.routing, shard, [tableSpan(def.name)]), schema,
+        params: after ?? [], spans: withClaims(cat.routing, shard, [tableSpan(def.name)]), schema,
       });
       if (res.error !== undefined) throw new SqlError(res.error);
       // 欠陥のスイッチ scanSkipsEmpty: 行のないシャードは、読まなかったのと同じく、その時計を公開の時刻に入れない。
