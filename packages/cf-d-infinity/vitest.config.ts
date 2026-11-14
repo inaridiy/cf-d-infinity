@@ -25,7 +25,7 @@ const workerd = tests.filter((f) => /from "miniflare"/.test(readFileSync(join(im
 const oracles = [
   "compat", "fuzz", "slt-more", "conflict-clauses", "basic", "insert-subquery", "autowrite-subquery", "collated-keys",
   "admission", "unique-reads", "export-import", "replay", "history", "elle-sim", "typed-diff", "storage-class", "key-affinity", "key-conversions", "shard-limits", "wide-integers",
-  "contextual-words", "join-word-before-comment",
+  "contextual-words", "join-word-before-comment", "placement-differential",
 ].map((name) => `test/${name}.test.ts`);
 
 export default defineConfig({
