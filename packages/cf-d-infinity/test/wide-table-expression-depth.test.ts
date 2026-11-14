@@ -42,11 +42,12 @@ beforeAll(() => {
 afterAll(() => mf?.dispose());
 
 describe("a table with almost 100 columns on workerd", () => {
-  for (const columns of [97, 98, 99]) {
+  for (const columns of [97, 98, 99, 100]) {
     it(`${columns} columns: either CREATE TABLE refuses the table, or rows can be written to it`, async () => {
       const rest = Array.from({ length: columns - 1 }, (_, i) => `c${i} INTEGER`).join(", ");
       const created = await post("/ddl", { sql: `CREATE TABLE w${columns}(id INTEGER PRIMARY KEY, ${rest})` });
-      if (created.status !== 200) return;
+      // 段 2 から、主キーのある 100 列までの表は作れる (段 1 までは、変更を捕捉する写しの表が 1 列多く、100 列の表は作れなかった)。
+      expect(created.json?.error).toBeUndefined();
       const insert = await post("/sql", { sql: `INSERT INTO w${columns}(id, c0) VALUES (1, 5)`, params: [] });
       expect(insert.json?.error).toBeUndefined();
       const update = await post("/sql", { sql: `UPDATE w${columns} SET c1 = 6 WHERE id = 1`, params: [] });
