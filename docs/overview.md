@@ -24,6 +24,11 @@ This is the English summary of how D∞ (`cf-d-infinity`) works. The full design
 - **A shard is one Durable Object holding ordinary SQLite tables.** User tables are stored as they were declared,
   with no hidden columns, and hold only the latest committed version of each row. The shard therefore runs pushed-down
   SQL, including joins and aggregates, with SQLite's own planner and executor.
+- **Inside a shard, only synchronous code touches the state.** A Durable Object runs one piece of JavaScript at a
+  time, so a synchronous function is atomic. The shard's kernel (`src/shard/kernel.ts`) has no `await`. A request is a
+  step: it validates the schema version and the ownership of the rows it touches, and then either finishes or returns
+  what it has to wait for (a peer shard, Meta, storage, a row lock). A small shell (`src/shard/core.ts`) performs the
+  wait and calls the same step again from the top, so a check made before a wait is never relied on after it.
 - **Replication is not implemented here.** A Durable Object's storage layer already replicates each commit to
   followers and confirms it on a quorum, so there is no Raft in this codebase.
 - **Nothing sits on the hot path of every request.** There is no central timestamp oracle and no coordinator
@@ -234,7 +239,7 @@ The checks are layered. Each one catches what the layer before it cannot see.
    instances. Each model has variants with a known bug put back, and the checker must find every one.
 2. **Counterexamples replayed against the code.** A model only checks the design. For each bug variant that the
    implementation guards against, a deterministic simulator test drives the model's counterexample against the real
-   code. For most of them (49 of 71) a fault switch also puts the same bug back into the code, and the test checks that
+   code. For most of them (51 of 74) a fault switch also puts the same bug back into the code, and the test checks that
    the switch produces the violation; the others replay the ordering on the fixed code only. Without the replays, a rare
    ordering is left to a random seed that may never produce it. The [coverage table](./model-coverage.md) maps every
    variant to its switch and replay.
