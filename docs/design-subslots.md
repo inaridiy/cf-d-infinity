@@ -87,7 +87,7 @@ intent の subslot は `pk` から計算できる。
 - `GroupPayload` (`:289`) を `PiecePayload` に替える (次の節)。
 - `pull`、`ack`、`finalize` と `abort` の `groups` (`:240` から `:256`) は、グループの名前ではなく piece を運ぶ。
 - `beginIncoming`、`fence`、`moves`、`drain`、`finishMove`、`finishIncoming` は `sub` を運ぶ。
-- `listGroups` と `GroupCursor` (`:302`) は変えない。列挙するのは今もグループである。
+- `listGroups` は `sub` を受け取る。列挙するのは今もグループで、`GroupCursor` (`:302`) の形は変えない。
 - `PROTOCOL_VERSION` を 3 にする (`:480`)。
 
 ### `docs/storage-format.md` で変わる行
@@ -207,6 +207,9 @@ slot を割るのは、そのテナントが 1 つのシャードを超えたと
 | 全表の span | claim が fence に重なれば `NotOwner`。移動の途中なら `Migrating` (今と同じ) | 今と同じ |
 
 claim のない shard key の span は、subslot の全体を claim したものとして扱う。
+受け取った範囲の記録を持つシャード (分割で生まれたシャード) は、記録した範囲の外の点と、外にはみ出す claim も `NotOwner` で断る。
+今のシャードは、fence した範囲と受け取り中の範囲しか知らないので、subslot で割った slot の残りの半分の行が届いても受けてしまう。
+範囲の記録を消さずに残す (「drain と finishMove」の節) ので、この確かめができる。
 渡した側は今と同じく、fence した範囲の要求を、m を決める前から断る (M18 の親より厳しい)。
 
 `enter` (`:611`) の形は変えない。
@@ -266,7 +269,23 @@ fence の後、書き込みは子に届く。
 
 shard key で絞る文は、グループの全体が要る。
 子は、そのグループの piece を続けて pull し、5 秒 (行ロックの待ちと同じ長さ) で揃わなければ `Migrating` を返して、背景で続ける。
-シャード内 UNIQUE の値を書く文もこの形 (`src/client/spans.ts:65`) なので、UNIQUE の検査は、いつもグループの全体を持つシャードで行われる。
+シャード内 UNIQUE の値を書く文もこの形 (`src/client/spans.ts:65`) なので、文と prepare の UNIQUE の検査は、グループの全体を持つシャードで行われる。
+
+適用は別である。
+fence の前に置かれた intent は、piece と一緒に別々の時点に運ばれ、別々に適用される。
+シャードをまたぐ取引 X が、同じグループの行 r1 (piece A) と r2 (piece B) の UNIQUE の値を、r2 は 'b' から 'c' へ、r1 は 'a' から 'b' へ変えるとする。
+piece A が届き、X が確定し、子の読み手が r1 の intent を決着させると (`settleIntents` から `finalize`)、子の r1 は 'b' になる。
+その後で piece B が、古い行 r2 = 'b' と intent を運んで届く。
+`receive` (`:816`) は r2 を r1 の隣に挿入しようとして、シャードの UNIQUE の index に断られ、piece B は届かなくなる。
+今は、グループの行と intent が 1 通で運ばれるので、この形はない (読んだだけで、走らせてはいない)。
+
+規則を 1 つ足す。
+親は、グループの最初の piece を切る前に、そのグループの intent のうち UNIQUE の値に触れるもの (UNIQUE のある表への挿入と削除、UNIQUE の列を変える更新) を、anchor に尋ねて決着させる。
+確定していれば、グループの全体を持っているうちに、まとめて適用する。
+決着が付かなければ、その pull は待たせる。
+fence の後は、親に新しい intent は置かれず、子は UNIQUE の値を書く文をグループが揃うまで受けないので、最初の piece を切ってからグループが子で揃うまで、そのグループの UNIQUE の値は変わらない。
+これは新しい守りなので、モデルを先に書く (M16 と M18 の組み合わせ)。
+計画書の不変条件 2 に割り当てる。
 
 転送は実測で 4.1 MB/s である (`scaling.md`)。
 Worker のやり直しは 12 回で、合わせて 1 秒に満たない (`src/client/db.ts:260`、`:1985`)。
@@ -276,12 +295,16 @@ Worker のやり直しは 12 回で、合わせて 1 秒に満たない (`src/cl
 ### drain と finishMove
 
 `drain` (`:853`) は、`listGroups` でグループを列挙し、グループごとに `from` を進めながら pull と ack を繰り返す。
-`listGroups` が挙げるのは fence の slot にあるグループで、`sub` に行のないグループは、空の piece 1 つで終わる。
+`listGroups` が挙げるのは、fence の slot にあり、`sub` に行か intent を持ち、渡し終えていないグループである。
+slot を subslot で割ると、グループは親にも残るので、今の終わり方 (ack 済みのグループは親から消え、列挙が空になる。`:858`、`:885`) は、この絞り込みがないと成り立たない。
+`sub` に行のないグループは運ばれず、要求が来たときだけ、空の piece 1 つで答える。
 `finishMove` と `finishIncoming` (`:890`、`:898`) の役割は変えない。
 `finishIncoming` は、`__incoming` の行を消さずに `done` と `m` を残し、その範囲の `__arrived` の行を消す。
 残した `m` が、その範囲の「床」になる。
 piece の記録のない行 (渡す側に行がなかった位置) を `T < m` で読む要求は、`ReadTooOld` で断る。
 `__arrived` を残さないので、piece の数だけ記録が増え続けることもない。
+受け取り終えた範囲は、全部の piece が届いたものとして扱う。
+起動のときの時計の再開 (`:264`、`:288`) は床の `m` も数え、遅れて転送されてきた `finalize` (`ensureArrived`) は、終えた範囲の piece を取りに行かない。
 
 床は、M18 の「行のない piece」の扱いである。
 読んだかぎりでは、今のコードにも同じ形の穴がある。
@@ -324,7 +347,8 @@ slot を subslot で割るのは、次の 2 つの場合である。
 分かれた slot では、書き込みが基準経路になり、同じ値の行を持ち主の全部から読む (`conflicting` の `want`、`src/client/db.ts:931`)。
 その読みは取引の span なので、同じ値を並行して書く 2 つの取引は、確定の検証で片方が中止になる (M1)。
 新しい仕組みは要らない。
-`uniquePending` と M16 は、シャードの中の話のまま成り立つ。
+`uniquePending` と M16 は、prepare の検査については、シャードの中の話のまま成り立つ。
+piece ごとの適用には、「書き込みが続く間の大きなグループ」の節の規則が要る。
 
 **既存の行への `CREATE UNIQUE INDEX`**：`Db.checkUnique` (`src/client/db.ts:1587`) も、各シャードの index の作成も、自分のシャードの行しか見ない。
 分かれたテナントで、同じ値の行が 2 つのシャードにあれば、通ってしまう。
@@ -343,9 +367,9 @@ slot を subslot で割るのは、次の 2 つの場合である。
 | 段 | 中身 | 落ちてから通る検査 | 規模 |
 |---|---|---|---|
 | 1 | 形式と配線。範囲表の `sub`、`subslotOf`、`Span.claim`、記録の表の形、`PiecePayload`。項目は slot の全体だけで、piece はいつも `(null, null]` | 挙動を変えない段なので、落ちる検査はない。代わりに次を確かめる。(a) `history` と `replay` の同じ seed で、RPC の列 (宛先とメソッド) が変更の前後で同じ。(b) 欠陥の表 (`scripts/fault-table.mjs`) の移動のスイッチの行が変わらない。(c) `applyMove` を乱択で重ねても、どの点にも持ち主がちょうど 1 つある。(d) 作り直した材料で `test/upgrade.test.ts` が通る | 約 600 行、2 から 3 日 |
-| 2 | piece 単位の移動。`pull`、`receive`、`ack`、`drain`、`assertOwned`、範囲の床 | 先に、今のコードで、1 通で運べる大きさの上限 (`GROUP_MAX_BYTES`) を `ShardDeps` から小さくできるようにし、`replay` に分割を足す (今は 3 シャード固定、`test/replay.test.ts:193`)。上限を小さくすると、`history`、`elle-sim`、`replay` の分割が「group too large to move」で止まる。段 2 の後は、同じ seed で、どのグループも数個の piece に分かれて運ばれ、検査が通る | 約 1,100 行、5 から 7 日。M18 に行のない piece を足す |
+| 2 | piece 単位の移動。`pull`、`receive`、`ack`、`drain`、`assertOwned`、範囲の床 | 先に、今のコードで、1 通で運べる大きさの上限 (`GROUP_MAX_BYTES`) を `ShardDeps` から小さくできるようにし、`replay` に分割を足す (今は 3 シャード固定、`test/replay.test.ts:193`)。上限を小さくすると、`history`、`elle-sim`、`replay` の分割が「group too large to move」で止まる。段 2 の後は、同じ seed で、どのグループも数個の piece に分かれて運ばれ、検査が通る。`replay` の表は `UNIQUE (tenant_id, code)` を持つ (`test/replay.test.ts:18`) ので、piece ごとの適用と UNIQUE の形にも届くはずである | 約 1,100 行、5 から 7 日。先に、M18 に行のない piece を足し、UNIQUE と piece の適用のモデルを書く |
 | 3 | 分かれた slot の経路。`withClaims`、`ownersOf`、プランナ、`NeedsReference`。移動はまだ slot の全体だけ | `SimOptions` (`test/sim.ts:295`) に、最初の範囲表で全部の slot を subslot で 2 つのシャードに分ける指定を足す。SQLite と突き合わせる検査 (`slt`、`fuzz`、`typed-diff`、`unique-conflicts`、`replay`) をその置き方で流す。段 3 の前は、テナントに絞った文が片方のシャードの行しか返さない。本番では、段 4 まで `sub` つきの項目はできない | 約 700 行、3 から 4 日 |
-| 4 | slot を subslot で割る移動と `planSplit`。既存の行への UNIQUE index の突き合わせ | `history`、`elle-sim`、`replay` の分割が、slot の分割と subslot の分割を乱択で選ぶ。M18 の `splitTenantTest` と、`halfArrivedTest` のうち claim の分け直しを除いた部分を、実コードで再生する。段 3 の置き方で見つかる UNIQUE index の重複は、段 3 で `test/open/` に置き、ここで通す | 約 900 行、5 から 7 日。UNIQUE index のモデルが先 |
+| 4 | slot を subslot で割る移動と `planSplit`。`listGroups` の `sub`、受け取った範囲の外を断る確かめ。既存の行への UNIQUE index の突き合わせ | `history`、`elle-sim`、`replay` の分割が、slot の分割と subslot の分割を乱択で選ぶ。M18 の `splitTenantTest` と、`halfArrivedTest` のうち claim の分け直しを除いた部分を、実コードで再生する。段 3 の置き方で見つかる UNIQUE index の重複は、段 3 で `test/open/` に置き、ここで通す | 約 900 行、5 から 7 日。UNIQUE index のモデルが先 |
 
 M18 の赤と、欠陥のスイッチ (`Faults`、`src/types.ts:372`) の対応は次のとおりである。
 再生は、その形に届く最初の段で足す。
@@ -356,7 +380,7 @@ M18 の赤と、欠陥のスイッチ (`Faults`、`src/types.ts:372`) の対応�
 | `m18_red_child_partial` | `partialGroupRead` | 受け取る側が、グループの piece が揃う前に shard key の span に答える | 2 |
 | `m18_red_answer_held` | `answerHeldRows` | 渡した側が、渡し終えていないグループの shard key の span に答える | 4 |
 | `m18_red_piece_without_clock` | `pieceWithoutClock` | `receive` が piece の m まで時計を進めない | 2 |
-| `m18_red_write_by_slot` | `ownBySlot` | 受け取る側が、グループの piece が 1 つでも届いていれば、どの行の書き込みも受ける (段 2)。subslot を見ずに slot だけで持ち主を決める (段 4、モデルの 2 本の run) | 2、4 |
+| `m18_red_write_by_slot` | `ownBySlot` | 受け取る側が、グループの piece が 1 つでも届いていれば、どの行の書き込みも受ける (段 2)。subslot を見ずに slot だけで持ち主を決め、受け取った範囲の外の点も受ける (段 4、モデルの 2 本の run) | 2、4 |
 | `m18_red_intents_by_group` | `intentsByGroup` | `pull` と `ack` が intent を `WHERE sk = ?` で選ぶ | 2 |
 
 今あるスイッチ (`applyAfterMoved`、`dropIntentsOnMove`、`servePastMove`、`ignoreFence`、`finishWithoutClock`) は、piece ごとの同じ守りを外すものとして残す。
@@ -389,7 +413,7 @@ M18 の赤と、欠陥のスイッチ (`Faults`、`src/types.ts:372`) の対応�
 | 活性 | 確かめていない。大きなテナントの移動の間の失敗は、上に数字で書いた |
 | 3 つの piece と取引 X | ランダム探索だけである。段 2 と段 4 の乱択の検査が受け持つ |
 
-M18 が扱っていない UNIQUE (書き込みと、既存の行への index) は、「2PC、index、エクスポート」の節に書いた。
+M18 が扱っていない UNIQUE は、piece ごとの適用を「書き込みが続く間の大きなグループ」の節に、書き込みの検査と既存の行への index を「2PC、index、エクスポート」の節に書いた。
 
 ## 持ち主の判断が要ること
 
