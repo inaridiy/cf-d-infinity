@@ -185,7 +185,7 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 
 | パス | 内容 |
 |---|---|
-| `src/shard/core.ts` | シャードのプロトコル (rollback-read、検証、anchor 2PC、回復、ライブ移動) |
+| `src/shard/core.ts` | シャードのプロトコル (rollback-read、検証、anchor 2PC、回復、ライブ移動)。要求の入口は、待つ段 (表定義の適用、グループの到着、intent の決着、行ロック) の後、`enter` を通って同期区間に入る。待ちの後の確かめ直し (表定義の版、範囲の持ち主) は `enter` にだけあり、文の実行と検証は `enter` が返す印を受け取る |
 | `src/shard/rows.ts` | 行の適用と set-based undo |
 | `src/client/db.ts` | Worker 側の入口。OCC の取引、経路決定、scatter |
 | `src/client/d1.ts` | D1 互換 API |
