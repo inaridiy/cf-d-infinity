@@ -1,7 +1,7 @@
 // 新旧コードが同時に話すときの版の検査。デプロイ後も旧コードの DO が最大 300 秒動く。
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { keyStringExact } from "../src/keys";
+import { keyString } from "../src/keys";
 import { SUBSLOTS, type Interval } from "../src/routing";
 import { encode } from "../src/shard/rows";
 import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type Piece, type PiecePayload, type PieceWant, type Span } from "../src/types";
@@ -14,11 +14,11 @@ import { encodeTuple, realOf, typedOf } from "../src/value";
 function wireSample(): string {
   const values = [5, realOf(5), 0.5, realOf(-0), "5", "", null, new Uint8Array([0, 255]), Number.POSITIVE_INFINITY, 2 ** 53 - 1];
   // 行イメージは、表定義の列の順のタプルである (版 4 から)。
-  const change = { table: "t", pk: keyStringExact([1]), sk: keyStringExact(["a"]), before: null, after: encodeTuple(values.map(typedOf)) };
+  const change = { table: "t", pk: keyString([1]), sk: keyString(["a"]), before: null, after: encodeTuple(values.map(typedOf)) };
   return [
     JSON.stringify(values, (_k, x) => (x instanceof Uint8Array ? { u8: [...x] } : typeof x === "number" && !Number.isFinite(x) ? String(x) : x)),
     encode(change),
-    keyStringExact(values),
+    keyString(values),
     moveSample(),
   ].join("\n");
 }
@@ -29,8 +29,8 @@ function wireSample(): string {
  * 見本を直すと指紋が変わるので、版を上げることになる。
  */
 function moveSample(): string {
-  const g = keyStringExact(["a"]);
-  const at: [string, string] = ["t", keyStringExact([1])];
+  const g = keyString(["a"]);
+  const at: [string, string] = ["t", keyString([1])];
   // slot の境目に揃った範囲と、ブロックの中で切った範囲。
   const range = { start: 32768 * SUBSLOTS, end: 65536 * SUBSLOTS } satisfies Interval;
   const part = { start: 7 * SUBSLOTS + 32768, end: 8 * SUBSLOTS } satisfies Interval;

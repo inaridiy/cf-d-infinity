@@ -12,7 +12,7 @@ import { DatabaseSync } from "node:sqlite";
 import initSqlJs from "sql.js";
 import { beforeAll, describe, expect, it } from "vitest";
 import { Db } from "../src/client/db";
-import { keyStringExact, keyValues, storedAs } from "../src/keys";
+import { keyString, keyValues, storedAs } from "../src/keys";
 import { oldKeyString } from "./key-string-old";
 import { initStoredValue, storedValue } from "../src/sql/stored";
 import type { Affinity, Value } from "../src/types";
@@ -169,17 +169,17 @@ describe("a key string is equal exactly when SQLite takes two values for the sam
   });
 
   it("the new key string, over every 64-bit INTEGER and every REAL", () => {
-    // 段 2 から使う keyStringExact。2^53 以上の INTEGER と、その前後の REAL の組でも一致する。
-    const r = keyDisagreements(EDGE_VALUES, (v) => keyStringExact([v]));
+    // 段 2 から使う keyString。2^53 以上の INTEGER と、その前後の REAL の組でも一致する。
+    const r = keyDisagreements(EDGE_VALUES, (v) => keyString([v]));
     expect(r.bad.slice(0, 10)).toEqual([]);
     // INTEGER の 2^53 と REAL の 2^53、INTEGER の -2^63 と REAL の -2^63 のような、2^53 以上で等しい組が入っている。
     expect(r.equal).toBeGreaterThan(8);
-    expect(keyStringExact([2n ** 60n])).toBe(keyStringExact([2 ** 60]));
-    expect(keyStringExact([2n ** 60n + 1n])).not.toBe(keyStringExact([2 ** 60]));
-    expect(keyStringExact([-(2n ** 63n)])).toBe(keyStringExact([-(2 ** 63)]));
+    expect(keyString([2n ** 60n])).toBe(keyString([2 ** 60]));
+    expect(keyString([2n ** 60n + 1n])).not.toBe(keyString([2 ** 60]));
+    expect(keyString([-(2n ** 63n)])).toBe(keyString([-(2 ** 63)]));
     // 形式 1 の keyString は、JS の表記で書く。2^53 以上では、表記が同じでも値が違う INTEGER がある。
     expect(oldKeyString([realOf(2 ** 60)])).toBe("[1152921504606847000]");
-    expect(keyStringExact([realOf(2 ** 60)])).toBe("[1152921504606846976]");
+    expect(keyString([realOf(2 ** 60)])).toBe("[1152921504606846976]");
   });
 });
 
@@ -207,9 +207,9 @@ describe("the new key string against the format-1 one", () => {
     const bad: string[] = [];
     let changed = 0;
     for (const v of today) {
-      const [was, now] = [oldKeyString([v]), keyStringExact([v])];
+      const [was, now] = [oldKeyString([v]), keyString([v])];
       // 今の決まりの値 (整数の JS の数は INTEGER) で渡しても、型のある値 (BigInt は INTEGER) で渡しても、同じ文字列になる。
-      if (keyStringExact([typedOf(v)]) !== now) bad.push(`${JSON.stringify(v)}: ${now} with today's value, ${keyStringExact([typedOf(v)])} with the typed value`);
+      if (keyString([typedOf(v)]) !== now) bad.push(`${JSON.stringify(v)}: ${now} with today's value, ${keyString([typedOf(v)])} with the typed value`);
       if (was === now) continue;
       // 変わってよいのは、設計書の「変わるキーと変わらないキー」の 2 行目だけである。
       const x = isReal(v) ? v.real : null;
@@ -224,8 +224,8 @@ describe("the new key string against the format-1 one", () => {
     const r = prng(9);
     for (let i = 0; i < 2000; i++) {
       const key = Array.from({ length: 1 + Math.floor(r() * 3) }, () => today[Math.floor(r() * today.length)]!);
-      const changes = key.some((v) => oldKeyString([v]) !== keyStringExact([v]));
-      if ((oldKeyString(key) === keyStringExact(key)) === changes) bad.push(`${JSON.stringify(key)}: ${oldKeyString(key)} and ${keyStringExact(key)}`);
+      const changes = key.some((v) => oldKeyString([v]) !== keyString([v]));
+      if ((oldKeyString(key) === keyString(key)) === changes) bad.push(`${JSON.stringify(key)}: ${oldKeyString(key)} and ${keyString(key)}`);
     }
     expect(bad.slice(0, 10)).toEqual([]);
   });
@@ -240,9 +240,9 @@ describe("a key string read back with keyValues", () => {
   it("gives values that write the same key string again", () => {
     const bad: string[] = [];
     for (const v of KEYS) {
-      const key = keyStringExact([v, null, v]);
+      const key = keyString([v, null, v]);
       const back = keyValues(key);
-      if (keyStringExact(back) !== key) bad.push(`${shownTyped(v)}: ${key} read back as ${back.map(shownTyped).join(", ")}`);
+      if (keyString(back) !== key) bad.push(`${shownTyped(v)}: ${key} read back as ${back.map(shownTyped).join(", ")}`);
       // 型は、INTEGER と、整数の値で 64 ビットに収まる REAL が INTEGER で戻り、ほかは元の型で戻る。
       const integral = typeof v === "bigint" || (typeof v === "number" && Number.isInteger(v) && v >= -(2 ** 63) && v < 2 ** 63);
       const want = integral ? shownTyped(BigInt(v as bigint | number)) : shownTyped(v);
@@ -261,8 +261,8 @@ describe("a key string read back with keyValues", () => {
     const seen = new Set<string>();
     KEYS.forEach((v, i) => {
       // 同じキーの値 (INTEGER の 5 と REAL の 5.0 など) は、先に入れたものだけが行になる。
-      if (seen.has(keyStringExact([v]))) return;
-      seen.add(keyStringExact([v]));
+      if (seen.has(keyString([v]))) return;
+      seen.add(keyString([v]));
       lite.prepare("INSERT INTO u VALUES (?, ?)").run(v as never, i);
       lite.prepare("INSERT INTO c VALUES (?, ?, ?)").run(v as never, KEYS[(i * 7) % KEYS.length] as never, i);
       stored.push([v, i]);
@@ -271,10 +271,10 @@ describe("a key string read back with keyValues", () => {
     const two = lite.prepare("SELECT v FROM c WHERE a IS ? AND b IS ?");
     const bad: string[] = [];
     for (const [v, i] of stored) {
-      const [k] = keyValues(keyStringExact([v]));
+      const [k] = keyValues(keyString([v]));
       const rows = one.all(k as never).map((r) => r.v);
       if (rows.length !== 1 || rows[0] !== i) bad.push(`${shownTyped(v)} looked up as ${shownTyped(k!)}: rows ${JSON.stringify(rows)}`);
-      const [a, b] = keyValues(keyStringExact([v, KEYS[(i * 7) % KEYS.length]!]));
+      const [a, b] = keyValues(keyString([v, KEYS[(i * 7) % KEYS.length]!]));
       const pair = two.all(a as never, b as never).map((r) => r.v);
       if (pair.length !== 1 || pair[0] !== i) bad.push(`(${shownTyped(v)}, …) looked up: rows ${JSON.stringify(pair)}`);
     }

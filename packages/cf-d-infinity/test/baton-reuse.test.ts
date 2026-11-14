@@ -11,7 +11,7 @@ import { describe, expect, it } from "vitest";
 import { Db, type ClientFaults } from "../src/client/db";
 import type { Faults } from "../src/types";
 import { handlePipeline, type PipelineReq } from "../src/client/hrana";
-import { keyStringExact } from "../src/keys";
+import { keyString } from "../src/keys";
 import { ownerOf } from "../src/routing";
 import { prng, seedsOr, SimCluster } from "./sim";
 
@@ -25,7 +25,7 @@ async function twoContinuations(clientFaults: ClientFaults, same = false) {
   const c = new SimCluster({ shards: 2, clientFaults });
   await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
   const { routing } = await c.catalog();
-  const on = (s: string, from: number) => { for (let i = from; ; i++) if (ownerOf(routing, keyStringExact([i])) === s) return i; };
+  const on = (s: string, from: number) => { for (let i = from; ; i++) if (ownerOf(routing, keyString([i])) === s) return i; };
   const [a0, a1, b0, b1] = [on("s0", 1), on("s1", 1), on("s0", 100), on("s1", 100)];
   if (same) {
     // COMMIT の再送: 書き込みを済ませた baton から、COMMIT だけを 2 回送る。中身が同じなので 2PC の ID も同じで、2 回目は
@@ -59,7 +59,7 @@ async function concurrentContinuations(seed: number, clientFaults: ClientFaults 
   c.net.jitter = () => (rnd() < 0.3 ? 0 : rnd() * 4);
   await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
   const { routing } = await c.catalog();
-  const on = (s: string, from: number) => { for (let i = from; ; i++) if (ownerOf(routing, keyStringExact([i])) === s) return i; };
+  const on = (s: string, from: number) => { for (let i = from; ; i++) if (ownerOf(routing, keyString([i])) === s) return i; };
   const ids = { a: [on("s0", 1), on("s1", 1)], b: [on("s0", 100), on("s1", 100)] };
   const begun = await step(c, null, ["BEGIN"]);
   const [a, b] = await Promise.all((["a", "b"] as const).map((k) =>
@@ -101,7 +101,7 @@ async function concurrentResends(seed: number, faults: Faults = {}) {
   c.net.jitter = () => (rnd() < 0.3 ? 0 : rnd() * 4);
   await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
   const { routing } = await c.catalog();
-  const ids = ["s0", "s1", "s2"].map((s) => { for (let i = 1; ; i++) if (ownerOf(routing, keyStringExact([i])) === s) return i; });
+  const ids = ["s0", "s1", "s2"].map((s) => { for (let i = 1; ; i++) if (ownerOf(routing, keyString([i])) === s) return i; });
   const begun = await step(c, null, ["BEGIN", ...ids.map((id) => `INSERT INTO t VALUES (${id}, 'r')`)]);
   const [a, b] = await Promise.all([step(c, begun.baton, ["COMMIT"]), step(c, begun.baton, ["COMMIT"])]);
   await c.settle();

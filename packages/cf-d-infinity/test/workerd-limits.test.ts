@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { Miniflare } from "miniflare";
 import initSqlJs from "sql.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { keyStringExact } from "../src/keys";
+import { keyString } from "../src/keys";
 import { ownerOf, type Routing } from "../src/routing";
 import { initStoredValue, storedValue } from "../src/sql/stored";
 import type { Affinity } from "../src/types";
@@ -391,7 +391,7 @@ describe("facts about workerd and the Durable Object SQLite that the value rewor
       ...INT64, ...int64s(300, 11), ...EDGE_DOUBLES, ...doubles(300, 12), 0.5, 1e19, 1e21, Infinity, -Infinity,
       "abc", "a\u0000b", "9223372036854775807", new Uint8Array([0, 255]), null,
     ];
-    const keys = values.map((v, i) => keyStringExact([v, values[(i * 7) % values.length]!]));
+    const keys = values.map((v, i) => keyString([v, values[(i * 7) % values.length]!]));
     const back = await p.keys(keys);
     expect(back.map((b) => b.again)).toEqual(keys);
     // 整数は BigInt で戻る。2^53 を超える整数も丸まらない (丸まっていれば、もう一度書いたキーが元と違う)。

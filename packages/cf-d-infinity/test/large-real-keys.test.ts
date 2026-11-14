@@ -1,7 +1,7 @@
 // 2^53 以上の整数の値の REAL を主キーに持つ行 (値の作り直しの段 2)。
 //
 // K1 が断るのは、格納の型が INTEGER の 2^53 以上の値だけで、整数の値の REAL (2^60 など) は保存できる。そのキー文字列は、
-// 整数の数字で書く (`[1152921504606846976]`。src/keys.ts の keyStringExact)。読み戻す keyValues は整数を INTEGER (bigint) で返すので、
+// 整数の数字で書く (`[1152921504606846976]`。src/keys.ts の keyString)。読み戻す keyValues は整数を INTEGER (bigint) で返すので、
 // 今の Value に戻す keyParams が、JS の数に正確に戻す。2^53 以上の INTEGER を断る橋 (fromTypedValue) をキーに通すと、こういう行は
 // 引けなくなる。ここでは、キーで書き換え、消し、取引の中で読み、分割で運んでも、行が引けることを確かめる。
 import { describe, expect, it } from "vitest";

@@ -1,4 +1,4 @@
-// 値の作り直しの段 1 まで使っていたキー文字列の関数 (保存の形式 1)。段 2 で src/keys.ts の keyStringExact に替えた。
+// 値の作り直しの段 1 まで使っていたキー文字列の関数 (保存の形式 1)。段 2 で src/keys.ts の keyString に替えた。
 // 試験 (test/key-conversions.test.ts) が、新しい関数が、いま保存できる値で、この関数と同じ文字列を返すことを確かめるために残す。
 // 書き換えない。
 import type { Value } from "../src/types";

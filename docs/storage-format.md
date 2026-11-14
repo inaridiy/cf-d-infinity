@@ -17,7 +17,7 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 | 形式 | 中身 | 区分 |
 |---|---|---|
 | 値の型 | 整数の JS の数は INTEGER、整数でない数は REAL、整数の値の REAL は `{ "real": 数 }` (`src/value.ts`) | 固定 |
-| キー文字列 | 主キーと shard key の値の並びを JSON にしたもの (`src/keys.ts` の `keyStringExact`)。INTEGER は、桁数に関わらず 10 進の数字で書く。REAL は、整数の値で 64 ビットの整数の範囲にあればその整数の数字で、そうでなければ `JSON.stringify` の表記で書く。INTEGER の 5 と REAL の 5.0 は同じ `5`。BLOB は `{"$b":"小文字の 16 進"}`、無限大は `{"$f":"Infinity"}`。値は列の型の親和性で揃えてから作る (`storedAs`)。読み戻すときは `keyValues` が数字の桁を落とさずに読む | 固定 |
+| キー文字列 | 主キーと shard key の値の並びを JSON にしたもの (`src/keys.ts` の `keyString`)。INTEGER は、桁数に関わらず 10 進の数字で書く。REAL は、整数の値で 64 ビットの整数の範囲にあればその整数の数字で、そうでなければ `JSON.stringify` の表記で書く。INTEGER の 5 と REAL の 5.0 は同じ `5`。BLOB は `{"$b":"小文字の 16 進"}`、無限大は `{"$f":"Infinity"}`。値は列の型の親和性で揃えてから作る (`storedAs`)。読み戻すときは `keyValues` が数字の桁を落とさずに読む | 固定 |
 | 行の置き場所 (token) | `token = region × 2^32 + slot × 2^16 + subslot` の 40 ビットの整数 (`src/routing.ts`)。region はいまは 0 で、行ごとに置く地域を決める拡張のために 8 ビットを空けてある。slot は、shard key のキー文字列の hash (FNV-1a と murmur3 の finalizer、32 ビット) の上位 16 ビット。subslot は、主キーのキー文字列の同じ hash の下位 16 ビット。表の名前は混ぜない。行ごとに保存するものはない。同じ shard key の行は、連続した 65,536 個の token (その slot のブロック) に載る | 固定 |
 | 範囲 | token の半開区間 `[start, end)`。範囲表、読む範囲の claim、範囲の移動の要求、分割の枠が、この形で範囲を運ぶ | 固定 |
 | 位置 (`Pos`) | グループの中の行の位置。`[表の名前, 主キーのキー文字列]` で、表の名前の順、表の中は主キーの順に並ぶ。端は `null`。表の列には、JSON の文字列で書く (端は `null` の 4 文字) | 固定 |

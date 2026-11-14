@@ -8,7 +8,7 @@ import type { Catalog, SplitMove, SplitSlot } from "../meta";
 import { hashKey, ownerOf, regionsOf, shardsOf, type Interval, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import { ident, parseStatements, text, type Node, type Params } from "../sql/cst";
-import { keyStringExact } from "../keys";
+import { keyString } from "../keys";
 import { fromTyped } from "../value";
 import { sha256Text } from "../sha256";
 import { SHARD_LIMITS, builtLimitOf, isShardLimit, withinShardLimits } from "../shard-limits";
@@ -225,7 +225,7 @@ async function runPlanned(
 function keysOf(l: Loaded): string[] {
   const at = l.table.pk.map((c) => l.columns.indexOf(c));
   if (at.some((i) => i < 0)) return [];
-  return l.rows.map((row) => `${l.table.name}\0${keyStringExact(at.map((i) => row[i] ?? null))}`);
+  return l.rows.map((row) => `${l.table.name}\0${keyString(at.map((i) => row[i] ?? null))}`);
 }
 
 /** 基準経路で集めた行。Worker の SQLite を作り直すときに読み直さずに済むように、表ごとに持っておく。 */
@@ -922,7 +922,7 @@ export class Txn extends ReadScope {
     // 行の持ち主のシャードへの問いを、表と shard key の値ごとにまとめる。1 つの行が 2 つの条件に当たっても、1 回だけ返る。
     const wanted = new Map<string, { def: TableDef; sk: string; conds: { sql: string; params: Value[] }[] }>();
     const want = (def: TableDef, sk: string, cols: string[], vals: Value[], op: "=" | "IS") => {
-      const id = `${def.name}\0${sk}\0${cols.join("\0")}\0${keyStringExact(vals)}`;
+      const id = `${def.name}\0${sk}\0${cols.join("\0")}\0${keyString(vals)}`;
       if (asked.has(id)) return;
       asked.add(id);
       const key = `${def.name}\0${sk}`;
@@ -939,7 +939,7 @@ export class Txn extends ReadScope {
       for (const cols of def.uniques) {
         const vals = cols.map((col) => imageAt(def, c.after!, col));
         if (vals.some((v) => v === null)) continue;
-        if (c.before && cols.every((col, i) => keyStringExact([imageAt(def, c.before!, col)]) === keyStringExact([vals[i]!]))) continue;
+        if (c.before && cols.every((col, i) => keyString([imageAt(def, c.before!, col)]) === keyString([vals[i]!]))) continue;
         want(def, c.sk, cols, vals, "=");
       }
       // シャードをまたぐ UNIQUE。index の表を引き、同じ値を持つ行の主キーと場所を知ってから、その行を読む。
@@ -947,16 +947,16 @@ export class Txn extends ReadScope {
         const keyOf = (r: Tuple | null): string | null => {
           if (!r) return null;
           const vals = ix.columns.map((col) => imageAt(def, r, col));
-          return vals.some((v) => v === null) ? null : keyStringExact(vals);
+          return vals.some((v) => v === null) ? null : keyString(vals);
         };
         const k = keyOf(c.after);
         if (k === null || k === keyOf(c.before) || asked.has(`${ix.table}\0${k}`)) continue;
         asked.add(`${ix.table}\0${k}`);
-        const sk = keyStringExact([k]);
+        const sk = keyString([k]);
         // 並べて出さない。取引の最初の読みが 2 つ並ぶと、読む時点が 2 つでき、片方は検証の窓から漏れる。
         const hit = await this.call(ownerOf(this.cat.routing, sk), {
           sql: `SELECT "pk", "sk" FROM ${q(ix.table)} WHERE "k" = ?`, params: [k],
-          spans: [rowSpan(ix.table, keyStringExact([k]), sk)],
+          spans: [rowSpan(ix.table, keyString([k]), sk)],
         });
         for (const [pk, at] of hit.values) {
           if (!have.has(`${def.name}\0${pk as string}`)) want(def, at as string, def.pk, pkValues(pk as string), "IS");
@@ -1080,7 +1080,7 @@ export class Txn extends ReadScope {
         const keyOf = (r: Tuple | null): string | null => {
           if (!r) return null;
           const vals = ix.columns.map((col) => imageAt(def!, r, col));
-          return vals.some((v) => v === null) ? null : keyStringExact(vals);
+          return vals.some((v) => v === null) ? null : keyString(vals);
         };
         const oldK = keyOf(c.before);
         const newK = keyOf(c.after);
@@ -1099,10 +1099,10 @@ export class Txn extends ReadScope {
 
   /** SQLite と同じく文の時点で検査する。commit の検証だけだと、文が成功した後で COMMIT が失敗する。 */
   async assertUnique(def: TableDef, ix: GlobalIndexDef, k: string, pk: string, resolve = false): Promise<void> {
-    const sk = keyStringExact([k]);
+    const sk = keyString([k]);
     const res = await this.call(ownerOf(this.cat.routing, sk), {
       sql: `SELECT "pk" FROM ${q(ix.table)} WHERE "k" = ?`, params: [k],
-      spans: [rowSpan(ix.table, keyStringExact([k]), sk)],
+      spans: [rowSpan(ix.table, keyString([k]), sk)],
     });
     if (res.values.some((r) => r[0] !== pk)) {
       if (resolve) throw new NeedsReference(`a row on another shard holds the same ${ix.columns.join(", ")}`);
@@ -1743,7 +1743,7 @@ export class Db {
       for (const row of rows) {
         const vals = ix.columns.map((col) => row[col] ?? null);
         if (vals.some((v) => v === null)) continue; // NULL のある値は、どの行とも衝突しない
-        const k = keyStringExact(vals);
+        const k = keyString(vals);
         const key = encodeKey(def, row);
         const prior = entries.get(k);
         if (prior !== undefined && prior.pk !== key.pk) throw new SqlError(`UNIQUE constraint failed: ${def.name}.${ix.columns.join(", ")}`);
@@ -1765,8 +1765,8 @@ export class Db {
     let left = [...entries].map(([k, row]) => ({ k, ...row }));
     let cat = await this.stillBuilding(version);
     for (let attempt = 0; left.length > 0; ) {
-      const owner = ownerOf(cat.routing, keyStringExact([left[0]!.k]));
-      const batch = left.filter((e) => ownerOf(cat.routing, keyStringExact([e.k])) === owner).slice(0, BUILD_BATCH);
+      const owner = ownerOf(cat.routing, keyString([left[0]!.k]));
+      const batch = left.filter((e) => ownerOf(cat.routing, keyString([e.k])) === owner).slice(0, BUILD_BATCH);
       const tx = new Txn(this, cat, this.nextTxnId());
       try {
         const ks = batch.map((e) => e.k);
@@ -1774,7 +1774,7 @@ export class Db {
         const found = await tx.call(owner, {
           sql: `SELECT "k", "pk" FROM ${q(ix.table)} WHERE "k" IN (SELECT value FROM json_each(?))`,
           params: [JSON.stringify(ks)],
-          spans: ks.map((k) => rowSpan(ix.table, keyStringExact([k]), keyStringExact([k]))),
+          spans: ks.map((k) => rowSpan(ix.table, keyString([k]), keyString([k]))),
         });
         const existing = new Map(found.values as [string, string][]);
         for (const e of batch) {

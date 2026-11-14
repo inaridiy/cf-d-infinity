@@ -404,7 +404,7 @@ BLOB は 16 進で 2 倍になる (今の JSON の行イメージも同じであ
 ### 形
 
 キー文字列 (`keyString`、`src/keys.ts:75`) の形は変えない。
-段 1 では、新しい書き方の関数を `keyStringExact` という名前で `keyString` の隣に置いた。段 2 で `keyString` と入れ替える。
+段 1 では、新しい書き方の関数を `keyStringExact` という名前で古い `keyString` の隣に置いた。段 2 で古い関数を消し、新しい関数を `keyString` という名前にした (古い関数は、新旧を比べる試験のために `test/key-string-old.ts` に `oldKeyString` として残した)。
 値の並びの JSON で、BLOB は `{"$b":"小文字の 16 進"}`、無限大は `{"$f":"Infinity"}` である。
 数の書き方だけを、次の 1 つの規則にする。
 
@@ -768,7 +768,7 @@ workerd の事実は「確かめた事実」の節に書いた。
 | 1 | `test/open/int64.test.ts` | 19 の場面を、シャード 1、2、4 と、実行 3 通りで流す。場面ごとに新しいクラスタと基準を使い、最初の食い違いで止めて、食い違い方を分ける。±(2^53 - 1) に収まる値では、どの場面も通る (D1 互換の API に BigInt を渡す場面を除く)。64 ビットの値では、19 の場面のどれもが、最初の大きな値で食い違う。断るのが 17、保存していない値を丸めて返すのが 1、D1 互換の API が BigInt を受け取れないのが 1 である。文書にある決まりで説明できない食い違いはなく、食い違い方は置き場所と経路で変わらない |
 | 2 | `test/typed-diff.test.ts` の末尾のブロック、`test/typed-diff-harness.ts` | 元の台本を、結果の INTEGER と REAL を区別して比べる。緩めるのは、文書にある 2 点だけである (整数の値の REAL を `integer` で返す、計算した 2^53 を超える整数を丸めて返す)。元の生成器には手を入れず、足す値と文は 2 つ目の生成器に置いた。どちらも通る。2^53 を超える整数と NUL を含む文字列は、同じ生成器に指定を付けて `test/open/typed-diff-wide.test.ts` が流す (いまは落ちる) |
 | 3 | `test/value-codec.test.ts` (段 1) | 通る。JS で要素にして戻した値、node:sqlite と sql.js のタプルの式を JS で戻した値 (列は 1、32、33、64、100。NUL を含む文字列と 64 ビットの整数を含む)、2 万個の double のビット、どの関数の呼び出しも引数が 32 以下であること |
-| 4 | `test/key-conversions.test.ts` | 通る。今の `keyString` が等しいことと、型のない主キーで UNIQUE の違反になることが、いま保存できる値で一致する。段 1 で、新しい `keyStringExact` の同じ確かめ (64 ビットの整数と、2^53 と 2^63 の前後の REAL を含む)、`keyValues` で引いた行が元の行であること、新旧の一致、`storedValue` と node:sqlite と sql.js の列の一致を足した。workerd の列との一致は `test/workerd-limits.test.ts` が見る |
+| 4 | `test/key-conversions.test.ts` | 通る。今の `keyString` が等しいことと、型のない主キーで UNIQUE の違反になることが、いま保存できる値で一致する。段 1 で、新しい `keyString` の同じ確かめ (64 ビットの整数と、2^53 と 2^63 の前後の REAL を含む)、`keyValues` で引いた行が元の行であること、新旧の一致、`storedValue` と node:sqlite と sql.js の列の一致を足した。workerd の列との一致は `test/workerd-limits.test.ts` が見る |
 | 5 | 書いていない | 3 つとも、確かめる相手が段 2 か段 3 でできる。`query` は段 3 で足す入口である。捕捉でまとめた `after` は、今は本体から読み直しているので、比べる相手がない (段 2)。タプルは段 2 までない。シミュレータの節の 4 つ目 (結果の列が 100 を超える文を断る) は入れた |
 | 6 | `test/workerd-limits.test.ts`、`test/workerd-probe.ts` | 「確かめた事実」の節のとおり。段 1 で、100 列の表の捕捉 (trigger と RETURNING) と読み (タプルと、型つきの読み) を、`src/value.ts` の式で足した。`test/rowcost.test.ts` の、D∞ を通した読みの行数は、包む実装が入る段 3 で足す |
 | 7 | `test/ddl-concurrent.test.ts` の 5、`test/ddl-harness.ts` | 2 つの形 (DROP して CREATE する形と、移行の道具が流す 4 文) で通る。作り直す表に、作業負荷が書かない列 `gen` を置き、既定値を表定義ごとに変えた。作り直した表に古い既定値の行があれば、古い表定義で作った行イメージが新しい表に入っている。行イメージが列名を持つ今でも見える。intent を決着させる守りを外す (`ddlIgnoresIntents`) と、この検査が気付く |
@@ -797,7 +797,7 @@ workerd の事実は「確かめた事実」の節に書いた。
 | 場所 | 足したもの |
 |---|---|
 | `src/value.ts` | `TypedValue`、`Elem`、`Tuple`、`encodeElem`、`decodeElem`、`selectElemSql`、`returningElemSql`、`jsonElemSql`、`MAX_FUNCTION_ARGS`、`tupleSql`、`parseTuple`、`encodeTuple`、`decodeTuple`、`typedOf` |
-| `src/keys.ts` | `keyStringExact`、`keyValues` |
+| `src/keys.ts` | `keyString`、`keyValues` |
 | `src/sql/stored.ts` | `initStoredValue`、`storedValue` |
 
 新旧のキー文字列は、いま保存できる値の集まりで一致した。
@@ -815,7 +815,7 @@ workerd の事実は「確かめた事実」の節に書いた。
 段 2 に残ること。
 
 - `Change`、`PiecePayload.rows`、取引が溜める変更をタプルにする。`__cap` を共有の表にし、trigger を `tupleSql` で作る。
-- `keyString` を `keyStringExact` に入れ替え、キー文字列を読む場所を `keyValues` にする。同じ seed の RPC の宛先とメソッドの列が、前後で同じであることを見る。
+- 古い `keyString` を新しい書き方 (段 1 の `keyStringExact`) に入れ替え、キー文字列を読む場所を `keyValues` にする。同じ seed の RPC の宛先とメソッドの列が、前後で同じであることを見る。
 - `TypedValue` を今の `Value` に直す橋を足し、2^53 以上の整数をそこで断る。
 - 表定義のときの上限の確かめを、新しい 4 つの文に替える。式の木の深さ (100) も見る。
 - シミュレータの確かめ (検査の 5) のうち、捕捉でまとめた `after` と本体の行の比較、タプルの長さの確かめを足す。
@@ -830,7 +830,7 @@ workerd の事実は「確かめた事実」の節に書いた。
 |---|---|
 | `src/types.ts` | `Change` の `before` と `after`、`PiecePayload.rows` をタプルにした。`PROTOCOL_VERSION` と `MIN_PROTOCOL_VERSION` を 4、`STORAGE_FORMAT` を 2 にした |
 | `src/value.ts` | 橋 `fromTypedValue` (`typedOf` の逆)。タプルの要素を値に戻すときは、どれもここを通り、2^53 以上の INTEGER はここで K1 の誤りになる |
-| `src/keys.ts` | `keyString` (形式 1) を消し、呼んでいた場所を `keyStringExact` にした。`keySql` を消した。キー文字列を今の `Value` に戻す `keyParams` を足した |
+| `src/keys.ts` | `keyString` (形式 1) を消し、呼んでいた場所を `keyString` にした。`keySql` を消した。キー文字列を今の `Value` に戻す `keyParams` を足した |
 | `src/shard/rows.ts` | 行を読み書きする関数をタプルにした (`selectRow`、`selectGroup`、`insertRow`、`setBasedRestore`、`applyChanges`)。`imageAt`、`valuesOf`、`tupleKey`。捕捉の trigger と `capturedChanges`。`imageList`、`typedRow`、`__dinf_wide`、`hasWideInteger`、`__capv_<表>` を消した。`imageStatements` (表を作るときに確かめる文)。`joinTerms` (釣り合った条件) |
 | `src/shard/kernel.ts` | `runCaptured` (RETURNING のタプル)、`exportRows` (走査と同じ列の並び)、範囲の検査の `deleteOutside` (タプルで読む)、値の長さの上限の誤りの言い換え |
 | `src/client/db.ts` | 行イメージを列名で引く 3 か所を `imageAt` に、index の表の項目を `tupleOfRow` にした。表を作るときの確かめ |
@@ -840,7 +840,7 @@ workerd の事実は「確かめた事実」の節に書いた。
 
 ### 設計書から変えた点
 
-- 関数の名前は `keyStringExact` のままにした (指示書のとおり。設計書は、入れ替えた後の名前を `keyString` と書いている)。形式 1 の関数は `test/key-string-old.ts` に残し、`test/key-conversions.test.ts` が新旧を比べ続ける。
+- 関数の名前は `keyString` のままにした (指示書のとおり。設計書は、入れ替えた後の名前を `keyString` と書いている)。形式 1 の関数は `test/key-string-old.ts` に残し、`test/key-conversions.test.ts` が新旧を比べ続ける。
 - キー文字列から値に戻す場所 (`pkValues`、`selectGroup`、捕捉のキー、Worker の衝突の探し方、述語の判定) は、`keyValues` の結果を `keyParams` で今の `Value` に直す。`fromTypedValue` は通さない。キーの整数には、2^53 以上の整数の値の REAL から作ったものがあり (K1 が断るのは格納の型が INTEGER の値だけ)、橋を通すと、そういう行が引けなくなるからである。`keyParams` は整数を JS の数に正確に戻し、戻らない整数だけを K1 と同じ誤りにする (`test/large-real-keys.test.ts`)。
 - 保存の形式の版は 2 に上げた (「永続データと通信で変わるもの」の節を直した)。
 - 「位置の比較」は、今のコードにない。位置 (`Pos`) は JSON の文字列として保存して比べるだけで (`posKey`、`posOf`)、キー文字列を値に戻していない。どの piece もグループの全体だからである。

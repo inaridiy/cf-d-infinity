@@ -6,7 +6,7 @@ import { encode, q, scanList } from "../shard/rows";
 import type { GlobalIndexDef, TableDef, Value, WritePlan } from "../types";
 import { SqlError, utf8Length } from "../types";
 import { bindParams, constant, ident, render, text, walk, type Node, type Params } from "./cst";
-import { keyStringExact, storedAs } from "../keys";
+import { keyString, storedAs } from "../keys";
 import { fromTyped, isReal, typedScalarSql } from "../value";
 import { SHARD_LIMITS, withinShardLimits } from "../shard-limits";
 import { assertPlainCreateTable, isInternalName } from "./ddl";
@@ -360,7 +360,7 @@ function pinsOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string[] | n
     if (norm.some((v) => v === undefined)) return null;
     keys = keys.flatMap((k) => norm.map((v) => [...k, v as Value]));
   }
-  return keys.map((k) => keyStringExact(k));
+  return keys.map((k) => keyString(k));
 }
 
 function pkOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string | null {
@@ -374,7 +374,7 @@ function pkOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string | null 
     if (v === undefined) return null;
     vals.push(v);
   }
-  return keyStringExact(vals);
+  return keyString(vals);
 }
 
 function joined(conj: Node[], a: Ref, b: Ref, i: number, s: Scope): boolean {
@@ -898,7 +898,7 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
     }
     built.push({
       // undefined が混じるときは viaWorker なので、この 2 つは使わない。
-      sk: keyStringExact(skVals.map((v) => v ?? null)), pk: keyStringExact(pkVals.map((v) => v ?? null)), uniq,
+      sk: keyString(skVals.map((v) => v ?? null)), pk: keyString(pkVals.map((v) => v ?? null)), uniq,
       sql: `(${parts.map((p) => p.sql).join(", ")})`, params: parts.flatMap((p) => p.params),
     });
   }

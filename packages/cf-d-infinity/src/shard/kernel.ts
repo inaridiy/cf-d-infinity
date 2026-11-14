@@ -21,7 +21,7 @@ import {
 } from "../types";
 import type { DdlEntry } from "../meta";
 import { blockOf, checkInterval, overlaps, rangeText, sameInterval, slotAligned, slotOf, tokenOf, type Interval } from "../routing";
-import { keyStringExact } from "../keys";
+import { keyString } from "../keys";
 import { type Runtime, systemRuntime } from "../runtime";
 import { attempt, done, tail, unwrap, wait, type Effect, type Fork, type Outcome, type PeerCall, type Program, type Step } from "./step";
 import {
@@ -1033,7 +1033,7 @@ export class ShardKernel {
         let read = 0;
         for (const r of rows) {
           read++;
-          add(keyStringExact(r));
+          add(keyString(r));
           if (out.length >= req.limit) {
             // NULL を含む shard key は行の比較で絞れないので、読んだ数で続きを表す。
             const next: GroupCursor = r.every((v) => v !== null)

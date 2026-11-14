@@ -58,7 +58,7 @@ export const convSql = (kind: "real" | "text") => {
  */
 function keysModule(): string {
   const out = buildSync({
-    stdin: { contents: 'export { keyStringExact, keyValues } from "./src/keys";', resolveDir: process.cwd(), loader: "ts" },
+    stdin: { contents: 'export { keyString, keyValues } from "./src/keys";', resolveDir: process.cwd(), loader: "ts" },
     bundle: true, format: "esm", write: false, logLevel: "silent",
   });
   return out.outputFiles[0]!.text;
@@ -66,7 +66,7 @@ function keysModule(): string {
 
 const SCRIPT = `
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
-import { keyStringExact, keyValues } from "./keys.js";
+import { keyString, keyValues } from "./keys.js";
 const hex = (b) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
 const unhex = (s) => Uint8Array.from(s.match(/../g) ?? [], (h) => parseInt(h, 16));
 const show = (v) => v === null ? ["null"] : typeof v === "bigint" ? ["bigint", String(v)]
@@ -134,7 +134,7 @@ export default {
       // キー文字列を値に戻し、戻した値の型と、もう一度書いたキー文字列を返す。
       return Response.json(body.map((key) => {
         const values = keyValues(key);
-        return { types: values.map((v) => (v === null ? "null" : v instanceof Uint8Array ? "blob" : typeof v)), again: keyStringExact(values) };
+        return { types: values.map((v) => (v === null ? "null" : v instanceof Uint8Array ? "blob" : typeof v)), again: keyString(values) };
       }));
     }
     if (url.pathname === "/bigint") {
@@ -159,7 +159,7 @@ export interface Probe {
   convert(kind: "real" | "text", values: (number | string)[]): Promise<string[][]>;
   /** JSON.parse の reviver が受け取った [キー, 値の型, 元の文面] の並び。 */
   reviver(text: string): Promise<[string, string, string][]>;
-  /** キー文字列を、workerd の中の keyValues で値に戻す。戻した値の型と、keyStringExact でもう一度書いた文字列を返す。 */
+  /** キー文字列を、workerd の中の keyValues で値に戻す。戻した値の型と、keyString でもう一度書いた文字列を返す。 */
   keys(keys: string[]): Promise<{ types: string[]; again: string }[]>;
   /** BigInt を DO の RPC と Service Binding の RPC に通した結果。 */
   bigint(): Promise<Record<"durableObject" | "serviceBinding", { arrived: string[]; returned: string[]; blob: string; error?: string }> & { structuredClone: string }>;

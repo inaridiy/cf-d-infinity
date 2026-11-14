@@ -7,7 +7,7 @@
 // 解釈の違いが入るからである。
 import type { Backend, Change, Row, TableDef, Value } from "../types";
 import { SqlError } from "../types";
-import { keyParams, keyStringExact } from "../keys";
+import { keyParams, keyString } from "../keys";
 import {
   decodeElem, encodeElem, fromTypedValue, isReal, parseTuple, realOf, tupleSql, typedOf, wideIntegerError, type Elem, type Tuple, type TypedValue,
 } from "../value";
@@ -169,16 +169,16 @@ export function tupleOfRow(def: TableDef, row: Row): Tuple {
  */
 export function encodeKey(def: TableDef, row: Row): { pk: string; sk: string } {
   return {
-    pk: keyStringExact(def.pk.map((c) => row[c] ?? null)),
-    sk: keyStringExact(def.shardKey.map((c) => row[c] ?? null)),
+    pk: keyString(def.pk.map((c) => row[c] ?? null)),
+    sk: keyString(def.shardKey.map((c) => row[c] ?? null)),
   };
 }
 
 /** タプルの行のキー。encodeKey と同じ文字列になる。 */
 export function tupleKey(def: TableDef, t: Tuple): { pk: string; sk: string } {
   return {
-    pk: keyStringExact(def.pk.map((c) => imageAt(def, t, c))),
-    sk: keyStringExact(def.shardKey.map((c) => imageAt(def, t, c))),
+    pk: keyString(def.pk.map((c) => imageAt(def, t, c))),
+    sk: keyString(def.shardKey.map((c) => imageAt(def, t, c))),
   };
 }
 

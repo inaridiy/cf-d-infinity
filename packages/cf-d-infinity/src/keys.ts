@@ -96,7 +96,7 @@ function numberKey(x: number): string {
  * キー文字列。値は、今の `Value` (整数の JS の数は INTEGER、`Real` は整数の値の REAL) でも、型のある値 (bigint は INTEGER、
  * number は REAL) でもよい。数のキーは INTEGER と REAL で同じ規則なので、どちらの決まりで渡しても同じ文字列になる。
  */
-export function keyStringExact(values: (TypedValue | Real)[]): string {
+export function keyString(values: (TypedValue | Real)[]): string {
   const parts = values.map((v) => {
     if (v === null) return "null";
     if (typeof v === "bigint") {

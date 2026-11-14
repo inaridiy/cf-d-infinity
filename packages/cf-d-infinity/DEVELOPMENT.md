@@ -201,7 +201,7 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `src/sql/cst.ts` | 構文木の入口。解析の前の書き換え、引数の束縛、定数の読み取り |
 | `src/meta.ts` | 表定義、DDL 履歴、範囲表、index の作成と書き込み禁止の期限、保守の操作の枠 |
 | `src/value.ts` | 値の格納の型 (INTEGER と REAL)。束縛の関数 `bindTyped` (DO、シミュレータ、Worker の SQLite の 3 つの Backend が通す)。行イメージの要素とタプル (`tupleSql`、`decodeElem`) と、要素を今の値に戻す橋 `fromTypedValue` |
-| `src/keys.ts` | キー文字列を作る関数 (`keyStringExact`) と読み戻す関数 (`keyValues`、`keyParams`)。SQLite の型の親和性を写す `storedAs` |
+| `src/keys.ts` | キー文字列を作る関数 (`keyString`) と読み戻す関数 (`keyValues`、`keyParams`)。SQLite の型の親和性を写す `storedAs` |
 | `src/sql/depth.ts` | 式の木の深さの見積もり (DO の SQLite の上限は 100)。表を作るときに、D∞ が作る文を確かめる |
 | `src/routing.ts` | 範囲表と、行の置き場所の計算。置き場所は token (region、65,536 個の slot、その中の 65,536 個の subslot を並べた 40 ビットの整数) で、範囲表は token の区間をシャードに対応させる。いまの区間は、どれも両端が slot の境目にある ([docs/design-subslots.md](../../docs/design-subslots.md) の段 1) |
 | `src/autoscaler.ts` | 増設の判断と手順 |

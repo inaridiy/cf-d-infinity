@@ -3,7 +3,7 @@
 // 「本体とずれた index」を見逃す。全部の要求が終わった後の静止した状態で、後始末が済んでいることを確かめる。
 import { expect } from "vitest";
 import { ORPHAN_AGE_MS } from "../src/shard/core";
-import { keyStringExact } from "../src/keys";
+import { keyString } from "../src/keys";
 import { selectList } from "../src/shard/rows";
 import type { Row } from "../src/types";
 import type { SimCluster } from "./sim";
@@ -59,7 +59,7 @@ export async function quiescentProblems(c: SimCluster): Promise<string[]> {
         for (const row of tryExec(b, `SELECT ${selectList(def)} FROM "${def.name}"`)) {
           const vals = ix.columns.map((col) => row[col] ?? null);
           if (vals.some((v) => v === null)) continue;
-          expected.add(`${keyStringExact(vals)} -> ${keyStringExact(def.pk.map((col) => row[col] ?? null))}`);
+          expected.add(`${keyString(vals)} -> ${keyString(def.pk.map((col) => row[col] ?? null))}`);
         }
         for (const row of tryExec(b, `SELECT "k", "pk" FROM "${ix.table}"`)) actual.add(`${row.k} -> ${row.pk}`);
       }
@@ -75,7 +75,7 @@ export async function quiescentProblems(c: SimCluster): Promise<string[]> {
         for (const row of tryExec(b, `SELECT * FROM "${def.name}"`)) {
           const vals = ix.columns.map((col) => row[col] ?? null);
           if (vals.some((v) => v === null)) continue;
-          seen.set(keyStringExact(vals), (seen.get(keyStringExact(vals)) ?? 0) + 1);
+          seen.set(keyString(vals), (seen.get(keyString(vals)) ?? 0) + 1);
         }
       }
       const dup = [...seen].filter(([, n]) => n > 1);

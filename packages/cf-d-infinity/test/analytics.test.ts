@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { collect } from "../src/analytics";
-import { keyStringExact } from "../src/keys";
+import { keyString } from "../src/keys";
 import { ownerOf } from "../src/routing";
 import type { Faults } from "../src/types";
 import { logRows, ORDERS, SimCluster, USERS } from "./sim";
@@ -56,7 +56,7 @@ describe("the analytics flush stops below unresolved intents (m6_red_resolved)",
     const db = c.client();
     await db.ddl(USERS);
     const { routing } = await c.catalog();
-    const on = (shard: string) => { for (let t = 1; ; t++) if (ownerOf(routing, keyStringExact([t])) === shard) return t; };
+    const on = (shard: string) => { for (let t = 1; ; t++) if (ownerOf(routing, keyString([t])) === shard) return t; };
     const [a, p] = [on("s0"), on("s1")];
     await db.query("INSERT INTO users(tenant_id,id,n) VALUES (?,1,0)", [a]);
     await db.query("INSERT INTO users(tenant_id,id,n) VALUES (?,1,0),(?,2,0)", [p, p]);
