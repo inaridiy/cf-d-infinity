@@ -61,6 +61,14 @@ describe("the shard kernel is synchronous", () => {
     expect(found).toEqual([]);
   });
 
+  it("no frame of a kernel program can hold a Section: a check made before a wait cannot be carried past it", () => {
+    // frame は、待ちをまたいで残る、ただ 1 つのものである。その宣言に、同期区間の印の型が現れない。
+    const src = readFileSync(join(SRC, "shard", "kernel.ts"), "utf8");
+    const frames = src.slice(src.indexOf("// ---- 手続きの frame ----"), src.indexOf("export class ShardKernel"));
+    expect(frames.length).toBeGreaterThan(1000);
+    expect(frames.split("\n").filter((line) => /\bSection\b/.test(code(line)))).toEqual([]);
+  });
+
   it("the check itself finds a wait, and the shell is where the waits are", () => {
     for (const line of ["  private async exec(req: ExecReq): Promise<ExecRes> {", "    await this.b.sync();", "    p.then(() => undefined);", "    queueMicrotask(() => this.wakeNext(key));", "    this.rt.after(5, wake);"]) {
       expect(WAITS.test(code(line)), line).toBe(true);
