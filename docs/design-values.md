@@ -1,6 +1,6 @@
 # 値と行イメージの作り直しの設計
 
-状態：設計。段 0 (検査) を実装した。段 1 から先はまだない。持ち主の判断と、段 0 の結果は末尾に記した
+状態：設計。段 0 (検査) と段 1 (符号とキー) を実装した。段 2 から先はまだない。持ち主の判断と、段 0 と段 1 の結果は末尾に記した
 作成日：2026-11-14
 前提：[storage-format.md](./storage-format.md)、[sql-language.md](./sql-language.md) の「値」、[design-subslots.md](./design-subslots.md)
 
@@ -149,7 +149,7 @@ D∞ の内部の表 (`__meta`、`__log_g*`、`__intents` など) が持つ整�
 INTEGER と TEXT を印つきの文字列にすれば、残りの 3 つは JS の型で見分けられる。
 「ドライバの `number` は、束縛でも読みでも REAL」という 1 つの規則になる。
 
-SQL の式は次の 3 つで、`src/value.ts` に置く。
+SQL の式は次の 3 つで、`src/value.ts` に置く (`selectElemSql`、`returningElemSql`、`jsonElemSql`)。
 
 ```sql
 -- 結果の列 (SELECT)。c は列の参照
@@ -164,6 +164,9 @@ JS の側は `decodeElem` と `encodeElem` の 2 つである。
 `decodeElem` は、`number` を REAL、BLOB を BLOB、`null` を NULL とし、文字列は先頭の 1 文字で分ける。
 REAL の文字列は `Number()` で読む。JS の `Number()` は正確に丸めるので、`quote()` が元の double に戻せる桁数で書くかぎり (`src/keys.ts:85` の確かめ)、同じ double になる。
 `encodeElem` が書く REAL は、JS の最短の表記に、小数点も指数もなければ `.0` を足したものである (無限大は `9.0e+999`)。
+NaN は NULL にする (SQLite が NaN を NULL として束縛するのと同じ)。64 ビットに収まらない `bigint` は投げる。
+`decodeElem` は、印のない文字列を受け取ると投げる。包み忘れた文の結果を、黙って TEXT として読まないためである。
+印の後ろが、その型の書き方でない文字列も投げる (`i` の後ろは 10 進の数字だけ、`r` の後ろは 10 進の小数か指数の表記だけ)。JS の `BigInt()` と `Number()` は、空の文字列を 0 に、16 進の文字列も数に読むからである。
 SQL が作った要素と JS が作った要素は、同じ REAL でも文字が違うことがある (`r3.000000000000000445e-01` と `r0.30000000000000004`)。
 要素を文字で比べる場所は作らず、比べるときは値に戻す (`touchesUniqueOnManyRows`、`src/shard/rows.ts:224`)。
 
@@ -178,6 +181,11 @@ SQL では `json_array(要素, ...)` で作る。
 32 は公式の表の上限である。手元の workerd は 127 個まで受け付けたが、本番が 32 で断るかは確かめられないので、32 に合わせる。
 要素は文字列か `null` なので、平らにしてよいかは迷わない。
 入れ子は SQL から JS へ渡す間だけの形で、保存する形はいつも平らな配列である。
+式は `tupleSql` が作り、読む側は `parseTuple` が平らにする。JS の側でタプルを作るのは `encodeTuple`、値に戻すのは `decodeTuple` である。
+
+段 3 まで、`Value` (`src/types.ts`) は今の形のままである。
+要素とタプルの関数は、作り直しの後の値の型を `TypedValue` という名前で `src/value.ts` の中に持ち、それで書いてある。
+今の `Value` を `TypedValue` にする橋が `typedOf` である。段 3 で `Value` が同じ形になったら、`TypedValue` と `typedOf` を消す。
 
 ## 境界
 
@@ -396,6 +404,7 @@ BLOB は 16 進で 2 倍になる (今の JSON の行イメージも同じであ
 ### 形
 
 キー文字列 (`keyString`、`src/keys.ts:75`) の形は変えない。
+段 1 では、新しい書き方の関数を `keyStringExact` という名前で `keyString` の隣に置いた。段 2 で `keyString` と入れ替える。
 値の並びの JSON で、BLOB は `{"$b":"小文字の 16 進"}`、無限大は `{"$f":"Infinity"}` である。
 数の書き方だけを、次の 1 つの規則にする。
 
@@ -423,7 +432,9 @@ REAL の 2^53 と INTEGER の 2^53 は同じキーで、INTEGER の 2^53 + 1 は
 
 キー文字列から値に戻す場所は、`pkValues` と `selectGroup` (`src/shard/rows.ts:26`、`:161`)、位置の比較である。
 `JSON.parse` は 2^53 以上の整数を丸めるので、reviver が受け取る元の文面 (`context.source`) を使う。
-数字だけの文面で 64 ビットに収まれば `BigInt(文面)`、そうでなければ `number` とする (`keyValues`、`src/keys.ts` に足す)。
+数字だけの文面で 64 ビットに収まれば `BigInt(文面)`、そうでなければ `number` とする (`keyValues`、`src/keys.ts`)。
+元の文面を受け取れない実行環境では、2^53 以上の整数を丸めたまま返さずに、投げる。
+`keyValues` は workerd の中でも動かして確かめた (`test/workerd-limits.test.ts`。キー文字列を値に戻して書き直すと、元の文字列になる)。
 戻した値は `WHERE 主キー IS ?` に束縛する。
 INTEGER の引数は、REAL で入っている同じ値の行にも当たる (確かめた)。
 
@@ -437,7 +448,7 @@ INTEGER の引数は、REAL で入っている同じ値の行にも当たる (�
 Worker は、文の中の値から行の置き場所を決めるために、「その値が列に入ると何になるか」を知る必要がある。
 今は `storedAs` (`src/keys.ts:42`) が、数に読める文字列の文法を正規表現で写し、REAL を TEXT にする変換だけを諦めている (`undefined` を返し、読みは絞らず、書き込みは基準経路)。
 
-`storedAs` を消し、`storedValue(v, 親和性)` に替える (`src/sql/` に置く)。
+`storedAs` を消し、`storedValue(v, 親和性)` に替える (`src/sql/stored.ts`。段 1 で書いた。段 3 まで、どこからも呼ばない)。
 
 | 入る値と列の親和性 | 決め方 |
 |---|---|
@@ -456,12 +467,16 @@ Worker は、文の中の値から行の置き場所を決めるために、「�
 `pinsOf` と `pkOf` (`src/sql/plan.ts:346`、`:363`) は同期の関数で、sql.js の初期化は非同期である。
 変換のための SQLite は、isolate に 1 つだけ開いて持ち続ける。
 `Db` が文を計画する前に、その初期化を 1 度だけ待つ (どの文も `Db.compiled` で sql.js を使うので、読み込みの費用は増えない)。
+初期化は `initStoredValue(engine)` で、sql.js の初期化の結果を引数で受け取る。
+Worker では wasm を実行時に生成できず、Worker の SQLite (`src/sql/scratch.ts`) が持つ engine は外から見えないからである。
+段 3 で、`scratch.ts` が engine を渡すようにつなぐ (sql.js を 2 つ読み込まない)。
 `storedValue` は、初期化の前に呼ばれたら投げる。
 プランナを直に呼ぶ試験 (`test/planner-shapes.test.ts`) は、先に初期化を待つ。
 
 JS に残す 3 行は、SQLite の文書が定める正確な変換で、1 行で書ける。
 残す理由は費用である。
 sql.js で 1 つの値を変換すると 21 から 25 µs かかった (用意した 2 つの文で、入れて読み直す形で測った)。
+段 1 の実装 (用意した 1 つの文で、数の 3 つの列に入れてタプルで読む) では 27 µs だった。同じ値を別の親和性で続けて尋ねたときは、直前の結果を使う。
 @libsql/client は JS の数を `float` で送るので、整数の主キーの列に REAL が入る変換は、ふつうの文のたびに起きる。
 1,000 行の INSERT で、キーの列ごとに 20 ms 余計にかかることになる。
 `test/key-conversions.test.ts` は、JS の行も含めた `storedValue` の全体を、本物の列に入れた結果と比べる。
@@ -624,9 +639,9 @@ DO の SQLite と Workers の CPU での値ではない。
 | 捕捉の後に読み直す行 (1 行の変更につき) | 最大 2 行 (ミラーと、変更後の行) | 0 行 |
 | 走査の読み (1 行あたり) | 0.44 µs | 1.38 µs |
 | 主キーで 1 行の読み (1 文あたり) | 1.03 µs | 1.92 µs |
-| 型の親和性の変換 (JS で済まない値、1 つあたり) | JS の関数 | 21 から 25 µs |
+| 型の親和性の変換 (JS で済まない値、1 つあたり) | JS の関数 (0.13 µs) | 27 µs (段 1 の実装で測った) |
 | 100 列の表の RETURNING に足す文面 | 約 10 KB | 15 KB |
-| 100 列の表の UPDATE の trigger の文面 | ミラーへの INSERT | 30 KB |
+| 100 列の表の UPDATE の trigger の文面 | ミラーへの INSERT | 35 KB (列名が 9 文字。`tupleSql` の文面を数えた) |
 
 捕捉は軽くなる。
 ミラーの行と変更後の行を 1 行ずつ読み直さなくなるからである。
@@ -681,7 +696,7 @@ NUL を含む文字列を作る生成器がない。
 |---|---|---|---|
 | 0 | 検査を先に作る。「足す検査」の 1 から 7。`src/` は変えない | 1 は `test/open/` で落ちる (今は拒否)。2 の型の比較は、整数の値の REAL を Hrana が `integer` で返すところで落ちる (今の文書どおりの違いなので、段 3 まで比較を緩める印を付ける)。6 は workerd の事実を確定する。7 は今のコードで通るはずで、落ちれば今の欠陥である | 試験 約 600 行、2 から 3 日 |
 | 1 | 符号とキー。`src/value.ts` に要素とタプルの関数、`src/keys.ts` に新しい `keyString` と `keyValues`、`src/sql/` に `storedValue`。まだどこからも呼ばない | 3 と 4。新旧の `keyString` の一致 | 約 350 行、2 日 |
-| 2 | 行イメージと捕捉。`Change` をタプルにし、`__cap` を共有にし、`runCaptured`、行を読み書きする関数、移動のペイロード、取引が溜める変更、表定義のときの上限の確かめ、材料を替える。`Value` はまだ今の形 (整数は `number`、整数の値の REAL は印) で、`decodeElem` はその形を返す。タプルの中の 2^53 以上の整数は K1 と同じ誤りにする (`decodeElem` と捕捉の 1 か所ずつ)。列名の予約のうち `$` を外す。`PROTOCOL_VERSION` を 4 にする | 5 の捕捉と長さの確かめ。`typed-diff`、`storage-class`、`wide-integers` (拒否のまま)、`fuzz`、`replay`、`history`、`upgrade` が、3 通りの実行で通る。`history` と `replay` の同じ seed で、RPC の宛先とメソッドの列が変更の前後で同じ (行イメージが短くなるので、大きさで切れる移動の場面は違ってよい)。`rowcost` の期待を 3 行から 2 行に直す。`internal-columns` の `$b` の列は、断る試験から、使える試験に変える。`test/protocol.test.ts` の指紋 | 約 850 行 (試験の補助の書き換えを含む)、4 から 5 日 |
+| 2 | 行イメージと捕捉。`Change` をタプルにし、`__cap` を共有にし、`runCaptured`、行を読み書きする関数、移動のペイロード、取引が溜める変更、表定義のときの上限の確かめ、材料を替える。`Value` はまだ今の形 (整数は `number`、整数の値の REAL は印) である。`decodeElem` は型のある値 (`TypedValue`) を返すので、それを今の `Value` に直す橋 (`typedOf` の逆) を段 2 で足して通す。タプルの中の 2^53 以上の整数は、その橋と捕捉の 1 か所ずつで、K1 と同じ誤りにする。列名の予約のうち `$` を外す。`PROTOCOL_VERSION` を 4 にする | 5 の捕捉と長さの確かめ。`typed-diff`、`storage-class`、`wide-integers` (拒否のまま)、`fuzz`、`replay`、`history`、`upgrade` が、3 通りの実行で通る。`history` と `replay` の同じ seed で、RPC の宛先とメソッドの列が変更の前後で同じ (行イメージが短くなるので、大きさで切れる移動の場面は違ってよい)。`rowcost` の期待を 3 行から 2 行に直す。`internal-columns` の `$b` の列は、断る試験から、使える試験に変える。`test/protocol.test.ts` の指紋 | 約 850 行 (試験の補助の書き換えを含む)、4 から 5 日 |
 | 3 | 値の型と型つきの読み。`Value` を替え、`bindTyped` の表、`query`、`readLimited` の包み、`exportRows` の読み、RETURNING の書き換え、`Compiled.columns`、Hrana、`toValue`、`constant`、`storedAs` の呼び出しを替える。K1 を外す。列名の予約の `__dinf_` を外す。`PROTOCOL_VERSION` を 5 にする | 1 が通り、`test/` へ移る。2 の緩めた印を外す。5 の `query` の確かめ。8 のスイッチ。`internal-columns` の `__dinf_` の列。`test/protocol.test.ts` の指紋 | 約 900 行、4 から 5 日 |
 | 4 | 入口と書き出し。`intMode`、HTTP の JSON、`bin/dump.js` と `importRows` と CLI とのあいだの JSON、`src/analytics.ts`、文書 | `test/export-import.test.ts` に 64 ビットの整数と NUL を含む文字列を足す。`test/d1.test.ts`、`test/binding.test.ts` に `intMode` | 約 300 行、1 から 2 日 |
 
@@ -749,10 +764,10 @@ workerd の事実は「確かめた事実」の節に書いた。
 |---|---|---|
 | 1 | `test/open/int64.test.ts` | 19 の場面を、シャード 1、2、4 と、実行 3 通りで流す。場面ごとに新しいクラスタと基準を使い、最初の食い違いで止めて、食い違い方を分ける。±(2^53 - 1) に収まる値では、どの場面も通る (D1 互換の API に BigInt を渡す場面を除く)。64 ビットの値では、19 の場面のどれもが、最初の大きな値で食い違う。断るのが 17、保存していない値を丸めて返すのが 1、D1 互換の API が BigInt を受け取れないのが 1 である。文書にある決まりで説明できない食い違いはなく、食い違い方は置き場所と経路で変わらない |
 | 2 | `test/typed-diff.test.ts` の末尾のブロック、`test/typed-diff-harness.ts` | 元の台本を、結果の INTEGER と REAL を区別して比べる。緩めるのは、文書にある 2 点だけである (整数の値の REAL を `integer` で返す、計算した 2^53 を超える整数を丸めて返す)。元の生成器には手を入れず、足す値と文は 2 つ目の生成器に置いた。どちらも通る。2^53 を超える整数と NUL を含む文字列は、同じ生成器に指定を付けて `test/open/typed-diff-wide.test.ts` が流す (いまは落ちる) |
-| 3 | 段 1 で書く | |
-| 4 | `test/key-conversions.test.ts` | 今の `keyString` が等しいことと、型のない主キーで UNIQUE の違反になることが、いま保存できる値で一致する。新しい `keyString` と `storedValue` の分は、段 1 で足す |
+| 3 | `test/value-codec.test.ts` (段 1) | 通る。JS で要素にして戻した値、node:sqlite と sql.js のタプルの式を JS で戻した値 (列は 1、32、33、64、100。NUL を含む文字列と 64 ビットの整数を含む)、2 万個の double のビット、どの関数の呼び出しも引数が 32 以下であること |
+| 4 | `test/key-conversions.test.ts` | 通る。今の `keyString` が等しいことと、型のない主キーで UNIQUE の違反になることが、いま保存できる値で一致する。段 1 で、新しい `keyStringExact` の同じ確かめ (64 ビットの整数と、2^53 と 2^63 の前後の REAL を含む)、`keyValues` で引いた行が元の行であること、新旧の一致、`storedValue` と node:sqlite と sql.js の列の一致を足した。workerd の列との一致は `test/workerd-limits.test.ts` が見る |
 | 5 | 書いていない | 3 つとも、確かめる相手が段 2 か段 3 でできる。`query` は段 3 で足す入口である。捕捉でまとめた `after` は、今は本体から読み直しているので、比べる相手がない (段 2)。タプルは段 2 までない。シミュレータの節の 4 つ目 (結果の列が 100 を超える文を断る) は入れた |
-| 6 | `test/workerd-limits.test.ts`、`test/workerd-probe.ts` | 「確かめた事実」の節のとおり。100 列の表の捕捉と読みは、タプルの式を作る関数が要るので、段 1 で足す。`test/rowcost.test.ts` の、D∞ を通した読みの行数は、包む実装が入る段 3 で足す |
+| 6 | `test/workerd-limits.test.ts`、`test/workerd-probe.ts` | 「確かめた事実」の節のとおり。段 1 で、100 列の表の捕捉 (trigger と RETURNING) と読み (タプルと、型つきの読み) を、`src/value.ts` の式で足した。`test/rowcost.test.ts` の、D∞ を通した読みの行数は、包む実装が入る段 3 で足す |
 | 7 | `test/ddl-concurrent.test.ts` の 5、`test/ddl-harness.ts` | 2 つの形 (DROP して CREATE する形と、移行の道具が流す 4 文) で通る。作り直す表に、作業負荷が書かない列 `gen` を置き、既定値を表定義ごとに変えた。作り直した表に古い既定値の行があれば、古い表定義で作った行イメージが新しい表に入っている。行イメージが列名を持つ今でも見える。intent を決着させる守りを外す (`ddlIgnoresIntents`) と、この検査が気付く |
 
 ### 見つかった今の欠陥
@@ -762,11 +777,44 @@ workerd の事実は「確かめた事実」の節に書いた。
 
 1. NUL を含む TEXT が、Worker の SQLite を通ると最初の NUL で切れる。答えが経路で変わり、INSERT … SELECT は切れた値を保存する (`test/open/nul-in-text.test.ts`)。
 2. 97 列から 99 列の表は、`CREATE TABLE` を通るのに、DO では 1 行も書けない。式の木の深さが 100 を超える (`test/open/wide-table-expression-depth.test.ts`)。
-3. 型のない列が 50 以上ある表は、`CREATE TABLE` を通るのに、DO では読むことも書くこともできない。結果の列が 100 を超える (`test/open/untyped-columns-result-limit.test.ts`)。
+3. 列の数と、型のない列の数と、1 を足して 100 を超える表は、`CREATE TABLE` を通るのに、DO では読むことも書くこともできない。行イメージを読む文と、行を集める走査が、型のない列ごとに `typeof` の列を、さらに 2^53 の確かめの列を足すので、結果の列が 100 を超える。PRIMARY KEY のない表は、rowid の列がもう 1 つ加わる。主キーの 1 列と型のない 50 列の表が、いちばん小さい例である (`test/open/untyped-columns-result-limit.test.ts`)。
 4. 取引の中の、複数のシャードを読む文が、読んだ後に 2 つ以上のシャードで行が変わっていると、スナップショットを読み続けずに `read too old` で失敗する (`test/open/snapshot-read-after-two-shards-changed.test.ts`)。
 5. D1 互換の API に BigInt を渡すと、値が小さくても、内部の誤り「Do not know how to serialize a BigInt」で失敗する。段 3 で BigInt を INTEGER として受け取るようになる (`test/open/int64.test.ts` が見ている)。
 
-2 と 3 は、シミュレータが DO の上限を模していなかったために、シミュレータの試験では通っていた。
+2 と 3 は、同じ 1 つの穴である。表を作るときの確かめ (`assertReplays`) も、シミュレータも、DO の SQLite の上限のうち、式の木の深さ (100) と結果の列の数 (100) を知らなかった。作れる表と、DO で使える表が食い違う。
+直すときは、列の数ごとに個別に手当てするのではなく、DO の上限を 1 か所に持ち、表を作るときの確かめとシミュレータの両方がそれを見る形にする (計画書の不変条件 3)。
+どちらも、シミュレータが DO の上限を模していなかったために、シミュレータの試験では通っていた。
 3 の上限は段 0 でシミュレータに入れた。2 の上限 (式の木の深さ) は node:sqlite では模倣できないので、workerd の試験でしか見えない。
 1 は、node:sqlite のドライバも TEXT を NUL で切るので、シミュレータでは見えない。
+
+## 段 1 の結果 (2026-11-14)
+
+符号とキーの関数を足した。足しただけで、どこからも呼んでいない (`src/` の中で、3 つのファイルの外に参照がないことを確かめた)。
+
+| 場所 | 足したもの |
+|---|---|
+| `src/value.ts` | `TypedValue`、`Elem`、`Tuple`、`encodeElem`、`decodeElem`、`selectElemSql`、`returningElemSql`、`jsonElemSql`、`MAX_FUNCTION_ARGS`、`tupleSql`、`parseTuple`、`encodeTuple`、`decodeTuple`、`typedOf` |
+| `src/keys.ts` | `keyStringExact`、`keyValues` |
+| `src/sql/stored.ts` | `initStoredValue`、`storedValue` |
+
+新旧のキー文字列は、いま保存できる値の集まりで一致した。
+集まりは、絶対値が 2^53 未満の INTEGER、double 20,285 個の REAL、数に読める文字列、BLOB、NULL と、それらを並べた複数の列のキーである。
+違ったのは、設計のとおり、絶対値が 2^53 以上で 64 ビットの整数の範囲にある整数の値の REAL のうち、JS の表記が正確な値と違うものだけだった (2^60 は、今は `1152921504606847000`、新しくは `1152921504606846976`)。
+
+設計書から変えた点と、設計書を直した点は次のとおりである。
+
+- `decodeElem` は、型のある値 (`TypedValue`) を返す。段 2 で今の `Value` に直す橋を足す (「段」の表の段 2 の行を直した)。段 2 の決まり (K1 と同じ誤り) を `decodeElem` に入れると、段 3 で外すことになる。
+- `storedValue` は、入った値を `useBigInt` の素の列ではなく、タプルで読む。sql.js のドライバが TEXT を NUL で切るからである (「型の親和性の変換」の節を直した)。
+- `initStoredValue` は、sql.js の engine を引数で受け取る。`src/sql/scratch.ts` の engine は外から見えず、段 1 では `scratch.ts` に触らないと決めたからである。本番の配線は段 3 に残る。
+- 100 列の表の UPDATE の trigger の文面は 35 KB だった (設計書は 30 KB と書いていた)。RETURNING に足す文面は 15 KB で、設計書のとおりだった。
+- `storedValue` の変換は 1 つあたり 27 µs だった (設計書は 21 から 25 µs)。
+
+段 2 に残ること。
+
+- `Change`、`PiecePayload.rows`、取引が溜める変更をタプルにする。`__cap` を共有の表にし、trigger を `tupleSql` で作る。
+- `keyString` を `keyStringExact` に入れ替え、キー文字列を読む場所を `keyValues` にする。同じ seed の RPC の宛先とメソッドの列が、前後で同じであることを見る。
+- `TypedValue` を今の `Value` に直す橋を足し、2^53 以上の整数をそこで断る。
+- 表定義のときの上限の確かめを、新しい 4 つの文に替える。式の木の深さ (100) も見る。
+- シミュレータの確かめ (検査の 5) のうち、捕捉でまとめた `after` と本体の行の比較、タプルの長さの確かめを足す。
+- 段 0 で見つかった欠陥の 2 (式の木の深さ) は、`imageList` の 2^53 の確かめがなくなれば、原因がなくなる。再現が通ることを確かめて `test/` へ移す。3 (結果の列の数) は、行を集める走査が `typeof` の列を足すのをやめる段 3 まで残る。
 

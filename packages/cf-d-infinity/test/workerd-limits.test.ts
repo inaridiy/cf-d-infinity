@@ -5,9 +5,13 @@ import { DatabaseSync } from "node:sqlite";
 import { Miniflare } from "miniflare";
 import initSqlJs from "sql.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { keyStringExact } from "../src/keys";
 import { ownerOf, type Routing } from "../src/routing";
-import { bitsOf, doubles, EDGE_DOUBLES, numericStrings } from "./value-corpus";
-import { CONV_COLUMNS, CONV_DDL, convSql, probe, type Cell, type Probe, type Step } from "./workerd-probe";
+import { initStoredValue, storedValue } from "../src/sql/stored";
+import type { Affinity } from "../src/types";
+import { decodeElem, decodeTuple, jsonElemSql, parseTuple, returningElemSql, selectElemSql, tupleSql, type TypedValue } from "../src/value";
+import { bitsOf, doubles, EDGE_DOUBLES, INT64, int64s, numericStrings } from "./value-corpus";
+import { CONV_COLUMNS, CONV_DDL, convSql, probe, type Arg, type Cell, type Probe, type Step } from "./workerd-probe";
 
 // ほかのテスト (autoscale-cron) も同時に bundle を作る。同じファイルへ書くと、読み込みの途中で書き換わるので、出力先を分ける。
 const BUNDLE = "dist/worker.limits.js";
@@ -93,10 +97,8 @@ describe("real Durable Object SQLite", () => {
 // 文字列だけを返す文は、同じ文を node:sqlite と sql.js でも実行して比べる。数を返す文は、ドライバごとに JS の型が違うので、
 // DO の結果だけを見る (その違いそのものが、確かめる事実である)。
 
-// 段 1 で src/value.ts に入る式。ここでは、事実を確かめるために同じ文面を書いておく。
-const selectElem = (c: string) => `CASE typeof(${c}) WHEN 'integer' THEN 'i'||${c} WHEN 'text' THEN 't'||${c} ELSE ${c} END`;
-const returningElem = (c: string) => `CASE typeof(${c}) WHEN 'integer' THEN 'i'||${c} WHEN 'text' THEN 't'||${c} WHEN 'real' THEN 'r'||quote(${c}) ELSE ${c} END`;
-const jsonElem = (c: string) => `substr(typeof(${c}),1,1) || CASE typeof(${c}) WHEN 'real' THEN quote(${c}) WHEN 'blob' THEN hex(${c}) ELSE ${c} END`;
+// 要素の式は、src/value.ts のものを使う。workerd で確かめるのは、D∞ が流す文面そのものである。
+const [selectElem, returningElem, jsonElem] = [selectElemSql, returningElemSql, jsonElemSql];
 /** 結果を返す SELECT を、型つきの読みの形に包む (設計書の「シャードからの読み」)。 */
 const typedRead = (sql: string, n: number) => {
   const cols = Array.from({ length: n }, (_, i) => `"c${i}"`);
@@ -110,6 +112,25 @@ const LOCAL_MAX_LENGTH = 2_200_000;
 
 /** 1 つの文の結果。値は文字にする。 */
 type Texts = (string | null)[][] | { error: string };
+/** 型と値を、比べられる文字にする。double はビットで比べる。-0.0 は 0.0 と区別しない。 */
+const shownValue = (v: TypedValue): string =>
+  v === null ? "NULL"
+    : typeof v === "bigint" ? `INTEGER ${v}`
+      : typeof v === "number" ? `REAL ${bitsOf(Object.is(v, -0) ? 0 : v)} (${v})`
+        : typeof v === "string" ? `TEXT ${JSON.stringify(v)}`
+          : `BLOB ${Buffer.from(v).toString("hex")}`;
+/** DO のドライバが返した値 (workerd-probe.ts が文字にしたもの) を、ドライバの値に戻す。 */
+const driverValue = (c: Cell): string | number | Uint8Array | null =>
+  c[0] === "null" ? null : c[0] === "number" ? Number(c[1]) : c[0] === "blob" ? Uint8Array.from(Buffer.from(String(c[1]), "hex")) : String(c[1]);
+/** 型の親和性の変換の表 (workerd-probe.ts の CONV_COLUMNS) の、列ごとの親和性。 */
+const CONV_AFFINITY: Affinity[] = ["TEXT", "NUMERIC", "INTEGER", "REAL", "BLOB"];
+/** storedValue の答えが、DO の列に入った値 (workerd-probe.ts の stored の書き方) と同じか。 */
+const sameStored = (got: TypedValue, stored: string): boolean =>
+  got === null ? stored === "null:"
+    : typeof got === "bigint" ? stored === `integer:${got}`
+      : typeof got === "number" ? stored.startsWith("real:") && bitsOf(Number(stored.slice(5))) === bitsOf(Object.is(got, -0) ? 0 : got)
+        : typeof got === "string" ? stored === `text:${Buffer.from(got, "utf8").toString("hex").toUpperCase()}`
+          : stored === `blob:${Buffer.from(got).toString("hex").toUpperCase()}`;
 const textOf = (v: unknown): string | null =>
   v === null || v === undefined ? null : v instanceof Uint8Array ? `x'${Buffer.from(v).toString("hex")}'` : String(v);
 const cellText = (c: Cell): string | null => (c[0] === "null" ? null : c[0] === "blob" ? `x'${c[1]}'` : String(c[1]));
@@ -121,6 +142,7 @@ describe("facts about workerd and the Durable Object SQLite that the value rewor
     p = probe();
     instances.push(p.mf);
     SQL = await initSqlJs();
+    await initStoredValue(SQL);
   });
 
   /** 同じ文の並びを、node:sqlite、sql.js、DO で実行する。引数は文字列だけ (3 つとも TEXT として束縛する)。 */
@@ -361,6 +383,78 @@ describe("facts about workerd and the Durable Object SQLite that the value rewor
     ]);
   });
 
+  it("reads a key string back with keyValues inside workerd, to the digit", async () => {
+    // keyValues (src/keys.ts) を、workerd の中で動かす。行の置き場所はキー文字列から決まるので、Worker が読み戻した値が
+    // 1 桁でも違えば、別の行を指す。
+    const values: TypedValue[] = [
+      ...INT64, ...int64s(300, 11), ...EDGE_DOUBLES, ...doubles(300, 12), 0.5, 1e19, 1e21, Infinity, -Infinity,
+      "abc", "a\u0000b", "9223372036854775807", new Uint8Array([0, 255]), null,
+    ];
+    const keys = values.map((v, i) => keyStringExact([v, values[(i * 7) % values.length]!]));
+    const back = await p.keys(keys);
+    expect(back.map((b) => b.again)).toEqual(keys);
+    // 整数は BigInt で戻る。2^53 を超える整数も丸まらない (丸まっていれば、もう一度書いたキーが元と違う)。
+    const integers = back.filter((_b, i) => typeof values[i] === "bigint");
+    expect(integers.every((b) => b.types[0] === "bigint")).toBe(true);
+    expect(integers.length).toBeGreaterThan(300);
+  });
+
+  it("captures and reads a table of 100 columns with the tuple expression, 64-bit integers and NUL included", async () => {
+    const cols = Array.from({ length: 100 }, (_, i) => `c${i}`);
+    // PRIMARY KEY のない表は、rowid を先頭に置く。要素は 101 個になり、32 個ずつの入れ子が 4 つになる。
+    const all = ["rowid", ...cols];
+    const tuple = (prefix: string) => tupleSql(all.map((c) => `${prefix}${c}`));
+    const triggers = [
+      `CREATE TRIGGER w_i AFTER INSERT ON w BEGIN INSERT INTO cap(tbl, new) VALUES ('w', ${tuple("new.")}); END`,
+      `CREATE TRIGGER w_u AFTER UPDATE ON w BEGIN INSERT INTO cap(tbl, old, new) VALUES ('w', ${tuple("old.")}, ${tuple("new.")}); END`,
+      `CREATE TRIGGER w_d AFTER DELETE ON w BEGIN INSERT INTO cap(tbl, old) VALUES ('w', ${tuple("old.")}); END`,
+    ];
+    const pool: TypedValue[] = [...INT64, ...EDGE_DOUBLES, 0.1 + 0.2, 5, 0.5, "", "abc", "a\u0000b", "é", "i5", new Uint8Array([]), new Uint8Array([0, 255]), null];
+    const rows = [0, 1, 2].map((r) => cols.map((_c, i) => pool[(i * 3 + r * 7) % pool.length]!));
+    // DO は BigInt を束縛できず、数は REAL として束縛する。INTEGER は、10 進の文字列を `(CAST(? AS INTEGER)+0)` で包んで束縛する。
+    const insert = (row: TypedValue[], returning = ""): Step => ({
+      sql: `INSERT INTO w VALUES (${row.map((v) => (typeof v === "bigint" ? "(CAST(? AS INTEGER)+0)" : "?")).join(", ")})${returning}`,
+      params: row.map((v): Arg =>
+        v === null ? null : typeof v === "bigint" ? String(v) : typeof v === "number" ? { f: Object.is(v, -0) ? "-0" : String(v) }
+          : typeof v === "string" ? v : { hex: Buffer.from(v).toString("hex") }),
+    });
+    const r = await p.run([
+      { sql: `CREATE TABLE w(${cols.join(", ")})` },
+      { sql: "CREATE TABLE cap(seq INTEGER PRIMARY KEY, tbl TEXT NOT NULL, old TEXT, new TEXT)" },
+      ...triggers.map((sql) => ({ sql })),
+      ...rows.map((row) => insert(row)),
+      { sql: "SELECT old, new FROM cap ORDER BY seq" },
+      // 主キーで行を読む文と同じ形。タプルを 1 列で読む。
+      { sql: `SELECT ${tupleSql(all)} FROM w ORDER BY rowid` },
+      // 型つきの読み。結果は、DO の上限ちょうどの 100 列である。
+      { sql: typedRead("SELECT * FROM w ORDER BY rowid", 100) },
+      { sql: "UPDATE w SET c1 = c0, c0 = NULL WHERE rowid = 2" },
+      { sql: "DELETE FROM w WHERE rowid = 3" },
+      { sql: "SELECT old, new FROM cap WHERE seq > 3 ORDER BY seq" },
+      // RETURNING による捕捉。足す文面は、タプルの式 1 つである。
+      insert(rows[0]!, ` RETURNING ${tupleSql(all)}`),
+    ]);
+    expect(r.map((step) => step.error)).toEqual(r.map(() => undefined));
+    const [captured, read, typed, , , changed, returned] = r.slice(8);
+    const want = (row: TypedValue[], rowid: number) => [BigInt(rowid), ...row].map(shownValue);
+    const tupleOf = (c: Cell) => (c[0] === "null" ? null : decodeTuple(parseTuple(String(c[1]))).map(shownValue));
+    expect(captured!.rows.map((row) => row.map(tupleOf))).toEqual(rows.map((row, i) => [null, want(row, i + 1)]));
+    expect(read!.rows.map((row) => tupleOf(row[0]!))).toEqual(rows.map((row, i) => want(row, i + 1)));
+    expect(typed!.rows.map((row) => row.map((c) => shownValue(decodeElem(driverValue(c)))))).toEqual(rows.map((row) => row.map(shownValue)));
+    expect(changed!.rows.map((row) => row.map(tupleOf))).toEqual([
+      [want(rows[1]!, 2), [BigInt(2), null, rows[1]![0]!, ...rows[1]!.slice(2)].map(shownValue)],
+      [want(rows[2]!, 3), null],
+    ]);
+    // rowid 3 の行を消したので、次の行はまた rowid 3 になる (採番した rowid が、返したタプルに入っている)。
+    expect(returned!.rows.map((row) => tupleOf(row[0]!))).toEqual([want(rows[0]!, 3)]);
+    // trigger の文面は、文の長さの上限 (100 KB) に収まる。列名が 9 文字の 100 列の表で、UPDATE の trigger は 35 KB、
+    // RETURNING に足すタプルの式は 15 KB である (設計書の「費用」の表)。
+    const long = (prefix: string) => tupleSql(Array.from({ length: 100 }, (_, i) => `${prefix}"column_${String(i).padStart(2, "0")}"`));
+    const update = `CREATE TRIGGER "__cap_some_table_U" AFTER UPDATE ON "some_table" WHEN EXISTS (SELECT 1 FROM __cap_on) BEGIN INSERT INTO __cap(tbl, old, new) VALUES ('some_table', ${long("old.")}, ${long("new.")}); END`;
+    expect(Math.round(update.length / 1000)).toBe(35);
+    expect(Math.round(tupleSql(Array.from({ length: 100 }, (_, i) => `"column_${String(i).padStart(2, "0")}"`)).length / 1000)).toBe(15);
+  });
+
   it("carries a BigInt over Durable Object RPC and over a Service Binding, at the top level and inside objects", async () => {
     const r = await p.bigint();
     const nested = `{"a":["bigint ${INT64_MAX}","bigint ${INT64_MIN}"],"b":{"0":1,"1":2}}`;
@@ -511,6 +605,7 @@ describe("facts about workerd and the Durable Object SQLite that the value rewor
     sqljs.run(CONV_DDL);
     const differ: Record<string, string[]> = {};
     const note = (key: string, text: string) => void (differ[key] ??= []).push(text);
+    const undecided: Record<string, number> = {};
     let roundTrips = 0;
     for (const kind of ["real", "text"] as const) {
       const values = kind === "real" ? reals : texts;
@@ -525,6 +620,10 @@ describe("facts about workerd and the Durable Object SQLite that the value rewor
         CONV_COLUMNS.forEach((col, j) => {
           if (b[j] !== a[j]) note(`${kind} into ${col}: sql.js against node:sqlite`, `${JSON.stringify(v)}: ${b[j]} / ${a[j]}`);
           if (c[j] !== a[j]) note(`${kind} into ${col}: workerd against node:sqlite`, `${JSON.stringify(v)}: ${c[j]} / ${a[j]}`);
+          // Worker が決める値 (storedValue) は、DO の列に入った値と同じである。決めない変換 (undefined) は比べない。
+          const decided = storedValue(v, CONV_AFFINITY[j]!);
+          if (decided === undefined) undecided[`${kind} into ${col}`] = (undecided[`${kind} into ${col}`] ?? 0) + 1;
+          else if (!sameStored(decided, c[j]!)) note(`${kind} into ${col}: storedValue against workerd`, `${JSON.stringify(v)}: ${String(decided)} / ${c[j]}`);
         });
         // 型のない列に入った REAL を quote() で書いた文字列は、JS の Number() で元の double に戻る (要素の 'r' の読み方)。
         if (typeof v === "number") {
@@ -539,6 +638,8 @@ describe("facts about workerd and the Durable Object SQLite that the value rewor
     sqljs.close();
     expect(Object.fromEntries(Object.entries(differ).map(([k, v]) => [k, `${v.length} values, for example ${v.slice(0, 3).join("; ")}`]))).toEqual({});
     expect(roundTrips).toBe(3 * reals.length);
+    // storedValue が決めないのは、REAL を TEXT にする変換だけである。
+    expect(undecided).toEqual({ "real into t": reals.length });
     // 値の数は、設計書の「確かめた事実」の表に書いてある。値の集まりを変えたら、設計書も直す。
     expect([reals.length, texts.length]).toEqual([20285, 113390]);
   }, 300_000);

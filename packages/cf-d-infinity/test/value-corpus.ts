@@ -72,3 +72,18 @@ export function bitsOf(x: number): string {
   b.writeDoubleBE(x);
   return b.toString("hex");
 }
+
+/** 型のある値。BigInt は INTEGER、数は REAL。node:sqlite は、この決まりのまま束縛する。 */
+export type Typed = null | bigint | number | string | Uint8Array;
+
+/**
+ * 型のある値を sql.js に束縛するための、引数の書き方と値。sql.js は、BigInt を TEXT として、32 ビットに収まる整数の値の数を
+ * INTEGER として束縛するので、型を保つ式で包む (src/value.ts の bindTyped と同じ包み方である)。
+ */
+export function sqljsBinding(values: Typed[]): { marks: string[]; params: (string | number | Uint8Array | null)[] } {
+  return {
+    marks: values.map((v) => (typeof v === "bigint" ? "(CAST(? AS INTEGER)+0)" : typeof v === "number" ? "(CAST(? AS REAL)+0.0)" : "?")),
+    params: values.map((v) => (typeof v === "bigint" ? String(v) : v)),
+  };
+}
+

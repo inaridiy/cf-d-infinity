@@ -3,6 +3,7 @@
 // D∞ の Worker (src/worker.ts) は使わない。確かめたいのは土台の振る舞いで、D∞ がそれをどう包んでいるかではない。
 // 渡された SQL と引数を DO の SQLite でそのまま実行し、結果の JS の型を isolate の中で見分けて返す。
 // 試験との間は JSON なので、JSON が消す区別 (-0 と 0、number と bigint、BLOB) は、消える前に文字にしておく。
+import { buildSync } from "esbuild";
 import { Miniflare } from "miniflare";
 
 /** 引数の書き方。JSON で運べない値を、isolate の中で作る。 */
@@ -51,8 +52,21 @@ export const convSql = (kind: "real" | "text") => {
   return `INSERT OR REPLACE INTO conv(id, t, n, i, r, b) VALUES (1, ${v}, ${v}, ${v}, ${v}, ${v}) RETURNING ${CONV_COLUMNS.map(stored).join(", ")}`;
 };
 
+/**
+ * キー文字列の関数 (src/keys.ts) を、workerd で動く 1 つのモジュールにまとめる。keyValues は、JSON.parse の reviver が元の文面を
+ * 受け取ることに頼っている。同じ関数を workerd の V8 で動かして確かめる。
+ */
+function keysModule(): string {
+  const out = buildSync({
+    stdin: { contents: 'export { keyStringExact, keyValues } from "./src/keys";', resolveDir: process.cwd(), loader: "ts" },
+    bundle: true, format: "esm", write: false, logLevel: "silent",
+  });
+  return out.outputFiles[0]!.text;
+}
+
 const SCRIPT = `
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { keyStringExact, keyValues } from "./keys.js";
 const hex = (b) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
 const unhex = (s) => Uint8Array.from(s.match(/../g) ?? [], (h) => parseInt(h, 16));
 const show = (v) => v === null ? ["null"] : typeof v === "bigint" ? ["bigint", String(v)]
@@ -116,6 +130,13 @@ export default {
       });
       return Response.json(sources);
     }
+    if (url.pathname === "/keys") {
+      // キー文字列を値に戻し、戻した値の型と、もう一度書いたキー文字列を返す。
+      return Response.json(body.map((key) => {
+        const values = keyValues(key);
+        return { types: values.map((v) => (v === null ? "null" : v instanceof Uint8Array ? "blob" : typeof v)), again: keyStringExact(values) };
+      }));
+    }
     if (url.pathname === "/bigint") {
       const values = { top: 9223372036854775807n, nested: { a: [9223372036854775807n, -9223372036854775808n], b: new Uint8Array([1, 2]) } };
       const via = (target) => attempt(async () => {
@@ -138,12 +159,18 @@ export interface Probe {
   convert(kind: "real" | "text", values: (number | string)[]): Promise<string[][]>;
   /** JSON.parse の reviver が受け取った [キー, 値の型, 元の文面] の並び。 */
   reviver(text: string): Promise<[string, string, string][]>;
+  /** キー文字列を、workerd の中の keyValues で値に戻す。戻した値の型と、keyStringExact でもう一度書いた文字列を返す。 */
+  keys(keys: string[]): Promise<{ types: string[]; again: string }[]>;
   /** BigInt を DO の RPC と Service Binding の RPC に通した結果。 */
   bigint(): Promise<Record<"durableObject" | "serviceBinding", { arrived: string[]; returned: string[]; blob: string; error?: string }> & { structuredClone: string }>;
 }
 
 export function probe(): Probe {
-  const options = { modules: [{ type: "ESModule" as const, path: "probe.js", contents: SCRIPT }], compatibilityDate: "2026-07-01" };
+  const modules = [
+    { type: "ESModule" as const, path: "probe.js", contents: SCRIPT },
+    { type: "ESModule" as const, path: "keys.js", contents: keysModule() },
+  ];
+  const options = { modules, compatibilityDate: "2026-07-01" };
   const mf = new Miniflare({
     workers: [
       { name: "probe", ...options, durableObjects: { PROBE: { className: "Probe", useSQLite: true } }, serviceBindings: { ECHO: { name: "echo", entrypoint: "Echo" } } },
@@ -170,6 +197,7 @@ export function probe(): Probe {
       return out;
     },
     reviver: (text) => post("/reviver", { text }),
+    keys: (keys) => post("/keys", keys),
     bigint: () => post("/bigint", null),
   };
 }
