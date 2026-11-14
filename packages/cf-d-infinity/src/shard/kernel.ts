@@ -1,7 +1,7 @@
 import { Hlc, SECOND, physicalToTs, tsToPhysical } from "../hlc";
 import { SHARD_LIMITS, ShardLimit, shardLimitOf, withinShardLimits } from "../shard-limits";
 import type {
-  Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, LockOwner, MetaApi,
+  Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, LockOwner,
   Participant, Piece, PiecePayload, PieceWant, Pos, PrepareReq, PrepareRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts,
   TxnStatus, Value,
 } from "../types";
@@ -9,33 +9,26 @@ import {
   ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, TableLocked, checkStorageFormat, isWideSpan, spanCovers, utf8Length,
   unprotectedSpans,
 } from "../types";
-import type { DdlEntry, SplitMove } from "../meta";
+import type { DdlEntry } from "../meta";
 import { blockOf, checkInterval, overlaps, rangeText, sameInterval, slotAligned, slotOf, tokenOf, type Interval } from "../routing";
 import { keyString } from "../keys";
-import { type Runtime, sleep, systemRuntime } from "../runtime";
+import { type Runtime, systemRuntime } from "../runtime";
+import { attempt, done, tail, unwrap, wait, type Effect, type Fork, type Outcome, type PeerCall, type Program, type Step } from "./step";
 import {
   CAPTURE_TABLES, applyChanges, asSqlError, assertKeyed, capturedChanges, decode, deleteRow, encode, encodeKey, insertRow, q,
   rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore, imageList, typedRow, typedValues,
 } from "./rows";
 
-export interface ShardDeps {
+/**
+ * 核の依存。同期のものだけである。相手のシャード、Meta、背景の仕事は、殻の依存 (core.ts の ShardDeps) にあり、核からは見えない。
+ * 保存先の確定の待ち (sync) は呼ばない (test/determinism.test.ts が確かめる)。実行環境からは、実時間だけを読む。
+ */
+export interface KernelDeps {
   id: string;
   backend: Backend;
   clock: Clock;
-  peer(id: string): ShardApi;
-  meta: Pick<MetaApi, never> & {
-    ddlSince(v: number): Promise<{ version: number; ddl: DdlEntry[] }>;
-    /** 適用できなかった版の取り消しを求める。取り消す版の番号か、取り消せなければ null が返る。 */
-    revokeDdl(version: number, reason: string): Promise<number | null>;
-    /** 分割の枠を示して、子が受け取り始める。分割の版が返る (meta.ts の startSplit)。 */
-    startSplit(id: string, move: SplitMove): Promise<{ version: number }>;
-    /** 分割の枠が生きていて、子が受け取り始めていることを確かめる (meta.ts の checkSplit)。 */
-    checkSplit(id: string, move: SplitMove): Promise<void>;
-  };
-  /** 実時間、待ち、乱数の出どころ。指定しなければ実物を使う。シミュレータは seed から決まる実装を渡す。 */
-  runtime?: Runtime;
-  /** 応答後も続ける処理。DO では ctx.waitUntil に渡す。 */
-  background?(p: Promise<unknown>): void;
+  /** 実時間の出どころ。指定しなければ実物を使う。シミュレータは seed から決まる実装を渡す。 */
+  runtime?: Pick<Runtime, "now">;
   /** phase 2 の再駆動を予約する。DO では storage.setAlarm に渡す。 */
   scheduleRedrive?(): void;
   K?: number;
@@ -69,7 +62,7 @@ export interface SpanEscape {
 }
 
 /** 範囲の検査をする行数の上限。全行を読んで消すので、大きな表を使う試験では検査を省く。 */
-export const SPAN_CHECK_MAX_ROWS = 3000;
+const SPAN_CHECK_MAX_ROWS = 3000;
 
 /** 受け取る時刻が、このシャードの時計よりこれ以上先なら断る。DO の間の時計のずれと、再起動後の先取り (1 秒) より十分に大きい。 */
 export const MAX_CLOCK_AHEAD_MS = 10 * 60_000;
@@ -90,17 +83,20 @@ export const GROUP_MAX_BYTES = 16_000_000;
 export const SHARD_MAX_ROWS = 200_000;
 export const SHARD_MAX_BYTES = SHARD_LIMITS.resultBytes;
 /** 値のおおよその大きさ (バイト)。上限の判定に使うだけで、正確である必要はない。 */
-export const sizeOf = (v: Value): number =>
+const sizeOf = (v: Value): number =>
   typeof v === "string" ? v.length * 2 : v instanceof Uint8Array ? v.byteLength : 8;
 
 export interface Intent {
   tbl: string; pk: string; sk: string; txn: string; anchor: string; prepare_ts: Ts; change: string;
 }
-export interface InFlight {
+/** 進行中の確定 (anchor の drive) の記録。 */
+export interface Flight {
+  /** 読み手が、確定の時刻をこれより後へ押した。 */
   pushed: Ts;
+  /** 確定の時刻を決めた。決めた後は押せない。 */
   decided: boolean;
-  settled: Promise<void>;
-  settle(): void;
+  /** 決着を待つもの。殻が、起こしてもらう関数を登録する。 */
+  waiters: (() => void)[];
 }
 
 /** 送り出した範囲 (__fenced の行)。token の区間である。終えた後も残し、その範囲の要求を断り続ける。 */
@@ -108,31 +104,31 @@ export interface FencedRange extends Interval { to: string; done: number }
 /** 受け取り中の範囲 (__incoming の、終えていない行)。終えた行は表に残るが、メモリには載せない。 */
 export interface IncomingRange extends Interval { from_id: string }
 /** 範囲の記録から、区間だけを取り出す。要求や応答には、これを載せる。 */
-export const intervalOf = (x: Interval): Interval => ({ start: x.start, end: x.end });
+const intervalOf = (x: Interval): Interval => ({ start: x.start, end: x.end });
 
 /**
  * 位置を、記録の表 (__moved、__moved_txn、__arrived) の列に書く形にする。JSON の文字列で、端は `null` である。
  * 主キーの列なので NULL にはしない (SQLite は、主キーの NULL を互いに別の値として扱う)。
  */
-export const posKey = (p: Pos): string => JSON.stringify(p);
-export const posOf = (key: string): Pos => JSON.parse(key) as Pos;
+const posKey = (p: Pos): string => JSON.stringify(p);
+const posOf = (key: string): Pos => JSON.parse(key) as Pos;
 /** グループの全体を 1 つで運ぶ piece の区間の端。いまは、どの piece も、始まりも終わりもこれである。 */
-export const END = posKey(null);
+const END = posKey(null);
 /** 運んだデータから、piece の名前だけを取り出す。 */
-export const pieceOf = (p: PiecePayload): Piece => ({ g: p.g, range: p.range, after: p.after });
+const pieceOf = (p: PiecePayload): Piece => ({ g: p.g, range: p.range, after: p.after });
 
-export const ROLLBACK = Symbol("rollback");
-export const FALLBACK = Symbol("fallback");
-export const BLOCKED = Symbol("blocked");
-export const PENDING_UNIQUE = Symbol("pending unique");
+const ROLLBACK = Symbol("rollback");
+const FALLBACK = Symbol("fallback");
+const BLOCKED = Symbol("blocked");
+const PENDING_UNIQUE = Symbol("pending unique");
 /** 述語の検証で読む commit の上限。超えたら競合とみなす。 */
-export const PRED_WINDOW = 2000;
+const PRED_WINDOW = 2000;
 /** ロックの TTL。Worker の死亡に備える。文を実行するたびに延ばす。 */
-export const LOCK_TTL_MS = 5000;
+const LOCK_TTL_MS = 5000;
 /** 読みが、1 つの取引の intent を決着させようとする回数の上限。間で待つので、合わせて 1 秒ほど待つ。 */
-export const SETTLE_TRIES = 10;
+const SETTLE_TRIES = 10;
 /** ロックを待つ時間の上限。SQLite の busy_timeout に相当する。 */
-export const LOCK_WAIT_MS = 5000;
+const LOCK_WAIT_MS = 5000;
 /**
  * 古い取引が保持者からロックを奪うまで待つ時間。
  * 保持者は多くの場合すぐ終わるので、すぐ奪うと無駄な abort を増やす。
@@ -140,7 +136,7 @@ export const LOCK_WAIT_MS = 5000;
  */
 export const WOUND_DELAY_MS = 200;
 /** DDL の適用が、進行中の取引の決着を待つ上限。超えたら再試行できる誤りを返す。 */
-export const SCHEMA_WAIT_MS = 5000;
+const SCHEMA_WAIT_MS = 5000;
 
 export interface RowLock extends LockOwner {
   expires: number;
@@ -168,7 +164,7 @@ export interface Rows {
 }
 
 /** Section を作る鍵。このファイルの外へは出さない。使うのは ShardCore.enter だけである。 */
-export const ENTER = Symbol("enter");
+const ENTER = Symbol("enter");
 
 /**
  * 同期区間に入った印。ShardCore.enter が、待ちの後の確かめ直しを済ませてから作る。コンストラクタは private で、作る関数は、
@@ -181,7 +177,7 @@ export const ENTER = Symbol("enter");
  * 型が確かめるのは、区間に入ったことまでである。印を await の後まで持ち越していないことは、型では確かめられない。
  * 印は、作った同期区間の中だけで使い、待った後は、enter をもう一度呼んで作り直す。
  */
-export class Section<K extends Check> {
+class Section<K extends Check> {
   /** 確かめ直したこと。多く確かめた印は、少なく求める関数へ渡せる。逆は渡せない。 */
   protected readonly rechecked: { readonly [P in K]: true };
   private constructor(rechecked: { readonly [P in K]: true }) {
@@ -203,40 +199,386 @@ export const lockIdOf = (txn: string): string => {
   return at < 0 ? txn : txn.slice(0, at);
 };
 
+// ---- 手続きの frame ----
+//
+// frame は、手続きが待ちをまたいで持ち越すものの全部である。3 種類に分けて書く。
+//   確かめ直さないこと: 待ちの前に 1 回だけ確かめた (待った) ことの印。印がある間、その確かめは、待ちの後で繰り返さない。
+//                       今日の振る舞いをそのまま写したもので、確かめ直すように直すときは、印を消す。
+//   持ち越す選択:       要求の時刻、期限、起こされた行、手順のどこまで済んだかなど、1 度決めたら変えない値。
+//   待ちの結果:         殻が書く。
+
+/** ensureSchema の frame。 */
+export interface SchemaFrame {
+  version: number;
+  /** 先の版まで適用するのを待った。 */
+  reached?: true;
+  /** 適用の後で、もう一度確かめた。 */
+  again?: true;
+}
+
+/** reachSchema の frame。 */
+export interface ReachFrame {
+  version: number;
+  catchUp: boolean;
+  /** 適用を待つ前の版。適用の後も同じなら、Meta にその版がまだない。 */
+  before?: number;
+}
+
+/** applySchema の frame。 */
+export interface ApplyFrame {
+  catchUp: boolean;
+  /** intent の決着を待った (か、待たないと決めた)。 */
+  settled?: true;
+  /** Meta から受け取った DDL。 */
+  got?: { ddl: DdlEntry[] };
+}
+
+/** schemaFailed の frame。 */
+export interface SchemaFailedFrame {
+  entry: DdlEntry;
+  message: string;
+  asked?: true;
+  /** 取り消す版の番号。取り消せなければ null。 */
+  reverted?: number | null;
+}
+
+/** settleAllIntents の frame。 */
+export interface SettleAllFrame {
+  deadline?: number;
+  /** いま決着させている intent の一覧 (取引ごとに 1 つ)。先頭が、いまの取引である。 */
+  batch?: Intent[];
+  res?: TxnStatus;
+  finishing?: true;
+  slept?: true;
+}
+
+/** ensureArrived の frame。 */
+export interface ArriveFrame {
+  groups: string[];
+  asked?: true;
+}
+
+/** beginIncoming の frame。 */
+export interface BeginIncomingFrame {
+  req: Interval & { from: string; slot: string };
+  /** Meta が返した、受け取り始める版。 */
+  slot?: { version: number };
+  reached?: true;
+  stored?: true;
+}
+
+/** fence の frame。 */
+export interface FenceFrame {
+  req: Interval & { to: string; schema?: number; slot: string };
+  checked?: true;
+  reached?: true;
+  stored?: true;
+}
+
+/** pull の frame。 */
+export interface PullFrame {
+  req: Interval & { want: PieceWant[]; to: string; maxBytes: number };
+  out?: PiecePayload[];
+}
+
+/** fetchGroups の frame。 */
+export interface FetchFrame {
+  groups: string[];
+  /** 受け取り中の範囲ごとの、まだ届いていないグループ。先頭が、いまの範囲である。 */
+  queue?: { range: IncomingRange; rest: string[] }[];
+  payload?: PiecePayload[];
+  received?: true;
+}
+
+/** receive の frame。 */
+export interface ReceiveFrame {
+  payload: PiecePayload[];
+  reached?: true;
+  stored?: true;
+}
+
+/** drain の frame。 */
+export interface DrainFrame {
+  req: Interval;
+  /** 渡す側のシャードと、範囲。 */
+  from?: string;
+  interval?: Interval;
+  total?: { groups: number; rows: number; bytes: number };
+  /** 何周目か、この周で見たグループの数、列挙の続きの位置。 */
+  pass?: number;
+  moved?: number;
+  cursor?: GroupCursor | null;
+  /** いまのページ、その中のまだ届いていないグループ、いま受け取っている分。 */
+  page?: { groups: string[]; cursor: GroupCursor | null };
+  ackedArrived?: true;
+  rest?: string[];
+  payload?: PiecePayload[];
+  received?: true;
+  acked?: true;
+}
+
+/** waitForForeignLocks の frame。 */
+export interface ForeignLocksFrame {
+  txn: string;
+  writes: Pick<Change, "table" | "pk">[];
+  deadline?: number;
+  /** 何番目の行まで見たか。 */
+  at?: number;
+}
+
+/** lockedExec の frame。 */
+export interface LockedFrame {
+  req: ExecReq;
+  me: LockOwner;
+  // ---- 持ち越す選択 ----
+  deadline?: number;
+  /** 起こされた行。取らずに去るなら、次の待ち手を起こす。起こすのは先頭の 1 件だけだからである。 */
+  woken?: string | null;
+  /** 待っている行。 */
+  waiting?: string;
+  // ---- 1 周 (行を待つたびにやり直す) の間だけ持ち越すもの ----
+  arrived?: true;
+  F?: Ts;
+  // ---- 待ちの結果 ----
+  applied?: Ts;
+}
+
+/** settleIntents の frame。 */
+export interface SettleFrame {
+  spans: Span[];
+  T: Ts;
+  /** 確定の時刻を T より後へ押した取引。もう尋ねない。 */
+  pushed?: Set<string>;
+  /** 取引ごとの、この手続きで決着させた回数。 */
+  tries?: Map<string, number>;
+  /** 適用した取引の commit 時刻の最大値。何も適用していなければ 0。 */
+  applied?: Ts;
+  /** いま決着させている intent の一覧 (取引ごとに 1 つ)。先頭が、いまの取引である。 */
+  batch?: Intent[];
+  slept?: true;
+  res?: TxnStatus;
+  finishing?: true;
+}
+
+/** exec の frame。 */
+export interface ExecFrame {
+  req: ExecReq;
+  // ---- 確かめ直さないこと ----
+  /** 版を、入口で確かめた (表定義の同期を待った)。intent の決着を待った後は、確かめ直さない (未解決の問題 27)。 */
+  planned?: true;
+  /** グループの到着を待った。 */
+  arrived?: true;
+  // ---- 持ち越す選択 ----
+  /** 読む時刻。 */
+  T?: Ts;
+  // ---- 待ちの結果 ----
+  applied?: Ts;
+  locked?: Outcome<ExecRes>;
+}
+
+/** execAuto の frame。 */
+export interface AutoFrame {
+  req: ExecReq;
+  // ---- 確かめ直さないこと ----
+  /** 版を、入口で確かめた (表定義の同期を待った)。 */
+  planned?: true;
+  /** グループの到着を待った。 */
+  arrived?: true;
+  /** intent の決着を待った後の、最初の同期区間に入った。数えるのと、入口の「未決着の intent」の確かめは、そこで 1 回だけする。 */
+  entered?: true;
+  // ---- 持ち越す選択 ----
+  /** この要求の時刻。決着させる intent の上限で、行を待つときの名前にもなる。 */
+  now?: Ts;
+  me?: LockOwner;
+  deadline?: number;
+  /** 待っている行と、起こされた行。 */
+  key?: string;
+  woken?: Set<string>;
+  // ---- 待ちの結果 ----
+  direct?: Outcome<ExecRes | null>;
+  waited?: Outcome<void>;
+}
+
+/** execDirect の frame。 */
+export interface DirectFrame {
+  req: ExecReq;
+  claim: Plan & Rows;
+  now: Ts;
+  // ---- 持ち越す選択 ----
+  me?: LockOwner;
+  deadline?: number;
+  key?: string;
+  woken?: Set<string>;
+}
+
+/** commitLocal と prepare の frame。 */
+export interface PrepareFrame<R> {
+  req: R;
+  /** 版を、入口で確かめた (表定義の同期を待った)。待ちの後で、もう一度確かめる。 */
+  planned?: true;
+  arrived?: true;
+  /** 欠陥 prepareWaits: 書く行の、他の取引のロックを待った。 */
+  waitedLocks?: true;
+}
+
+/** unchanged の frame。 */
+export interface UnchangedFrame {
+  req: { spans: Span[]; from: Ts; schema: number };
+  synced?: Outcome<void>;
+}
+
+/** syncSchema の frame。 */
+export interface SyncSchemaFrame {
+  req: { version: number };
+  asked?: true;
+}
+
+/** commit の frame。 */
+export interface CommitFrame {
+  req: CommitReq;
+  planned?: true;
+  /** 登録した、この実行の記録。 */
+  flight?: Flight;
+  driving?: true;
+  res?: CommitRes;
+}
+
+/** drive の frame。 */
+export interface DriveFrame {
+  req: CommitReq;
+  flight: Flight;
+  /** 参加者の prepare の答え。 */
+  acks?: PrepareRes[];
+  /** 欠陥 prepareWaits: 自分の書く行の、他の取引のロックを待った。 */
+  waitedLocks?: true;
+  /** 決めた確定の時刻。 */
+  c?: Ts;
+  refreshed?: { ok: boolean; reason?: string }[];
+  /** 確定の記録を書いた。 */
+  recorded?: true;
+}
+
+/** phase2 の frame。 */
+export interface Phase2Frame {
+  txn: string;
+  c: Ts;
+  shards: string[];
+  local?: true;
+  sent?: true;
+}
+
+/** finalize と abort の frame。 */
+export interface SettleTxnFrame<R> {
+  req: R;
+  arrived?: true;
+  /** 運んだ piece の決着を、まだ転送していない先。 */
+  queue?: [string, Piece[]][];
+}
+
+/** queryTxn と status の frame。 */
+export interface TxnQueryFrame<R> {
+  req: R;
+  waited?: true;
+}
+
+/** redrive の frame。 */
+export interface RedriveFrame {
+  more?: boolean;
+  errors?: string[];
+  /** 届け終えていない確定、受け取り中の範囲 (配列と位置)、取り残された intent。 */
+  txns?: Row[];
+  ranges?: IncomingRange[];
+  at?: number;
+  orphans?: Intent[];
+  last?: Outcome<unknown>;
+}
+
+/** 失敗しても続ける仕事 1 つの frame。待ちの失敗を、結果として返す。 */
+export interface GuardedFrame {
+  effect: Effect;
+  out?: Outcome<unknown>;
+}
+
+/** 取り残された intent の決着の frame。 */
+export interface OrphanFrame {
+  anchor: string;
+  txn: string;
+  res?: TxnStatus;
+  finishing?: true;
+}
+
+/** 手続きごとの、frame と結果の型。 */
+export interface Sig {
+  schema: [SchemaFrame, void];
+  reach: [ReachFrame, void];
+  apply: [ApplyFrame, void];
+  schemaFailed: [SchemaFailedFrame, void];
+  settleAll: [SettleAllFrame, void];
+  arrive: [ArriveFrame, void];
+  beginIncoming: [BeginIncomingFrame, { schema: number }];
+  fence: [FenceFrame, void];
+  pull: [PullFrame, PiecePayload[]];
+  fetch: [FetchFrame, void];
+  receive: [ReceiveFrame, void];
+  drain: [DrainFrame, { groups: number; rows: number; bytes: number }];
+  foreignLocks: [ForeignLocksFrame, void];
+  locked: [LockedFrame, ExecRes];
+  settle: [SettleFrame, Ts];
+  exec: [ExecFrame, ExecRes];
+  execAuto: [AutoFrame, ExecRes];
+  direct: [DirectFrame, ExecRes | null];
+  commitLocal: [PrepareFrame<Omit<PrepareReq, "anchor">>, CommitRes];
+  prepare: [PrepareFrame<PrepareReq>, PrepareRes];
+  unchanged: [UnchangedFrame, { ok: boolean; reason?: string }];
+  syncSchema: [SyncSchemaFrame, { moving: boolean }];
+  commit: [CommitFrame, CommitRes];
+  drive: [DriveFrame, CommitRes];
+  phase2: [Phase2Frame, void];
+  finalize: [SettleTxnFrame<{ txn: string; c: Ts; pieces?: Piece[] }>, void];
+  abort: [SettleTxnFrame<{ txn: string; pieces?: Piece[] }>, void];
+  queryTxn: [TxnQueryFrame<{ txn: string; pushTo: Ts }>, TxnStatus];
+  status: [TxnQueryFrame<{ txn: string }>, TxnStatus];
+  redrive: [RedriveFrame, boolean];
+  guarded: [GuardedFrame, Outcome<unknown>];
+  orphan: [OrphanFrame, void];
+}
+
 export class ShardKernel {
   readonly id: string;
   epoch = 0;
-  b: Backend;
-  hlc = new Hlc(0);
-  ceiling: Ts = 0;
-  defs = new Map<string, TableDef>();
-  schema = 0;
+  private b: Backend;
+  private hlc = new Hlc(0);
+  private ceiling: Ts = 0;
+  private defs = new Map<string, TableDef>();
+  private schema = 0;
+  /** 表定義の適用が進行中か。殻が、適用を始めるときと終えたときに書く。 */
+  private schemaChanging = false;
   /** 直近の write の索引。キーごとの最新 commit 時刻だけを持ち、検査を O(1) にする。 */
-  recent = new Map<string, Ts>();
-  recentLowWater: Ts = 0;
-  maxCommit: Ts = 0;
-  logLowWater: Ts = 0;
-  ddlFloor: Ts = 0;
-  flushedTs: Ts = 0;
-  inflight = new Map<string, InFlight>();
-  fenced: FencedRange[] = [];
-  incoming: IncomingRange[] = [];
+  private recent = new Map<string, Ts>();
+  private recentLowWater: Ts = 0;
+  private maxCommit: Ts = 0;
+  private logLowWater: Ts = 0;
+  private ddlFloor: Ts = 0;
+  private flushedTs: Ts = 0;
+  private inflight = new Map<string, Flight>();
+  private fenced: FencedRange[] = [];
+  private incoming: IncomingRange[] = [];
   // 送り出しと到着の記録は、表では piece ごと (g, lo, after) に持つ。いまは、どの piece もグループの全体 (位置の区間が端から端まで) で、
   // fence はブロックを途中で切らないので、メモリではグループの名前で引く。
   /** 親：移動済みグループ。 */
-  moved = new Map<string, { m: Ts; to: string; acked: boolean }>();
+  private moved = new Map<string, { m: Ts; to: string; acked: boolean }>();
   /** 子：到着済みグループとその m。 */
-  arrived = new Map<string, Ts>();
-  maxArrived: Ts = 0;
+  private arrived = new Map<string, Ts>();
+  private maxArrived: Ts = 0;
   /** 行ロック。メモリだけに置く。消えても検証が F 以降の変更を見るので安全である。 */
-  locks = new Map<string, RowLock>();
-  waiters = new Map<string, Waiter[]>();
-  stats = { at: 0, reads: 0, writes: 0, groups: new Map<string, number>() };
-  faults: Faults;
-  K: number;
-  rt: Runtime;
+  private locks = new Map<string, RowLock>();
+  private waiters = new Map<string, Waiter[]>();
+  private stats = { at: 0, reads: 0, writes: 0, groups: new Map<string, number>() };
+  private faults: Faults;
+  private K: number;
+  private rt: Pick<Runtime, "now">;
 
-  constructor(readonly deps: ShardDeps) {
+  constructor(private deps: KernelDeps) {
     this.id = deps.id;
     this.b = deps.backend;
     this.rt = deps.runtime ?? systemRuntime;
@@ -245,9 +587,14 @@ export class ShardKernel {
     this.boot();
   }
 
+  /** 試験が、状態を確かめるのに覗く。 */
+  peek(): { locks: ReadonlyMap<string, RowLock>; recentLowWater: Ts } {
+    return { locks: this.locks, recentLowWater: this.recentLowWater };
+  }
+
   // ---- 起動と永続メタデータ ----
 
-  boot(): void {
+  private boot(): void {
     const b = this.b;
     b.exec(`CREATE TABLE IF NOT EXISTS __meta(k TEXT PRIMARY KEY, v)`);
     // ほかの表に触る前に確かめる。新しい形式の DO を、古いコードが作り変えてしまわないようにする。
@@ -315,11 +662,11 @@ export class ShardKernel {
   }
 
   /** 初めて開く DO に、変更ログの世代の一覧を作る。保存の形式を変えたときの移行は checkStorageFormat (src/types.ts) に置く。 */
-  initStorage(): void {
+  private initStorage(): void {
     if (this.metaGet("log_gens") === null) this.metaSet("log_gens", JSON.stringify([]));
   }
 
-  logGens(): number[] {
+  private logGens(): number[] {
     return JSON.parse((this.metaGet("log_gens") as string | null) ?? "[]") as number[];
   }
 
@@ -327,7 +674,7 @@ export class ShardKernel {
    * 変更ログを commit_ts の昇順で読む。世代は commit_ts の範囲で分かれているので、古い世代から順に読めば全体も昇順になる。
    * where は `commit_ts > ?` のような条件で、各世代の表に同じものを付ける。
    */
-  logScan(where: string, params: Value[], limit?: number): Row[] {
+  private logScan(where: string, params: Value[], limit?: number): Row[] {
     const out: Row[] = [];
     for (const g of this.logGens()) {
       const rest = limit === undefined ? "" : ` LIMIT ${limit - out.length}`;
@@ -341,7 +688,7 @@ export class ShardKernel {
    * 変更ログを commit 時刻の順に 1 行ずつ読む。fn が false を返したらそこでやめる。
    * 保持窓の全行を配列にすると、書き込みの多いシャードでは起動と過去時点の読みがメモリを使い切る。
    */
-  logEach(where: string, params: Value[], fn: (commitTs: Ts, txn: string, blob: string) => boolean | void): void {
+  private logEach(where: string, params: Value[], fn: (commitTs: Ts, txn: string, blob: string) => boolean | void): void {
     for (const g of this.logGens()) {
       const { rows } = this.b.iterate(`SELECT commit_ts, txn, blob FROM __log_g${g} ${where} ORDER BY commit_ts`, ...params);
       for (const r of rows) {
@@ -351,7 +698,7 @@ export class ShardKernel {
   }
 
   /** commit の変更ログを、c の世代の表へ書く。必ず書き込みの取引の中で呼ぶ。 */
-  logInsert(c: Ts, txn: string, blob: string): void {
+  private logInsert(c: Ts, txn: string, blob: string): void {
     const g = Math.floor(tsToPhysical(c) / (this.deps.logGenMs ?? LOG_GEN_MS));
     const gens = this.logGens();
     if (!gens.includes(g)) {
@@ -369,7 +716,7 @@ export class ShardKernel {
    * DROP TABLE は行の書き込みとして課金されないので、GC の費用は世代の数にしかよらない。
    * 消す前に logLowWater を上げるので、消した範囲を必要とする読みと検証は ReadTooOld か abort になる。
    */
-  gc(writing?: number): void {
+  private gc(writing?: number): void {
     const now = this.deps.clock.now();
     let water = Math.min(this.hlc.value, physicalToTs(now)) - physicalToTs(this.deps.logRetainMs ?? LOG_RETAIN_MS);
     // 未決着の intent は、その prepare 以降に commit し得る。分析へ未送出の範囲も残す。
@@ -408,22 +755,22 @@ export class ShardKernel {
     else this.b.exec(`DELETE FROM __txn WHERE done = 1 AND at < ?`, cutoff);
   }
 
-  metaGet(k: string): Value {
+  private metaGet(k: string): Value {
     return this.b.exec(`SELECT v FROM __meta WHERE k = ?`, k)[0]?.v ?? null;
   }
-  metaSet(k: string, v: Value): void {
+  private metaSet(k: string, v: Value): void {
     this.b.exec(`INSERT INTO __meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, k, v);
   }
 
   /** 適用に失敗し、取り消せもしなかった DDL。直るまで、このシャードは要求を受けられない。 */
-  schemaStuck: { version: number; message: string } | null = null;
+  private schemaStuck: { version: number; message: string } | null = null;
 
-  def(table: string): TableDef {
+  private def(table: string): TableDef {
     const d = this.defs.get(table);
     if (!d) throw new SqlError(`no such table: ${table}`);
     return d;
   }
-  loadDefs(e: DdlEntry): void {
+  private loadDefs(e: DdlEntry): void {
     for (const d of e.defs) this.defs.set(d.name, d);
     for (const n of e.drops) this.defs.delete(n);
   }
@@ -436,17 +783,17 @@ export class ShardKernel {
   // ---- 時計 ----
 
   /** HLC を進めた値が保存済みの上限を超えたら、上限を先取りして保存する (最大で毎秒 1 回)。 */
-  guardCeiling(): void {
+  private guardCeiling(): void {
     if (this.faults.hlcNoCeiling || this.hlc.value <= this.ceiling) return;
     this.ceiling = this.hlc.value + SECOND;
     this.metaSet("ceiling", this.ceiling);
   }
-  issue(): Ts {
+  private issue(): Ts {
     const t = this.hlc.tick(this.deps.clock.now());
     this.guardCeiling();
     return t;
   }
-  observe(ts: Ts | undefined): void {
+  private observe(ts: Ts | undefined): void {
     if (ts === undefined) return;
     // 時刻は呼び出し側から届く。接続をまたいで順序を保つ token は、利用者のブラウザを経由することもある。
     // そのまま受け入れると、大きな値 1 つで時計が進みきり、以後の時刻が重複して、変更ログの行が失われる。
@@ -464,22 +811,22 @@ export class ShardKernel {
   // いまは、fence も受け取り中の範囲もブロックを途中で切らないので、同じ shard key の 1 行と全体は、同じ範囲に当たる。
 
   /** 所有を確かめる対象の区間。pk を省くと、その shard key のブロックの全体である。 */
-  areaOf(sk: string, pk?: string): Interval {
+  private areaOf(sk: string, pk?: string): Interval {
     if (pk === undefined) return blockOf(sk);
     const token = tokenOf(sk, pk);
     return { start: token, end: token + 1 };
   }
-  fencedIn(area: Interval): FencedRange | undefined {
+  private fencedIn(area: Interval): FencedRange | undefined {
     return this.fenced.find((f) => overlaps(f, area));
   }
-  incomingIn(area: Interval): IncomingRange | undefined {
+  private incomingIn(area: Interval): IncomingRange | undefined {
     return this.incoming.find((f) => overlaps(f, area));
   }
   /**
    * 所有を確かめる対象。書く行、範囲の順に並べる。この順は、sksOf の順と同じである。
    * 複数の対象が別々の理由で断られるとき、先に並んだものの理由が、要求の答えになる。
    */
-  areasOf(spans: Span[], writes: Pick<Change, "pk" | "sk">[]): { sk: string; area: Interval }[] {
+  private areasOf(spans: Span[], writes: Pick<Change, "pk" | "sk">[]): { sk: string; area: Interval }[] {
     const out = writes.map((w) => ({ sk: w.sk, area: this.areaOf(w.sk, w.pk) }));
     for (const s of spans) {
       if (s.kind === "pk") out.push({ sk: s.sk, area: this.areaOf(s.sk, s.pk) });
@@ -492,7 +839,7 @@ export class ShardKernel {
    * シャードの手順 (グループの列挙、pull、ack) は、まだグループの全体を運ぶことを前提にしている。途中まで受けると、
    * 同じ shard key の、範囲の外の行まで運んでしまうので、範囲の移動の入口で断る。
    */
-  wholeSlotsOnly(x: Interval): void {
+  private wholeSlotsOnly(x: Interval): void {
     try {
       checkInterval(x);
     } catch (e) {
@@ -500,7 +847,7 @@ export class ShardKernel {
     }
     if (!slotAligned(x)) throw new SqlError(`moving a part of a slot is not supported yet: ${rangeText(x)}`);
   }
-  sksOf(spans: Span[], writes: Pick<Change, "sk">[] = []): string[] {
+  private sksOf(spans: Span[], writes: Pick<Change, "sk">[] = []): string[] {
     const out = new Set<string>(writes.map((w) => w.sk));
     for (const s of spans) if (s.kind === "pk" || s.kind === "sk" || (s.kind === "pred" && s.sk)) out.add(s.sk!);
     return [...out];
@@ -515,7 +862,7 @@ export class ShardKernel {
    * 決着の問い合わせは、相手の取引の確定の時刻を押し上げる。持ち主でない要求は結局断るので、問い合わせる前に断る。
    * そこで通っても、決着を待った後で enter がもう一度確かめる。
    */
-  assertOwned({ spans, writes, at: T }: Rows): void {
+  private assertOwned({ spans, writes, at: T }: Rows): void {
     for (const { sk, area } of this.areasOf(spans, writes)) {
       const f = this.fencedIn(area);
       if (f && !this.faults.ignoreFence) throw new NotOwner(f.to);
@@ -556,10 +903,10 @@ export class ShardKernel {
    *     確かめる。1 行は token 1 つ、shard key の範囲はブロックの全体、全表の範囲は読み手の claim である。
    * 確かめるだけで、状態は変えない。時計を進める、数える、ロックを延ばすのは、呼び出し側が区間の中でする。
    */
-  enter(claim: Plan & Rows): Section<Check>;
-  enter(claim: Plan): Section<"schema">;
-  enter(claim: Rows): Section<"owned">;
-  enter(claim: Partial<Plan> & Partial<Rows>): Section<Check> {
+  private enter(claim: Plan & Rows): Section<Check>;
+  private enter(claim: Plan): Section<"schema">;
+  private enter(claim: Rows): Section<"owned">;
+  private enter(claim: Partial<Plan> & Partial<Rows>): Section<Check> {
     const rechecked: { schema?: true; owned?: true } = {};
     if ("schema" in claim) {
       if (!this.faults.noSchemaRecheck && claim.schema !== this.schema) throw new NotOwner(`stale schema ${claim.schema} < ${this.schema}`);
@@ -575,7 +922,7 @@ export class ShardKernel {
   // ---- ライブ移動 ----
 
   /** 範囲の移動の途中か。送り出し中 (fence 済みで未完了) か、受け取り中である。 */
-  moving(): boolean {
+  private moving(): boolean {
     return this.incoming.length > 0 || this.fenced.some((f) => !f.done);
   }
 
@@ -745,7 +1092,7 @@ export class ShardKernel {
     return out;
   }
 
-  count(kind: "reads" | "writes", spans: Span[], writes: Pick<Change, "sk">[] = []): void {
+  private count(kind: "reads" | "writes", spans: Span[], writes: Pick<Change, "sk">[] = []): void {
     // 起動後の最初の要求から数え始める。0 のままだと最初の報告の経過時間が 0 になり、
     // Autoscaler は眠っていたシャードの負荷を次の問い合わせまで判断できない。
     if (this.stats.at === 0) this.stats.at = this.deps.clock.now();
@@ -756,7 +1103,7 @@ export class ShardKernel {
 
   // ---- 行ロック ----
 
-  lockKey(table: string, pk: string): string {
+  private lockKey(table: string, pk: string): string {
     return `${table}\0${pk}`;
   }
 
@@ -777,21 +1124,21 @@ export class ShardKernel {
     next?.wake();
   }
 
-  wakeAll(key: string): void {
+  private wakeAll(key: string): void {
     for (const w of this.waiters.get(key) ?? []) w.wake();
     this.waiters.delete(key);
   }
 
-  grant(key: string, owner: LockOwner): void {
+  private grant(key: string, owner: LockOwner): void {
     this.locks.set(key, { ...owner, expires: this.deps.clock.now() + (this.deps.lockTtlMs ?? LOCK_TTL_MS) });
   }
 
-  renew(txn: string): void {
+  private renew(txn: string): void {
     const until = this.deps.clock.now() + (this.deps.lockTtlMs ?? LOCK_TTL_MS);
     for (const l of this.locks.values()) if (l.txn === txn) l.expires = until;
   }
 
-  releaseLocks(txn: string): void {
+  private releaseLocks(txn: string): void {
     const id = lockIdOf(txn);
     for (const [key, l] of this.locks) {
       if (l.txn !== id) continue;
@@ -804,6 +1151,67 @@ export class ShardKernel {
     this.releaseLocks(req.txn);
   }
 
+  // ---- 行を待つ (殻の waitForRow が使う) ----
+  //
+  // 待ち手の列と、奪う判断は、核が持つ。殻は、期限、奪うまでの猶予、保持者の期限切れの 3 つのタイマーを掛け、起こされるのを待つ。
+
+  /**
+   * 行を押さえている相手。ロックの持ち主か、欠陥 woundPrepared のときは、ロックのない行の intent の持ち主 (prepare 済みの取引) である。
+   * intent に開始時刻はないので、prepare_ts の物理時刻で代える。
+   */
+  holderOf(key: string): { lock: RowLock | undefined; intent: Intent | undefined; held: LockOwner | undefined } {
+    const lock = this.liveLock(key);
+    const cut = key.indexOf("\0");
+    const intent = !lock && this.faults.woundPrepared ? this.intentAt(key.slice(0, cut), key.slice(cut + 1)) : undefined;
+    const held: LockOwner | undefined = lock ?? (intent && { txn: intent.txn, start: tsToPhysical(intent.prepare_ts) });
+    return { lock, intent, held };
+  }
+
+  /**
+   * 待ち手を、行の列に入れる。古い取引を先に起こす。同じ開始時刻の間は到着順である。
+   * 返すのは、入れた列である。待ち手は、去るときに、入れた列から自分を消す (leave)。
+   */
+  enqueue(key: string, w: Waiter): Waiter[] {
+    const list = this.waiters.get(key) ?? [];
+    const at = list.findIndex((x) => this.older(w, x));
+    list.splice(at < 0 ? list.length : at, 0, w);
+    this.waiters.set(key, list);
+    return list;
+  }
+
+  leave(list: Waiter[], w: Waiter): void {
+    const at = list.indexOf(w);
+    if (at >= 0) list.splice(at, 1);
+  }
+
+  /**
+   * 古い取引が、猶予の後で、若い保持者から行を奪う (wound-wait)。保持者が替わっていたら、奪わずに false を返す。
+   * 奪われた取引は commit の検証で気付く。
+   */
+  wound(key: string, held: LockOwner, intent: Intent | undefined): boolean {
+    if (intent) {
+      if (this.intentAt(intent.tbl, intent.pk)?.txn !== intent.txn) return false;
+      this.b.exec(`DELETE FROM __intents WHERE tbl = ? AND pk = ?`, intent.tbl, intent.pk);
+    } else {
+      if (this.locks.get(key)?.txn !== held.txn) return false;
+      this.locks.delete(key);
+    }
+    return true;
+  }
+
+  /** 進行中の確定の決着を待つものを登録する。 */
+  onSettled(txn: string, wake: () => void): void {
+    this.inflight.get(txn)!.waiters.push(wake);
+  }
+
+  /** 殻が、表定義の適用を始めたときと、終えたときに呼ぶ。 */
+  schemaChangeStarted(): void {
+    this.schemaChanging = true;
+  }
+  schemaChangeEnded(): void {
+    this.schemaChanging = false;
+  }
+
   /** 古い取引が優先される。 */
   older(a: LockOwner, b: LockOwner): boolean {
     return a.start < b.start || (a.start === b.start && a.txn < b.txn);
@@ -811,7 +1219,7 @@ export class ShardKernel {
 
 
 
-  blockedBy(changes: Pick<Change, "table" | "pk">[], me: LockOwner): string | null {
+  private blockedBy(changes: Pick<Change, "table" | "pk">[], me: LockOwner): string | null {
     for (const c of changes) {
       const key = this.lockKey(c.table, c.pk);
       const held = this.liveLock(key);
@@ -830,13 +1238,13 @@ export class ShardKernel {
 
   // ---- intent の解決 ----
 
-  overlapping(spans: Span[], upTo: Ts): Intent[] {
+  private overlapping(spans: Span[], upTo: Ts): Intent[] {
     const all = this.b.exec(`SELECT * FROM __intents WHERE prepare_ts <= ?`, upTo) as unknown as Intent[];
     return all.filter((i) => spans.some((s) => spanCovers(s, i.tbl, i.pk, i.sk) && this.intentMatches(s, i)));
   }
 
   /** intent が述語に関わるか。適用後の行と、本体の現在の行のどちらかが満たせば関わる。 */
-  intentMatches(s: Span, i: Intent): boolean {
+  private intentMatches(s: Span, i: Intent): boolean {
     if (s.kind !== "pred") return true;
     const c = decode<Change>(i.change);
     const def = this.defs.get(s.table);
@@ -849,7 +1257,7 @@ export class ShardKernel {
    * 行イメージが述語を満たすかを本物の表で判定する。型親和性と照合順序が読み取りと同じになるからである。
    * 判定できないときは競合側へ倒す。誤って「関係ない」と答えると Serializable が破れる。
    */
-  rowMatches(s: Extract<Span, { kind: "pred" }>, def: TableDef, pk: string, row: Row): boolean {
+  private rowMatches(s: Extract<Span, { kind: "pred" }>, def: TableDef, pk: string, row: Row): boolean {
     try {
       return this.rollback(() => {
         deleteRow(this.b, def, pk);
@@ -864,7 +1272,7 @@ export class ShardKernel {
   }
 
   /** (from, 現在] の commit のうち、述語に関わるものがあるか。 */
-  predicateChanged(s: Extract<Span, { kind: "pred" }>, from: Ts): boolean {
+  private predicateChanged(s: Extract<Span, { kind: "pred" }>, from: Ts): boolean {
     const def = this.defs.get(s.table);
     if (!def || from < this.logLowWater || from < this.ddlFloor) return true;
     const rows = this.logScan(`WHERE commit_ts > ?`, [from], PRED_WINDOW + 1);
@@ -883,7 +1291,7 @@ export class ShardKernel {
 
   // ---- rollback-read ----
 
-  rollback<T>(fn: () => T): T {
+  private rollback<T>(fn: () => T): T {
     let out: { v: T } | undefined;
     try {
       this.b.tx(() => {
@@ -897,7 +1305,7 @@ export class ShardKernel {
   }
 
   /** T より後の commit について、pk ごとに最も古い before-image を集める。 */
-  deltaAfter(T: Ts): { table: string; pk: string; image: Row | null }[] {
+  private deltaAfter(T: Ts): { table: string; pk: string; image: Row | null }[] {
     if (T >= this.maxCommit) return [];
     const floor = Math.max(this.logLowWater, this.ddlFloor);
     if (T < floor) throw new ReadTooOld(`moved at ${floor}`);
@@ -914,7 +1322,7 @@ export class ShardKernel {
     return [...seen.values()];
   }
 
-  restore(targets: { table: string; pk: string; image: Row | null }[]): void {
+  private restore(targets: { table: string; pk: string; image: Row | null }[]): void {
     if (targets.length === 0) return;
     const cat = (t: string) => this.def(t);
     if (this.faults.rowwiseUndo) rowwiseRestore(this.b, cat, targets);
@@ -926,7 +1334,7 @@ export class ShardKernel {
    * 文の意味は SQLite が解釈し、変更行は trigger が捕捉するので、UPSERT や
    * INSERT ... SELECT のような構文でも Worker 側で解析する必要がない。
    */
-  run(sec: Section<"owned">, req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number; bytes?: number; over?: boolean } {
+  private run(sec: Section<"owned">, req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number; bytes?: number; over?: boolean } {
     const out = this.checked(sec, req, () => this.runStatement(req));
     // 取引の文は、ここでは変更を返すだけで、確定のときにもう一度確かめられる (assertWriteSetFits)。
     // ここでも断るのは、COMMIT まで待たずに、文の時点で伝えるためである。
@@ -942,7 +1350,7 @@ export class ShardKernel {
    * 要求の文は、run か、ここを通して実行する。同期区間の印を受け取るのは、区間に入っていない入口が文を実行できないように
    * するためである。
    */
-  checked<T>(_sec: Section<"owned">, req: ExecReq, exec: () => T): T {
+  private checked<T>(_sec: Section<"owned">, req: ExecReq, exec: () => T): T {
     const report = this.deps.spanEscape;
     if (!report || this.checking) return exec();
     this.checking = true;
@@ -966,10 +1374,10 @@ export class ShardKernel {
     }
     return exec();
   }
-  checking = false;
+  private checking = false;
 
   /** 範囲の外の行を、利用者の表と index の表から消す。行が多すぎて検査を省くときは false を返す。 */
-  deleteOutside(req: ExecReq): boolean {
+  private deleteOutside(req: ExecReq): boolean {
     const own = new Set((req.overlay ?? []).map((c) => `${c.table}\0${c.pk}`));
     const doomed: { def: TableDef; pk: string }[] = [];
     let seen = 0;
@@ -995,7 +1403,7 @@ export class ShardKernel {
     return true;
   }
 
-  runStatement(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number; bytes?: number; over?: boolean } {
+  private runStatement(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number; bytes?: number; over?: boolean } {
     if (!req.write) return { ...this.readLimited(req), changes: [] };
     const captured = this.runCaptured(req);
     if (captured) return captured;
@@ -1017,7 +1425,7 @@ export class ShardKernel {
   }
 
   /** 読み取りの文を実行し、上限を超えた時点で打ち切る。全行を集めてから数えると、数える前にメモリが尽きる。 */
-  readLimited(req: ExecReq): { columns: string[]; values: Value[][]; bytes?: number; over?: boolean } {
+  private readLimited(req: ExecReq): { columns: string[]; values: Value[][]; bytes?: number; over?: boolean } {
     const maxRows = Math.min(req.maxRows ?? SHARD_MAX_ROWS, SHARD_MAX_ROWS);
     const maxBytes = Math.min(req.maxBytes ?? SHARD_MAX_BYTES, SHARD_MAX_BYTES);
     const { columns, rows } = this.b.iterate(req.sql, ...req.params);
@@ -1040,7 +1448,7 @@ export class ShardKernel {
    * Worker から届いた文を、DO の SQLite の上限で測る。超える文は、何も読まず書かずに ShardLimit で断る。Worker はそれを受けて、
    * 文を基準経路で実行し直す (src/shard-limits.ts、計画書の不変条件 13)。
    */
-  withinLimits(req: Pick<ExecReq, "sql" | "params">): void {
+  private withinLimits(req: Pick<ExecReq, "sql" | "params">): void {
     const over = shardLimitOf(req.sql, req.params ?? []);
     if (over) throw new ShardLimit(over);
   }
@@ -1052,7 +1460,7 @@ export class ShardKernel {
    * trigger の捕捉は __cap、__capv、__cap_on へ書くので、ROLLBACK しても 1 文あたり 3 行が課金される。
    * 文の形が想定と合わなければ、その文だけを巻き戻して null を返す。呼び出し側は trigger の経路に任せる。
    */
-  runCaptured(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[] } | null {
+  private runCaptured(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[] } | null {
     const capture = req.write?.capture;
     const span = req.spans[0];
     // 2 つ目以降の範囲は、同じ表の、UNIQUE の検査で読む行だけである (spans.ts の規則 3)。ほかの表を読む文は、ここでは扱わない。
@@ -1091,13 +1499,13 @@ export class ShardKernel {
   }
 
 
-  intentAt(table: string, pk: string): Intent | undefined {
+  private intentAt(table: string, pk: string): Intent | undefined {
     return this.b.exec(`SELECT * FROM __intents WHERE tbl = ? AND pk = ?`, table, pk)[0] as unknown as Intent | undefined;
   }
 
   // ---- 検証 ----
 
-  touch(table: string, pk: string, sk: string, ts: Ts): void {
+  private touch(table: string, pk: string, sk: string, ts: Ts): void {
     for (const k of [`p\0${table}\0${pk}`, `s\0${table}\0${sk}`, `t\0${table}`, `s\0*\0${sk}`, `t\0*`]) {
       if ((this.recent.get(k) ?? 0) < ts) this.recent.set(k, ts);
     }
@@ -1107,7 +1515,7 @@ export class ShardKernel {
    * from より後の write があるか。to より後の write も含むので保守的に abort する側へ倒れる。
    * 答えは、範囲をこのシャードが持っているときだけ意味がある。だから、持ち主を確かめた同期区間の印を受け取る。
    */
-  changedSince(_sec: Section<"owned">, span: Span, from: Ts): boolean {
+  private changedSince(_sec: Section<"owned">, span: Span, from: Ts): boolean {
     const key =
       span.kind === "pk" ? `p\0${span.table}\0${span.pk}`
       : span.kind === "sk" ? `s\0${span.table}\0${span.sk}`
@@ -1123,7 +1531,7 @@ export class ShardKernel {
    * 検証に失敗したら理由を返す。`unique:` で始まる理由はリトライしても通らない。
    * 通った取引は、このまま確定するか intent を置く。だから、版と持ち主の両方を確かめた同期区間の印を受け取る。
    */
-  validate(sec: Section<Check>, txn: string, T: Ts, writes: Change[], spans: Span[]): string | null {
+  private validate(sec: Section<Check>, txn: string, T: Ts, writes: Change[], spans: Span[]): string | null {
     if (T < this.logLowWater || T < this.recentLowWater) return "T older than conflict window";
     const inf = Number.MAX_SAFE_INTEGER;
     for (const w of writes) {
@@ -1156,7 +1564,7 @@ export class ShardKernel {
    * intent は本体にないので、SQLite の制約では見つからない。見逃すと、確定済みの取引の phase 2 が
    * UNIQUE 違反で適用できなくなり、再駆動が永久に失敗する。書き込みの経路はすべてこれを通す。
    */
-  uniquePending(txn: string, writes: Change[]): string | null {
+  private uniquePending(txn: string, writes: Change[]): string | null {
     const constrained = writes.filter((w) => this.hasUniqueBeyondKey(w.table));
     if (!constrained.some((w) => w.after)) return null;
     // 衝突し得るのは、同じ表の、同じ shard key の値 (グループ) の行だけである。シャードの中の UNIQUE は、shard key の列を
@@ -1189,7 +1597,7 @@ export class ShardKernel {
    *   変更ログの 1 行に収まること。
    * 書き込み禁止の印は表定義にあるので、要求の版が現行であることを確かめた同期区間の印を受け取る。
    */
-  assertWriteSetFits(_sec: Section<"schema">, writes: Change[]): void {
+  private assertWriteSetFits(_sec: Section<"schema">, writes: Change[]): void {
     this.assertUnlocked(writes);
     if (this.faults.noWriteSetLimit || writes.length === 0) return;
     let bytes = 0;
@@ -1202,7 +1610,7 @@ export class ShardKernel {
   }
 
   /** 書き込む表が、表定義の変更で書き込み禁止になっていないか。 */
-  assertUnlocked(writes: Pick<Change, "table">[]): void {
+  private assertUnlocked(writes: Pick<Change, "table">[]): void {
     if (this.faults.ignoreTableLock) return;
     for (const w of writes) {
       const def = this.defs.get(w.table);
@@ -1212,11 +1620,11 @@ export class ShardKernel {
   }
 
   /** 主キーが違っても衝突し得る表か。UNIQUE index のある表である。 */
-  hasUniqueBeyondKey(table: string): boolean {
+  private hasUniqueBeyondKey(table: string): boolean {
     return this.def(table).uniques.length > 0;
   }
 
-  checkUnique(txn: string, writes: Change[]): string | null {
+  private checkUnique(txn: string, writes: Change[]): string | null {
     const constrained = writes.filter((w) => this.hasUniqueBeyondKey(w.table));
     if (constrained.length === 0) return null;
     const pending = this.uniquePending(txn, constrained);
@@ -1231,7 +1639,7 @@ export class ShardKernel {
 
   // ---- 書き込み ----
 
-  applyAndLog(txn: string, c: Ts, changes: Change[]): void {
+  private applyAndLog(txn: string, c: Ts, changes: Change[]): void {
     const logged = changes.map((ch) => {
       const before = selectRow(this.b, this.def(ch.table), ch.pk);
       return { ...ch, before };
@@ -1241,7 +1649,7 @@ export class ShardKernel {
   }
 
   /** 本体へ適用済みの変更を変更ログと直近 write の索引へ記録する。 */
-  logChanges(txn: string, c: Ts, logged: Change[]): void {
+  private logChanges(txn: string, c: Ts, logged: Change[]): void {
     this.logInsert(c, txn, encode(logged));
     this.maxCommit = Math.max(this.maxCommit, c);
     for (const ch of logged) this.touch(ch.table, ch.pk, ch.sk, c);
@@ -1249,7 +1657,7 @@ export class ShardKernel {
   }
 
   /** 索引が膨らんだら捨てて low-water を上げる。それより古い T の取引は保守的に abort する。 */
-  pruneRecent(): void {
+  private pruneRecent(): void {
     if (this.recent.size < (this.deps.recentMax ?? 200_000)) return;
     this.recentLowWater = this.hlc.value;
     this.recent.clear();
@@ -1261,7 +1669,7 @@ export class ShardKernel {
    * prepare の同期区間。呼び出し側 (prepare と、anchor の drive) が、版を確かめて区間に入ってから呼ぶ。
    * 持ち主は、ここで確かめる。再送への答えと、書き込みの大きさの確認が、その前に来るからである。
    */
-  prepareSync(plan: Section<"schema">, req: PrepareReq): PrepareRes {
+  private prepareSync(plan: Section<"schema">, req: PrepareReq): PrepareRes {
     const dup = this.b.exec(`SELECT prepare_ts FROM __intents WHERE txn = ? LIMIT 1`, req.txn)[0];
     // 同じ 2PC の ID の intent がもうある。ID は続きの中身の指紋を含むので、同じ書き込みの prepare の再送である。同じ答えを返す。
     if (dup) return { ok: true, prepareTs: dup.prepare_ts as Ts };
@@ -1332,13 +1740,13 @@ export class ShardKernel {
 
 
   /** 移動済みグループの intent は親で適用しない。応答が飛行中だと、適用した分が子に届かず消えるからである。 */
-  localIntents(txn: string): Intent[] {
+  private localIntents(txn: string): Intent[] {
     const rows = this.b.exec(`SELECT * FROM __intents WHERE txn = ?`, txn) as unknown as Intent[];
     return this.faults.applyAfterMoved ? rows : rows.filter((r) => !this.moved.has(r.sk));
   }
 
   /** 取引の intent を運んだ piece を、転送先ごとに返す。 */
-  forwards(txn: string): Map<string, Piece[]> {
+  private forwards(txn: string): Map<string, Piece[]> {
     const out = new Map<string, Piece[]>();
     if (this.faults.applyAfterMoved) return out;
     for (const r of this.b.exec(`SELECT g, lo, "after", dest FROM __moved_txn WHERE txn = ?`, txn)) {
@@ -1356,7 +1764,7 @@ export class ShardKernel {
 
   // ---- anchor への照会 ----
 
-  decided(txn: string): TxnStatus | null {
+  private decided(txn: string): TxnStatus | null {
     const r = this.b.exec(`SELECT status, c FROM __txn WHERE txn = ?`, txn)[0];
     if (!r) return null;
     return r.status === "committed" ? { status: "committed", c: r.c as Ts } : { status: "aborted" };
@@ -1375,6 +1783,1201 @@ export class ShardKernel {
   /** 直近の redrive で失敗した処理の理由。運用の診断に使う。 */
   lastRedriveErrors: string[] = [];
 
+
+  // ---- 手続き ----
+  //
+  // ここから下は、待ちを含む要求の処理である。どれも同期の 1 歩 (xxxStep) で、殻 (core.ts の walk) が、終わるまで繰り返し呼ぶ。
+  // 1 歩は、frame を見て、済んでいない最初のことをする。待つ必要があれば、待ち (Effect) を返す。待ちの後は、同じ 1 歩が
+  // 先頭から呼ばれるので、待ちの前に読んだ状態は、frame に書いたもの以外、残らない。
+
+  /** 核の別の手続きを走らせる待ち。 */
+  private call<N extends keyof Sig>(program: N, frame: Sig[N][0]): Effect {
+    return { kind: "call", program, frame };
+  }
+  private peer<M extends keyof ShardApi>(to: string, method: M, req: Parameters<ShardApi[M]>[0]): PeerCall {
+    return { to, method, req };
+  }
+
+  /**
+   * 確かめ直さずに、同期区間の印を作る。今日のコードが、待ちの後で確かめ直していない所を、そのまま写すためにある。
+   * 引数は、未解決の問題の番号である。直すときは、enter に置き換える。
+   */
+  private unchecked(_problem: 26): Section<Check> {
+    return Section[ENTER]({ schema: true, owned: true });
+  }
+
+  // ---- 手続き: 表定義 ----
+
+  /**
+   * 要求の計画の版が、このシャードの現行の版であるようにする。古い版の要求は断る。先の版なら、そこまで適用してから、もう一度確かめる。
+   */
+  private schemaStep(f: SchemaFrame): Step<void, SchemaFrame> {
+    const version = f.version;
+    if (f.again) return done(undefined);
+    if (f.reached) {
+      // Meta にある版は全部適用するので、要求の版を通り越していることがある。要求の版が取り消されたときもそうなる。
+      // その場合は、この要求が古い。
+      f.again = true;
+      return wait(this.call("schema", { version }));
+    }
+    // 古い表定義の要求を通すと、新しいグローバル index の更新が漏れる。経路と同じく取り直させる。
+    if (version < this.schema) throw new NotOwner(`stale schema ${version} < ${this.schema}`);
+    if (version === this.schema) {
+      // DDL の適用が intent の決着を待っている間は、古い表定義の新しい要求を受けない。
+      // 受けると intent が増え続けて、DDL がいつまでも適用できない。呼び出し側は表定義を取り直して、同じ待ちに合流する。
+      if (this.schemaChanging) throw new NotOwner(`stale schema ${version}: a schema change is being applied`);
+      return done(undefined);
+    }
+    f.reached = true;
+    return wait(this.call("reach", { version, catchUp: false }));
+  }
+
+  /**
+   * 少なくともこの版まで DDL を適用する。先の版まで進んでもよい。
+   * 要求の計画の版を確かめる schemaStep と違い、増設の手順 (受け入れ、fence、行の受け取り) が使う。
+   * そこでは「この版より古くない」ことだけが要る。
+   */
+  private reachStep(f: ReachFrame): Step<void, ReachFrame> {
+    if (f.before !== undefined) {
+      if (this.schema === f.before) throw new SqlError(`schema version ${f.version} is not recorded yet (shard ${this.id} is at ${f.before})`);
+      f.before = undefined;
+    }
+    if (!(f.version > this.schema)) return done(undefined);
+    // 追いつくための適用は、移動の途中でも通る。進行中の通常の適用 (移動の途中は断られる) には合流しない。
+    if (f.catchUp && this.schemaChanging) return wait({ kind: "schemaChangeOver" });
+    f.before = this.schema;
+    return wait({ kind: "schemaChange", catchUp: f.catchUp });
+  }
+
+  /**
+   * Meta から DDL を取り、順に適用する。
+   * 先に、このシャードが持つ intent をすべて決着させる。intent の行イメージは DDL より前の表の形なので、
+   * 表や列が消えた後では適用できない。確定済みの取引がそうなると、再駆動が永久に失敗する。
+   */
+  private applyStep(f: ApplyFrame): Step<void, ApplyFrame> {
+    if (!f.settled) {
+      // 範囲の移動の途中は適用しない。親と子の版がずれると、運ぶ行と intent の形が受け取る側の表と合わなくなる。
+      // 親は intent を決着させないと DDL を適用できず、その決着は子へ転送され、子はその行を受け取れない、という行き詰まりになる。
+      // 子が親の版へ追いつく場合 (catchUp) だけは通す。届く行がその版の形だからである。
+      if (!f.catchUp && this.moving()) throw new ConflictError(`schema change is waiting for a shard split on ${this.id} to finish`);
+      f.settled = true;
+      if (!this.faults.ddlIgnoresIntents) return wait(this.call("settleAll", {}));
+    }
+    if (!f.got) return wait({ kind: "meta", method: "ddlSince", args: [this.schema] }, "got");
+    const { ddl } = f.got;
+    // 取り消された版と、それを取り消す版。このシャードがまだ適用していなければ、両方とも実行しない。
+    const skip = new Set<number>();
+    for (const e of ddl) if (e.reverts !== undefined && e.reverts > this.schema) skip.add(e.reverts).add(e.version);
+    for (const e of ddl) {
+      if (e.version <= this.schema) continue;
+      const skipped = skip.has(e.version);
+      try {
+        this.b.tx(() => {
+          if (!skipped) for (const s of e.sql) this.b.exec(s);
+          this.b.exec(`INSERT INTO __ddl(version, entry) VALUES (?, ?)`, e.version, JSON.stringify(skipped ? { ...e, skipped } : e));
+        });
+      } catch (err) {
+        return tail(this.call("schemaFailed", { entry: e, message: (err as Error).message }));
+      }
+      this.schemaStuck = null;
+      if (!skipped) this.loadDefs(e);
+      this.schema = e.version;
+      // index を公開する版は、時刻を運ぶ。index を使わずに確定した書き込みは、どのシャードのものも、この時刻以下である。
+      // ここから先、このシャードで読む文は index を使う。その文が、時刻の順で、それらの書き込みの後ろに来るようにする。
+      if (e.at !== undefined && !this.faults.publishWithoutClock) this.observe(e.at);
+      // 変更ログの行イメージは DDL より前の形なので、それより古い T は読み戻せない。
+      this.ddlFloor = this.issue();
+      this.metaSet("ddl_floor", this.ddlFloor);
+    }
+    return done(undefined);
+  }
+
+  /**
+   * このシャードの行では DDL を適用できなかった。重複のある列への UNIQUE index や、既存の行が CHECK に反する ADD COLUMN で起きる。
+   * 放置すると、このシャードは全要求を断り続ける。Meta に取り消しを求め、取り消す版ごと読み飛ばして先へ進む。
+   */
+  private schemaFailedStep(f: SchemaFailedFrame): Step<void, SchemaFailedFrame> {
+    const e = f.entry;
+    if (!f.asked) {
+      f.asked = true;
+      return wait({ kind: "meta", method: "revokeDdl", args: [e.version, f.message], orNull: true }, "reverted");
+    }
+    if (f.reverted === null) {
+      this.schemaStuck = { version: e.version, message: f.message };
+      throw new SqlError(`schema change ${e.version} cannot be applied on shard ${this.id}: ${f.message}`);
+    }
+    return tail(this.call("apply", { catchUp: true }));
+  }
+
+  /**
+   * 持っている intent を、anchor に尋ねて全部決着させる。進行中の取引は終わるまで待つ。
+   * 待っている間、新しい prepare は schemaStep が断るので、intent は増えない。
+   */
+  private settleAllStep(f: SettleAllFrame): Step<void, SettleAllFrame> {
+    // 待ちは実時間のタイマーなので、期限も実時間で測る。
+    f.deadline ??= this.rt.now() + SCHEMA_WAIT_MS;
+    for (;;) {
+      if (!f.batch) {
+        const pending = this.b.exec(`SELECT DISTINCT txn, anchor FROM __intents`) as unknown as Intent[];
+        if (pending.length === 0) return done(undefined);
+        f.batch = pending;
+      }
+      const i = f.batch[0];
+      if (i) {
+        if (!f.res) return wait({ kind: "ask", anchor: i.anchor, txn: i.txn, pushTo: 0 }, "res");
+        if (!f.finishing) {
+          f.finishing = true;
+          if (f.res.status === "committed") return wait(this.call("finalize", { req: { txn: i.txn, c: f.res.c } }));
+          if (f.res.status === "aborted") return wait(this.call("abort", { req: { txn: i.txn } }));
+        }
+        f.batch.shift();
+        f.res = undefined;
+        f.finishing = undefined;
+        continue;
+      }
+      if (!f.slept) {
+        if ((this.b.exec(`SELECT count(*) n FROM __intents`)[0]!.n as number) === 0) return done(undefined);
+        if (this.rt.now() > f.deadline) {
+          throw new ConflictError("schema change is waiting for transactions on this shard to finish");
+        }
+        f.slept = true;
+        return wait({ kind: "sleep", ms: 5 });
+      }
+      f.slept = undefined;
+      f.batch = undefined;
+    }
+  }
+
+  private syncSchemaStep(f: SyncSchemaFrame): Step<{ moving: boolean }, SyncSchemaFrame> {
+    if (!f.asked) {
+      f.asked = true;
+      if (f.req.version > this.schema) return wait(this.call("schema", { version: f.req.version }));
+    }
+    return done({ moving: this.moving() });
+  }
+
+  // ---- 手続き: ライブ移動 ----
+
+  /** 未着のグループを引き取る。 */
+  private arriveStep(f: ArriveFrame): Step<void, ArriveFrame> {
+    if (f.asked) return done(undefined);
+    const wanted = f.groups.filter((g) => this.incomingIn(this.areaOf(g)) && !this.arrived.has(g));
+    if (!wanted.length) return done(undefined);
+    f.asked = true;
+    return wait({ kind: "pull", groups: wanted });
+  }
+
+  private beginIncomingStep(f: BeginIncomingFrame): Step<{ schema: number }, BeginIncomingFrame> {
+    const req = f.req;
+    if (f.stored) return done({ schema: this.schema });
+    const range = intervalOf(req);
+    const same = () => this.incoming.some((x) => sameInterval(x, range) && x.from_id === req.from);
+    if (!f.slot) {
+      this.wholeSlotsOnly(req);
+      if (same()) return done({ schema: this.schema });
+      // Meta が分割に渡した枠を示す。枠がある間、Meta は新しい版を記録しない (specs/m15_maintenance_slot.qnt)。
+      // 受け取り始める版は、枠を取ったときの Meta の版である。分割を進める側が先に読んだ版は使わない。間に記録された版を、
+      // 親だけが先に適用していると、子が親より古い版で受け取り始め、子へ移った行を読めなくなる。
+      return wait({ kind: "meta", method: "startSplit", args: [req.slot, { parent: req.from, child: this.id, ...range }] }, "slot");
+    }
+    if (!f.reached) {
+      f.reached = true;
+      return wait(this.call("reach", { version: f.slot.version, catchUp: false }));
+    }
+    if (same()) return done({ schema: this.schema });
+    // 重なる範囲を別の親から受け取ると、どちらの行が正しいのか決められない。送り出し中のシャードも子にしない。
+    const clash = this.incomingIn(range);
+    if (clash) throw new SqlError(`shard ${this.id} is already receiving ${rangeText(clash)} from ${clash.from_id}`);
+    if (this.fenced.some((x) => !x.done)) throw new ConflictError(`shard ${this.id} is still handing a range over; it cannot receive one until that finishes`);
+    this.b.exec(`INSERT INTO __incoming(lo, hi, from_id) VALUES (?, ?, ?)`, range.start, range.end, req.from);
+    this.incoming.push({ ...range, from_id: req.from });
+    f.stored = true;
+    return wait({ kind: "sync" });
+  }
+
+  private fenceStep(f: FenceFrame): Step<void, FenceFrame> {
+    const req = f.req;
+    if (f.stored) return done(undefined);
+    const range = intervalOf(req);
+    const same = () => this.fenced.some((x) => sameInterval(x, range) && x.to === req.to);
+    if (!f.checked) {
+      this.wholeSlotsOnly(req);
+      if (same()) return done(undefined);
+      // 子の表定義の版まで追いついてから fence する。子が先の版にいると、親の古い形の行と intent を子が受け取れない。
+      // 移動の間は、親も子も DDL を適用しない (applyStep)。
+      // 親が先の版にいるなら、そのままでよい。子は、行を受け取るときに親の版まで追いつく。
+      f.checked = true;
+      return wait({ kind: "meta", method: "checkSplit", args: [req.slot, { parent: this.id, child: req.to, ...range }] });
+    }
+    if (!f.reached) {
+      f.reached = true;
+      if (req.schema !== undefined) return wait(this.call("reach", { version: req.schema, catchUp: false }));
+    }
+    if (same()) return done(undefined);
+    // 同じ範囲を 2 つの子へ送り出すと、行が両方へ分かれ、範囲表はどちらか片方しか指さない。
+    const clash = this.fencedIn(range);
+    if (clash) throw new SqlError(`${rangeText(clash)} of shard ${this.id} ${clash.done ? "were moved" : "are being moved"} to ${clash.to}`);
+    // 受け取り中のシャードは、まだ届いていない行を持っていない。その範囲を送り出すと、届いていない行が取り残される。
+    if (this.incoming.length > 0) throw new ConflictError(`shard ${this.id} is still receiving a range; it cannot be split until that finishes`);
+    this.b.exec(`INSERT INTO __fenced(lo, hi, "to") VALUES (?, ?, ?)`, range.start, range.end, req.to);
+    this.fenced.push({ ...range, to: req.to, done: 0 });
+    f.stored = true;
+    return wait({ kind: "sync" });
+  }
+
+  /**
+   * piece を子へ渡す。m を確定してから応答するので、再送しても同じ m になる。
+   * 親は ack まで行を保持する。子が受け取る前に落ちても再送で取り戻せるからである。
+   *
+   * 要求は、区間 [start, end) で fence を名指しする。区間の境目をブロックの中に置くと、同じグループが別々の fence に
+   * 入り得るからである。
+   * いまは、どの piece もグループの全体である (区間は端から端まで)。1 通に収まらないグループを主キーの順の区間に切るのは、
+   * 後の段で足す (docs/design-subslots.md の「piece の pull」)。
+   */
+  private pullStep(f: PullFrame): Step<PiecePayload[], PullFrame> {
+    if (f.out) return done(f.out);
+    f.out = this.pullPieces(f.req);
+    return wait({ kind: "sync" });
+  }
+
+  private pullPieces(req: Interval & { want: PieceWant[]; to: string; maxBytes: number }): PiecePayload[] {
+    const fence = this.fenced.find((x) => sameInterval(x, req));
+    const out: PiecePayload[] = [];
+    let bytes = 0;
+    for (const w of req.want) {
+      const g = w.g;
+      // 続きの位置からの要求は、グループを分けて運ぶようになってから受ける。
+      if ("from" in w && w.from !== null) throw new SqlError(`pull of group ${g} from a position: a group is still moved as one piece`);
+      const f = fence && overlaps(fence, blockOf(g)) ? fence : undefined;
+      const known0 = this.moved.get(g);
+      if (known0 && known0.to !== req.to) throw new NotOwner(known0.to);
+      if (!f) throw new SqlError(`pull of unfenced group ${g}`);
+      // fence の宛先でないシャードには渡さない。渡すと、行が範囲表の指さないシャードへ行く。
+      if (f.to !== req.to) throw new NotOwner(f.to);
+      const rows = [...this.defs.values()].flatMap((def) =>
+        selectGroup(this.b, def, g).map((row) => ({ table: def.name, row })),
+      );
+      const intents = this.faults.dropIntentsOnMove ? [] : this.b.exec(`SELECT * FROM __intents WHERE sk = ?`, g);
+      const size = encode(rows).length + encode(intents).length;
+      // 1 グループは 1 回の RPC で運ぶ。RPC の上限 (32 MiB) を超える大きさは運べないので、はっきり断る。
+      // 断らないと、運べないまま再試行を続け、原因が見えない。
+      if (size > GROUP_MAX_BYTES) {
+        throw new SqlError(`group too large to move: shard key ${g} holds ${size} bytes (limit ${GROUP_MAX_BYTES}); this split cannot finish`);
+      }
+      if (out.length > 0 && bytes + size > req.maxBytes) break;
+      bytes += size;
+      let known = this.moved.get(g);
+      if (!known) {
+        known = { m: this.issue(), to: req.to, acked: false };
+        this.moved.set(g, known);
+        this.b.tx(() => {
+          this.b.exec(
+            `INSERT INTO __moved(g, lo, hi, "after", up_to, m, dest) VALUES (?, ?, ?, ?, ?, ?, ?)`, g, f.start, f.end, END, END, known!.m, req.to,
+          );
+          for (const i of intents) {
+            this.b.exec(
+              `INSERT OR IGNORE INTO __moved_txn(txn, g, lo, "after", dest) VALUES (?, ?, ?, ?, ?)`, i.txn as string, g, f.start, END, req.to,
+            );
+          }
+        });
+      }
+      out.push({ g, range: intervalOf(f), after: null, upTo: null, m: known.m, rows, intents, schema: this.schema });
+    }
+    return out;
+  }
+
+  /** グループを、渡す側から引き取る。 */
+  private fetchStep(f: FetchFrame): Step<void, FetchFrame> {
+    if (!f.queue) {
+      // pull は、渡す側の fence を範囲で名指しする。受け取り中の範囲ごとにまとめて送る。
+      const byRange = new Map<IncomingRange, string[]>();
+      for (const g of f.groups) {
+        const range = this.incomingIn(this.areaOf(g))!;
+        byRange.set(range, [...(byRange.get(range) ?? []), g]);
+      }
+      f.queue = [...byRange].map(([range, rest]) => ({ range, rest }));
+    }
+    let forks: Fork[] | undefined;
+    for (;;) {
+      const cur = f.queue[0];
+      if (!cur) return done(undefined, forks);
+      const from = cur.range.from_id;
+      if (f.payload) {
+        if (!f.received) {
+          f.received = true;
+          return wait(this.call("receive", { payload: f.payload }));
+        }
+        // 受け取った。渡す側には、待たずに ack を送る。
+        const payload = f.payload;
+        forks = [{ kind: "detached", effect: { kind: "peer", call: this.peer(from, "ack", { pieces: payload.map(pieceOf) }) } }];
+        const got = new Set(payload.map((p) => p.g));
+        cur.rest = cur.rest.filter((g) => !got.has(g));
+        f.payload = undefined;
+        f.received = undefined;
+      }
+      if (!cur.rest.length) {
+        f.queue.shift();
+        continue;
+      }
+      const pull = this.peer(from, "pull", { ...intervalOf(cur.range), want: cur.rest.map((g) => ({ g, from: null })), to: this.id, maxBytes: 1_000_000 });
+      return wait({ kind: "peer", call: pull }, "payload", forks);
+    }
+  }
+
+  private receiveStep(f: ReceiveFrame): Step<void, ReceiveFrame> {
+    const payload = f.payload;
+    if (f.stored) return done(undefined);
+    if (!f.reached) {
+      // グループの一部だけの piece は、まだ受け取れない。受け取ると、一部しか届いていないグループを「到着した」と記録してしまう。
+      const part = payload.find((p) => p.after !== null || p.upTo !== null);
+      if (part) throw new SqlError(`received a part of group ${part.g}: a group is still moved as one piece`);
+      // 親の表定義の版まで追いついてから受け取る。子は増設の途中で生まれるので、DDL の「全シャードへの適用」から
+      // 漏れることがある。古い版のままだと、届いた行と表の形が合わず、新しい index を保守しない古い計画の書き込みも通る。
+      const version = Math.max(0, ...payload.map((p) => p.schema));
+      f.reached = true;
+      if (!this.faults.childKeepsOldSchema) return wait(this.call("reach", { version, catchUp: true }));
+    }
+    const fresh = payload.filter((p) => !this.arrived.has(p.g));
+    this.b.tx(() => {
+      for (const p of fresh) {
+        for (const { table, row } of p.rows) insertRow(this.b, this.def(table), row);
+        for (const i of p.intents) {
+          this.b.exec(
+            `INSERT OR IGNORE INTO __intents(tbl, pk, sk, txn, anchor, prepare_ts, change) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            i.tbl ?? null, i.pk ?? null, i.sk ?? null, i.txn ?? null, i.anchor ?? null, i.prepare_ts ?? null, i.change ?? null,
+          );
+        }
+        this.b.exec(
+          `INSERT OR IGNORE INTO __arrived(g, lo, hi, "after", up_to, m) VALUES (?, ?, ?, ?, ?, ?)`,
+          p.g, p.range.start, p.range.end, posKey(p.after), posKey(p.upTo), p.m,
+        );
+      }
+    });
+    // 到着の印は挿入と同じ同期区間で付ける。確定の待ちの間に、要求駆動の pull と背景の drain が
+    // 同じグループを受け取ると二重に挿入してしまう。応答は output gate が確定まで止めるので安全である。
+    for (const p of fresh) {
+      this.arrived.set(p.g, p.m);
+      this.maxArrived = Math.max(this.maxArrived, p.m);
+      this.observe(p.m);
+    }
+    f.stored = true;
+    return wait({ kind: "sync" }); // 親が行を消すのは到着の確定後である。
+  }
+
+  /** 子が、受け取り中の範囲の全グループを引き取る。 */
+  private drainStep(f: DrainFrame): Step<{ groups: number; rows: number; bytes: number }, DrainFrame> {
+    if (!f.total) {
+      const range = this.incoming.find((x) => sameInterval(x, f.req));
+      if (!range) return done({ groups: 0, rows: 0, bytes: 0 });
+      f.from = range.from_id;
+      f.interval = intervalOf(range);
+      f.total = { groups: 0, rows: 0, bytes: 0 };
+      f.pass = 0;
+      f.moved = 0;
+    }
+    const from = f.from!;
+    const interval = f.interval!;
+    const total = f.total;
+    // 到着済みのグループの piece。いまは、グループの全体の 1 つである。
+    const whole = (g: string): Piece => ({ g, range: interval, after: null });
+    // 親のグループを先頭から順に列挙して運ぶ。最後まで行ったら、もう一度先頭から列挙して、取り残しがないことを確かめる。
+    // ack 済みのグループは親から消えているので、2 周目は残る側のグループを読むだけである。
+    for (;;) {
+      if (!f.rest) {
+        if (!f.page) return wait({ kind: "peer", call: this.peer(from, "listGroups", { ...interval, limit: 256, cursor: f.cursor }) }, "page");
+        const page = f.page;
+        if (!f.ackedArrived) {
+          f.cursor = page.cursor;
+          f.ackedArrived = true;
+          // 受け取り済みで親に ack が届いていないグループは、ack だけを送り直す。
+          const arrived = page.groups.filter((g) => this.arrived.has(g));
+          if (arrived.length) return wait({ kind: "peer", call: this.peer(from, "ack", { pieces: arrived.map(whole) }) });
+        }
+        f.rest = page.groups.filter((g) => !this.arrived.has(g));
+        f.moved! += page.groups.length;
+      }
+      if (f.payload) {
+        const payload = f.payload;
+        if (!f.received) {
+          f.received = true;
+          return wait(this.call("receive", { payload }));
+        }
+        if (!f.acked) {
+          f.acked = true;
+          return wait({ kind: "peer", call: this.peer(from, "ack", { pieces: payload.map(pieceOf) }) });
+        }
+        total.groups += payload.length;
+        for (const p of payload) {
+          total.rows += p.rows.length;
+          total.bytes += encode(p.rows).length;
+        }
+        const got = new Set(payload.map((p) => p.g));
+        f.rest = f.rest.filter((g) => !got.has(g));
+        f.payload = undefined;
+        f.received = undefined;
+        f.acked = undefined;
+      }
+      // pull は大きさの上限で途中までしか返さないことがある。残りを取り終えるまで繰り返す。
+      if (f.rest.length) {
+        const pull = this.peer(from, "pull", { ...interval, want: f.rest.map((g) => ({ g, from: null })), to: this.id, maxBytes: 1_000_000 });
+        return wait({ kind: "peer", call: pull }, "payload");
+      }
+      f.rest = undefined;
+      f.page = undefined;
+      f.ackedArrived = undefined;
+      if (f.cursor !== null) continue;
+      if (f.moved === 0) return done(total);
+      if (f.pass! > 100) throw new SqlError("drain does not converge");
+      f.pass!++;
+      f.cursor = undefined;
+      f.moved = 0;
+    }
+  }
+
+  // ---- 手続き: 行ロックの待ち ----
+
+  /**
+   * 欠陥 prepareWaits だけが使う。prepare が、書く行の他の取引のロックが空くのを待つ。prepare の要求に開始時刻はないので、
+   * 最も若い待ち手として待ち、wound はしない。期限を過ぎたら待つのをやめ、検証に任せる (ロックが残っていれば abort)。
+   */
+  private foreignLocksStep(f: ForeignLocksFrame): Step<void, ForeignLocksFrame> {
+    f.deadline ??= this.deps.clock.now() + LOCK_WAIT_MS;
+    const me: LockOwner = { txn: lockIdOf(f.txn), start: Number.MAX_SAFE_INTEGER };
+    for (f.at ??= 0; f.at < f.writes.length; f.at++) {
+      const w = f.writes[f.at]!;
+      const key = this.lockKey(w.table, w.pk);
+      const l = this.liveLock(key);
+      if (l && l.txn !== me.txn) {
+        if (this.deps.clock.now() >= f.deadline) return done(undefined);
+        return wait({ kind: "row", key, me, deadline: f.deadline, quiet: true });
+      }
+    }
+    return done(undefined);
+  }
+
+  /**
+   * 悲観的な DML。最新の状態 F で実行し、変更行のロックを取る。
+   * 先に intent を決着させる。確定済みで未適用の行を読み飛ばすと、T も F も新しいのに見えない commit ができる。
+   */
+  private lockedStep(f: LockedFrame): Step<ExecRes, LockedFrame> {
+    const { req, me } = f;
+    f.deadline ??= this.deps.clock.now() + LOCK_WAIT_MS;
+    const deadline = f.deadline;
+    // 最新の状態を読むので、読む時刻はない。
+    const claim: Rows = { spans: req.spans, writes: [], at: null };
+    if (f.waiting !== undefined) {
+      // 行を待って、起こされた。到着の待ちからやり直す。
+      f.woken = f.waiting;
+      f.waiting = undefined;
+      f.arrived = undefined;
+      f.F = undefined;
+    }
+    if (!f.arrived) {
+      f.arrived = true;
+      return wait(this.call("arrive", { groups: this.sksOf(req.spans) }));
+    }
+    // 欠陥 dmlAtT は、F を発行せず、取引の T を F として使う。T は別のシャードの時計から来ることがある。
+    const atT = this.faults.dmlAtT && req.T !== undefined;
+    if (f.F === undefined) {
+      // F はこのシャードが発行する時刻である。取引の T と因果トークンまで時計を進めてから発行するので、F より後の確定は F より大きい
+      // (specs/m9_protocol.qnt の m9_red_f_is_t)。
+      if (!this.faults.dmlSkipsClock) {
+        this.observe(req.minTs);
+        this.observe(req.T);
+      }
+      f.F = atT ? req.T! : this.issue();
+      this.assertOwned(claim);
+      return wait(this.call("settle", { spans: req.spans, T: f.F }), "applied");
+    }
+    if (f.applied) {
+      if (!atT) f.F = this.issue();
+      return wait(this.call("settle", { spans: req.spans, T: f.F }), "applied");
+    }
+    const F = f.F;
+    // ここから先は待たない。版は確かめ直さない。行ロックや intent の決着を待っている間に DDL が適用されると、この文は
+    // 古い計画のまま実行される。文の変更は、取引の確定 (commitLocal、prepare、commit) が版を確かめる (未解決の問題 27)。
+    const sec = this.enter(claim);
+    this.count("writes", req.spans);
+    this.renew(me.txn);
+    const overlay = (req.overlay ?? []).map((c) => ({ table: c.table, pk: c.pk, image: c.after }));
+    let out: { columns: string[]; values: Value[][]; changes: Change[]; count?: number };
+    // 欠陥 lockedReadAtT は、ロック読みを T の snapshot で読む (返す F は変えない)。dmlAtT は、F = T の状態で実行する。
+    const readAt = atT ? F : this.faults.lockedReadAtT && !req.write ? req.T : undefined;
+    try {
+      out = this.rollback(() => {
+        if (readAt !== undefined) this.restore(this.deltaAfter(readAt));
+        if (overlay.length) setBasedRestore(this.b, (t) => this.def(t), overlay);
+        return this.run(sec, req);
+      });
+    } catch (e) {
+      if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner || e instanceof ShardLimit) throw e;
+      // 文は F の状態を読んだうえで失敗した。読んだ時刻を付けて返し、呼び出し側に範囲を記録させる (ExecRes.error)。
+      return done({ columns: [], values: [], changes: [], error: asSqlError(e).message, F, T: req.T ?? F, hlc: this.hlc.value, epoch: this.epoch });
+    }
+    const rows = [...out.changes, ...(req.lockRows ?? [])] as Pick<Change, "table" | "pk">[];
+    const blocked = this.blockedBy(rows, me);
+    if (!blocked) {
+      for (const c of rows) this.grant(this.lockKey(c.table, c.pk), me);
+      if (f.woken && this.locks.get(f.woken)?.txn === me.txn) f.woken = null;
+      return done({ ...out, changes: out.changes.map((c) => ({ ...c, since: F })), F, T: req.T ?? F, hlc: this.hlc.value, epoch: this.epoch });
+    }
+    if (f.woken && f.woken !== blocked) this.wakeNext(f.woken);
+    f.woken = null;
+    if (this.deps.clock.now() >= deadline) throw new ConflictError("lock wait timeout");
+    f.waiting = blocked;
+    return wait({ kind: "row", key: blocked, me, deadline });
+  }
+
+  /** 起こされた行を取らずに去るなら、次の待ち手を起こす。 */
+  private lockedExit(f: LockedFrame): Fork[] {
+    if (f.woken) this.wakeNext(f.woken);
+    return [];
+  }
+
+  // ---- 手続き: intent の決着 ----
+
+  /**
+   * T 以下で確定し得る intent をすべて決着させる。
+   * 無視してよいのは commit 時刻が T を超えると確定した intent だけである。
+   */
+  private settleStep(f: SettleFrame): Step<Ts, SettleFrame> {
+    const pushed = (f.pushed ??= new Set());
+    // 取引ごとの、この手続きで決着させた回数。決着させた後も intent が残ることはある (運ばれた行の到着を待つ、など)。
+    // その場合は、イベントループへ制御を返して待ってから、もう 1 度問い合わせる。上限を超えて残るなら、ここでは適用できない
+    // (不変条件 2 の症状)。
+    const tries = (f.tries ??= new Map());
+    f.applied ??= 0;
+    for (;;) {
+      if (!f.batch) {
+        const pending = this.overlapping(f.spans, f.T).filter((i) => !pushed.has(i.txn));
+        if (pending.length === 0) return done(f.applied);
+        f.batch = [...new Set(pending.map((i) => i.txn))].map((txn) => pending.find((i) => i.txn === txn)!);
+      }
+      const intent = f.batch[0];
+      if (!intent) {
+        f.batch = undefined;
+        continue;
+      }
+      const txn = intent.txn;
+      if (!f.res) {
+        const n = tries.get(txn) ?? 0;
+        if (!f.slept) {
+          if (n >= SETTLE_TRIES) {
+            // 待たずに問い合わせを繰り返すと止まらない。anchor が自分なら問い合わせも適用も microtask だけで済み、イベントループが回らず、
+            // どの時間の制限も効かない (未解決の問題 18)。読みを、理由を付けて失敗させる。
+            throw new SqlError(`stuck: transaction ${txn} is decided but its write to ${intent.tbl} cannot be applied on ${this.id}`);
+          }
+          f.slept = true;
+          if (n > 0) return wait({ kind: "sleep", ms: Math.min(100, 2 ** n) });
+        }
+        tries.set(txn, n + 1);
+        if (this.faults.readerTimeoutPass) pushed.add(txn);
+        else return wait({ kind: "ask", anchor: intent.anchor, txn, pushTo: f.T }, "res");
+      } else if (f.res.status === "committed") {
+        if (!f.finishing) {
+          f.finishing = true;
+          return wait(this.call("finalize", { req: { txn, c: f.res.c } }));
+        }
+        f.applied = Math.max(f.applied, f.res.c);
+      } else if (f.res.status === "aborted") {
+        if (!f.finishing) {
+          f.finishing = true;
+          return wait(this.call("abort", { req: { txn } }));
+        }
+      } else pushed.add(txn);
+      f.batch.shift();
+      f.slept = undefined;
+      f.res = undefined;
+      f.finishing = undefined;
+    }
+  }
+
+  /** 取り残された intent を、anchor に尋ねて決着させる (redrive)。 */
+  private orphanStep(f: OrphanFrame): Step<void, OrphanFrame> {
+    if (!f.res) return wait({ kind: "ask", anchor: f.anchor, txn: f.txn, pushTo: 0 }, "res");
+    if (!f.finishing) {
+      f.finishing = true;
+      if (f.res.status === "committed") return wait(this.call("finalize", { req: { txn: f.txn, c: f.res.c } }));
+      if (f.res.status === "aborted") return wait(this.call("abort", { req: { txn: f.txn } }));
+    }
+    return done(undefined);
+  }
+
+  // ---- 手続き: 文の実行 ----
+
+  /** 時刻 T の状態 (と自分の未 commit write) の上で文を実行し、ROLLBACK する。 */
+  private execStep(f: ExecFrame): Step<ExecRes, ExecFrame> {
+    const req = f.req;
+    if (!f.planned) {
+      this.withinLimits(req);
+      f.planned = true;
+      return wait(this.call("schema", { version: req.schema }));
+    }
+    if (req.lock && (req.write || req.lockRows)) {
+      if (!f.locked) return attempt(this.call("locked", { req, me: req.lock }), "locked");
+      if (f.locked.ok) return done(f.locked.value);
+      const e = f.locked.error;
+      if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner || e instanceof ShardLimit) throw e;
+      throw asSqlError(e);
+    }
+    if (!f.arrived) {
+      if (req.lock) this.renew(req.lock.txn);
+      f.arrived = true;
+      return wait(this.call("arrive", { groups: this.sksOf(req.spans) }));
+    }
+    if (f.T === undefined) {
+      this.observe(req.minTs);
+      const first = req.T ?? this.issue();
+      this.observe(first);
+      f.T = first;
+      this.assertOwned({ spans: req.spans, writes: [], at: first });
+      return wait(this.call("settle", { spans: req.spans, T: first }), "applied");
+    }
+    // 時刻が未指定の読みは、決着させた取引より後の時刻で読む。先に取った T のままだと、
+    // 読み取りの開始前に確定した書き込みが見えない。push した取引の c が新しい T 以下になり得るので、
+    // 決着が起きなくなるまで取り直す。
+    if (req.T === undefined && f.applied) {
+      f.T = this.issue();
+      return wait(this.call("settle", { spans: req.spans, T: f.T }), "applied");
+    }
+    const T = f.T;
+    const applied = f.applied!;
+    // T を指定した autocommit の読み (複数シャードの読み) も同じである。T は対象シャードの時計の最大値だが、
+    // phase 2 が届いていない参加者の時計は commit 時刻に追いついていない。anchor の時計が進んでいると c > T になり、
+    // そのまま T で読むと、開始前に確定して応答まで返った書き込みが見えない。T を取り直させる。
+    if (req.T !== undefined && req.realtime && applied > T && !this.faults.noRealtimeBump) throw new ReadTooOld(`moved at ${this.hlc.value}`);
+    // ここから先は待たない。版は確かめ直さない。intent の決着を待っている間に DDL が適用されると、この文は古い計画の
+    // まま実行される。取引の文の変更は、取引の確定 (commitLocal、prepare、commit) が版を確かめる (未解決の問題 27)。
+    const sec = this.enter({ spans: req.spans, writes: [], at: T });
+    this.count(req.write ? "writes" : "reads", req.spans);
+    if (req.fresh && req.spans.some((s) => this.changedSince(sec, s, T))) {
+      throw new ReadTooOld(`moved at ${this.hlc.value}`);
+    }
+    const delta = this.deltaAfter(T);
+    const overlay = (req.overlay ?? []).map((c) => ({ table: c.table, pk: c.pk, image: c.after }));
+    try {
+      if (delta.length === 0 && overlay.length === 0 && !req.write) {
+        // 差分がなければ本体がそのまま T の状態なので、トランザクションは要らない。
+        return done({ ...this.run(sec, req), T, hlc: this.hlc.value, epoch: this.epoch });
+      }
+      const out = this.rollback(() => {
+        this.restore(delta);
+        if (overlay.length) setBasedRestore(this.b, (t) => this.def(t), overlay);
+        return this.run(sec, req);
+      });
+      return done({ ...out, T, hlc: this.hlc.value, epoch: this.epoch });
+    } catch (e) {
+      if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner || e instanceof ShardLimit) throw e;
+      // 文は T の状態を読んだうえで失敗した。読んだ時刻を付けて返し、呼び出し側に範囲を記録させる。
+      return done({ columns: [], values: [], changes: [], error: asSqlError(e).message, T, hlc: this.hlc.value, epoch: this.epoch });
+    }
+  }
+
+  /** シングルシャードの autocommit 書き込み。1 回の RPC で完結する。 */
+  private autoStep(f: AutoFrame): Step<ExecRes, AutoFrame> {
+    const req = f.req;
+    if (!f.planned) {
+      this.withinLimits(req);
+      f.planned = true;
+      return wait(this.call("schema", { version: req.schema }));
+    }
+    if (!f.arrived) {
+      f.arrived = true;
+      return wait(this.call("arrive", { groups: this.sksOf(req.spans) }));
+    }
+    // 最新の状態に書くので、読む時刻はない。
+    const claim: Plan & Rows = { schema: req.schema, spans: req.spans, writes: [], at: null };
+    if (f.now === undefined) {
+      this.observe(req.minTs);
+      f.now = this.issue();
+      this.assertOwned(claim);
+      return wait(this.call("settle", { spans: req.spans, T: f.now }));
+    }
+    const now = f.now;
+    const woken = (f.woken ??= new Set());
+    let sec: Section<Check> | undefined;
+    if (!f.entered) {
+      f.entered = true;
+      sec = this.enter(claim);
+      this.count("writes", req.spans);
+      // 読む範囲に未決着の intent があると commit 時刻の順序を保証できないので no-wait で返す。
+      if (!this.faults.ignoreIntentsInValidation && this.overlapping(req.spans, Number.MAX_SAFE_INTEGER).length > 0) {
+        throw new ConflictError("pending intent");
+      }
+    }
+    try {
+      if (sec) {
+        // 入口の同期区間の続き。捕捉できる形の文は、先に高速経路 (directStep) を試す。
+        if (req.write?.capture && !this.faults.triggerCapture) return attempt(this.call("direct", { req, claim, now }), "direct");
+      } else if (f.direct) {
+        const direct = unwrap(f.direct);
+        f.direct = undefined;
+        if (direct) return done(direct);
+        // 高速経路の応答を受け取るまでに、制御を 1 回手放している。ここでは区間に入り直さず、下の下書きは、手放す前の確かめのまま
+        // 実行する。版は、確定の直前に確かめ直す。持ち主は確かめ直さない (未解決の問題 26)。
+        sec = this.unchecked(26);
+      } else {
+        // 行を待った後。autocommit は取引より若いものとして順番を待つ。待っている間に行が変わるので、区間に入り直して実行し直す。
+        unwrap(f.waited!);
+        f.waited = undefined;
+        woken.add(f.key!);
+        sec = this.enter(claim);
+        if (this.overlapping(req.spans, Number.MAX_SAFE_INTEGER).length > 0) throw new ConflictError("pending intent");
+      }
+      const dry = this.rollback(() => this.run(sec!, req));
+      if (!f.me) {
+        f.me = { txn: `auto-${now}`, start: this.deps.clock.now() };
+        f.deadline = this.deps.clock.now() + LOCK_WAIT_MS;
+      }
+      const me = f.me;
+      const key = this.blockedBy(dry.changes, me);
+      if (key !== null) {
+        f.key = key;
+        return attempt({ kind: "row", key, me, deadline: f.deadline! }, "waited");
+      }
+      // 同じ主キーでなくても、他の取引の intent が同じ UNIQUE の値を持っていれば確定できない。
+      const pending = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, dry.changes);
+      if (pending) throw new ConflictError(pending);
+      this.assertWriteSetFits(sec, dry.changes);
+      // 下書きを取った区間の続きで、間に待ちはない。高速経路が null を返した後の道では、制御を手放した後の確かめ直しは、
+      // これだけである。
+      this.enter({ schema: req.schema });
+      const c = this.issue();
+      if (dry.changes.length) this.b.tx(() => this.applyAndLog(`auto-${c}`, c, dry.changes));
+      return done({ ...dry, T: c, hlc: this.hlc.value, epoch: this.epoch });
+    } catch (e) {
+      if (e instanceof ConflictError || e instanceof NotOwner) throw e;
+      throw asSqlError(e);
+    }
+  }
+
+  /** autocommit はロックを取らないので、起こされたら、用が済み次第、次の待ち手を起こす。 */
+  private autoExit(f: { woken?: Set<string> }): Fork[] {
+    return [...(f.woken ?? [])].map((key) => ({ kind: "wake", key }));
+  }
+
+  /**
+   * autocommit の高速経路。文を下書きせずに 1 回だけ実行し、そのまま確定する。
+   * ROLLBACK した書き込みも課金されるので、下書きと再適用をやめると 1 行の更新が 6 行から 2 行になる。
+   * 行ロックに当たったときだけ ROLLBACK して待つ。捕捉できない形なら null を返し、通常の経路に任せる。
+   */
+  private directStep(f: DirectFrame): Step<ExecRes | null, DirectFrame> {
+    const { req, claim } = f;
+    if (!f.me) {
+      f.me = { txn: `auto-${f.now}`, start: this.deps.clock.now() };
+      f.deadline = this.deps.clock.now() + LOCK_WAIT_MS;
+    }
+    const me = f.me;
+    const woken = (f.woken ??= new Set());
+    if (f.key !== undefined) woken.add(f.key);
+    // 最初の 1 歩は、autoStep が入った同期区間の続きで、間に待ちはない。行を待った後は、ここで区間に入り直す。
+    const sec = this.enter(claim);
+    if (f.key !== undefined && this.overlapping(req.spans, Number.MAX_SAFE_INTEGER).length > 0) throw new ConflictError("pending intent");
+    const hit: { key: string | null } = { key: null };
+    const pending: { reason: string | null } = { reason: null };
+    let out: { changes: Change[]; c: Ts } | undefined;
+    try {
+      out = this.b.tx(() => {
+        const r = this.checked(sec, req, () => this.runCaptured(req));
+        if (!r) throw FALLBACK;
+        hit.key = this.blockedBy(r.changes, me);
+        if (hit.key !== null) throw BLOCKED;
+        pending.reason = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, r.changes);
+        if (pending.reason) throw PENDING_UNIQUE;
+        this.assertWriteSetFits(sec, r.changes);
+        const c = this.issue();
+        if (r.changes.length) this.logChanges(`auto-${c}`, c, r.changes);
+        return { changes: r.changes, c };
+      });
+    } catch (e) {
+      if (e === FALLBACK) return done(null);
+      if (e === PENDING_UNIQUE) throw new ConflictError(pending.reason!);
+      if (e !== BLOCKED) throw e;
+    }
+    if (out) return done({ columns: [], values: [], changes: out.changes, T: out.c, hlc: this.hlc.value, epoch: this.epoch });
+    f.key = hit.key!;
+    return wait({ kind: "row", key: f.key, me, deadline: f.deadline! });
+  }
+
+  // ---- 手続き: 確定 ----
+
+  private commitLocalStep(f: PrepareFrame<Omit<PrepareReq, "anchor">>): Step<CommitRes, PrepareFrame<Omit<PrepareReq, "anchor">>> {
+    const req = f.req;
+    if (!f.planned) {
+      f.planned = true;
+      return wait(this.call("schema", { version: req.schema }));
+    }
+    if (!f.arrived) {
+      f.arrived = true;
+      return wait(this.call("arrive", { groups: this.sksOf(req.spans, req.writes) }));
+    }
+    if (this.faults.prepareWaits && !f.waitedLocks) {
+      f.waitedLocks = true;
+      return wait(this.call("foreignLocks", { txn: req.txn, writes: req.writes }));
+    }
+    // グループの到着を待っている間に DDL が適用されることがある。古い計画のまま書かない。
+    // 時計は、版を確かめた後、持ち主を確かめる前に進める。版の古い要求の T は、時計に取り込まない。
+    this.enter({ schema: req.schema });
+    this.observe(req.T);
+    const sec = this.enter({ schema: req.schema, spans: req.spans, writes: req.writes, at: req.T });
+    try {
+      this.assertWriteSetFits(sec, req.writes);
+    } catch (e) {
+      this.releaseLocks(req.txn);
+      throw e;
+    }
+    const reason = this.validate(sec, req.txn, req.T, req.writes, req.spans);
+    if (reason) {
+      this.releaseLocks(req.txn); // 失敗した取引のロックを残すと、TTL まで全員が待つ
+      return done({ ok: false, reason });
+    }
+    const c = this.issue();
+    if (req.writes.length) this.b.tx(() => this.applyAndLog(req.txn, c, req.writes));
+    this.releaseLocks(req.txn);
+    this.count("writes", req.spans, req.writes);
+    return done({ ok: true, c });
+  }
+
+  private prepareStep(f: PrepareFrame<PrepareReq>): Step<PrepareRes, PrepareFrame<PrepareReq>> {
+    const req = f.req;
+    if (!f.planned) {
+      f.planned = true;
+      return wait(this.call("schema", { version: req.schema }));
+    }
+    if (!f.arrived) {
+      f.arrived = true;
+      return wait(this.call("arrive", { groups: this.sksOf(req.spans, req.writes) }));
+    }
+    if (this.faults.prepareWaits && !f.waitedLocks) {
+      f.waitedLocks = true;
+      return wait(this.call("foreignLocks", { txn: req.txn, writes: req.writes }));
+    }
+    return done(this.prepareSync(this.enter({ schema: req.schema }), req));
+  }
+
+  /**
+   * 表を消す前の確認 (Db の guardedDrop、specs/m14_rebuild_guard.qnt)。
+   * 先に、表を書き込み禁止にする版を適用する。適用の前に intent を全部決着させ、適用の後は、その表への書き込みを断る。
+   * だから、ここで変更がなければ、表を消すまで、読んだ範囲は変わらない。
+   */
+  private unchangedStep(f: UnchangedFrame): Step<{ ok: boolean; reason?: string }, UnchangedFrame> {
+    const req = f.req;
+    if (!f.synced) return attempt(this.call("schema", { version: req.schema }), "synced");
+    let sec: Section<"owned">;
+    try {
+      unwrap(f.synced);
+      sec = this.enter({ spans: req.spans, writes: [], at: req.from });
+    } catch (e) {
+      return done({ ok: false, reason: e instanceof Error ? e.message : String(e) });
+    }
+    for (const s of req.spans) {
+      if (this.changedSince(sec, s, Math.max(req.from, s.since ?? 0))) return done({ ok: false, reason: `${s.table} changed after it was read` });
+      // 版の適用は intent を決着させてから行う (settleAllStep) が、それに頼らず、決着していない書き込みも変更として数える。
+      const hit = this.faults.unchangedIgnoresIntents ? undefined : this.overlapping([s], Number.MAX_SAFE_INTEGER)[0];
+      if (hit) return done({ ok: false, reason: `${s.table} has a pending write of ${hit.txn}` });
+    }
+    return done({ ok: true });
+  }
+
+  /** 複数のシャードに書く取引の確定。このシャードが anchor である。 */
+  private commitStep(f: CommitFrame): Step<CommitRes, CommitFrame> {
+    const req = f.req;
+    if (!f.planned) {
+      f.planned = true;
+      return wait(this.call("schema", { version: req.schema }));
+    }
+    if (!f.flight) {
+      // 同じ 2PC の ID の実行は 1 つずつにする。同じ中身の COMMIT が 2 つ同時に届くと (再送が元の COMMIT を追い越す)、後の実行の
+      // prepare は、先の実行が適用した行に当たって断られ、中止の abort(ID) が先の実行の残りの intent を消した
+      // (specs/m17_txn_id_reuse.qnt の m17_red_resend、2026-11-13 の Codex の 2 回目の見直し、指摘 1)。先の実行が終わるのを待って
+      // から記録を確かめ、待ち終えてから実行を登録するまで待ちを挟まない。
+      if (this.inflight.get(req.txn) && !this.faults.concurrentDrives) return wait({ kind: "flight", txn: req.txn });
+      // 2PC の ID は、取引の ID と続きの中身の指紋である (Txn.commit)。同じ ID の記録があるのは、同じ中身の COMMIT の再送なので、
+      // 前の結果を返す。baton の使い回しでできた中身の違う続きは、別の ID の別の 2PC になる。
+      const known = this.b.exec(`SELECT status, c FROM __txn WHERE txn = ?`, req.txn)[0];
+      if (known) return done(known.status === "committed" ? { ok: true, c: known.c as Ts } : { ok: false, reason: "aborted" });
+      // 決着の記録は保持時間の後に消す。消した tombstone の後に同じ取引の COMMIT が届いて確定すると、
+      // 中止と判断して intent を無視した読み手と矛盾する (specs/m10_txn_record_gc.qnt の反例)。
+      // 保持時間の半分より古い取引の COMMIT を受け付けなければ、消した後に確定することはない。
+      if (this.deps.clock.now() - tsToPhysical(req.T) > (this.deps.txnRetainMs ?? TXN_RETAIN_MS) / 2) {
+        return done({ ok: false, reason: "conflict: transaction older than the commit window" });
+      }
+      f.flight = { pushed: 0, decided: false, waiters: [] };
+      this.inflight.set(req.txn, f.flight);
+      const me = req.participants.find((p) => p.shard === this.id);
+      if (me) return wait(this.call("arrive", { groups: this.sksOf(me.spans, me.writes) }));
+    }
+    if (!f.driving) {
+      f.driving = true;
+      return wait(this.call("drive", { req, flight: f.flight }), "res");
+    }
+    return done(f.res!);
+  }
+
+  /** 実行の登録を消し、決着を待っていたものを起こす。 */
+  private commitExit(f: CommitFrame): Fork[] {
+    if (f.flight) {
+      this.inflight.delete(f.req.txn);
+      for (const wake of f.flight.waiters) wake();
+    }
+    return [];
+  }
+
+  private driveStep(f: DriveFrame): Step<CommitRes, DriveFrame> {
+    const { req, flight } = f;
+    const self = req.participants.find((p) => p.shard === this.id);
+    if (!self) throw new SqlError("anchor must be a participant");
+    let others = req.participants.filter((p) => p.shard !== this.id);
+    if (this.faults.skipReadOnlyPrepare) others = others.filter((p) => p.writes.length > 0);
+
+    if (!f.acks) {
+      const calls = others.map((p) =>
+        this.peer(p.shard, "prepare", { txn: req.txn, T: req.T, writes: p.writes, spans: p.spans, anchor: this.id, schema: req.schema }),
+      );
+      return wait({ kind: "peers", calls }, "acks");
+    }
+    if (f.c === undefined) {
+      const acks = f.acks;
+      const failed = acks.find((a) => !a.ok);
+      if (failed && !failed.ok) return this.decideAbort(req, failed.reason);
+      const stamps = acks.map((a) => (a as { prepareTs: Ts }).prepareTs);
+      if (this.faults.prepareWaits && !f.waitedLocks) {
+        f.waitedLocks = true;
+        return wait(this.call("foreignLocks", { txn: req.txn, writes: self.writes }));
+      }
+
+      // ここから c の確定までは待たない。
+      // 参加者の応答を待っている間に、この anchor に DDL が適用されていれば、取引は古い表定義で計画されている。
+      let plan: Section<"schema">;
+      try {
+        plan = this.enter({ schema: req.schema });
+      } catch (e) {
+        return this.decideAbort(req, (e as Error).message);
+      }
+      if (!this.faults.anchorNoAbsorb) this.observe(Math.max(0, ...stamps, flight.pushed));
+      const mine = this.prepareSync(plan, {
+        txn: req.txn, T: req.T, writes: self.writes, spans: self.spans, anchor: this.id, schema: req.schema,
+      });
+      if (!mine.ok) return this.decideAbort(req, mine.reason);
+      const c = this.faults.anchorNoAbsorb
+        ? Math.max(mine.prepareTs, ...stamps, flight.pushed + 1)
+        : mine.prepareTs;
+      flight.decided = true;
+      f.c = c;
+
+      const stale = others.flatMap((p, i) => {
+        const spans = this.faults.predicateProtected
+          ? p.spans.filter((s) => !p.writes.some((w) => w.table === s.table))
+          : unprotectedSpans(p.spans, p.writes);
+        return spans.length > 0 && stamps[i]! < c ? [{ p, spans, from: stamps[i]! }] : [];
+      });
+      const calls = stale.map((s) => this.peer(s.p.shard, "refresh", { txn: req.txn, spans: s.spans, from: s.from, to: c }));
+      return wait({ kind: "peers", calls }, "refreshed");
+    }
+    const c = f.c;
+    if (!f.recorded) {
+      const bad = f.refreshed!.find((r) => !r.ok);
+      if (bad) return this.decideAbort(req, bad.reason ?? "refresh failed");
+
+      this.b.exec(
+        `INSERT INTO __txn(txn, status, c, participants, at) VALUES (?, 'committed', ?, ?, ?)`,
+        req.txn, c, JSON.stringify(req.participants.map((p) => p.shard)), this.deps.clock.now(),
+      );
+      f.recorded = true;
+      // record の確定を待ってから phase 2 と応答を送る。先に送ると、確定の前に再起動したとき、記録が消えて
+      // 照会した参加者が tombstone を書き、phase 2 を受けた参加者とで決着が割れる (specs/m3_anchor_recovery.qnt の m3_red)。
+      if (!this.faults.phase2BeforeSync) return wait({ kind: "sync" });
+    }
+    this.deps.scheduleRedrive?.();
+    const phase2 = this.call("phase2", { txn: req.txn, c, shards: req.participants.map((p) => p.shard) });
+    return done({ ok: true, c }, [{ kind: "background", effect: phase2 }]);
+  }
+
+  private decideAbort(req: CommitReq, reason: string): { done: true; value: CommitRes; forks?: Fork[] } {
+    this.b.exec(`INSERT OR IGNORE INTO __txn(txn, status, done, at) VALUES (?, 'aborted', 1, ?)`, req.txn, this.deps.clock.now());
+    // 記録が確定のまま残ったなら、同じ ID の別の実行が確定させている。abort を送るとその intent を消すので、送らずにその決着を
+    // 答える (同じ ID は同じ中身なので、確定が正しい答えである)。実行を 1 つずつにしてあるので、ここには来ないはずの 2 つ目の守り
+    // である (specs/m17_txn_id_reuse.qnt の ABORT_CHECKS)。
+    const kept = this.decided(req.txn);
+    if (kept?.status === "committed" && !this.faults.abortIgnoresRecord) return done({ ok: true, c: kept.c });
+    const aborts: Fork[] = req.participants.map((p) => ({
+      kind: "background",
+      effect: p.shard === this.id ? this.call("abort", { req: { txn: req.txn } }) : { kind: "peer", call: this.peer(p.shard, "abort", { txn: req.txn }) },
+    }));
+    return done({ ok: false, reason }, aborts);
+  }
+
+  /** 確定した取引を、自分と、ほかの参加者に適用させる。全員に届いたら、記録に印を付ける。 */
+  private phase2Step(f: Phase2Frame): Step<void, Phase2Frame> {
+    if (!f.local) {
+      f.local = true;
+      return wait(this.call("finalize", { req: { txn: f.txn, c: f.c } }));
+    }
+    if (!f.sent) {
+      f.sent = true;
+      const calls = f.shards.filter((shard) => shard !== this.id).map((shard) => this.peer(shard, "finalize", { txn: f.txn, c: f.c }));
+      return wait({ kind: "peers", calls });
+    }
+    this.b.exec(`UPDATE __txn SET done = 1 WHERE txn = ?`, f.txn);
+    return done(undefined);
+  }
+
+  private finalizeStep(f: SettleTxnFrame<{ txn: string; c: Ts; pieces?: Piece[] }>): Step<void, SettleTxnFrame<{ txn: string; c: Ts; pieces?: Piece[] }>> {
+    const req = f.req;
+    if (!f.arrived) {
+      f.arrived = true;
+      // いまは、どの piece もグループの全体なので、到着はグループの名前で確かめる。
+      if (req.pieces) return wait(this.call("arrive", { groups: req.pieces.map((p) => p.g) }));
+    }
+    if (!f.queue) {
+      this.observe(req.c);
+      const rows = this.localIntents(req.txn);
+      if (rows.length) {
+        this.b.tx(() => {
+          this.applyAndLog(req.txn, req.c, rows.map((r) => decode<Change>(r.change)));
+          for (const r of rows) this.b.exec(`DELETE FROM __intents WHERE tbl = ? AND pk = ?`, r.tbl, r.pk);
+        });
+      }
+      this.releaseLocks(req.txn);
+      for (const r of rows) this.wakeAll(this.lockKey(r.tbl, r.pk));
+      f.queue = [...this.forwards(req.txn)];
+    }
+    const next = f.queue.shift();
+    if (!next) return done(undefined);
+    return wait({ kind: "peer", call: this.peer(next[0], "finalize", { txn: req.txn, c: req.c, pieces: next[1] }) });
+  }
+
+  private abortStep(f: SettleTxnFrame<{ txn: string; pieces?: Piece[] }>): Step<void, SettleTxnFrame<{ txn: string; pieces?: Piece[] }>> {
+    const req = f.req;
+    if (!f.arrived) {
+      f.arrived = true;
+      if (req.pieces) return wait(this.call("arrive", { groups: req.pieces.map((p) => p.g) }));
+    }
+    if (!f.queue) {
+      this.releaseLocks(req.txn);
+      for (const r of this.localIntents(req.txn)) {
+        this.b.exec(`DELETE FROM __intents WHERE tbl = ? AND pk = ?`, r.tbl, r.pk);
+        this.wakeAll(this.lockKey(r.tbl, r.pk));
+      }
+      f.queue = [...this.forwards(req.txn)];
+    }
+    const next = f.queue.shift();
+    if (!next) return done(undefined);
+    return wait({ kind: "peer", call: this.peer(next[0], "abort", { txn: req.txn, pieces: next[1] }) });
+  }
+
+  // ---- 手続き: anchor への照会 ----
+
+  private queryTxnStep(f: TxnQueryFrame<{ txn: string; pushTo: Ts }>): Step<TxnStatus, TxnQueryFrame<{ txn: string; pushTo: Ts }>> {
+    const req = f.req;
+    if (f.waited) return done(this.decided(req.txn) ?? { status: "aborted" });
+    const known = this.decided(req.txn);
+    if (known) return done(known);
+    const flight = this.inflight.get(req.txn);
+    // push は c の決定前だけ受理する。決定後に受理しても c は動かず、読み手が intent を誤って無視する。
+    if (flight && (!flight.decided || this.faults.pushAfterDecide)) {
+      flight.pushed = Math.max(flight.pushed, req.pushTo);
+      return done({ status: "pushed" });
+    }
+    if (flight) {
+      f.waited = true;
+      return wait({ kind: "flight", txn: req.txn }); // c の決定後は決着まで保留する。
+    }
+    // 記録がなく in-flight でもない。presumed abort を tombstone で確定させる。
+    this.b.exec(`INSERT OR IGNORE INTO __txn(txn, status, done, at) VALUES (?, 'aborted', 1, ?)`, req.txn, this.deps.clock.now());
+    return done(this.decided(req.txn)!);
+  }
+
+  private statusStep(f: TxnQueryFrame<{ txn: string }>): Step<TxnStatus, TxnQueryFrame<{ txn: string }>> {
+    if (!f.waited) {
+      f.waited = true;
+      if (this.inflight.get(f.req.txn)) return wait({ kind: "flight", txn: f.req.txn });
+    }
+    return tail(this.call("queryTxn", { req: { txn: f.req.txn, pushTo: 0 } }));
+  }
+
+  // ---- 手続き: 保守 ----
+
+  /**
+   * alarm の本体。phase 2 の再駆動と、取り残された intent の掃除を行う。
+   * 未完了の仕事が残っていれば true を返す。呼び出し側 (DO の alarm) は true なら次の alarm を予約する。
+   * 参加者の intent は、anchor が再起動で決着を送り損ねると読み手が来るまで残る。残った intent は変更ログの GC を止めるので、
+   * 読み手を待たずにここで決着させる。
+   */
+  private redriveStep(f: RedriveFrame): Step<boolean, RedriveFrame> {
+    const errors = (f.errors ??= []);
+    if (f.last) {
+      if (!f.last.ok) {
+        f.more = true;
+        const e = f.last.error;
+        if (errors.length < 10) errors.push(String((e as Error)?.message ?? e).slice(0, 160));
+      }
+      f.last = undefined;
+    }
+    const guarded = (effect: Effect) => wait(this.call("guarded", { effect }), "last");
+    f.txns ??= this.b.exec(`SELECT txn, c, participants FROM __txn WHERE status = 'committed' AND done = 0`);
+    const r = f.txns.shift();
+    if (r) {
+      const shards = JSON.parse(r.participants as string) as string[];
+      return guarded(this.call("phase2", { txn: r.txn as string, c: r.c as Ts, shards }));
+    }
+    // 受け取り中の範囲は、配列をその場で順に見る。途中で範囲が増えれば、それも見る。
+    f.ranges ??= this.incoming;
+    f.at ??= 0;
+    if (f.at < f.ranges.length) return guarded(this.call("drain", { req: intervalOf(f.ranges[f.at++]!) }));
+    if (!f.orphans) {
+      // 進行中の取引の intent には触れない。anchor がまだ決着を送っている最中かもしれないからである。
+      const cutoff = physicalToTs(this.deps.clock.now() - ORPHAN_AGE_MS);
+      f.orphans = this.b.exec(`SELECT DISTINCT txn, anchor FROM __intents WHERE prepare_ts < ?`, cutoff) as unknown as Intent[];
+    }
+    const o = f.orphans.shift();
+    if (o) return guarded(this.call("orphan", { anchor: o.anchor, txn: o.txn }));
+    const left = this.b.exec(`SELECT (SELECT count(*) FROM __intents) + (SELECT count(*) FROM __txn WHERE status = 'committed' AND done = 0) n`)[0]?.n as number;
+    this.lastRedriveErrors = errors;
+    return done(Boolean(f.more) || left > 0 || this.incoming.length > 0);
+  }
+
+  /** 待ち 1 つを実行し、失敗しても、結果として返す。 */
+  private guardedStep(f: GuardedFrame): Step<Outcome<unknown>, GuardedFrame> {
+    if (!f.out) return attempt(f.effect, "out");
+    return done(f.out);
+  }
+
+  /** 手続きの表。殻は、名前で手続きを引いて走らせる。 */
+  readonly programs: { [N in keyof Sig]: Program<ShardKernel, Sig[N][0], Sig[N][1]> } = {
+    schema: { step: this.schemaStep },
+    reach: { step: this.reachStep },
+    apply: { step: this.applyStep },
+    schemaFailed: { step: this.schemaFailedStep },
+    settleAll: { step: this.settleAllStep },
+    arrive: { step: this.arriveStep },
+    beginIncoming: { step: this.beginIncomingStep },
+    fence: { step: this.fenceStep },
+    pull: { step: this.pullStep },
+    fetch: { step: this.fetchStep },
+    receive: { step: this.receiveStep },
+    drain: { step: this.drainStep },
+    foreignLocks: { step: this.foreignLocksStep },
+    locked: { step: this.lockedStep, exit: this.lockedExit },
+    settle: { step: this.settleStep },
+    exec: { step: this.execStep },
+    execAuto: { step: this.autoStep, exit: this.autoExit },
+    direct: { step: this.directStep, exit: this.autoExit },
+    commitLocal: { step: this.commitLocalStep },
+    prepare: { step: this.prepareStep },
+    unchanged: { step: this.unchangedStep },
+    syncSchema: { step: this.syncSchemaStep },
+    commit: { step: this.commitStep, exit: this.commitExit },
+    drive: { step: this.driveStep },
+    phase2: { step: this.phase2Step },
+    finalize: { step: this.finalizeStep },
+    abort: { step: this.abortStep },
+    queryTxn: { step: this.queryTxnStep },
+    status: { step: this.statusStep },
+    redrive: { step: this.redriveStep },
+    guarded: { step: this.guardedStep },
+    orphan: { step: this.orphanStep },
+  };
 
   /** 分析パスへ渡す変更を読み出す。flushTs は未解決 intent の prepare_ts 未満に抑える。 */
   flush(req: { upTo?: Ts }): FlushRes {

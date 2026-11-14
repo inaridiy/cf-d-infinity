@@ -64,7 +64,7 @@ Categories:
 | m11_impl_backfill | BUG-2: row changes between backfill read and write | ignoreTableLock | unique-index-build:109; ddl-concurrent:368 | A |
 | m11_impl_chunk | BUG-1: same-shard duplicate overwritten in backfill | none | ddl-concurrent:334 (fixed) | A |
 | m11_impl_drop | BUG-5: committed intent applied to recreated table | ddlIgnoresIntents | review-regressions:181; ddl-concurrent:495 | A |
-| m11_red_no_reject | shard accepts stale-version requests | none (check at core.ts:347) | migration:234 (fixed, guard-only) | A |
+| m11_red_no_reject | shard accepts stale-version requests | none (check in `schemaStep`, src/shard/kernel.ts) | migration:234 (fixed, guard-only) | A |
 | m11_red_early_public | index public before backfill finishes | publishBeforeBackfill (added 2026-11-12; publishes before any entry is written, as in the model's trace) | unique-index-build ("a UNIQUE index that spans shards is published after the existing rows are indexed (m11_red_early_public)"; added 2026-11-12) | A |
 | m11_red_no_write_only | writes skip a write-only index | none | none | D |
 | m11_red_no_sync | DDL returns before all shards applied it | none (stub at ddl-concurrent:687, seed sweep) | migration:247 (fixed) | A |

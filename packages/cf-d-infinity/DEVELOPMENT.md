@@ -14,7 +14,7 @@ await db.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)");
 await db.execute({ sql: "INSERT INTO users(name) VALUES (?)", args: ["alice"] });
 ```
 
-シャードの本体 `src/shard/core.ts` は DO に依存しないので、同じコードが node:sqlite (`test/sim.ts`) と workerd (`src/worker.ts`) の両方で動く。
+シャードの本体 (`src/shard/kernel.ts` と `src/shard/core.ts`) は DO に依存しないので、同じコードが node:sqlite (`test/sim.ts`) と workerd (`src/worker.ts`) の両方で動く。
 SQLite との差分は [docs/sql-language.md](../../docs/sql-language.md) にある。
 
 ## 動かす
@@ -187,7 +187,9 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 
 | パス | 内容 |
 |---|---|
-| `src/shard/core.ts` | シャードのプロトコル (rollback-read、検証、anchor 2PC、回復、ライブ移動)。要求の入口は、待つ段 (表定義の適用、グループの到着、intent の決着、行ロック) の後、`enter` を通って同期区間に入る。待ちの後の確かめ直し (表定義の版、範囲の持ち主) は `enter` にだけあり、文の実行と検証は `enter` が返す印を受け取る |
+| `src/shard/kernel.ts` | シャードの核。状態を読み書きするのは、ここだけである (rollback-read、検証、anchor 2PC、回復、ライブ移動)。同期で、async の関数を持たない (`test/determinism.test.ts` が確かめる)。要求は、同期の 1 歩 (`xxxStep`) で処理する。1 歩は、frame (待ちをまたいで残るデータ) を見て、終えるか、待ちたいこと (Effect) を返す。待ちの後の確かめ直し (表定義の版、範囲の持ち主) は `enter` にだけあり、文の実行と検証は `enter` が返す印を受け取る。印は frame に入れられないので、待ちの後へ持ち越せない |
+| `src/shard/core.ts` | シャードの殻 (`ShardCore`)。核の 1 歩を呼び、返った待ち (相手のシャード、Meta、保存先の確定、行ロック、タイマー) を実行して、同じ 1 歩を先頭から呼び直す。状態は持たない (待ちの合流のための Promise だけを持つ) |
+| `src/shard/step.ts` | 核と殻の間の型 (Effect、Step、Fork) |
 | `src/shard/rows.ts` | 行の適用と set-based undo |
 | `src/client/db.ts` | Worker 側の入口。OCC の取引、経路決定、scatter |
 | `src/client/d1.ts` | D1 互換 API |

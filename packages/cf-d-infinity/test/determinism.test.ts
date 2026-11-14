@@ -45,3 +45,28 @@ describe("nondeterministic input goes through the Runtime", () => {
     expect(BANNED.test("const t0 = this.rt.now();")).toBe(false);
   });
 });
+
+// シャードの状態を読み書きするのは、同期の核 (src/shard/kernel.ts) だけである。核は待たない。待つのは殻 (src/shard/core.ts) で、
+// 核が返した待ち (src/shard/step.ts の Effect) を実行してから、核の同じ 1 歩を先頭から呼び直す。核の中に待ちがなければ、
+// 待ちの前に確かめたことを、待ちの後まで持ち越す書き方ができない。ここでは、核のソースに、待つ手段がないことを確かめる。
+const WAITS = /\b(async|await|Promise|PromiseLike|queueMicrotask)\b|\.(then|catch|finally|sync|after)\s*\(/;
+const code = (line: string) => line.replace(/\/\/.*$/, "").replace(/^\s*\*.*$/, "").replace(/^\s*\/\*\*.*$/, "");
+
+describe("the shard kernel is synchronous", () => {
+  it("src/shard/kernel.ts has no async function, no await, no Promise, no timer and no storage sync", () => {
+    const found: string[] = [];
+    readFileSync(join(SRC, "shard", "kernel.ts"), "utf8").split("\n").forEach((line, i) => {
+      if (WAITS.test(code(line))) found.push(`kernel.ts:${i + 1}: ${line.trim().slice(0, 120)}`);
+    });
+    expect(found).toEqual([]);
+  });
+
+  it("the check itself finds a wait, and the shell is where the waits are", () => {
+    for (const line of ["  private async exec(req: ExecReq): Promise<ExecRes> {", "    await this.b.sync();", "    p.then(() => undefined);", "    queueMicrotask(() => this.wakeNext(key));", "    this.rt.after(5, wake);"]) {
+      expect(WAITS.test(code(line)), line).toBe(true);
+    }
+    expect(WAITS.test(code("    return wait({ kind: \"sync\" }); // 確定を await する"))).toBe(false);
+    const shell = readFileSync(join(SRC, "shard", "core.ts"), "utf8").split("\n").filter((line) => WAITS.test(code(line)));
+    expect(shell.length).toBeGreaterThan(0);
+  });
+});
