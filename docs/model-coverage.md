@@ -120,7 +120,7 @@ Categories:
 
 ## Switches that match no red module
 
-- `rowSpanDespiteUnique`: narrows a write's span to one row despite an in-shard UNIQUE. Used in span-check:25 and :32, review-regressions:57, health:76.
+- `rowSpanDespiteUnique`: narrows a write's span to one row despite an in-shard UNIQUE. Used in span-check:28, :38 and :45, review-regressions:57, health:76. Since 2026-11-14 the shard's write guard also refuses the REPLACE this switch narrows (span-check:38); span-check:28 turns the guard off to show the read check alone.
 - `autoIgnoresUniqueIntents`: autocommit write ignores UNIQUE values held by other transactions' intents. Used in review-regressions:65, health:76.
 - `noWriteSetLimit`: no write-set size check before commit. Used in limits:115.
 - `rowwiseUndo`: undo row by row, so a UNIQUE swap breaks the snapshot. Used in counterexamples:269.
