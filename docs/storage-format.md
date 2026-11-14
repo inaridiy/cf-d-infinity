@@ -26,7 +26,7 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 
 | 表 | 中身 | 区分 |
 |---|---|---|
-| 利用者の表 | 利用者が書いた表定義 (SHARD KEY の句を除く) | 固定 (利用者の形式) |
+| 利用者の表 | 利用者が書いた表定義 | 固定 (利用者の形式) |
 | `__gidx_<index>(k, pk, sk)` | シャードをまたぐ UNIQUE の index。`k` は値のキー文字列 | 固定。中身は index を作り直せば戻るが、作り直す手順は Early 版にない |
 | `__meta(k, v)` | `format` (保存の形式の版)、`epoch`、`ceiling`、`flushed`、`log_low_water`、`ddl_floor`、`log_gens` (変更ログの世代の JSON の配列) | 固定 |
 | `__ddl(version, entry)` | Meta から受け取った表定義の版。`entry` は `DdlEntry` の JSON (`TableDef` を含む) | 固定 |

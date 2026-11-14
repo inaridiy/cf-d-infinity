@@ -270,6 +270,25 @@ tests   $f m17_red_abort
 tests   $f m17_red_resend
 tests   $f m17_red_impl
 
+echo "== M18 subslot split (1 つの shard key の行を、複数のシャードに分けて持つ)"
+f=m18_subslot_split.qnt
+green   $f m18_green tenantSplitSafe                    # piece 1 は親に残り、piece 2 は子へ移る。テナントの読みは両方のシャードが答える
+green   $f m18_green_clock tenantSplitSafe              # 答えた読みの時刻を覚えて、noWriteBelowRead を確かめる
+green   $f m18_green_chunks tenantSplitSafe             # 上の範囲が 2 通の応答に分かれて移る (16 MB を超えるテナント)。Worker の claim の分け方は任意
+red     $f m18_red_partial_answer readConsistent        # 親が、範囲表の古い要求を断らず、まだ持っている piece だけを答える
+red     $f m18_red_child_partial readConsistent         # 子が、届いた piece だけを答える
+red     $f m18_red_answer_held readConsistent           # 答える行を要求の範囲で絞らない: 親の控えの行が、子の答えと重なる
+red     $f m18_red_piece_without_clock noWriteBelowRead # piece が時刻を運ばない
+red     $f m18_red_write_by_slot singleOwner            # 書き込みの宛先と持ち主の確認を slot だけで決める
+red     $f m18_red_write_by_slot noLostWrite
+red     $f m18_red_intents_by_group intentNotLost       # pull が、shard key の intent を全部運ぶ
+witness $f m18_green witnessSplitWritten
+witness $f m18_green witnessTenantReadBoth
+witness $f m18_green witnessIntentMovedThenApplied
+witness $f m18_green_chunks witnessHalfArrived
+witness $f m18_green_chunks witnessReadWhileMoving      # 移動の途中でも、claim を piece で分け直せばテナントの読みが揃う
+for m in m18_green m18_green_clock m18_green_chunks m18_red_partial_answer m18_red_child_partial m18_red_answer_held m18_red_piece_without_clock m18_red_write_by_slot m18_red_intents_by_group; do tests $f $m; done
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect

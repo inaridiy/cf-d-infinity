@@ -48,26 +48,33 @@ echo "commit $commit" | tee "$out/commit"
 # --from を与えると、その seed から始める (まとめて回すとき。結果の置き場は <日付>-from<seed> になる)。
 if [ -z "$from" ]; then from=$(( ($(date +%s) / 86400) % 100000 * 10000 + 1 )); fi
 to=$(( from + seeds - 1 ))
-budget=$(( hours * 3600 / 3 ))
+# 時間は 3 つの検査で分け合う。等分すると、seed が多いときに直列化の検査 (history、ほかの 2 つより重い) だけが時間切れになる
+# (2026-11-13 の 4,200 seed で、5 時間の枠を 1 割ほど超えた)。各検査は、全体の残りの時間から、後の検査に 1/6 ずつ残した分を使う。
+total=$(( hours * 3600 ))
+reserve=$(( total / 6 ))
+deadline=$(( $(date +%s) + total ))
 
 : > "$out/summary.txt"
-echo "commit $commit, seeds $from..$to, limit ${budget}s per check" >> "$out/summary.txt"
+echo "commit $commit, seeds $from..$to, ${total}s in all" >> "$out/summary.txt"
 cd "$wt/packages/cf-d-infinity"
+left=3
 for check in replay history ddl-concurrent; do
+  left=$(( left - 1 ))
   start=$(date +%s)
+  budget=$(( deadline - start - left * reserve ))
   # 欠陥を自分で入れて決まった seed で見つかることを確かめる試験は、ほかの seed では落ちるのが正しいので、流さない。
   setsid node scripts/sweep.mjs "test/$check.test.ts" "$from" "$to" --procs "$procs" --exclude "put back|search: seeds" > "$out/$check.txt" 2>&1 &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
     if [ $(( $(date +%s) - start )) -gt "$budget" ]; then
       kill -KILL -- -"$pid" 2>/dev/null
-      echo "hung: $check did not finish within ${budget}s" >> "$out/$check.txt"
+      echo "timeout: $check did not finish within ${budget}s (a time limit, not proof of a hang)" >> "$out/$check.txt"
       break
     fi
     sleep 10
   done
   wait "$pid" 2>/dev/null
-  { echo; echo "## $check ($(( $(date +%s) - start ))s)"; grep -E "passed|seeds:|hung" "$out/$check.txt"; } >> "$out/summary.txt"
+  { echo; echo "## $check ($(( $(date +%s) - start ))s)"; grep -E "passed|seeds:|timeout" "$out/$check.txt"; } >> "$out/summary.txt"
 done
 echo "== $(date -Is) done" >> "$out/nightly.log"
 cat "$out/summary.txt"

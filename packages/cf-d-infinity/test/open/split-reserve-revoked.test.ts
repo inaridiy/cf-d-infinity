@@ -16,7 +16,7 @@ describe("a split reserved while a shard that takes no part in it fails the late
   it("lets the shard revoke the version, applies the revocation everywhere, and takes the slot in one call", async () => {
     const c = new SimCluster({ shards: 2 });
     const db = new Db(c);
-    await db.ddl("CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, gone INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)");
+    await db.ddl("CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, gone INTEGER, PRIMARY KEY (tenant_id, id))");
     const { routing } = await c.catalog();
     const tenants = Array.from({ length: 200 }, (_, i) => i + 1);
     const on = (shard: string) => tenants.filter((t) => ownerOf(routing, JSON.stringify([t])) === shard);

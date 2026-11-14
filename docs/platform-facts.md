@@ -2,6 +2,7 @@
 
 2026-11-06 時点で Cloudflare 公式ドキュメント・changelog から確認した値。
 設計判断の前提はここに集約する。
+後から確かめ直した項目には、その日付を添える。
 「未確認」と書いた項目は公式情報が見つからず、実測が必要なものである。
 
 ## Durable Objects (SQLite backend)
@@ -46,6 +47,7 @@
 | 2026-10-30 | Deferred code update が既定。active な object は最大 300 秒旧コードで動く。best effort |
 | 2026-10-01 | 保留中の RPC / fetch / waitUntil が eviction を防ぐ (操作ごとに最大 15 分) |
 | 2026-07-09 | 新規 namespace は SQLite 必須 |
+| 2026-07-04 | クラスを wrangler の設定の `exports` で宣言できる (`migrations` は旧来の書き方として残る)。`exports` の Durable Object の項目と `migrations` は同じ Worker の設定に書けず、検証で拒まれる。Workflow の項目は `migrations` と両立する。`exports` でデプロイした Worker は `migrations` へ戻れない (2026-11-14 に確認) |
 
 ### 料金 (Paid)
 
@@ -63,11 +65,11 @@
 |---|---|
 | メモリ | 128 MB / isolate |
 | CPU | 既定 30 秒、最大 5 分 |
-| subrequest | 10,000 / invocation (申請で最大 1,000 万) |
+| subrequest | 10,000 / invocation (Paid の既定)。wrangler の設定の `limits.subrequests` で Worker ごとに最大 1,000 万まで上げられる。申請ではなく設定で変える。Free は 50 (Cloudflare の内部サービス宛ては 1,000) (2026-11-14 に確認) |
 | `waitUntil` | 応答後 30 秒まで |
 | script size | 64 MiB |
 | 時刻 | `Date.now()` は最後の I/O の時刻に固定され、実行中は進まない |
-| inbound | HTTP / WebSocket のみ。生 TCP は受けられない |
+| inbound | HTTP / WebSocket。公開インターネットからの生 TCP は受けられない。`connect()` ハンドラはあるが、受けるのは別の Worker が Service Binding で転送した TCP 接続だけ。Spectrum 経由で受ける機能は非公開ベータで、公式ブログにしかない (2026-11-14 に確認) |
 | 料金 | 100 万リクエストで $0.30、100 万 CPU ms で $0.02。月 1,000 万リクエストと 3,000 万 CPU ms を含む |
 
 ## Containers
@@ -95,6 +97,24 @@
 | R2 レイテンシ | 公式ブログの一般論で「数十〜数百 ms」 |
 | Pipelines | 1 GB/s / stream、5 MB / request、20 stream / account。配信保証は未確認 |
 | DuckDB Iceberg | REST catalog で読み書き可、R2 Data Catalog へ attach 可。ただし R2 backend の公式サポート範囲と `MERGE INTO` はドキュメント間で不一致 |
+
+## 確かめ直した項目 (2026-11-14)
+
+公式ブログの記事と上の表が食い違う、という指摘があった 3 項目を、公式ドキュメントで確かめ直した。
+公式ドキュメントとブログが食い違うときは、公式ドキュメントの値を採る。
+
+| 項目 | 公式ドキュメント | 公式ブログだけにある記載 | 上の表 |
+|---|---|---|---|
+| Worker への inbound の生 TCP | `connect()` ハンドラで TCP 接続を受けられる。ただし受けるのは、別の Worker が Service Binding の `connect()` で転送した接続だけ。公開インターネットからの直接の inbound TCP は「現時点では対応していない」(Connect Handler、最終更新 2026-10-13)。Containers も、利用者は HTTP 以外の TCP / UDP を Container へ送れないまま (Lifecycle of a Container、最終更新 2026-11-09) | Spectrum が受けた TCP 接続を Worker の `connect(socket)` へ渡す。Worker から DO へ、DO から Container へ回せる。非公開ベータ (2026-08-03 の記事) | Workers の inbound を直した。Containers の到達経路は変えていない |
+| subrequest | Paid は既定 10,000 / invocation で、`limits.subrequests` により Worker ごとに最大 1,000 万。Free は 50 が最大。内部サービス宛ては Free が 1,000、Paid は設定した値と同じ (Workers の Limits、最終更新 2026-11-13) | 「1 回の要求あたり 100 万まで (以前は 1,000)」(2026-10-02 の記事)。公式ドキュメントの既定 (10,000) とも最大 (1,000 万) とも合わない | 10,000 は正しい。「申請で」を「設定で」に直した |
+| Vectorize の 1 index のベクトル数 | 2,000 万 (Vectorize の Limits、最終更新 2026-10-30)。changelog では 2026-01-23 に 500 万から 1,000 万、2026-08-04 に 1,000 万から 2,000 万 | 2,000 万 (2026-10-02 の記事)。公式ドキュメントと一致する。記事が「以前は 500 万」と書くのは、過去 1 年の引き上げをまとめた記事だからである | 記載がなかった。変更なし。1,000 万は 2026-08-04 より前の値 |
+
+出典 (いずれも 2026-11-14 に取得した):
+
+- inbound の生 TCP: <https://developers.cloudflare.com/workers/runtime-apis/handlers/connect/>、<https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/> (Considerations)、<https://developers.cloudflare.com/containers/concepts/architecture/>、ブログ <https://blog.cloudflare.com/grpc-workers/>
+- subrequest: <https://developers.cloudflare.com/workers/platform/limits/#subrequests>、<https://developers.cloudflare.com/workers/wrangler/configuration/#limits>、ブログ <https://blog.cloudflare.com/enterprise-for-all-update/>
+- Vectorize: <https://developers.cloudflare.com/vectorize/platform/limits/>、<https://developers.cloudflare.com/changelog/product/vectorize/>、ブログ <https://blog.cloudflare.com/enterprise-for-all-update/>
+- Durable Object の `exports` (「直近の変更」の 2026-07-04 の行): <https://developers.cloudflare.com/changelog/product/durable-objects/>、<https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/> (Constraints and limitations、最終更新 2026-09-28)、<https://developers.cloudflare.com/workers/wrangler/configuration/#exports>
 
 ## ローカルの workerd で確かめたもの
 

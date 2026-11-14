@@ -19,6 +19,7 @@ export const COMPATIBILITY_DATE = "2026-07-01";
 export class Conflict extends Error {}
 
 const readText = (path) => (existsSync(path) ? readFileSync(path, "utf8") : null);
+const isRecord = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
 function parseJsonc(text, path) {
   const errors = [];
@@ -123,6 +124,60 @@ function planCode(cwd, config, opts, { writes, done, kept, next }) {
 }
 
 /**
+ * Durable Object のクラスの宣言を計画する。wrangler の設定での書き方は 2 通りある。
+ *   - `migrations`: 順序のある移行の列。旧来の書き方で、どちらも使っていない設定にはこちらを足す。
+ *   - `exports`: クラスごとの宣言 (2026-07-04 から)。一度 `exports` でデプロイした Worker は `migrations` へ戻れない。
+ * `exports` の Durable Object の項目 (`type` が "durable-object"。削除や改名の印も含む) と `migrations` は、
+ * 同じ Worker の設定に両方は書けず、Cloudflare が検証で拒む。Workflow の項目 ("workflow") は `migrations` と両立する。
+ * そこで、Durable Object を `exports` で宣言している設定には、移行を足さずに `exports` へ宣言する。
+ * どちらのキーも環境 (`env.<名前>`) に継承されるので、最上位に移行を足すと `exports` を使う環境も壊れる。環境の中も見る。
+ * 出典 (2026-11-14 に確認):
+ *   https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/ (Constraints and limitations)
+ *   https://developers.cloudflare.com/workers/wrangler/configuration/ (Inheritable keys)
+ * wrangler 4.158.0 の設定の検証も同じ条件で拒む: 環境ごとに継承を解決した後で、移行が 1 つ以上あり、
+ * `exports` に Durable Object の項目が 1 つでもあると誤りにする。
+ */
+function planClasses(doc, config, configName, { done, kept }) {
+  const migrations = config.migrations ?? [];
+  if (!Array.isArray(migrations)) throw new Conflict(`${configName}: "migrations" is not an array`);
+  const exported = config.exports ?? {};
+  if (!isRecord(exported)) throw new Conflict(`${configName}: "exports" is not an object`);
+  const declaresClasses = (map) => isRecord(map) && Object.values(map).some((e) => e?.type === "durable-object");
+  const exportsAt = declaresClasses(exported)
+    ? "exports"
+    : Object.entries(isRecord(config.env) ? config.env : {}).filter(([, e]) => declaresClasses(e?.exports)).map(([name]) => `env.${name}.exports`)[0];
+  // 同じ名前の項目が既にあるなら、SQLite の生きたクラスでなければならない (削除の印、KV、Workflow などは別物)。
+  for (const c of CLASSES) {
+    const e = exported[c];
+    if (e !== undefined && !(e?.type === "durable-object" && (e.state ?? "created") === "created" && e.storage === "sqlite")) {
+      throw new Conflict(`${configName}: "exports.${c}" is not a live SQLite-backed Durable Object class; cf-d-infinity uses that class name`);
+    }
+  }
+  if (exportsAt) {
+    if (migrations.length > 0) {
+      throw new Conflict(`${configName}: "${exportsAt}" declares Durable Object classes and "migrations" is set too; Cloudflare rejects a Worker that uses both. Keep one of the two and run init again`);
+    }
+    const missing = CLASSES.filter((c) => exported[c] === undefined);
+    if (missing.length === 0) kept.push(`"exports" entries for the three classes`);
+    else {
+      for (const c of missing) doc.set(["exports", c], { type: "durable-object", storage: "sqlite" });
+      done.push(`"exports" entries for ${missing.join(", ")} (SQLite-backed classes; no migration, because "${exportsAt}" already declares Durable Object classes and Cloudflare rejects the two together)`);
+    }
+    return;
+  }
+  const declared = new Set(migrations.flatMap((m) => [...(m?.new_sqlite_classes ?? []), ...(m?.new_classes ?? [])]));
+  const present = CLASSES.filter((c) => declared.has(c));
+  if (present.length === CLASSES.length) kept.push("migration for the three classes");
+  else if (present.length > 0) {
+    throw new Conflict(`${configName}: a migration already declares ${present.join(", ")} but not all of ${CLASSES.join(", ")}`);
+  } else {
+    if (migrations.some((m) => m?.tag === MIGRATION_TAG)) throw new Conflict(`${configName}: migration tag ${MIGRATION_TAG} is already used for something else`);
+    doc.push(["migrations"], { tag: MIGRATION_TAG, new_sqlite_classes: CLASSES });
+    done.push(`migration ${MIGRATION_TAG} (SQLite-backed classes ${CLASSES.join(", ")})`);
+  }
+}
+
+/**
  * 既存の Workers プロジェクトへ足す変更を計画する。
  * @returns {{ writes: {path: string, content: string}[], done: string[], kept: string[], next: string[] }}
  */
@@ -151,19 +206,8 @@ function planExisting(cwd, configName, opts) {
     }
   }
 
-  // Migration
-  const migrations = config.migrations ?? [];
-  if (!Array.isArray(migrations)) throw new Conflict(`${configName}: "migrations" is not an array`);
-  const declared = new Set(migrations.flatMap((m) => [...(m?.new_sqlite_classes ?? []), ...(m?.new_classes ?? [])]));
-  const present = CLASSES.filter((c) => declared.has(c));
-  if (present.length === CLASSES.length) kept.push("migration for the three classes");
-  else if (present.length > 0) {
-    throw new Conflict(`${configName}: a migration already declares ${present.join(", ")} but not all of ${CLASSES.join(", ")}`);
-  } else {
-    if (migrations.some((m) => m?.tag === MIGRATION_TAG)) throw new Conflict(`${configName}: migration tag ${MIGRATION_TAG} is already used for something else`);
-    doc.push(["migrations"], { tag: MIGRATION_TAG, new_sqlite_classes: CLASSES });
-    done.push(`migration ${MIGRATION_TAG} (SQLite-backed classes ${CLASSES.join(", ")})`);
-  }
+  // クラスの宣言 (移行か、`exports` の項目)
+  planClasses(doc, config, configName, { done, kept });
 
   // Service Binding
   const services = config.services ?? [];

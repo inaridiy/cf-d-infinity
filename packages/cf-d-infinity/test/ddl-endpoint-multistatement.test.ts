@@ -43,7 +43,7 @@ afterAll(() => mf?.dispose());
 
 describe("POST /ddl with the data token", () => {
   it("does not execute a second statement inside the shards' SQLite", async () => {
-    expect((await post("/ddl", { sql: "CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)" })).status).toBe(200);
+    expect((await post("/ddl", { sql: "CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id))" })).status).toBe(200);
     expect((await post("/sql", { sql: "INSERT INTO t VALUES (1, 1, 1)" })).status).toBe(200);
     // Does a table of this name exist inside the shard that holds tenant 1? (Uses the CTE scoping gap reported
     // separately to look inside the shard; "no such table" is the expected answer.)
@@ -60,7 +60,7 @@ describe("POST /ddl with the data token", () => {
   }, 60_000);
 
   it("does not execute a second statement inside Meta's SQLite (which holds the range table and the DDL log)", async () => {
-    expect((await post("/ddl", { sql: "CREATE TABLE m(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)" })).status).toBe(200);
+    expect((await post("/ddl", { sql: "CREATE TABLE m(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id))" })).status).toBe(200);
     const ddl = await post("/ddl", { sql: "CREATE INDEX m_v ON m(tenant_id, v); CREATE TABLE zzz_probe(a)" });
     const known = await post("/sql", { sql: "SELECT * FROM zzz_probe" });
     // The catalog has no table zzz_probe, so creating it must work. Meta validates the statement in its own SQLite

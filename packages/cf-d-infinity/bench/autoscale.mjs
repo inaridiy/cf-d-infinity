@@ -10,7 +10,7 @@ const CLIENTS = Number(process.env.CLIENTS ?? 120);
 // 一定レートの負荷 (書き込み/s)。未指定なら応答が返ると次を送る負荷になり、台数とともに負荷も増える。
 const RATE = process.env.RATE ? Number(process.env.RATE) : undefined;
 
-await post("/admin/ddl", { cluster, shards: 2, sql: "CREATE TABLE bench(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)" });
+await post("/admin/ddl", { cluster, shards: 2, sql: "CREATE TABLE bench(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id))" });
 await seed(2, TENANTS, cluster);
 await post("/admin/autoscale/start", { cluster, shards: 2, tickMs: 5000, thresholds: { cooldownMs: Number(process.env.COOLDOWN ?? 15000), sustainTicks: Number(process.env.SUSTAIN ?? 2) } });
 

@@ -182,7 +182,7 @@ describe("the cf-d-infinity command", () => {
   });
 
   it("exports schema and rows as SQL, and imports them into an empty database with the same contents", async () => {
-    await cli(["sql", "CREATE TABLE things(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, label TEXT, data BLOB, score REAL, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)", ...to]);
+    await cli(["sql", "CREATE TABLE things(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, label TEXT, data BLOB, score REAL, PRIMARY KEY (tenant_id, id))", ...to]);
     await cli(["sql", "CREATE TABLE people(id INTEGER PRIMARY KEY, email TEXT UNIQUE)", ...to]);
     await sql(logged, "INSERT INTO things VALUES (1, 1, ?, x'00ff10', 1.5), (1, 2, NULL, NULL, -2), (2, 1, ?, x'', 0)", ["it's a 'quoted'\nline\r\nwith breaks", "日本語; -- not a comment"]);
     for (let i = 1; i <= 30; i++) await sql(logged, "INSERT INTO people(id, email) VALUES (?, ?)", [i, `p${i}@example.test`]);
@@ -193,7 +193,8 @@ describe("the cf-d-infinity command", () => {
     const dump = readFileSync(file, "utf8");
     // 1 文が 1 行。文字列の中の改行は char() の連結になっている。
     expect(dump.split("\n").filter((l) => l && !l.startsWith("--")).every((l) => l.endsWith(";"))).toBe(true);
-    expect(dump).toContain('SHARD KEY ("tenant_id")');
+    // 表定義は利用者の文面のまま書き出す (shard key は主キーの先頭の列で決まるので、書き足すものはない)。
+    expect(dump).toContain("PRIMARY KEY (tenant_id, id));");
     expect(dump).toContain("|| char(10) ||");
     expect(dump).toContain("X'00ff10'");
 

@@ -9,7 +9,7 @@ import { MAX_WRITE_SET_BYTES } from "../src/types";
 import { quiescentProblems } from "./invariants";
 import { DO_MAX_BOUND_PARAMS, DO_MAX_VALUE_BYTES, SimCluster, SqliteBackend } from "./sim";
 
-const DOCS = `CREATE TABLE docs(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+const DOCS = `CREATE TABLE docs(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (tenant_id, id))`;
 async function tenantOn(c: SimCluster, shard: string): Promise<number> {
   const { routing } = await c.catalog();
   for (let t = 1; ; t++) if (ownerOf(routing, JSON.stringify([t])) === shard) return t;

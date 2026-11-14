@@ -84,7 +84,7 @@ async function answers(c: SimCluster): Promise<Record<string, string>> {
 async function workload(): Promise<SimCluster> {
   const c = new SimCluster({ shards: 3, seed: 1 });
   const db = c.client();
-  await db.ddl("CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT UNIQUE, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)");
+  await db.ddl("CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT UNIQUE, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, id))");
   await db.ddl("CREATE TABLE kv(k TEXT PRIMARY KEY, v, r REAL)");
   await db.ddl("CREATE TABLE logs(msg TEXT, at INTEGER)");
   await db.ddl("CREATE TABLE gone(id INTEGER PRIMARY KEY, x TEXT)");

@@ -8,7 +8,7 @@ import { quiescentProblems } from "./invariants";
 import { SimCluster } from "./sim";
 
 const USERS = `CREATE TABLE users(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT, code TEXT, n INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (tenant_id, id), UNIQUE (email), UNIQUE (tenant_id, code)) SHARD KEY (tenant_id)`;
+  PRIMARY KEY (tenant_id, id), UNIQUE (email), UNIQUE (tenant_id, code))`;
 const ALL = "SELECT tenant_id, id, email, code, n FROM users ORDER BY tenant_id, id";
 
 /** 同じ文を D∞ と本物の SQLite に流し、文ごとの変更行数と、最後の全行を比べる。 */
@@ -17,7 +17,7 @@ async function same(statements: [string, unknown[]][], shards = 3) {
   const db = c.client();
   const lite = new DatabaseSync(":memory:");
   await db.ddl(USERS);
-  lite.exec(USERS.replace(/SHARD KEY \([^)]*\)/, ""));
+  lite.exec(USERS);
   for (const [sql, params] of statements) {
     const want = (() => {
       try {

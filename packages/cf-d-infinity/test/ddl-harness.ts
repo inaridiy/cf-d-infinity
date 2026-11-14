@@ -23,10 +23,10 @@ export function prng(seed: number) {
 
 export const ACCT = `CREATE TABLE acct(
   tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, n INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+  PRIMARY KEY (tenant_id, id))`;
 export const SIDE = `CREATE TABLE side(
   tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER NOT NULL,
-  PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+  PRIMARY KEY (tenant_id, id))`;
 export const INDEX = "acct_v";
 
 export const TENANTS = 6;
@@ -207,12 +207,17 @@ export async function misplacedRows(c: SimCluster, table = "acct"): Promise<stri
     .map(({ shard, row }) => `${row.tenant_id}/${row.id} on ${shard}`);
 }
 
-/** ADD COLUMN extra DEFAULT 5 の後の行。extra は既定値か、書いた値 (n と同じ) のどちらかでなければならない。 */
-export async function extraViolations(c: SimCluster): Promise<string[]> {
+/**
+ * ADD COLUMN extra DEFAULT 5 の後の行。extra は既定値か、その行に extra を書いたどれかの書き込みの値 (その書き込みの n) で
+ * なければならない。extra を書かない UPDATE (表定義の変更の前に計画した書き込み) は extra を前の値のまま残すので、extra が
+ * 最後の n と同じとは限らない。2026-11-13 までの確かめは extra と n が同じことを求め、extra を書いた書き込みの後に extra を
+ * 書かない UPDATE が届く順序で、正しい行を違反と数えた (検査の誤り。一晩分の試験の seed 900541、901960)。
+ */
+export async function extraViolations(c: SimCluster, written?: Map<string, Set<number>>): Promise<string[]> {
   const cat = await c.catalog();
   if (!cat.tables.acct?.columns.includes("extra")) return [];
   return (await rawRows(c, "acct"))
-    .filter(({ row }) => row.extra !== 5 && row.extra !== row.n)
+    .filter(({ row }) => row.extra !== 5 && row.extra !== row.n && !written?.get(`${row.tenant_id}/${row.id}`)?.has(row.extra as number))
     .map(({ row }) => `${row.tenant_id}/${row.id} extra=${row.extra} n=${row.n}`);
 }
 
@@ -412,7 +417,10 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
       paused = true;
       // 途中で失敗しても、作業負荷を止めたままにしない。止めたままだと、失敗が記録されるだけで、実行が終わらなくなる。
       try {
-        while (active > 0) await c.sleep(1);
+        // 分割も止め、進めている分割が終わるのを待つ。分割の途中の生の表は、運んでいる最中の行を範囲表のどのシャードにも
+        // 見せないことがあり、index と表が合わないように見えた (検査の誤り。2026-11-13 の一晩分の試験の seed 903321。
+        // データベースを通した読み (wrongRead) は正しかった)。
+        while (active > 0 || splitting) await c.sleep(1);
         await c.settle();
         for (const core of c.cores.values()) await core.redrive().catch(() => {});
         await c.settle();
@@ -483,6 +491,8 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
     reads.push({ tenant: t, value: { count: r.rows[0]!.c, sum: r.rows[0]!.s } });
   };
   type Writes = TxRecord["writes"] & { v?: (number | null)[] };
+  /** 確定した書き込みが extra に書いた値。行ごとに持つ (record が、extra を書く操作の成功のときに足す)。 */
+  const extraWritten = new Map<string, Set<number>>();
   const noteV = (writes: Writes, v: number | null) => void (writes.v = [...(writes.v ?? []), v]);
   const put = async (tx: Q, x: { t: number; i: number }, n: number, v: number | null, extra: boolean, writes: Writes) => {
     await tx.query("DELETE FROM acct WHERE tenant_id = ? AND id = ?", [x.t, x.i]);
@@ -497,8 +507,9 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
     body(tx: Q, reads: Read[], writes: Writes): Promise<void>;
     side?: { t: number; id: number; n: number };
   }
-  const record = (p: Plan, ts: number | undefined, reads: Read[], writes: Writes, begun: number, vreads: VRead[] = []) => {
+  const record = (p: Plan, ts: number | undefined, reads: Read[], writes: Writes, begun: number, vreads: VRead[] = [], extra = false) => {
     const acked_ = env.tick();
+    if (extra) for (const w of writes) if (w.value !== null) extraWritten.set(w.key, (extraWritten.get(w.key) ?? new Set()).add(w.value));
     if (writes.length) commits++;
     const wv = writes.map((_w, i) => writes.v?.[i] ?? null);
     writes.forEach((w, i) => {
@@ -583,7 +594,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
       const r = extra
         ? await db.query("UPDATE acct SET v = ?, n = ?, extra = ? WHERE tenant_id = ? AND id = ?", [v, n, n, x.t, x.i])
         : await db.query("UPDATE acct SET v = ?, n = ? WHERE tenant_id = ? AND id = ?", [v, n, x.t, x.i]);
-      if (r.changes > 0) record(p, r.ts, [], w1(), begun);
+      if (r.changes > 0) record(p, r.ts, [], w1(), begun, [], extra);
       return;
     }
     if (mode === "autoInsert") {
@@ -597,7 +608,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
         last = { tx, reads: [], writes: [] };
         await p.body(tx, last.reads, last.writes);
       });
-      record(p, last!.tx.commitTs ?? last!.tx.T, last!.reads, last!.writes, begun);
+      record(p, last!.tx.commitTs ?? last!.tx.T, last!.reads, last!.writes, begun, [], extra);
       return;
     }
     const tx = await db.begin();
@@ -616,7 +627,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
       await tx.unlockAll();
       throw e;
     }
-    record(p, tx.commitTs ?? tx.T, reads, writes, begun);
+    record(p, tx.commitTs ?? tx.T, reads, writes, begun, [], extra);
   };
 
   const worker = async () => {
@@ -651,6 +662,8 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
 
   let stop = false;
   let splits = 0;
+  /** 分割を進めている最中か。checkpoint は、これが終わるのを待ってから表を調べる。 */
+  let splitting = false;
   const grower = (async () => {
     let next = c.shardIds.length;
     while (!stop && s.splits && next < c.shardIds.length + 5) {
@@ -662,6 +675,8 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
       if (!range) continue;
       const child = `s${next++}`;
       for (let attempt = 0; attempt < 20; attempt++) {
+        while (paused) await c.sleep(1);
+        splitting = true;
         try {
           await split(c, parent, child, { range });
           splits++;
@@ -677,6 +692,8 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
           // 子が古い表定義のまま親の行を受け取ると drain が失敗する。要求が届けば子は追い付くので、やり直す。
           if (attempt === 19) errors.push(`split: ${m}`);
           await c.sleep(5);
+        } finally {
+          splitting = false;
         }
       }
     }
@@ -727,7 +744,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   }
 
   const misplaced = await misplacedRows(c);
-  const badExtra = await extraViolations(c);
+  const badExtra = await extraViolations(c, extraWritten);
 
   const sideExists = cat.tables.side !== undefined;
   const sideRows = sideExists ? (await rawRows(c, "side")).map(({ row }) => row.n as number) : [];

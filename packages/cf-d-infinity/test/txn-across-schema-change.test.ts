@@ -22,7 +22,7 @@ import { SimCluster } from "./sim";
 describe("a transaction that planned a write before a UNIQUE index existed", () => {
   const setup = async () => {
     const c = new SimCluster({ shards: 2 });
-    await new Db(c).ddl("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)");
+    await new Db(c).ddl("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id))");
     const A = await tenantOn(c, "s0");
     const B = await tenantOn(c, "s1");
     await new Db(c).query("INSERT INTO t VALUES (?, 1, 7)", [B]);
@@ -60,7 +60,7 @@ describe("a transaction that planned a write before a UNIQUE index existed", () 
     await db.query("BEGIN");
     await db.query("INSERT INTO t VALUES (?, 1, 7)", [A]);
     const other = new Db(c);
-    await other.ddl("CREATE TABLE extra(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)");
+    await other.ddl("CREATE TABLE extra(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (tenant_id, id))");
     await other.ddl("CREATE UNIQUE INDEX u ON t(v)");
     await db.query("SELECT count(*) FROM extra").catch(() => undefined);
     await db.query("COMMIT").catch(() => undefined);

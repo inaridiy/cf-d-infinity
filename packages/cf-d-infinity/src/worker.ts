@@ -602,10 +602,8 @@ export async function schemaSql(env: Env, name = "shard"): Promise<string[]> {
   const reverted = new Set(ddl.flatMap((e) => (e.reverts === undefined ? [] : [e.reverts, e.version])));
   return ddl.flatMap((e) => {
     if (typeof e.user !== "string" || e.user.trim() === "" || reverted.has(e.version)) return [];
-    // 履歴の文面からは SHARD KEY が除かれている。取り込み先で行の置き場所が変わらないよう、表定義から書き戻す。
-    const def = e.defs[0];
-    const createsTable = /^\s*CREATE\s+TABLE\b/i.test(e.user) && def !== undefined && !def.name.startsWith("__");
-    return [createsTable ? `${e.user} SHARD KEY (${def.shardKey.map((c) => `"${c.replaceAll('"', '""')}"`).join(", ")})` : e.user];
+    // shard key は主キーの先頭の列で決まるので、利用者の文面のままで、取り込み先でも行の置き場所は同じになる。
+    return [e.user];
   });
 }
 

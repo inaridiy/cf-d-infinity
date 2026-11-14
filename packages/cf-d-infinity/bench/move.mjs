@@ -5,8 +5,8 @@ import { load, post } from "./run.mjs";
 // 環境変数名に GROUPS は使えない。bash の特殊変数なので代入が無視される。
 const GROUPS = Number(process.env.GROUP_COUNT ?? 256);
 const ROWS = 400;
-const ddl = "CREATE TABLE bulk(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v TEXT, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)";
-const ddl2 = "CREATE TABLE bench(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)";
+const ddl = "CREATE TABLE bulk(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v TEXT, PRIMARY KEY (tenant_id,id))";
+const ddl2 = "CREATE TABLE bench(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id,id))";
 const prep = async (cluster) => {
   await post("/admin/ddl", { cluster, shards: 1, sql: ddl });
   await post("/admin/ddl", { cluster, shards: 1, sql: ddl2 });

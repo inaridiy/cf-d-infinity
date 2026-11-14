@@ -15,10 +15,10 @@ import { prng, seedsOr, SimCluster } from "./sim";
 
 const DDL = [
   `CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT, code TEXT, v INTEGER NOT NULL DEFAULT 0, n INTEGER NOT NULL DEFAULT 0,
-     PRIMARY KEY (tenant_id, id), UNIQUE (tenant_id, code), UNIQUE (email)) SHARD KEY (tenant_id)`,
+     PRIMARY KEY (tenant_id, id), UNIQUE (tenant_id, code), UNIQUE (email))`,
   `CREATE INDEX acct_v ON acct(v)`,
   `CREATE TABLE item(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, acct_id INTEGER, qty INTEGER NOT NULL DEFAULT 0,
-     PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`,
+     PRIMARY KEY (tenant_id, id))`,
   `CREATE TABLE flat(id INTEGER PRIMARY KEY, v INTEGER, tag TEXT)`,
   `CREATE TABLE one(id INTEGER PRIMARY KEY)`,
 ];

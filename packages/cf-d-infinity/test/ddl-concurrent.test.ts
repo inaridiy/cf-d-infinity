@@ -188,7 +188,7 @@ const CASES = {
         e.useExtra = true;
       },
     },
-    seeds: [1, 2, 3, 4, 5, 6], known: [],
+    seeds: [1, 2, 3, 4, 5, 6, 901960], known: [], // 901960: extra を書かない UPDATE が後に届く順序 (2026-11-13 の一晩分の試験)
   },
   // シャードをまたぐ UNIQUE の index の作成 (書き込みを止めて作る) と、分割。値はほぼ一意で、ときどき重複する。
   uniqueIndexAndSplits: {
@@ -201,7 +201,7 @@ const CASES = {
         e.useExtra = true;
       },
     },
-    seeds: [1, 2, 3, 4, 5, 6], known: [],
+    seeds: [1, 2, 3, 4, 5, 6, 900541, 903321], known: [], // 900541: 上と同じ。903321: 分割の途中の表を checkpoint が読んだ
   },
 } satisfies Record<string, Case>;
 
@@ -302,10 +302,10 @@ describe("4. DDL racing with shard splits", () => {
 
 const T = `CREATE TABLE t(
   tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, n INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+  PRIMARY KEY (tenant_id, id))`;
 const U = `CREATE TABLE u(
   tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER,
-  PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`;
+  PRIMARY KEY (tenant_id, id))`;
 
 async function two(faults?: Faults) {
   const c = new SimCluster({ shards: 2, faults });

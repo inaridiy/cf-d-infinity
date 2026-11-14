@@ -102,7 +102,7 @@ describe.skipIf(!!process.env.REFERENCE)("the gather budget is a total that does
         for (const skewed of [true, false]) {
           const c = new SimCluster({ shards });
           const db = new Db(c, { limits: { bytes: BUDGET } });
-          await db.ddl("CREATE TABLE g(g INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (g, id)) SHARD KEY (g)");
+          await db.ddl("CREATE TABLE g(g INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (g, id))");
           for (let at = 0; at < rows; at += 50) {
             const chunk = Array.from({ length: Math.min(50, rows - at) }, (_v, i) => at + i);
             await db.query(`INSERT INTO g VALUES ${chunk.map(() => "(?, ?, ?)").join(", ")}`, chunk.flatMap((i) => [skewed ? 1 : i, i, "z".repeat(1000)]));
@@ -135,7 +135,7 @@ describe("the size of a transaction is a total that does not depend on placement
       for (const shards of [1, 2, 4]) {
         for (const skewed of [true, false]) {
           const db = new Db(new SimCluster({ shards }));
-          await db.ddl("CREATE TABLE w(g INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (g, id)) SHARD KEY (g)");
+          await db.ddl("CREATE TABLE w(g INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (g, id))");
           const got = await db.transaction(async (tx) => {
             for (let i = 0; i < rows; i++) await tx.query("INSERT INTO w VALUES (?, ?, ?)", [skewed ? 1 : i, i, "w".repeat(50_000)]);
           }).then(() => "ok", (e: Error) => `error ${e.message.slice(0, 40)}`);

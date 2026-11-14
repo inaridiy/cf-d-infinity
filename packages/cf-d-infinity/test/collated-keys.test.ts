@@ -9,8 +9,8 @@ describe("collations on key columns", () => {
     const db = new SimCluster({ shards: 2 }).client();
     for (const sql of [
       "CREATE TABLE a(name TEXT COLLATE NOCASE PRIMARY KEY, n INTEGER)",
-      "CREATE TABLE a(tenant TEXT COLLATE RTRIM NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (tenant, id)) SHARD KEY (tenant)",
-      "CREATE TABLE a(tenant_id INTEGER NOT NULL, code TEXT COLLATE NOCASE NOT NULL, PRIMARY KEY (tenant_id, code)) SHARD KEY (tenant_id)",
+      "CREATE TABLE a(tenant TEXT COLLATE RTRIM NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (tenant, id))",
+      "CREATE TABLE a(tenant_id INTEGER NOT NULL, code TEXT COLLATE NOCASE NOT NULL, PRIMARY KEY (tenant_id, code))",
       "CREATE TABLE a(id INTEGER PRIMARY KEY, email TEXT COLLATE NOCASE UNIQUE)",
     ]) await expect(db.ddl(sql)).rejects.toThrow(/^unsupported: COLLATE/);
     await db.ddl("CREATE TABLE b(id INTEGER PRIMARY KEY, email TEXT COLLATE NOCASE)");
@@ -19,7 +19,7 @@ describe("collations on key columns", () => {
 
   it("work on other columns, including a UNIQUE inside one shard key", async () => {
     const db = new SimCluster({ shards: 2 }).client();
-    await db.ddl("CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT COLLATE NOCASE, PRIMARY KEY (tenant_id, id), UNIQUE (tenant_id, code)) SHARD KEY (tenant_id)");
+    await db.ddl("CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT COLLATE NOCASE, PRIMARY KEY (tenant_id, id), UNIQUE (tenant_id, code))");
     await db.query("INSERT INTO p VALUES (1, 1, 'abc')");
     await expect(db.query("INSERT INTO p VALUES (1, 2, 'ABC')")).rejects.toThrow(/UNIQUE/);
     await db.query("INSERT INTO p VALUES (2, 1, 'ABC')");

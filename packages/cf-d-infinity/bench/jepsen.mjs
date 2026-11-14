@@ -32,7 +32,7 @@ const event = (kind, detail) => {
 
 await post("/admin/ddl", {
   cluster, shards: SHARDS,
-  sql: "CREATE TABLE jep(k INTEGER NOT NULL, id INTEGER NOT NULL, v TEXT NOT NULL, PRIMARY KEY (k, id)) SHARD KEY (k)",
+  sql: "CREATE TABLE jep(k INTEGER NOT NULL, id INTEGER NOT NULL, v TEXT NOT NULL, PRIMARY KEY (k, id))",
 });
 const t0 = Date.now();
 const until = t0 + DURATION;

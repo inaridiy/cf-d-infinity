@@ -78,7 +78,7 @@ describe("shard health", () => {
     spanFaults.rowSpanDespiteUnique = true;
     const c = new SimCluster({ shards: 2, faults: { autoIgnoresUniqueIntents: true }, noSpanCheck: true });
     const db = c.client();
-    await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)`);
+    await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id))`);
     await db.ddl(`CREATE UNIQUE INDEX p_code ON p(tenant_id, code)`);
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));

@@ -16,7 +16,7 @@ import { duplicates, hold, indexAgreement, rawRows, tenantOn } from "./ddl-harne
 import { SimCluster } from "./sim";
 
 const outcome = (p: Promise<unknown>) => p.then(() => "ok", (e: Error) => e.message);
-const TABLE = "CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)";
+const TABLE = "CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id))";
 /** indexAgreement の `値 -> 行` から値だけを取る。 */
 const values = (list: string[]) => list.map((x) => x.split(" -> ")[0]);
 
@@ -24,7 +24,7 @@ describe("CREATE UNIQUE INDEX on a table that already has duplicate values, whil
   const setup = async () => {
     const c = new SimCluster({ shards: 2 });
     const db = new Db(c);
-    await db.ddl("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)");
+    await db.ddl("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id))");
     const A = await tenantOn(c, "s0");
     const B = await tenantOn(c, "s1");
     // 重複がある。A/1 と B/1 が v = 7、A/2 と B/2 が v = 8。この index は作れない。
@@ -122,7 +122,7 @@ describe("a table whose rows are being indexed", () => {
   const writeAfterScan = async (faults?: Faults) => {
     const c = new SimCluster({ shards: 2, faults });
     const db = new Db(c);
-    await db.ddl("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)");
+    await db.ddl("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id))");
     const A = await tenantOn(c, "s0");
     const B = await tenantOn(c, "s1");
     await db.query("INSERT INTO t VALUES (?, 1, 7)", [A]);
@@ -195,7 +195,7 @@ describe("the publication of a UNIQUE index that spans shards", () => {
   /** s1 の時計は s0 より 5 秒進んでいる。s1 で index なしに書いた値を、index が出来た後で、s0 だけを触る文が使おうとする。 */
   const afterPublish = async (faults?: Faults) => {
     const c = new SimCluster({ shards: 2, skewMs: (id) => (id === "s1" ? 5000 : 0), faults });
-    await new Db(c).ddl("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)");
+    await new Db(c).ddl("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id))");
     const A = await tenantOn(c, "s0");
     const B = await tenantOn(c, "s1");
     // index の項目が s0 に載る値を選ぶ。
@@ -270,7 +270,7 @@ describe("the lease on a table whose rows are being indexed", () => {
   const slowBuild = async (o: { leaseMs?: number; buildMaxMs?: number }) => {
     const c = new SimCluster({ shards: 2, ...o });
     const db = new Db(c);
-    await db.ddl("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)");
+    await db.ddl("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id))");
     await db.query("INSERT INTO t VALUES (1, 1, 1), (2, 1, 2), (3, 1, 3)");
     // 行を読む要求を、1 回ごとに 2 秒遅らせる。作る作業が、期限より長くかかる。
     c.net.gate = (m) => (m.from === "client" && m.method === "exec" && /FROM "t"\s+ORDER BY/.test((m.req as { sql: string }).sql) ? c.sleep(2_000) : undefined);

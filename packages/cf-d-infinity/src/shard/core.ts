@@ -133,6 +133,49 @@ interface Waiter extends LockOwner {
   wake(): void;
 }
 
+/**
+ * 待ちの後で確かめ直すこと。schema は、要求を計画した表定義の版が、いまも現行であること。owned は、読む範囲と書く行を、読む時刻で
+ * このシャードが持っていること。
+ */
+type Check = "schema" | "owned";
+
+/** 同期区間が頼る表定義の版。要求を計画したときの版である。 */
+interface Plan {
+  schema: number;
+}
+
+/** 同期区間が頼る行。読む範囲、書く行、読む時刻 (null は最新の状態) である。 */
+interface Rows {
+  spans: Span[];
+  writes: Pick<Change, "sk">[];
+  at: Ts | null;
+}
+
+/** Section を作る鍵。このファイルの外へは出さない。使うのは ShardCore.enter だけである。 */
+const ENTER = Symbol("enter");
+
+/**
+ * 同期区間に入った印。ShardCore.enter が、待ちの後の確かめ直しを済ませてから作る。コンストラクタは private で、作る関数は、
+ * このファイルの外へ出さない鍵 (ENTER) でしか呼べない。このファイルの中でも、enter のほかでは作らない。
+ *
+ * 要求の文を実行する関数 (run、checked)、取引を検証する関数 (validate、changedSince)、書き込みを受け入れる関数
+ * (assertWriteSetFits、prepareSync) は、この印を受け取る。確かめ直しを飛ばした入口は、印を持てないので、型の検査を通らない。
+ * 型の引数は、確かめ直したことである。版を確かめ直していない印は、版に頼る関数へ渡せない。
+ *
+ * 型が確かめるのは、区間に入ったことまでである。印を await の後まで持ち越していないことは、型では確かめられない。
+ * 印は、作った同期区間の中だけで使い、待った後は、enter をもう一度呼んで作り直す。
+ */
+class Section<K extends Check> {
+  /** 確かめ直したこと。多く確かめた印は、少なく求める関数へ渡せる。逆は渡せない。 */
+  protected readonly rechecked: { readonly [P in K]: true };
+  private constructor(rechecked: { readonly [P in K]: true }) {
+    this.rechecked = rechecked;
+  }
+  static [ENTER]<K extends Check>(rechecked: { readonly [P in K]: true }): Section<K> {
+    return new Section(rechecked);
+  }
+}
+
 /** シャード 1 個のプロトコル本体。DO に依存せず、Node の SQLite でも同じコードが動く。 */
 
 /**
@@ -397,16 +440,6 @@ export class ShardCore implements ShardApi {
   }
 
   /**
-   * 待ちを挟んだ後で、要求の表定義がまだ現行かを確かめ直す。
-   * 入口で確かめた後、行ロックや intent の決着を待っている間に DDL が適用されることがある。
-   * そのまま書くと、新しいグローバル index を保守しない古い計画が通ってしまう。
-   */
-  private requireSchema(version: number): void {
-    if (this.faults.noSchemaRecheck) return;
-    if (version !== this.schema) throw new NotOwner(`stale schema ${version} < ${this.schema}`);
-  }
-
-  /**
    * Meta から DDL を取り、順に適用する。
    * 先に、このシャードが持つ intent をすべて決着させる。intent の行イメージは DDL より前の表の形なので、
    * 表や列が消えた後では適用できない。確定済みの取引がそうなると、再駆動が永久に失敗する。
@@ -528,10 +561,14 @@ export class ShardCore implements ShardApi {
   }
 
   /**
-   * 同期区間の入口で呼ぶ。親は fence した範囲を一切受理せず、子は T < m を拒否する。
+   * 読む範囲と書く行を、読む時刻でこのシャードが持っているか。親は fence した範囲を一切受理せず、子は T < m を拒否する。
    * 子に T < m の状態はないので、答えると移動前の commit を失った結果を返すことになる。
+   *
+   * 同期区間の入口では、enter がこれを呼ぶ。ほかに呼ぶのは、intent の決着を始める前だけである (exec、lockedExec、execAuto)。
+   * 決着の問い合わせは、相手の取引の確定の時刻を押し上げる。持ち主でない要求は結局断るので、問い合わせる前に断る。
+   * そこで通っても、決着を待った後で enter がもう一度確かめる。
    */
-  private assertOwned(spans: Span[], writes: Pick<Change, "sk">[], T: Ts | null): void {
+  private assertOwned({ spans, writes, at: T }: Rows): void {
     for (const sk of this.sksOf(spans, writes)) {
       const f = this.fencedRange(sk);
       if (f && !this.faults.ignoreFence) throw new NotOwner(f.to);
@@ -557,6 +594,34 @@ export class ShardCore implements ShardApi {
       if (this.incoming.length > 0 || this.fenced.some((f) => !f.done)) throw new Migrating();
       if (T !== null && T < this.maxArrived && !this.faults.servePastMove) throw new ReadTooOld(`moved at ${this.maxArrived}`);
     }
+  }
+
+  // ---- 同期区間 ----
+
+  /**
+   * 同期区間に入る。要求を処理する関数は、待つ段 (表定義の適用、グループの到着、intent の決着、行ロックの待ち) を終えたら
+   * これを呼び、返った印を使って、await を挟まずに状態を読み書きする。もう一度待ったら、もう一度呼ぶ。
+   *
+   * 待っている間に変わり得ることを、ここで確かめ直す。入口ごとに手で並べない。確かめるのは、引数に挙げたことである。
+   *   schema: 要求の表定義が、まだ現行か。入口で確かめた後、行ロックや intent の決着を待っている間に DDL が適用されることがある。
+   *     そのまま書くと、新しいグローバル index を保守しない古い計画が通ってしまう。
+   *   spans、writes、at: 読む範囲と書く行を、読む時刻でこのシャードが持っているか (assertOwned)。
+   * 確かめるだけで、状態は変えない。時計を進める、数える、ロックを延ばすのは、呼び出し側が区間の中でする。
+   */
+  private enter(claim: Plan & Rows): Section<Check>;
+  private enter(claim: Plan): Section<"schema">;
+  private enter(claim: Rows): Section<"owned">;
+  private enter(claim: Partial<Plan> & Partial<Rows>): Section<Check> {
+    const rechecked: { schema?: true; owned?: true } = {};
+    if ("schema" in claim) {
+      if (!this.faults.noSchemaRecheck && claim.schema !== this.schema) throw new NotOwner(`stale schema ${claim.schema} < ${this.schema}`);
+      rechecked.schema = true;
+    }
+    if ("spans" in claim) {
+      this.assertOwned(claim as Rows);
+      rechecked.owned = true;
+    }
+    return Section[ENTER](rechecked as { schema: true; owned: true });
   }
 
   // ---- ライブ移動 ----
@@ -1050,6 +1115,8 @@ export class ShardCore implements ShardApi {
    */
   private async lockedExec(req: ExecReq, me: LockOwner): Promise<ExecRes> {
     const deadline = this.deps.clock.now() + LOCK_WAIT_MS;
+    // 最新の状態を読むので、読む時刻はない。
+    const claim: Rows = { spans: req.spans, writes: [], at: null };
     // 起こされた行。取らずに去るなら次の待ち手を起こす。起こすのは先頭の 1 件だけだからである。
     let woken: string | null = null;
     try {
@@ -1064,14 +1131,15 @@ export class ShardCore implements ShardApi {
         // 欠陥 dmlAtT は、F を発行せず、取引の T を F として使う。T は別のシャードの時計から来ることがある。
         const atT = this.faults.dmlAtT && req.T !== undefined;
         let F = atT ? req.T! : this.issue();
-        this.assertOwned(req.spans, [], null);
+        this.assertOwned(claim);
         let applied = await this.settleIntents(req.spans, F);
         while (applied) {
           if (!atT) F = this.issue();
           applied = await this.settleIntents(req.spans, F);
         }
-        // ここから先は await を挟まない。
-        this.assertOwned(req.spans, [], null);
+        // ここから先は await を挟まない。版は確かめ直さない。行ロックや intent の決着を待っている間に DDL が適用されると、この文は
+        // 古い計画のまま実行される。文の変更は、取引の確定 (commitLocal、prepare、commit) が版を確かめる。
+        const sec = this.enter(claim);
         this.count("writes", req.spans);
         this.renew(me.txn);
         const overlay = (req.overlay ?? []).map((c) => ({ table: c.table, pk: c.pk, image: c.after }));
@@ -1082,7 +1150,7 @@ export class ShardCore implements ShardApi {
           out = this.rollback(() => {
             if (readAt !== undefined) this.restore(this.deltaAfter(readAt));
             if (overlay.length) setBasedRestore(this.b, (t) => this.def(t), overlay);
-            return this.run(req);
+            return this.run(sec, req);
           });
         } catch (e) {
           if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner || e instanceof ShardLimit) throw e;
@@ -1255,8 +1323,8 @@ export class ShardCore implements ShardApi {
    * 文の意味は SQLite が解釈し、変更行は trigger が捕捉するので、UPSERT や
    * INSERT ... SELECT のような構文でも Worker 側で解析する必要がない。
    */
-  private run(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number; bytes?: number; over?: boolean } {
-    const out = this.checked(req, () => this.runStatement(req));
+  private run(sec: Section<"owned">, req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number; bytes?: number; over?: boolean } {
+    const out = this.checked(sec, req, () => this.runStatement(req));
     // 取引の文は、ここでは変更を返すだけで、確定のときにもう一度確かめられる (assertWriteSetFits)。
     // ここでも断るのは、COMMIT まで待たずに、文の時点で伝えるためである。
     this.assertUnlocked(out.changes);
@@ -1267,8 +1335,11 @@ export class ShardCore implements ShardApi {
    * 範囲の検査 (試験用)。範囲の外の行を消した状態で同じ文を実行し、全部の行がある状態と結果を比べる。
    * 結果が違えば、文は宣言していない行を読んでいる。そういう行は intent の決着も commit の検証も受けない。
    * どの文の形にも同じ検査が掛かるので、範囲の作り方を文の形ごとに確かめなくてよい。
+   *
+   * 要求の文は、run か、ここを通して実行する。同期区間の印を受け取るのは、区間に入っていない入口が文を実行できないように
+   * するためである。
    */
-  private checked<T>(req: ExecReq, exec: () => T): T {
+  private checked<T>(_sec: Section<"owned">, req: ExecReq, exec: () => T): T {
     const report = this.deps.spanEscape;
     if (!report || this.checking) return exec();
     this.checking = true;
@@ -1388,7 +1459,7 @@ export class ShardCore implements ShardApi {
     this.observe(req.minTs);
     let T = req.T ?? this.issue();
     this.observe(T);
-    this.assertOwned(req.spans, [], T);
+    this.assertOwned({ spans: req.spans, writes: [], at: T });
     let applied = await this.settleIntents(req.spans, T);
     // 時刻が未指定の読みは、決着させた取引より後の時刻で読む。先に取った T のままだと、
     // 読み取りの開始前に確定した書き込みが見えない。push した取引の c が新しい T 以下になり得るので、
@@ -1401,10 +1472,11 @@ export class ShardCore implements ShardApi {
     // phase 2 が届いていない参加者の時計は commit 時刻に追いついていない。anchor の時計が進んでいると c > T になり、
     // そのまま T で読むと、開始前に確定して応答まで返った書き込みが見えない。T を取り直させる。
     if (req.T !== undefined && req.realtime && applied > T && !this.faults.noRealtimeBump) throw new ReadTooOld(`moved at ${this.hlc.value}`);
-    // ここから先は await を挟まない。
-    this.assertOwned(req.spans, [], T);
+    // ここから先は await を挟まない。版は確かめ直さない。intent の決着を待っている間に DDL が適用されると、この文は古い計画の
+    // まま実行される。取引の文の変更は、取引の確定 (commitLocal、prepare、commit) が版を確かめる。
+    const sec = this.enter({ spans: req.spans, writes: [], at: T });
     this.count(req.write ? "writes" : "reads", req.spans);
-    if (req.fresh && req.spans.some((s) => this.changedSince(s, T))) {
+    if (req.fresh && req.spans.some((s) => this.changedSince(sec, s, T))) {
       throw new ReadTooOld(`moved at ${this.hlc.value}`);
     }
     const delta = this.deltaAfter(T);
@@ -1412,12 +1484,12 @@ export class ShardCore implements ShardApi {
     try {
       if (delta.length === 0 && overlay.length === 0 && !req.write) {
         // 差分がなければ本体がそのまま T の状態なので、トランザクションは要らない。
-        return { ...this.run(req), T, hlc: this.hlc.value, epoch: this.epoch };
+        return { ...this.run(sec, req), T, hlc: this.hlc.value, epoch: this.epoch };
       }
       const out = this.rollback(() => {
         this.restore(delta);
         if (overlay.length) setBasedRestore(this.b, (t) => this.def(t), overlay);
-        return this.run(req);
+        return this.run(sec, req);
       });
       return { ...out, T, hlc: this.hlc.value, epoch: this.epoch };
     } catch (e) {
@@ -1434,10 +1506,11 @@ export class ShardCore implements ShardApi {
     await this.ensureArrived(this.sksOf(req.spans));
     this.observe(req.minTs);
     const now = this.issue();
-    this.assertOwned(req.spans, [], null);
+    // 最新の状態に書くので、読む時刻はない。
+    const claim: Plan & Rows = { schema: req.schema, spans: req.spans, writes: [], at: null };
+    this.assertOwned(claim);
     await this.settleIntents(req.spans, now);
-    this.requireSchema(req.schema);
-    this.assertOwned(req.spans, [], null);
+    let sec = this.enter(claim);
     this.count("writes", req.spans);
     // 読む範囲に未決着の intent があると commit 時刻の順序を保証できないので no-wait で返す。
     if (!this.faults.ignoreIntentsInValidation && this.overlapping(req.spans, Number.MAX_SAFE_INTEGER).length > 0) {
@@ -1445,10 +1518,12 @@ export class ShardCore implements ShardApi {
     }
     try {
       if (req.write?.capture && !this.faults.triggerCapture) {
-        const direct = await this.execDirect(req, now);
+        const direct = await this.execDirect(sec, req, claim, now);
         if (direct) return direct;
+        // execDirect の応答を受け取るまでに、制御を 1 回手放している (microtask)。ここでは区間に入り直さず、下の下書きは、手放す前の
+        // 印で実行する。版は、確定の直前に確かめ直す。持ち主は確かめ直さない。
       }
-      let dry = this.rollback(() => this.run(req));
+      let dry = this.rollback(() => this.run(sec, req));
       // autocommit は取引より若いものとして順番を待つ。待っている間に行が変わるので実行し直す。
       const me: LockOwner = { txn: `auto-${now}`, start: this.deps.clock.now() };
       const deadline = this.deps.clock.now() + LOCK_WAIT_MS;
@@ -1458,10 +1533,9 @@ export class ShardCore implements ShardApi {
         for (let key = this.blockedBy(dry.changes, me); key !== null; key = this.blockedBy(dry.changes, me)) {
           await this.waitForRow(key, me, deadline);
           woken.add(key);
-          this.requireSchema(req.schema);
-          this.assertOwned(req.spans, [], null);
+          sec = this.enter(claim);
           if (this.overlapping(req.spans, Number.MAX_SAFE_INTEGER).length > 0) throw new ConflictError("pending intent");
-          dry = this.rollback(() => this.run(req));
+          dry = this.rollback(() => this.run(sec, req));
         }
       } finally {
         for (const key of woken) queueMicrotask(() => this.wakeNext(key));
@@ -1469,8 +1543,10 @@ export class ShardCore implements ShardApi {
       // 同じ主キーでなくても、他の取引の intent が同じ UNIQUE の値を持っていれば確定できない。
       const pending = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, dry.changes);
       if (pending) throw new ConflictError(pending);
-      this.assertWriteSetFits(dry.changes);
-      this.requireSchema(req.schema);
+      this.assertWriteSetFits(sec, dry.changes);
+      // 下書きを取った区間の続きで、間に await はない。execDirect が null を返した後の道では、制御を手放した後の確かめ直しは、
+      // これだけである。
+      this.enter({ schema: req.schema });
       const c = this.issue();
       if (dry.changes.length) this.b.tx(() => this.applyAndLog(`auto-${c}`, c, dry.changes));
       return { ...dry, T: c, hlc: this.hlc.value, epoch: this.epoch };
@@ -1527,8 +1603,10 @@ export class ShardCore implements ShardApi {
    * autocommit の高速経路。文を下書きせずに 1 回だけ実行し、そのまま確定する。
    * ROLLBACK した書き込みも課金されるので、下書きと再適用をやめると 1 行の更新が 6 行から 2 行になる。
    * 行ロックに当たったときだけ ROLLBACK して待つ。捕捉できない形なら null を返し、通常の経路に任せる。
+   *
+   * execAuto が、同期区間の中で呼ぶ。最初の実行は、その区間の印 (sec) で行う。行ロックを待った後は、同じ claim で区間に入り直す。
    */
-  private async execDirect(req: ExecReq, now: Ts): Promise<ExecRes | null> {
+  private async execDirect(sec: Section<Check>, req: ExecReq, claim: Plan & Rows, now: Ts): Promise<ExecRes | null> {
     const me: LockOwner = { txn: `auto-${now}`, start: this.deps.clock.now() };
     const deadline = this.deps.clock.now() + LOCK_WAIT_MS;
     const woken = new Set<string>();
@@ -1539,13 +1617,13 @@ export class ShardCore implements ShardApi {
         let out: { changes: Change[]; c: Ts } | undefined;
         try {
           out = this.b.tx(() => {
-            const r = this.checked(req, () => this.runCaptured(req));
+            const r = this.checked(sec, req, () => this.runCaptured(req));
             if (!r) throw FALLBACK;
             hit.key = this.blockedBy(r.changes, me);
             if (hit.key !== null) throw BLOCKED;
             pending.reason = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, r.changes);
             if (pending.reason) throw PENDING_UNIQUE;
-            this.assertWriteSetFits(r.changes);
+            this.assertWriteSetFits(sec, r.changes);
             const c = this.issue();
             if (r.changes.length) this.logChanges(`auto-${c}`, c, r.changes);
             return { changes: r.changes, c };
@@ -1558,8 +1636,7 @@ export class ShardCore implements ShardApi {
         if (out) return { columns: [], values: [], changes: out.changes, T: out.c, hlc: this.hlc.value, epoch: this.epoch };
         await this.waitForRow(hit.key!, me, deadline);
         woken.add(hit.key!);
-        this.requireSchema(req.schema);
-        this.assertOwned(req.spans, [], null);
+        sec = this.enter(claim);
         if (this.overlapping(req.spans, Number.MAX_SAFE_INTEGER).length > 0) throw new ConflictError("pending intent");
       }
     } finally {
@@ -1579,8 +1656,11 @@ export class ShardCore implements ShardApi {
     }
   }
 
-  /** from より後の write があるか。to より後の write も含むので保守的に abort する側へ倒れる。 */
-  private changedSince(span: Span, from: Ts): boolean {
+  /**
+   * from より後の write があるか。to より後の write も含むので保守的に abort する側へ倒れる。
+   * 答えは、範囲をこのシャードが持っているときだけ意味がある。だから、持ち主を確かめた同期区間の印を受け取る。
+   */
+  private changedSince(_sec: Section<"owned">, span: Span, from: Ts): boolean {
     const key =
       span.kind === "pk" ? `p\0${span.table}\0${span.pk}`
       : span.kind === "sk" ? `s\0${span.table}\0${span.sk}`
@@ -1592,8 +1672,11 @@ export class ShardCore implements ShardApi {
     return span.kind === "pred" ? this.predicateChanged(span, from) : true;
   }
 
-  /** 検証に失敗したら理由を返す。`unique:` で始まる理由はリトライしても通らない。 */
-  private validate(txn: string, T: Ts, writes: Change[], spans: Span[]): string | null {
+  /**
+   * 検証に失敗したら理由を返す。`unique:` で始まる理由はリトライしても通らない。
+   * 通った取引は、このまま確定するか intent を置く。だから、版と持ち主の両方を確かめた同期区間の印を受け取る。
+   */
+  private validate(sec: Section<Check>, txn: string, T: Ts, writes: Change[], spans: Span[]): string | null {
     if (T < this.logLowWater || T < this.recentLowWater) return "T older than conflict window";
     const inf = Number.MAX_SAFE_INTEGER;
     for (const w of writes) {
@@ -1605,14 +1688,14 @@ export class ShardCore implements ShardApi {
       // ロックを持っていても検証は省かない。ロックは再起動、TTL、wound で消えているかもしれない。
       const since = this.faults.validateFromT ? T : (w.since ?? T);
       const trusted = this.faults.trustLocks && w.since !== undefined;
-      if (!trusted && this.changedSince({ kind: "pk", table: w.table, pk: w.pk, sk: w.sk }, since)) return `write after T on ${w.pk}`;
+      if (!trusted && this.changedSince(sec, { kind: "pk", table: w.table, pk: w.pk, sk: w.sk }, since)) return `write after T on ${w.pk}`;
       const def = this.def(w.table);
       const row = selectRow(this.b, def, w.pk);
       if (row && w.before === null) return `unique: ${w.table} ${w.pk}`;
     }
     for (const s of spans) {
       if (this.faults.trustLocks && s.since !== undefined) continue;
-      if (this.changedSince(s, this.faults.validateFromT ? T : (s.since ?? T))) return `span changed after T`;
+      if (this.changedSince(sec, s, this.faults.validateFromT ? T : (s.since ?? T))) return `span changed after T`;
       if (this.faults.ignoreIntentsInValidation) continue;
       const hit = this.overlapping([s], inf).find((i) => i.txn !== txn);
       if (hit) return `intent inside read span (${hit.txn})`;
@@ -1657,8 +1740,9 @@ export class ShardCore implements ShardApi {
    * 取引がこのシャードに書く変更を、確定の前に確かめる。書き込みは、取引でも autocommit でも、必ずここを通る。
    *   表が書き込み禁止でないこと。index を既存の行から作っている間、その表の行は変わってはならない。
    *   変更ログの 1 行に収まること。
+   * 書き込み禁止の印は表定義にあるので、要求の版が現行であることを確かめた同期区間の印を受け取る。
    */
-  private assertWriteSetFits(writes: Change[]): void {
+  private assertWriteSetFits(_sec: Section<"schema">, writes: Change[]): void {
     this.assertUnlocked(writes);
     if (this.faults.noWriteSetLimit || writes.length === 0) return;
     let bytes = 0;
@@ -1729,16 +1813,17 @@ export class ShardCore implements ShardApi {
     await this.ensureArrived(this.sksOf(req.spans, req.writes));
     if (this.faults.prepareWaits) await this.waitForForeignLocks(req.txn, req.writes);
     // グループの到着を待っている間に DDL が適用されることがある。古い計画のまま書かない。
-    this.requireSchema(req.schema);
+    // 時計は、版を確かめた後、持ち主を確かめる前に進める。版の古い要求の T は、時計に取り込まない。
+    this.enter({ schema: req.schema });
     this.observe(req.T);
-    this.assertOwned(req.spans, req.writes, req.T);
+    const sec = this.enter({ schema: req.schema, spans: req.spans, writes: req.writes, at: req.T });
     try {
-      this.assertWriteSetFits(req.writes);
+      this.assertWriteSetFits(sec, req.writes);
     } catch (e) {
       this.releaseLocks(req.txn);
       throw e;
     }
-    const reason = this.validate(req.txn, req.T, req.writes, req.spans);
+    const reason = this.validate(sec, req.txn, req.T, req.writes, req.spans);
     if (reason) {
       this.releaseLocks(req.txn); // 失敗した取引のロックを残すと、TTL まで全員が待つ
       return { ok: false, reason };
@@ -1754,31 +1839,35 @@ export class ShardCore implements ShardApi {
     await this.ensureSchema(req.schema);
     await this.ensureArrived(this.sksOf(req.spans, req.writes));
     if (this.faults.prepareWaits) await this.waitForForeignLocks(req.txn, req.writes);
-    this.requireSchema(req.schema);
-    return this.prepareSync(req);
+    return this.prepareSync(this.enter({ schema: req.schema }), req);
   }
 
-  private prepareSync(req: PrepareReq): PrepareRes {
+  /**
+   * prepare の同期区間。呼び出し側 (prepare と、anchor の drive) が、版を確かめて区間に入ってから呼ぶ。
+   * 持ち主は、ここで確かめる。再送への答えと、書き込みの大きさの確認が、その前に来るからである。
+   */
+  private prepareSync(plan: Section<"schema">, req: PrepareReq): PrepareRes {
     const dup = this.b.exec(`SELECT prepare_ts FROM __intents WHERE txn = ? LIMIT 1`, req.txn)[0];
     // 同じ 2PC の ID の intent がもうある。ID は続きの中身の指紋を含むので、同じ書き込みの prepare の再送である。同じ答えを返す。
     if (dup) return { ok: true, prepareTs: dup.prepare_ts as Ts };
     // phase 2 で初めて上限に当たると、確定した取引が適用できなくなる。intent を置く前に拒否する。
     try {
-      this.assertWriteSetFits(req.writes);
+      this.assertWriteSetFits(plan, req.writes);
     } catch (e) {
       this.releaseLocks(req.txn);
       return { ok: false, reason: (e as Error).message };
     }
     this.observe(req.T);
+    let sec: Section<Check>;
     try {
-      this.assertOwned(req.spans, req.writes, req.T);
+      sec = this.enter({ schema: req.schema, spans: req.spans, writes: req.writes, at: req.T });
     } catch (e) {
       // 参加者が非オーナーなら取引は abort で、Worker が経路を更新して再実行する。
       this.releaseLocks(req.txn);
       return { ok: false, reason: e instanceof Error ? e.message : String(e) };
     }
     this.count("writes", req.spans, req.writes);
-    const reason = this.validate(req.txn, req.T, req.writes, req.spans);
+    const reason = this.validate(sec, req.txn, req.T, req.writes, req.spans);
     if (reason) {
       this.releaseLocks(req.txn);
       return { ok: false, reason };
@@ -1805,14 +1894,15 @@ export class ShardCore implements ShardApi {
     if (!this.faults.refreshNoBump) this.observe(req.to);
     // DDL や変更ログの切り詰めより古い窓は、変更の有無を確かめられない。
     if (req.from < this.ddlFloor || req.from < this.logLowWater) return { ok: false, reason: "refresh: window too old" };
+    let sec: Section<"owned">;
     try {
       // from より後に移動してきたグループは、親での変更を確かめられないので abort する。
-      this.assertOwned(req.spans, [], req.from);
+      sec = this.enter({ spans: req.spans, writes: [], at: req.from });
     } catch (e) {
       return { ok: false, reason: e instanceof Error ? e.message : String(e) };
     }
     for (const s of req.spans) {
-      if (this.changedSince(s, Math.max(req.from, s.since ?? 0))) return { ok: false, reason: "refresh: span changed" };
+      if (this.changedSince(sec, s, Math.max(req.from, s.since ?? 0))) return { ok: false, reason: "refresh: span changed" };
       if (this.faults.ignoreIntentsInValidation) continue;
       const hit = this.overlapping([s], req.to).find((i) => i.txn !== req.txn);
       if (hit) return { ok: false, reason: `refresh: intent ${hit.txn}` };
@@ -1826,14 +1916,15 @@ export class ShardCore implements ShardApi {
    * だから、ここで変更がなければ、表を消すまで、読んだ範囲は変わらない。
    */
   async unchanged(req: { spans: Span[]; from: Ts; schema: number }): Promise<{ ok: boolean; reason?: string }> {
+    let sec: Section<"owned">;
     try {
       await this.ensureSchema(req.schema);
-      this.assertOwned(req.spans, [], req.from);
+      sec = this.enter({ spans: req.spans, writes: [], at: req.from });
     } catch (e) {
       return { ok: false, reason: e instanceof Error ? e.message : String(e) };
     }
     for (const s of req.spans) {
-      if (this.changedSince(s, Math.max(req.from, s.since ?? 0))) return { ok: false, reason: `${s.table} changed after it was read` };
+      if (this.changedSince(sec, s, Math.max(req.from, s.since ?? 0))) return { ok: false, reason: `${s.table} changed after it was read` };
       // 版の適用は intent を決着させてから行う (settleAllIntents) が、それに頼らず、決着していない書き込みも変更として数える。
       const hit = this.faults.unchangedIgnoresIntents ? undefined : this.overlapping([s], Number.MAX_SAFE_INTEGER)[0];
       if (hit) return { ok: false, reason: `${s.table} has a pending write of ${hit.txn}` };
@@ -1892,11 +1983,14 @@ export class ShardCore implements ShardApi {
 
     // ここから c の確定までは await を挟まない。
     // 参加者の応答を待っている間に、この anchor に DDL が適用されていれば、取引は古い表定義で計画されている。
-    if (!this.faults.noSchemaRecheck && req.schema !== this.schema) {
-      return this.decideAbort(req, `not owner: stale schema ${req.schema} < ${this.schema}`);
+    let plan: Section<"schema">;
+    try {
+      plan = this.enter({ schema: req.schema });
+    } catch (e) {
+      return this.decideAbort(req, (e as Error).message);
     }
     if (!this.faults.anchorNoAbsorb) this.observe(Math.max(0, ...stamps, flight.pushed));
-    const mine = this.prepareSync({
+    const mine = this.prepareSync(plan, {
       txn: req.txn, T: req.T, writes: self.writes, spans: self.spans, anchor: this.id, schema: req.schema,
     });
     if (!mine.ok) return this.decideAbort(req, mine.reason);

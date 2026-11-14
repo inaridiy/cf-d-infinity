@@ -20,7 +20,7 @@ describe("rollback-read reconstructs every past state", () => {
       const rnd = prng(seed);
       const c = new SimCluster({ shards: 1, K: 10_000 });
       const db = new Db(c);
-      await db.ddl(`CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)`);
+      await db.ddl(`CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (tenant_id,id))`);
       await db.ddl(`CREATE UNIQUE INDEX t_code ON t(tenant_id, code)`);
       const dump = "SELECT id, code, n FROM t WHERE tenant_id = 1 ORDER BY id";
       const snapshots: { T: number; rows: unknown[] }[] = [];
@@ -65,7 +65,7 @@ describe("rollback-read reconstructs every past state", () => {
   it("falls back to ReadTooOld above the delta limit K", async () => {
     const c = new SimCluster({ shards: 1, K: 3 });
     const db = new Db(c);
-    await db.ddl(`CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)`);
+    await db.ddl(`CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (tenant_id,id))`);
     const T = (await db.query("SELECT count(*) c FROM t WHERE tenant_id = 1")).ts!;
     for (let i = 0; i < 5; i++) await db.query("INSERT INTO t VALUES (1,?)", [i]);
     const { version } = await c.catalog();

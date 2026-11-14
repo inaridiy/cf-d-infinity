@@ -67,7 +67,7 @@ describe("writes go through SQLite itself, not through the parser", () => {
   });
   it("logs the row that REPLACE removes implicitly, so the snapshot can restore it", async () => {
     const { c, db } = await setup();
-    await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT NOT NULL, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)`);
+    await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT NOT NULL, PRIMARY KEY (tenant_id,id))`);
     await db.ddl(`CREATE UNIQUE INDEX p_code ON p(tenant_id, code)`);
     await db.query("INSERT INTO p VALUES (1,1,'a')");
     await db.query("INSERT OR REPLACE INTO p(tenant_id,id,code) VALUES (1,2,'a')");
@@ -244,7 +244,7 @@ describe("transactions", () => {
 });
 
 describe("global index", () => {
-  const ACC = `CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT UNIQUE, PRIMARY KEY (tenant_id,id)) SHARD KEY (tenant_id)`;
+  const ACC = `CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT UNIQUE, PRIMARY KEY (tenant_id,id))`;
   it("finds a row by a non shard key column without scatter", async () => {
     const { c, db } = await setup();
     await db.ddl(ACC);

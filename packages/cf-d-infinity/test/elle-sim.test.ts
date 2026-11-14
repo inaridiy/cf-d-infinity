@@ -32,7 +32,7 @@ async function run(seed: number, o: { faults?: Faults; restarts?: boolean; split
     },
   });
   c.net.jitter = () => (rnd() < 0.5 ? 0 : rnd() * 3);
-  await c.client().ddl("CREATE TABLE jep(k INTEGER NOT NULL, id INTEGER NOT NULL, v TEXT NOT NULL, PRIMARY KEY (k, id)) SHARD KEY (k)");
+  await c.client().ddl("CREATE TABLE jep(k INTEGER NOT NULL, id INTEGER NOT NULL, v TEXT NOT NULL, PRIMARY KEY (k, id))");
   let stop = false;
   const chaos = (async () => {
     while (!stop && o.restarts) {

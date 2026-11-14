@@ -7,7 +7,7 @@ import { quiescentProblems } from "./invariants";
 import { SimCluster } from "./sim";
 
 const T = `CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, n INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (tenant_id, id), UNIQUE (tenant_id, code)) SHARD KEY (tenant_id)`;
+  PRIMARY KEY (tenant_id, id), UNIQUE (tenant_id, code))`;
 
 describe("a statement that failed inside a transaction", () => {
   for (const [name, failing, undo] of [

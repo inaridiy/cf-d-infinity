@@ -54,7 +54,7 @@ describe("the schema read inside a statement that touches a table (invariant 5: 
   const setup = async () => {
     const c = new SimCluster({ shards: 2 });
     const db = c.client();
-    await db.ddl("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER, tags TEXT, PRIMARY KEY (tenant_id, id)) SHARD KEY (tenant_id)");
+    await db.ddl("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER, tags TEXT, PRIMARY KEY (tenant_id, id))");
     await db.query("INSERT INTO t VALUES (1, 1, 0, '[\"a\",\"b\"]')");
     return { c, db };
   };

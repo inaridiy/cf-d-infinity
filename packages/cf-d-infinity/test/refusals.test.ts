@@ -61,7 +61,7 @@ describe("the statements this database refuses", () => {
   });
 
   const DDL = [
-    "CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT, code TEXT, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, id), UNIQUE (email), UNIQUE (tenant_id, code)) SHARD KEY (tenant_id)",
+    "CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT, code TEXT, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tenant_id, id), UNIQUE (email), UNIQUE (tenant_id, code))",
     "CREATE TABLE k(id TEXT PRIMARY KEY, v)",
     "CREATE TABLE d(id INTEGER PRIMARY KEY, email TEXT DEFAULT 'none@x' UNIQUE, n INTEGER)",
     "CREATE TABLE allowed(id INTEGER PRIMARY KEY)",
@@ -117,7 +117,7 @@ describe("the statements this database refuses", () => {
       "INSERT INTO t(tenant_id, id, email) VALUES (7, 1, 'z@x') RETURNING (SELECT max(id) FROM allowed) AS top",
     ];
     const lite = new DatabaseSync(":memory:");
-    for (const s of [...DDL, ...ROWS]) lite.exec(s.replace(/ SHARD KEY \([^)]*\)/, ""));
+    for (const s of [...DDL, ...ROWS]) lite.exec(s);
     const dbs = [await cluster(1), await cluster(3)];
     for (const sql of statements) {
       const want = (() => {
