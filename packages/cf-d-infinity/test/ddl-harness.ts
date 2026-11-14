@@ -417,7 +417,10 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
       paused = true;
       // 途中で失敗しても、作業負荷を止めたままにしない。止めたままだと、失敗が記録されるだけで、実行が終わらなくなる。
       try {
-        while (active > 0) await c.sleep(1);
+        // 分割も止め、進めている分割が終わるのを待つ。分割の途中の生の表は、運んでいる最中の行を範囲表のどのシャードにも
+        // 見せないことがあり、index と表が合わないように見えた (検査の誤り。2026-11-13 の一晩分の試験の seed 903321。
+        // データベースを通した読み (wrongRead) は正しかった)。
+        while (active > 0 || splitting) await c.sleep(1);
         await c.settle();
         for (const core of c.cores.values()) await core.redrive().catch(() => {});
         await c.settle();
@@ -659,6 +662,8 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
 
   let stop = false;
   let splits = 0;
+  /** 分割を進めている最中か。checkpoint は、これが終わるのを待ってから表を調べる。 */
+  let splitting = false;
   const grower = (async () => {
     let next = c.shardIds.length;
     while (!stop && s.splits && next < c.shardIds.length + 5) {
@@ -670,6 +675,8 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
       if (!range) continue;
       const child = `s${next++}`;
       for (let attempt = 0; attempt < 20; attempt++) {
+        while (paused) await c.sleep(1);
+        splitting = true;
         try {
           await split(c, parent, child, { range });
           splits++;
@@ -685,6 +692,8 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
           // 子が古い表定義のまま親の行を受け取ると drain が失敗する。要求が届けば子は追い付くので、やり直す。
           if (attempt === 19) errors.push(`split: ${m}`);
           await c.sleep(5);
+        } finally {
+          splitting = false;
         }
       }
     }

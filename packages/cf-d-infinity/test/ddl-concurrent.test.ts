@@ -188,7 +188,7 @@ const CASES = {
         e.useExtra = true;
       },
     },
-    seeds: [1, 2, 3, 4, 5, 6], known: [],
+    seeds: [1, 2, 3, 4, 5, 6, 901960], known: [], // 901960: extra を書かない UPDATE が後に届く順序 (2026-11-13 の一晩分の試験)
   },
   // シャードをまたぐ UNIQUE の index の作成 (書き込みを止めて作る) と、分割。値はほぼ一意で、ときどき重複する。
   uniqueIndexAndSplits: {
@@ -201,7 +201,7 @@ const CASES = {
         e.useExtra = true;
       },
     },
-    seeds: [1, 2, 3, 4, 5, 6], known: [],
+    seeds: [1, 2, 3, 4, 5, 6, 900541, 903321], known: [], // 900541: 上と同じ。903321: 分割の途中の表を checkpoint が読んだ
   },
 } satisfies Record<string, Case>;
 
