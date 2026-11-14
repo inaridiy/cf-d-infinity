@@ -460,13 +460,21 @@ class Parser {
     return this.node("frame_bound_following", s, { expr, followingKw: this.kw("FOLLOWING") });
   }
 
-  /** 型の名前。語の並びと、括弧の中の 1 つか 2 つの数。 */
+  /** 型の名前の語か。列の制約の先頭の語と、予約語は、型の名前にならない。 */
+  private isTypeWord(): boolean {
+    const t = this.t;
+    return t.kind === "word" && !COLUMN_CONSTRAINT_START.has(t.upper) && !RESERVED.has(t.upper);
+  }
+
+  /**
+   * 型の名前。語の並びと、括弧の中の 1 つか 2 つの数。
+   * 引用した名前 (`"INTEGER"`、`'my type'`) は、SQLite は読むが、ここでは読まない。ddl.ts は型の名前の文面で rowid の別名と
+   * 型の親和性を決めるので、引用符の付いた文面を渡すと、`id "INTEGER" PRIMARY KEY` を別名と見なさない。
+   */
   private dataType(): Node {
     const start = this.t.start;
     const words: Node[] = [];
-    while ((this.t.kind === "word" && !COLUMN_CONSTRAINT_START.has(this.t.upper) && !RESERVED.has(this.t.upper)) || this.t.kind === "quoted" || this.t.kind === "string") {
-      words.push(this.t.kind === "word" ? this.kw() : this.aliasName());
-    }
+    while (this.isTypeWord()) words.push(this.kw());
     if (words.length === 0) this.fail();
     const params = this.isOp("(") ? this.paren(() => this.list(() => this.signedNumber())) : undefined;
     return params ? this.node("named_data_type", start, { name: one(words), params }) : this.node("named_data_type", start, { name: one(words) });
@@ -939,8 +947,7 @@ class Parser {
   columnDefinition(): Node {
     const start = this.t.start;
     const name = this.identifier();
-    const hasType = (this.t.kind === "word" && !COLUMN_CONSTRAINT_START.has(this.t.upper) && !RESERVED.has(this.t.upper)) || this.t.kind === "quoted" || this.t.kind === "string";
-    const dataType = hasType ? this.dataType() : undefined;
+    const dataType = this.isTypeWord() ? this.dataType() : undefined;
     const constraints: Node[] = [];
     while (this.t.kind === "word" && COLUMN_CONSTRAINT_START.has(this.t.upper)) {
       const c = this.constraint(false);
@@ -985,13 +992,10 @@ class Parser {
       }
       case "UNIQUE": {
         const uniqueKw = this.kw();
-        // 表の UNIQUE の列は、名前だけならその識別子を項にする。照合順序か方向の付いた列は、index の列の形で持つ。
-        const column = (): Node => {
-          const c = this.indexedColumn();
-          return c.expr.type === "identifier" && !c.direction ? c.expr : c;
-        };
+        // 表の UNIQUE の列は、名前だけを読む。照合順序や方向の付いた列 (`UNIQUE (a COLLATE NOCASE)`) は、SQLite は読むが、
+        // ここでは読まない。ddl.ts は列の名前だけを取り出すので、読むと、照合順序を知らない UNIQUE を記録してしまう。
         constraint = table
-          ? this.node("constraint_unique", s, { uniqueKw, columns: this.paren(() => this.list(column)), clauses: onConflict() })
+          ? this.node("constraint_unique", s, { uniqueKw, columns: this.paren(() => this.list(() => this.identifier())), clauses: onConflict() })
           : this.node("constraint_unique", s, { uniqueKw, clauses: onConflict() });
         break;
       }

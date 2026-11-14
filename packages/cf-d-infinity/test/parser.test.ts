@@ -165,6 +165,9 @@ const KNOWN_DIFFERENCES: string[] = [
   // 表の制約は、SQLite では `,` なしでも続けて書ける。制約のない CONSTRAINT 名前 も書ける。どちらも読まない。
   "refuses: CREATE TABLE t (a, PRIMARY KEY (a) UNIQUE (a))",
   "refuses: CREATE TABLE t (a INT CONSTRAINT x)",
+  // 引用した型の名前と、表の UNIQUE の列の照合順序や方向。読むと、DDL の解釈 (ddl.ts) が誤った表定義を記録する (parser.ts)。
+  "refuses: CREATE TABLE t (id \"INTEGER\" PRIMARY KEY, v 'my type')",
+  "refuses: CREATE TABLE t (a INT, UNIQUE (a COLLATE NOCASE DESC))",
 ];
 
 describe("the SQL parser", () => {
@@ -396,8 +399,8 @@ describe("the SQL parser", () => {
     it("reads SQLite statements the old parser could not, and answers them as SQLite does", async () => {
       for (const sql of [
         "SELECT a, sum(b) OVER w FROM t WINDOW w AS (PARTITION BY a ORDER BY b)", "SELECT a = b IN (1, 2) FROM t", "SELECT a NOT LIKE b ESCAPE c FROM t",
-        "SELECT * FROM t NATURAL CROSS JOIN u", "PRAGMA cache_size = -2000", 'PRAGMA table_xinfo("t")', 'CREATE TABLE t (a "my type", b INT REFERENCES u (a) MATCH FULL)',
-        "CREATE TABLE t (a INT, UNIQUE (a COLLATE NOCASE DESC))", "SELECT a < b BETWEEN c AND d, a ISNULL = b FROM t",
+        "SELECT * FROM t NATURAL CROSS JOIN u", "PRAGMA cache_size = -2000", 'PRAGMA table_xinfo("t")', "CREATE TABLE t (a INT, b INT REFERENCES u (a) MATCH FULL)",
+        "SELECT a < b BETWEEN c AND d, a ISNULL = b FROM t", "SELECT a COLLATE 'nocase' FROM t", "BEGIN TRANSACTION x",
       ]) expect(refuses(sql)).toBe("accepted");
       const problems = await diff(`
         CREATE TABLE w (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, s TEXT);
@@ -413,6 +416,18 @@ describe("the SQL parser", () => {
       `, 4);
       expect(problems).toEqual([]);
     });
+
+    it("answers random WHERE clauses as SQLite does, on three shards", async () => {
+      // 前のパーサは、乱数で作った式の 3 割ほどを読めなかった。読めるようになった式が、計画の組み立て (条件の押し下げ、行を集める経路) を
+      // 通っても、SQLite と同じ答えになることを確かめる。
+      const script = [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a, b, c, q)",
+        "INSERT INTO t VALUES (1, 1, 2, 3, 'x'), (2, 0, NULL, -1, '10'), (3, 5, 2.5, 'x', NULL), (4, NULL, 0, 7, 'ab'), (5, 3, 3, 3, 3), (6, -2, 1, 0, '2.5')",
+        ...Array.from({ length: 400 }, (_v, seed) => `SELECT id FROM t WHERE ${randomExpression(seed + 1, { evaluable: true })} ORDER BY id`),
+        ...Array.from({ length: 100 }, (_v, seed) => `SELECT id, ${randomExpression(seed + 1000, { evaluable: true })} AS v FROM t WHERE id = ${1 + (seed % 6)}`),
+      ].join(";\n");
+      expect(await diff(`${script};\n`, 3)).toEqual([]);
+    }, 120000);
 
     it("refuses what is not SQLite, which the old parser let through", () => {
       for (const sql of [
