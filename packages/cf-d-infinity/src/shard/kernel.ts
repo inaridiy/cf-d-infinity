@@ -1174,8 +1174,12 @@ export class ShardKernel {
   }
 
   private wakeAll(key: string): void {
-    for (const w of this.waiters.get(key) ?? []) w.wake();
+    // 列の写しをたどる。起こされた待ち手は、その場で同じ列から自分を消す (殻の waitForRow の leave)。列そのものをたどると、
+    // 1 つおきに飛ばされ、飛ばされた待ち手は、行が空いた後も待ちの期限 (5 秒) まで待って失敗した
+    // (test/waiters-behind-intent.test.ts。2026-11-14 に、核と殻に分ける作業で見つけた)。
+    const list = [...(this.waiters.get(key) ?? [])];
     this.waiters.delete(key);
+    for (const w of list) w.wake();
   }
 
   private grant(key: string, owner: LockOwner): void {

@@ -1,4 +1,4 @@
-// 未解決: 同じ行の intent を 2 つ以上の文が待っていると、intent が決着したとき、待ち手の半分しか起こされない。
+// 2026-11-14 に直した (src/shard/kernel.ts の wakeAll が列の写しをたどる): 同じ行の intent を 2 つ以上の文が待っていると、intent が決着したとき、待ち手の半分しか起こされない。
 //
 // 行の待ち手は、行ごとの列に並ぶ (核の waiters)。intent の決着 (finalize、abort) は、その行の待ち手を全部起こす (wakeAll)。
 // wakeAll は、列を先頭から順にたどって起こす。起こされた待ち手は、その場で、同じ列から自分を消す (殻の waitForRow の leave)。
@@ -13,9 +13,9 @@
 // 見つけたのは、シャードを同期の核と殻に分ける作業で、待ち手の列の扱いを 1 行ずつ写していたときである (2026-11-14)。
 // その作業は振る舞いを変えないので、この挙動もそのまま写してある。直すなら、wakeAll が列の写しをたどればよい。
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { hold, tenantOn } from "../ddl-harness";
-import { SimCluster } from "../sim";
+import { Db } from "../src/client/db";
+import { hold, tenantOn } from "./ddl-harness";
+import { SimCluster } from "./sim";
 
 const T = `CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (tenant_id, id))`;
 

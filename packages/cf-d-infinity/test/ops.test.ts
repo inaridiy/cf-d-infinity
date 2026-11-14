@@ -173,7 +173,8 @@ describe("the cf-d-infinity command", () => {
     const r = await cli(["status", ...to]);
     expect(r.code).toBe(0);
     expect(r.stdout.split("\n")[1]).toMatch(/^shard\s+slots\s+size\s+waiting\s+unapplied\s+moving$/);
-    expect(r.stdout).toMatch(/shard-0\s+0-1023\s+\d+ kB\s+0\s+0\s+-/);
+    // 4 シャードで始めたクラスタの shard-0 は、テナントのスロット 65,536 個のうち最初の 4 分の 1 を持つ (src/routing.ts)。
+    expect(r.stdout).toMatch(/shard-0\s+0-16383\s+\d+ kB\s+0\s+0\s+-/);
     expect(r.stdout).toContain("No problems found.");
     const json = JSON.parse((await cli(["status", "--json", ...to])).stdout);
     expect(json.problems).toEqual([]);
