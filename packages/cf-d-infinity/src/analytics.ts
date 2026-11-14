@@ -1,6 +1,7 @@
 import type { Cluster } from "./client/db";
 import type { Change, Ts } from "./types";
 import { shardsOf } from "./routing";
+import { rowOf } from "./shard/rows";
 
 export interface Snapshot {
   /** このスナップショットが表す時刻。W 以下の commit がすべて含まれる。 */
@@ -14,7 +15,7 @@ export interface Snapshot {
  * Compactor Container が同じ処理を行う。W より新しい変更は次回まで保留する。
  */
 export async function collect(cluster: Cluster, pending: Snapshot["changes"] = []): Promise<Snapshot> {
-  const { routing } = await cluster.catalog();
+  const { routing, tables } = await cluster.catalog();
   const parts = await Promise.all(shardsOf(routing).map((id) => cluster.shard(id).flush({})));
   const W = Math.min(...parts.map((p) => p.flushTs));
   const all = [
@@ -22,7 +23,9 @@ export async function collect(cluster: Cluster, pending: Snapshot["changes"] = [
     ...parts.flatMap((p) =>
       p.entries.flatMap((e) =>
         e.changes.filter((c) => !c.table.startsWith("__")).map((c: Change) => ({
-          commit_ts: e.commitTs, table: c.table, pk: c.pk, deleted: c.after === null, row: c.after,
+          // 行イメージは列名を持たないタプルなので、表定義の列名を付け直してから出す。表が消えていれば、タプルのまま出す。
+          commit_ts: e.commitTs, table: c.table, pk: c.pk, deleted: c.after === null,
+          row: c.after && tables[c.table] ? rowOf(tables[c.table]!, c.after) : c.after,
         })),
       ),
     ),

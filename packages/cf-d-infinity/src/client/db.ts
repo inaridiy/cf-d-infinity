@@ -2,7 +2,8 @@ import type {
   Change, CommitRes, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
 } from "../types";
 import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, utf8Length } from "../types";
-import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, imageList, pkValues, q, scanList, typedValues } from "../shard/rows";
+import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, imageAt, imageStatements, pkValues, q, scanList, tupleOfRow, typedValues } from "../shard/rows";
+import type { Tuple } from "../value";
 import type { Catalog, SplitMove, SplitSlot } from "../meta";
 import { hashKey, ownerOf, regionsOf, shardsOf, type Interval, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
@@ -10,7 +11,7 @@ import { ident, parseStatements, text, type Node, type Params } from "../sql/cst
 import { keyStringExact } from "../keys";
 import { fromTyped } from "../value";
 import { sha256Text } from "../sha256";
-import { SHARD_LIMITS, isShardLimit, withinShardLimits } from "../shard-limits";
+import { SHARD_LIMITS, isShardLimit, shardLimitOf, withinShardLimits } from "../shard-limits";
 import { scanSql, untypedOf, SCHEMA_STATEMENTS, findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
 import { parseDdl } from "../sql/ddl";
 import { openScratch, ScratchDb, type Compiled } from "../sql/scratch";
@@ -878,7 +879,11 @@ export class Txn extends ReadScope {
         // 変更を捕捉するための表を作る前に確かめる。作った後では、文が見る表定義に、その表が混ざる。
         if (w.reads(p.sql).metadata) throw new SqlError(METADATA_IN_WRITE);
         for (const ddl of CAPTURE_TABLES) w.exec(ddl);
-        for (const d of p.tables) for (const ddl of captureDdl(d)) w.exec(ddl);
+        // 捕捉の trigger は、Worker の SQLite を作った表定義 (this.cat) で作る。計画の表定義 (p.tables) は、計画した後に取引が
+        // 新しい版で始まると古い。古い版の trigger は列の少ないタプルを書き、新しい列の値を落とす (REPLACE が入れ直した行の既定値など)。
+        // 行イメージが列名を持っていた間は、変更後の行を本体から読み直していたので、見えなかった (test/setup.ts の行イメージの検査が
+        // 基準経路だけの実行の test/ddl-concurrent.test.ts で見つけた)。
+        for (const d of p.tables) for (const ddl of captureDdl(catalog(d.name))) w.exec(ddl);
         w.exec(`PRAGMA recursive_triggers = ON`);
         w.exec(`INSERT INTO __cap_on VALUES (1)`);
         const r = w.raw(p.sql, ...p.params);
@@ -895,7 +900,8 @@ export class Txn extends ReadScope {
         for (const c of changes) {
           this.buffer(ownerOf(this.cat.routing, c.sk), c);
           const def = catalog(c.table);
-          const id = def.rowidAlias ? c.after?.[def.rowidAlias] : def.implicitRowid ? c.after?.rowid : undefined;
+          const idColumn = def.rowidAlias ?? (def.implicitRowid ? "rowid" : null);
+          const id = idColumn !== null && c.after ? imageAt(def, c.after, idColumn) : undefined;
           if (typeof id === "number") this.db.planContext(this.cat).sawId(def.name, id);
         }
         // 同じ値の行は全部ここにあり、SQLite が一意性を確かめ終えている。index の項目は、確かめ直さずに書く。
@@ -931,16 +937,16 @@ export class Txn extends ReadScope {
       if (c.before === null && !have.has(`${def.name}\0${c.pk}`)) want(def, c.sk, def.pk, pkValues(c.pk), "IS");
       // シャード内の UNIQUE。shard key を含むので、同じ値の行は同じ shard key の値の中にある。`=` は列の照合順序で比べる。
       for (const cols of def.uniques) {
-        const vals = cols.map((col) => c.after![col] ?? null);
+        const vals = cols.map((col) => imageAt(def, c.after!, col));
         if (vals.some((v) => v === null)) continue;
-        if (c.before && cols.every((col) => keyStringExact([c.before![col] ?? null]) === keyStringExact([c.after![col] ?? null]))) continue;
+        if (c.before && cols.every((col, i) => keyStringExact([imageAt(def, c.before!, col)]) === keyStringExact([vals[i]!]))) continue;
         want(def, c.sk, cols, vals, "=");
       }
       // シャードをまたぐ UNIQUE。index の表を引き、同じ値を持つ行の主キーと場所を知ってから、その行を読む。
       for (const ix of def.globalIndexes) {
-        const keyOf = (r: Row | null): string | null => {
+        const keyOf = (r: Tuple | null): string | null => {
           if (!r) return null;
-          const vals = ix.columns.map((col) => r[col] ?? null);
+          const vals = ix.columns.map((col) => imageAt(def, r, col));
           return vals.some((v) => v === null) ? null : keyStringExact(vals);
         };
         const k = keyOf(c.after);
@@ -1070,9 +1076,9 @@ export class Txn extends ReadScope {
     for (const c of changes) {
       const def = this.cat.tables[c.table];
       for (const ix of def?.globalIndexes ?? []) {
-        const keyOf = (r: Row | null): string | null => {
+        const keyOf = (r: Tuple | null): string | null => {
           if (!r) return null;
-          const vals = ix.columns.map((col) => r[col] ?? null);
+          const vals = ix.columns.map((col) => imageAt(def!, r, col));
           return vals.some((v) => v === null) ? null : keyStringExact(vals);
         };
         const oldK = keyOf(c.before);
@@ -1106,8 +1112,9 @@ export class Txn extends ReadScope {
   indexWrite(ix: GlobalIndexDef, row: Row, remove: boolean): void {
     const def = this.cat.tables[ix.table]!;
     const key = encodeKey(def, row);
+    const image = tupleOfRow(def, row);
     this.buffer(ownerOf(this.cat.routing, key.sk), {
-      table: ix.table, ...key, before: remove ? row : null, after: remove ? null : row,
+      table: ix.table, ...key, before: remove ? image : null, after: remove ? null : image,
     });
   }
 
@@ -1344,11 +1351,15 @@ export class Db {
    */
   private async assertReplays(sql: string, cat: Catalog): Promise<void> {
     const parsed = parseDdl(sql, cat);
-    // 基準経路は、条件を押し下げられなければ表を丸ごと読む (scanOf)。その走査と、行イメージを読む文は、作りとして DO の SQLite の
-    // 上限に収まらなければならない。収まらない表 (極端に長い列名など) は、表定義で断る (src/shard-limits.ts、計画書の不変条件 13)。
+    // 基準経路は、条件を押し下げられなければ表を丸ごと読む (scanOf)。その走査と、シャードが行イメージを読み書きする文
+    // (捕捉の trigger、主キーとグループの読み、行を入れ直す文。src/shard/rows.ts の imageStatements) は、作りとして DO の SQLite の
+    // 上限 (文の長さ、束縛の変数の数) に収まらなければならない。収まらない表 (極端に長い列名、多すぎる列など) は、
+    // 表定義で断る (src/shard-limits.ts、計画書の不変条件 13)。断るかどうかは表定義だけで決まる。
     for (const def of parsed.defs ?? []) {
-      if (!withinShardLimits(scanSql(fullScan(def)), []) || !withinShardLimits(`SELECT ${imageList(def)} FROM ${q(def.name)} WHERE ${def.pk.map((c) => `${q(c)} IS ?`).join(" AND ")}`, def.pk.map(() => 0))) {
-        throw new SqlError(`unsupported: the table ${def.name} is too wide for a shard to scan within Durable Object SQLite limits; use fewer or shorter column names`);
+      const statements = [{ sql: scanSql(fullScan(def)), params: [] as Value[] }, ...imageStatements(def)];
+      const over = statements.map((s) => shardLimitOf(s.sql, s.params)).find((x) => x !== null);
+      if (over) {
+        throw new SqlError(`unsupported: the table ${def.name} is too wide for a shard to scan and capture its rows within Durable Object SQLite limits (${over}); use fewer or shorter column names`);
       }
     }
     // 既存の行から作る index の文は、公開のときに再生する。ここで確かめておく。

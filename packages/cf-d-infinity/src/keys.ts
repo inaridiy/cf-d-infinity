@@ -64,16 +64,6 @@ function toNumeric(v: Value): Value {
   return v;
 }
 
-/**
- * SQL の中でキー文字列の元を作る式 (trigger が変更を捕まえるときに使う)。結果を JSON.parse して keyStringExact に通すと、
- * 同じ行の keyStringExact と同じ文字列になる。BLOB は JSON に入らないので、同じ印 (小文字の 16 進) の object にする。
- */
-export function keySql(exprs: string[]): string {
-  // REAL は quote() で書く。SQLite の JSON と printf は有効数字 15 桁か 16 桁で丸めるが、quote() は元の double に戻せる桁数で書く
-  // (node:sqlite、workerd、sql.js で確かめた。無限大は 9.0e+999 で、JSON.parse は Infinity に読む)。
-  return `json_array(${exprs.map((e) => `CASE typeof(${e}) WHEN 'blob' THEN json_object('$b', lower(hex(${e}))) WHEN 'real' THEN json(quote(${e})) ELSE ${e} END`).join(", ")})`;
-}
-
 // ---- キー文字列 (docs/design-values.md の「キー文字列」) ----
 //
 // 値の並びの JSON である。BLOB は `{"$b":"小文字の 16 進"}`、無限大は `{"$f":"Infinity"}` と書く。数の書き方は 1 つの規則による。

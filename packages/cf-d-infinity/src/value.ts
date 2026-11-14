@@ -215,7 +215,8 @@ export function fromTyped(v: Value, t: unknown, where = "the statement"): Value 
 
 // ---- 要素とタプル (docs/design-values.md の「値の型と符号」。値の作り直しの段 1) ----
 //
-// ここから下は、まだどこからも呼ばれていない。段 2 で行イメージが、段 3 で型つきの読みが使い始める。
+// 段 2 から、行イメージ (src/shard/rows.ts) がタプルを使う。結果の列の要素の式 (selectElemSql、returningElemSql) は、段 3 で
+// 型つきの読みが使い始める。
 //
 // 値 1 つを、JSON にもドライバの結果にも置ける形にしたものを「要素」と呼ぶ。先頭の 1 文字が格納の型で、後ろがその値である。
 // INTEGER は 10 進の数字 (`i9223372036854775807`)、TEXT はその文字列 (`tabc`)、REAL は quote() の文字列 (`r5.0`)、
@@ -371,6 +372,22 @@ export const encodeTuple = (values: TypedValue[]): Tuple => values.map(encodeEle
 
 /** タプルを値の並びに戻す。 */
 export const decodeTuple = (t: Tuple): TypedValue[] => t.map(decodeElem);
+
+/**
+ * 型のある値を、今の `Value` にする (typedOf の逆。値の作り直しの段 2 の橋)。行イメージのタプルを値に戻すときは、どれもここを通す。
+ * bigint は INTEGER なので、JS の数にする。number は REAL なので、整数の値なら印を付ける。
+ * 絶対値が 2^53 以上の INTEGER は、今の Value では正確に持てないので、K1 と同じ誤りにする (where は誤りに書く場所、表の名前)。
+ * 段 3 で `Value` が型のある値になると、この橋は要らなくなる。
+ */
+export function fromTypedValue(v: TypedValue, where: string): Value {
+  if (typeof v === "bigint") {
+    if (v > MAX_EXACT || v < -MAX_EXACT) throw wideIntegerError(where);
+    return Number(v);
+  }
+  if (typeof v === "number") return realOf(v);
+  return v;
+}
+const MAX_EXACT = BigInt(Number.MAX_SAFE_INTEGER);
 
 /**
  * 今の `Value` を、型のある値にする。今の決まりでは、64 ビットに収まる整数の JS の数は INTEGER、印つきの値 (`Real`) と

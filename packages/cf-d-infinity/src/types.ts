@@ -1,7 +1,7 @@
 // 分散プロトコルの共有型。docs/design.md の用語に対応する。
 export type Ts = number;
 import type { Interval } from "./routing";
-import type { Real } from "./value";
+import type { Real, Tuple } from "./value";
 
 /** SQLite の値。整数の JS の数は INTEGER、整数でない JS の数は REAL、整数の値の REAL は Real (src/value.ts)。 */
 export type Value = string | number | null | Uint8Array | Real;
@@ -61,13 +61,16 @@ export interface TableDef {
 
 export type Affinity = "INTEGER" | "REAL" | "NUMERIC" | "TEXT" | "BLOB";
 
-/** 1 行の変更。before/after はその行全体のイメージで、null は不在を表す。 */
+/**
+ * 1 行の変更。before/after はその行全体のイメージで、null は不在を表す。イメージは、表定義の列の順に並べた要素のタプル
+ * (src/value.ts) で、列名は持たない。PRIMARY KEY のない表は、先頭に rowid を置く (src/shard/rows.ts の imageColumns)。
+ */
 export interface Change {
   table: string;
-  pk: string; // pk 値の JSON
-  sk: string; // shard key 値の JSON
-  before: Row | null;
-  after: Row | null;
+  pk: string; // pk 値のキー文字列
+  sk: string; // shard key 値のキー文字列
+  before: Tuple | null;
+  after: Tuple | null;
   /** 悲観的な DML がこの行を読んだ時刻 F。検証はここから c までを見る。 */
   since?: Ts;
 }
@@ -321,7 +324,8 @@ export interface PiecePayload extends Piece {
   upTo: Pos;
   /** 渡す側がこの piece を手放した時刻。受け取る側は、時計をここまで進める。 */
   m: Ts;
-  rows: { table: string; row: Row }[];
+  /** 行は、変更と同じくタプルで運ぶ。 */
+  rows: { table: string; row: Tuple }[];
   intents: Row[];
   /** 送り出した親の表定義の版。行はこの版の形をしている。 */
   schema: number;
@@ -517,8 +521,10 @@ export class ReadTooOld extends Error {
 // 版 3 (2026-11-14): 配置を token の区間にした (docs/design-subslots.md の段 1)。範囲の単位が slot の番号 (4,096 個) から token に
 // なり、span の slots を claim (token の区間の組) に替え、pull、ack、finalize、abort がグループの名前ではなく piece を運ぶ。
 // 版 2 の要求は、範囲の数の意味も、移動の要求の形も違うので、受け付けない。
-export const PROTOCOL_VERSION = 3;
-export const MIN_PROTOCOL_VERSION = 3;
+// 版 4 (2026-11-14): 行イメージを、列名つきの object から、表定義の列の順のタプルにした (docs/design-values.md の段 2)。
+// Change の before と after、PiecePayload の rows、取引が溜める変更の形が変わる。版 3 の要求の行イメージは読めないので、受け付けない。
+export const PROTOCOL_VERSION = 4;
+export const MIN_PROTOCOL_VERSION = 4;
 
 export class VersionSkew extends Error {
   readonly retryable = true;
@@ -588,10 +594,14 @@ export function utf8Length(s: string): number {
  * Durable Object に保存しているデータの形式の版 (docs/storage-format.md)。内部の表の形や意味を、互換でない形で変えるときに上げる。
  * 新しいコードが書いた DO を古いコードが開くと、黙って壊すおそれがある。版が新しすぎれば起動を拒否する。
  * 上げるときは、古い版から 1 つずつ進める移行を STORAGE_MIGRATIONS に足し、古い版の材料を test/fixtures/storage/ に残す。
+ *
+ * 版 2 (2026-11-14): 行イメージをタプルにし、捕捉を共有の __cap(seq, tbl, old, new) にした (docs/design-values.md の段 2)。
+ * __intents.change と __log_g*.blob の行イメージ、Meta の __ddl が記録する捕捉の trigger の文、__cap の形が変わる。
+ * 最初の公開の前なので、版 1 からの移行は書かない (持ち主の決定、2026-11-14)。版 1 のデータは、移行がないと言って起動を拒否する。
  */
-export const STORAGE_FORMAT = 1;
+export const STORAGE_FORMAT = 2;
 
-/** 版 n の保存データを版 n + 1 にする移行。鍵は n である。Early 版 (1) の前の形式は持たない (公開前は後方互換を持たない)。 */
+/** 版 n の保存データを版 n + 1 にする移行。鍵は n である。最初の公開の前の形式は持たない (公開前は後方互換を持たない)。 */
 const STORAGE_MIGRATIONS: Record<number, (b: Backend) => void> = {};
 
 /** 保存形式の版を確かめる。初めて開く DO には現在の版を書く。古い版なら、移行を順に流す。 */

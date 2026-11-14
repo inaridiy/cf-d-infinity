@@ -5,9 +5,10 @@ import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { afterEach, beforeAll, beforeEach, expect } from "vitest";
 import { spanFaults } from "../src/client/spans";
+import { imageChecks } from "../src/shard/rows";
 import { parseObserver } from "../src/sql/cst";
 import { openScratch } from "../src/sql/scratch";
-import { allSpanEscapes, injectedFault, tracedNets } from "./sim";
+import { allSpanEscapes, imageCheckOff, injectedFault, tracedNets } from "./sim";
 
 // PARSER_CORPUS=<ディレクトリ> を付けて流すと、試験が解析に渡した文を、プロセスごとの 1 行 1 文の JSON のファイルに書き出す。
 // パーサの突き合わせ (test/parser-oracle.test.ts) が、これを文の集まりとして読む。同じ文は、プロセスの中で 1 度だけ書く。
@@ -44,6 +45,19 @@ afterEach(() => {
   const name = `${basename(state.testPath ?? "unknown")}--${state.currentTestName ?? "unknown"}`.replace(/[^A-Za-z0-9._-]+/g, "_");
   mkdirSync(dir, { recursive: true });
   writeFileSync(`${dir}/${name}.txt`, nets.map((n, i) => n.log.map((m) => `${i} ${m.from}>${m.to} ${String(m.method)}\n`).join("")).join(""));
+});
+
+// 行イメージの検査 (docs/design-values.md の「足す検査」の 5)。捕捉でまとめた変更後の行が文の後の本体の行と違うか、タプルの長さが
+// 読む表定義の列の数と違えば、その試験を失敗にする。検査は報告するだけで、処理を変えない (RPC の列も変わらない)。シャードの捕捉と、
+// Worker の SQLite (基準経路の書き込み) の捕捉の両方に掛かる。守りを外して古い欠陥を再現する試験は、noImageCheck で切る。
+const imageProblems: string[] = [];
+imageChecks.report = (problem) => {
+  if (!imageCheckOff.now) imageProblems.push(problem);
+};
+afterEach(() => {
+  const found = [...new Set(imageProblems.splice(0))];
+  imageCheckOff.now = false;
+  expect(found.slice(0, 5), "row images that disagree with the table or with its definition").toEqual([]);
 });
 
 afterEach(() => {

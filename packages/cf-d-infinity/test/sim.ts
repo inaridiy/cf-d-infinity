@@ -324,6 +324,11 @@ export interface SimOptions {
   recentMax?: number;
   /** 範囲の検査 (ShardDeps.spanEscape) を切る。既定では掛ける。 */
   noSpanCheck?: boolean;
+  /**
+   * 行イメージの検査 (src/shard/rows.ts の imageChecks。捕捉の変更後の行と本体の行、タプルの長さと表定義) を、このクラスタを作った
+   * 試験の間だけ切る。守りを外して古い欠陥を再現する試験が使う。既定では掛ける。
+   */
+  noImageCheck?: boolean;
   /** 仮想の実行環境の seed。同じ seed なら同じ実行になる。 */
   seed?: number;
   /** index を既存の行から作る間の、書き込み禁止の期限と、その上限 (ms)。既定は meta.ts の INDEX_LEASE_MS と INDEX_BUILD_MAX_MS。 */
@@ -344,6 +349,8 @@ export const allSpanEscapes: SpanEscape[] = [];
  * 書き出して空にする。中身は書かない。変更の前後で、同じ seed の実行の RPC の列が同じかを比べるのに使う。
  */
 export const tracedNets: SimNet[] = [];
+/** 行イメージの検査を、いまの試験の間だけ止めているか (SimOptions の noImageCheck)。test/setup.ts が試験ごとに戻す。 */
+export const imageCheckOff = { now: false };
 
 export class SimCluster implements Cluster {
   /** 起動時のシャード。増設後の一覧は catalog の routing を見る。 */
@@ -380,6 +387,7 @@ export class SimCluster implements Cluster {
     if (injected?.side === "shard") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
     this.clientFaults = injected?.side === "client" ? { ...o.clientFaults, [injected.name]: true } : o.clientFaults;
     if (process.env.RPC_TRACE) tracedNets.push(this.net);
+    if (o.noImageCheck) imageCheckOff.now = true;
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
     this.runtime = this.virtual ?? systemRuntime;
     this.shardIds = o.stored ? [...o.stored.shards.keys()] : Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);

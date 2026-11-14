@@ -25,9 +25,10 @@ import { keyStringExact } from "../keys";
 import { type Runtime, systemRuntime } from "../runtime";
 import { attempt, done, tail, unwrap, wait, type Effect, type Fork, type Outcome, type PeerCall, type Program, type Step } from "./step";
 import {
-  CAPTURE_TABLES, applyChanges, asSqlError, assertKeyed, capturedChanges, decode, deleteRow, encode, encodeKey, insertRow, pkValues, q,
-  rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore, imageList, typedRow, typedValues,
+  CAPTURE_TABLES, applyChanges, asSqlError, capturedChanges, checkAfter, decode, deleteRow, encode, imageSql, insertRow, pkValues, q,
+  returnedRows, rowwiseRestore, selectGroup, selectRow, setBasedRestore, tupleKey, typedScanList, typedValues,
 } from "./rows";
+import { parseTuple, type Tuple } from "../value";
 
 /**
  * 核の依存。同期のものだけである。相手のシャード、Meta、背景の仕事は、殻の依存 (core.ts の ShardDeps) にあり、核からは見えない。
@@ -92,6 +93,9 @@ export const ORPHAN_AGE_MS = 2000;
 export const GROUP_MAX_BYTES = 16_000_000;
 export const SHARD_MAX_ROWS = 200_000;
 export const SHARD_MAX_BYTES = SHARD_LIMITS.resultBytes;
+/** 取引の大きさの上限を超えた書き込みの誤り。 */
+const writeSetTooLarge = (): string =>
+  `transaction too large: it changes more than ${MAX_WRITE_SET_BYTES} bytes of rows on one shard; split it into smaller transactions`;
 /** 値のおおよその大きさ (バイト)。上限の判定に使うだけで、正確である必要はない。 */
 const sizeOf = (v: Value): number =>
   typeof v === "string" ? v.length * 2 : v instanceof Uint8Array ? v.byteLength : 8;
@@ -1046,7 +1050,7 @@ export class ShardKernel {
         const known = p.after === null ? this.moved.get(g) : undefined;
         if (!known || known.acked) continue;
         for (const def of this.defs.values()) {
-          for (const row of selectGroup(this.b, def, g)) deleteRow(this.b, def, encodeKey(def, row).pk);
+          for (const row of selectGroup(this.b, def, g)) deleteRow(this.b, def, tupleKey(def, row).pk);
         }
         this.b.exec(`DELETE FROM __intents WHERE sk = ?`, g);
         this.b.exec(`UPDATE __moved SET acked = 1 WHERE g = ?`, g);
@@ -1105,7 +1109,8 @@ export class ShardKernel {
     const def = this.defs.get(req.table);
     if (!def) throw new SqlError(`no such table: ${req.table}`);
     const cols = def.pk.map(q).join(", ");
-    const list = imageList(def);
+    // 型のない列の型を一緒に読む (走査と同じ列の並び)。値の作り直しの段 3 で、型つきの読みに替わる。
+    const list = typedScanList(def);
     const keyset = req.after !== null && req.after.every((v) => v !== null);
     const where = keyset ? `WHERE (${cols}) > (${def.pk.map(() => "?").join(", ")})` : "";
     const limit = Math.max(1, Math.min(req.limit, 5000));
@@ -1310,7 +1315,7 @@ export class ShardKernel {
    * 行イメージが述語を満たすかを本物の表で判定する。型親和性と照合順序が読み取りと同じになるからである。
    * 判定できないときは競合側へ倒す。誤って「関係ない」と答えると Serializable が破れる。
    */
-  private rowMatches(s: Extract<Span, { kind: "pred" }>, def: TableDef, pk: string, row: Row): boolean {
+  private rowMatches(s: Extract<Span, { kind: "pred" }>, def: TableDef, pk: string, row: Tuple): boolean {
     try {
       return this.rollback(() => {
         deleteRow(this.b, def, pk);
@@ -1358,11 +1363,11 @@ export class ShardKernel {
   }
 
   /** T より後の commit について、pk ごとに最も古い before-image を集める。 */
-  private deltaAfter(T: Ts): { table: string; pk: string; image: Row | null }[] {
+  private deltaAfter(T: Ts): { table: string; pk: string; image: Tuple | null }[] {
     if (T >= this.maxCommit) return [];
     const floor = Math.max(this.logLowWater, this.ddlFloor);
     if (T < floor) throw new ReadTooOld(`moved at ${floor}`);
-    const seen = new Map<string, { table: string; pk: string; image: Row | null }>();
+    const seen = new Map<string, { table: string; pk: string; image: Tuple | null }>();
     // K を超えた時点で読むのをやめる。T 以降の全ログを読んでから数えると、古い T の読みが来るたびに保持窓の全行を読む。
     this.logEach(`WHERE commit_ts > ?`, [T], (_ts, _txn, blob) => {
       for (const c of decode<Change[]>(blob)) {
@@ -1375,7 +1380,7 @@ export class ShardKernel {
     return [...seen.values()];
   }
 
-  private restore(targets: { table: string; pk: string; image: Row | null }[]): void {
+  private restore(targets: { table: string; pk: string; image: Tuple | null }[]): void {
     if (targets.length === 0) return;
     const cat = (t: string) => this.def(t);
     if (this.faults.rowwiseUndo) rowwiseRestore(this.b, cat, targets);
@@ -1439,13 +1444,13 @@ export class ShardKernel {
       // 条件の span は、条件に合う行の主キーを先に求める。
       const matching = spans.flatMap((s) => {
         if (s.kind !== "pred") return [];
-        const keys = this.b.exec(`SELECT ${selectList(def)} FROM ${q(def.name)} AS ${q(s.alias)} WHERE (${s.where})`, ...s.params)
-          .map((row) => encodeKey(def, row)).filter((k) => s.sk === undefined || s.sk === k.sk);
+        const keys = this.b.raw(`SELECT ${imageSql(def)} FROM ${q(def.name)} AS ${q(s.alias)} WHERE (${s.where})`, ...s.params).values
+          .map((r) => tupleKey(def, parseTuple(r[0] as string))).filter((k) => s.sk === undefined || s.sk === k.sk);
         return [new Set(keys.map((k) => k.pk))];
       });
-      for (const row of this.b.exec(`SELECT ${selectList(def)} FROM ${q(def.name)}`)) {
+      for (const r of this.b.raw(`SELECT ${imageSql(def)} FROM ${q(def.name)}`).values) {
         if (++seen > SPAN_CHECK_MAX_ROWS) return false;
-        const key = encodeKey(def, row);
+        const key = tupleKey(def, parseTuple(r[0] as string));
         // 取引が自分で書いた行は、ほかの取引から守る必要がないので、範囲に入っていなくてよい。
         if (own.has(`${def.name}\0${key.pk}`)) continue;
         const covered = spans.some((s) => s.kind !== "pred" && spanCovers(s, def.name, key.pk, key.sk)) || matching.some((m) => m.has(key.pk));
@@ -1458,6 +1463,18 @@ export class ShardKernel {
 
   private runStatement(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number; bytes?: number; over?: boolean } {
     if (!req.write) return { ...this.readLimited(req), changes: [] };
+    try {
+      return this.runWrite(req);
+    } catch (e) {
+      // 行イメージのタプルが DO の SQLite の値の長さの上限を超えると、SQLite が文を止める。BLOB は 16 進で 2 倍になり、JSON は
+      // 文字を逃がす。1 行のイメージがその上限を超える書き込みは、取引の大きさの上限 (MAX_WRITE_SET_BYTES) も必ず超えるので、
+      // 同じ誤りにする (docs/design-values.md の「大きさの勘定」)。値そのものが上限を超える書き込みも、同じく大きすぎる。
+      if (e instanceof Error && /string or blob too big/i.test(e.message)) throw new SqlError(writeSetTooLarge());
+      throw e;
+    }
+  }
+
+  private runWrite(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number } {
     const captured = this.runCaptured(req);
     if (captured) return captured;
     // REPLACE が暗黙に消す行は recursive_triggers がないと DELETE trigger を発火しない。
@@ -1468,7 +1485,7 @@ export class ShardKernel {
     // 捕捉のための trigger の中の書き込みは、changes() に入らない。
     const count = this.b.exec(`SELECT changes() AS n`)[0]!.n as number;
     const changes = capturedChanges(this.b, (t) => this.def(t));
-    const sk = req.write.sk;
+    const sk = req.write!.sk;
     if (sk !== null) {
       for (const c of changes) {
         if (c.sk !== sk) throw new SqlError(`row of shard key ${c.sk} written through shard key ${sk}`);
@@ -1510,7 +1527,7 @@ export class ShardKernel {
 
   /**
    * 書き込み文を実行し、変更行を trigger ではなく RETURNING と主キーの読みで捕捉する。
-   * trigger の捕捉は __cap、__capv、__cap_on へ書くので、ROLLBACK しても 1 文あたり 3 行が課金される。
+   * trigger の捕捉は __cap と __cap_on へ書くので、ROLLBACK しても 1 行の文で 2 行が課金される。
    * 文の形が想定と合わなければ、その文だけを巻き戻して null を返す。呼び出し側は trigger の経路に任せる。
    */
   private runCaptured(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[] } | null {
@@ -1520,24 +1537,25 @@ export class ShardKernel {
     if (!capture || this.faults.triggerCapture || !span || req.spans.some((s) => s.table !== span.table)) return null;
     if (capture === "update" && span.kind !== "pk") return null;
     const def = this.def(span.table);
-    // RETURNING で行を読むと文が長くなる (列ごとに typeof と 2^53 の確かめ)。DO の SQLite の上限を超えるなら、文をそのまま
-    // 実行する trigger の捕捉に任せる。入口の確かめ (withinLimits) は、受け取った文を測っている (Codex の 2 回目の見直し、指摘 7)。
-    if (!withinShardLimits(`${req.sql} RETURNING ${imageList(def)}`, req.params)) return null;
+    // RETURNING で行を読むと文が長くなる (行のタプルの式)。DO の SQLite の上限を超えるなら、文をそのまま実行する trigger の
+    // 捕捉に任せる。入口の確かめ (withinLimits) は、受け取った文を測っている (Codex の 2 回目の見直し、指摘 7)。
+    const returning = `${req.sql} RETURNING ${imageSql(def)}`;
+    if (!withinShardLimits(returning, req.params)) return null;
     const sk = req.write!.sk;
     try {
       return this.b.tx(() => {
         const before = span.kind === "pk" && capture === "update" ? selectRow(this.b, def, span.pk) : null;
-        const was = before && encodeKey(def, before).pk;
-        const rows = this.b.exec(`${req.sql} RETURNING ${imageList(def)}`, ...req.params).map((r) => typedRow(def, r));
-        if (capture === "update" && (rows.length > 1 || (rows.length === 1 && was !== encodeKey(def, rows[0]!).pk))) {
+        const was = before && tupleKey(def, before).pk;
+        const rows = returnedRows(def, this.b.raw(returning, ...req.params).values, capture !== "delete");
+        if (capture === "update" && (rows.length > 1 || (rows.length === 1 && was !== tupleKey(def, rows[0]!).pk))) {
           throw FALLBACK;
         }
-        if (capture !== "delete") for (const row of rows) assertKeyed(def, row);
         const changes: Change[] = rows.map((row) => ({
-          table: def.name, ...encodeKey(def, row),
+          table: def.name, ...tupleKey(def, row),
           before: capture === "insert" ? null : capture === "delete" ? row : before,
           after: capture === "delete" ? null : row,
         }));
+        for (const c of changes) checkAfter(this.b, def, c.pk, c.after, "the RETURNING capture");
         if (sk !== null) {
           for (const c of changes) {
             if (c.sk !== sk) throw new SqlError(`row of shard key ${c.sk} written through shard key ${sk}`);
@@ -1656,9 +1674,7 @@ export class ShardKernel {
     let bytes = 0;
     for (const w of writes) {
       bytes += utf8Length(encode(w));
-      if (bytes > MAX_WRITE_SET_BYTES) {
-        throw new SqlError(`transaction too large: it changes more than ${MAX_WRITE_SET_BYTES} bytes of rows on one shard; split it into smaller transactions`);
-      }
+      if (bytes > MAX_WRITE_SET_BYTES) throw new SqlError(writeSetTooLarge());
     }
   }
 

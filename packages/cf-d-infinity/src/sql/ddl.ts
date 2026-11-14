@@ -50,15 +50,18 @@ const INTERNAL_NAMES = new Set([
  * (そこには利用者の表しかない。Db.tablesOf)。ここで断るのは、内部の表と物理的に衝突する名前を作ることである。
  */
 export const isInternalName = (name: string): boolean =>
-  INTERNAL_NAMES.has(name.toLowerCase()) || /^(sqlite_|__gidx_|__cap_|__capv_|__log_g)/i.test(name);
+  INTERNAL_NAMES.has(name.toLowerCase()) || /^(sqlite_|__gidx_|__cap_|__log_g)/i.test(name);
 
 /**
- * 列の名前のうち、内部で使う接頭辞。行イメージの JSON の印 (`{"$b": 16 進}`、`{"$f": "Infinity"}`。src/shard/rows.ts の encode)
- * と、Worker やシャードが文に足す列の別名 (`__dinf_typeof_<i>` など) である。利用者の列がこの名前だと、行イメージを読むときに
- * 行そのものを印と取り違えたり (確定した INSERT が消える)、足した列が利用者の列を上書きしたりする (2026-11-13 の Codex の
- * 指摘 C2、C3)。新しい印や別名は、この接頭辞で作る (test/internal-names.test.ts が、印と別名がここに当たることを確かめる)。
+ * 列の名前のうち、内部で使う接頭辞。Worker やシャードが文に足す列の別名 (`__dinf_typeof_<i>` など) である。利用者の列がこの名前だと、
+ * 足した列が利用者の列を上書きする (2026-11-13 の Codex の指摘 C3)。新しい別名は、この接頭辞で作る
+ * (test/internal-columns.test.ts が、別名がここに当たることを確かめる)。
+ *
+ * 以前は `$` も予約していた。列名つきの JSON の行イメージで、`$b` という名前の列が BLOB の印 `{"$b": ...}` と見分けられず、
+ * 確定した INSERT が消えたからである (指摘 C2)。行イメージはタプルになり、列名を持たないので、値の作り直しの段 2 で外した。
+ * 印 `$b`、`$f` が残るのはキー文字列と baton の JSON で、どちらにも列名は入らない。`__dinf_` は、別名がなくなる段 3 で外す。
  */
-export const INTERNAL_COLUMN_PREFIXES = ["$", "__dinf_"];
+export const INTERNAL_COLUMN_PREFIXES = ["__dinf_"];
 export const isInternalColumn = (name: string): boolean =>
   INTERNAL_COLUMN_PREFIXES.some((p) => name.toLowerCase().startsWith(p));
 

@@ -78,7 +78,7 @@ describe("a write set that is too large, sent to a shard that gave the range awa
     const big = "x".repeat(MAX_WRITE_SET_BYTES + 1000);
     const request = async (shard: string, txn: string): Promise<PrepareReq> => ({
       txn, T: await c.shard(shard).now({}), schema: version, anchor: shard, spans: [],
-      writes: [{ table: "docs", pk: key, sk: key, before: { id: moving, body: "a" }, after: { id: moving, body: big } }],
+      writes: [{ table: "docs", pk: key, sk: key, before: [`i${moving}`, "ta"], after: [`i${moving}`, `t${big}`] }],
     });
     const local = (shard: string, txn: string) => request(shard, txn).then((req) => outcome(c.shard(shard).commitLocal(req)));
     const prepare = (shard: string, txn: string) =>

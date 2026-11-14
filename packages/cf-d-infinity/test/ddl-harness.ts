@@ -8,6 +8,7 @@ import { Db, type Txn } from "../src/client/db";
 import { split } from "../src/autoscaler";
 import { ownerOf, planSplit, shardsOf } from "../src/routing";
 import { decode, encode } from "../src/shard/rows";
+import { decodeElem } from "../src/value";
 import type { Change, Faults, Row } from "../src/types";
 
 export function prng(seed: number) {
@@ -753,10 +754,13 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
 
   // 成功を返した書き込みの commit 時刻を、変更ログから引く。autocommit の一部は時刻を返さないからである。
   const logged = new Map<number, number>();
+  const nAt = (cat.tables.acct?.columns ?? ["tenant_id", "id", "v", "n"]).indexOf("n");
   for (const b of c.backends.values()) {
     for (const r of logRows(b)) {
       for (const ch of decode<Change[]>(r.blob as string)) {
-        if (ch.table === "acct" && ch.after && typeof ch.after.n === "number") logged.set(ch.after.n, r.commit_ts as number);
+        // 行イメージは acct の列の順のタプルである。n の位置は、表定義が変わっても同じである (列は末尾にだけ足す)。
+        const n = ch.table === "acct" && ch.after ? decodeElem(ch.after[nAt] ?? null) : null;
+        if (typeof n === "bigint") logged.set(Number(n), r.commit_ts as number);
       }
     }
   }
