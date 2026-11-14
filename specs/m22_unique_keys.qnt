@@ -34,6 +34,7 @@
 //   writeTerminates     計画した取引は、移動が途中で止まっても (新しい piece を切る手に公平性がなくても) いつか確定か中止になる
 module m22_core {
   const NVAL: int               // 値の種類 (キーの位置の数)
+  const NPIECE: int             // piece の数 (2 か 3)。行 1 は piece 1、行 2 は piece 2。piece 3 にはキーの位置だけが入り得る
   const MOVE_ALL: bool          // true: グループの全部が移る。false: piece 1 は親に残る
   const NTXN: int
   // ---- 設計の条件。赤は 1 つずつ外す ----
@@ -57,10 +58,10 @@ module m22_core {
   pure val C = 2
   pure val SHARDS = Set(1, 2)
   pure val ROWS = Set(1, 2)
-  pure val PIECES = Set(1, 2)
+  pure val PIECES = 1.to(NPIECE)
   // 行 r は piece r にある
   pure def pieceOfRow(r: int): int = r
-  pure val MOVED = if (MOVE_ALL) Set(1, 2) else Set(2)
+  pure val MOVED = if (MOVE_ALL) PIECES else PIECES.exclude(Set(1))
   pure val VALS = 1.to(NVAL)
   pure val ALLV = 0.to(NVAL)
   pure val TXNS = 1.to(NTXN)
@@ -380,9 +381,65 @@ module m22_core {
   val witnessTwoShardCommit = not(marks.contains(8))
 }
 
-// 決めた設計。グループの全部が piece ごとに移る (段 2)
+
+// ---- 緑 (決めた設計) -------------------------------------------------------------
+// 安全性の緑は witness の印を持たない (TRACK = false)。印を持つ同じ設定は、下の m22_track で witness を調べる
+
+// グループの全部が piece ごとに移る (段 2)。取引 2 つ、キーの位置の piece は任意
 module m22_green {
-  import m22_core(NVAL = 2, MOVE_ALL = true, NTXN = 2,
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = true, NTXN = 2,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+}
+
+// テナントを割る移動 (段 4)。piece 1 は親に残り、親は piece 1 の位置の書き込みを受け続ける。行とキーの行が別のシャードにあれば 2PC になる。
+// キーの位置が全部 piece 2 にあれば、シャードをまたぐ UNIQUE (キーの行が別のシャードにある) と同じ形である
+module m22_green_split {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = false, NTXN = 2,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+}
+
+// 外しても破れない: 親が、fence の後も、まだ切っていない piece の位置の prepare を受ける (M20 の PARENT_STOPS を外す)。
+// キーの行は位置の持ち主だけが確かめるので、UNIQUE はこの規則に頼らない (親が書き込みを止めるのは、時刻 m の規則のためである)
+module m22_green_parent_until_cut {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = true, NTXN = 2,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = true, CHILD_GROUP = 0, TRACK = false).*
+}
+
+// piece 3 つ (piece 3 にはキーの位置だけが入り得る)。取引 1 つ。HEAVY でない検査に入れる小さい版
+module m22_green3_one {
+  import m22_core(NVAL = 2, NPIECE = 3, MOVE_ALL = true, NTXN = 1,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = true).*
+  // 移動の途中の 1 行の INSERT。キーの位置は行と違う piece にあり、グループはまだ揃っていない
+  run insertMidMoveOtherPieceTest =
+    init.then(given(Map(1 -> 0, 2 -> 0), Map(1 -> 2, 2 -> 3)))   // キー 1 は piece 2、キー 2 は piece 3
+        .then(fence)
+        .then(cutPiece(1)).then(receive(1))
+        .then(plan(1, Map(1 -> 1)))                   // INSERT: 行 1 に値 1
+        .then(prepareAt(C, 1))                        // 行 1 の部分
+        .then(cutPiece(2)).then(receive(2))           // キー 1 の位置を覆う piece 2 を pull する。piece 3 は親にあり、切られていない
+        .then(prepareAt(C, 1))
+        .then(decide(1, true)).then(applyAt(C, 1))
+        .expect(status.get(1) == "applied" and not(cut.contains(3)) and marks.contains(2) and uniqueSafe)
+}
+// HEAVY: piece 3 つ、取引 2 つ
+module m22_green3 {
+  import m22_core(NVAL = 2, NPIECE = 3, MOVE_ALL = true, NTXN = 2,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+}
+module m22_green3_split {
+  import m22_core(NVAL = 2, NPIECE = 3, MOVE_ALL = false, NTXN = 2,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+}
+
+// ---- witness のための、印を持つ同じ設定 ---------------------------------------------
+module m22_track {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = true, NTXN = 2,
                   KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
                   KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = true).*
   // M20 の反例 (m20_red_piecewise) の形。決着させずに切っても、確定した取引は適用できる
@@ -400,13 +457,21 @@ module m22_green {
         .then(applyAt(C, 1))
         .expect(tab.get(C) == Map(1 -> 2, 2 -> 1) and key.get(C) == Map(1 -> 2, 2 -> 1) and status.get(1) == "applied"
                 and marks.contains(6) and marks.contains(7) and uniqueSafe)
-  // 移動の途中の 1 行の INSERT。キーの位置は、まだ切っていない piece にある。子は、その piece を pull してから確かめる
-  run insertDuringMoveTest =
+  // 移動の途中の 1 行の INSERT。行とキーの位置が同じ piece にあり、グループの残り (piece 2) はまだ親にある
+  run insertMidMoveSamePieceTest =
+    init.then(given(Map(1 -> 0, 2 -> 0), Map(1 -> 1, 2 -> 2)))
+        .then(fence)
+        .then(cutPiece(1)).then(receive(1))           // piece 1 (行 1 とキー 1 の位置) だけが届いている
+        .then(plan(1, Map(1 -> 1)))                   // INSERT: 行 1 に値 1
+        .then(prepareAt(C, 1))                        // 行とキーの行の部分を、子が 1 度に置く
+        .then(decide(1, true)).then(applyAt(C, 1))
+        .expect(status.get(1) == "applied" and not(cut.contains(2)) and marks.contains(1) and uniqueSafe)
+  // キーの位置がまだ切っていない piece にある INSERT。子は、その piece を pull してから確かめる
+  run insertKeyInUncutPieceTest =
     init.then(given(Map(1 -> 0, 2 -> 0), Map(1 -> 2, 2 -> 2)))
         .then(fence)
-        .then(cutPiece(1)).then(receive(1))           // piece 1 (行 1 の位置) だけが届いている
-        .then(plan(1, Map(1 -> 1)))                   // INSERT: 行 1 に値 1
-        .expect(not(canPrepare(C, 1)) or ready(C, 1) == Set(1))
+        .then(cutPiece(1)).then(receive(1))
+        .then(plan(1, Map(1 -> 1)))
         .then(prepareAt(C, 1))                        // 行 1 の部分だけを置く。キー 1 の位置 (piece 2) はまだ親にある
         .expect(did.get(1) == Set(1))
         .then(cutPiece(2)).then(receive(2))           // 子が piece 2 を pull する
@@ -423,11 +488,16 @@ module m22_green {
         .then(cutPiece(2)).then(receive(2))
         .then(prepareAt(C, 1))                        // キー 1 の holder は r2。断る
         .expect(status.get(1) == "aborted" and marks.contains(5) and uniqueSafe)
+  // 同じ値を 2 つの取引が同時に取る。2 つ目は、キーの行の intent (ロック) で断られる (M16 の試適用の代わり)
+  run pendingConflictTest =
+    init.then(given(Map(1 -> 0, 2 -> 0), Map(1 -> 1, 2 -> 1)))
+        .then(plan(1, Map(1 -> 1))).then(plan(2, Map(2 -> 1)))
+        .then(prepareAt(P, 1))
+        .then(prepareAt(P, 2))                        // キー 1 に取引 1 の intent がある。主キーの一致で見つかる
+        .expect(status.get(2) == "aborted" and uniqueSafe)
 }
-
-// テナントを割る移動 (段 4)。piece 1 は親に残り、親は piece 1 の位置の書き込みを受け続ける。行とキーの行が別のシャードにあれば 2PC になる
-module m22_green_split {
-  import m22_core(NVAL = 2, MOVE_ALL = false, NTXN = 2,
+module m22_track_split {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = false, NTXN = 2,
                   KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
                   KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = true).*
   // M20 の m20_red_late_intent の形。親は、移った値を知らなくても、キーの持ち主 (子) が断る
@@ -439,6 +509,7 @@ module m22_green_split {
         .then(prepareAt(P, 1))                        // 行 1 の部分は親が置く
         .then(prepareAt(C, 1))                        // キー 1 の部分は子が確かめ、holder の r2 を見て断る
         .expect(status.get(1) == "aborted" and marks.contains(3) and uniqueSafe)
+  // 行は親、キーの行は子。2 つのシャードの 2PC で確定し、両方で適用される
   run twoShardTest =
     init.then(given(Map(1 -> 0, 2 -> 0), Map(1 -> 2, 2 -> 2)))
         .then(fence)
@@ -448,4 +519,182 @@ module m22_green_split {
         .then(decide(1, true))
         .then(applyAt(P, 1)).then(applyAt(C, 1))
         .expect(status.get(1) == "applied" and marks.contains(8) and uniqueSafe)
+}
+
+// ---- 赤 (設計の条件を 1 つずつ外す) ---------------------------------------------------
+
+// キーの部分を、その値を持つ (持つことになる) 行のシャードが、手元のキーの行で確かめる。シャードの中の UNIQUE の index と同じ考え方。
+// テナントを割ると、親はもう持っていないキーの行を「ない」と見る
+module m22_red_key_at_row {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = false, NTXN = 2,
+                  KEY_OWNER = false, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+  run counterexampleTest =
+    init.then(given(Map(1 -> 0, 2 -> 2), Map(1 -> 2, 2 -> 2)))   // r2 = 2 (piece 2)。キー 2 も piece 2
+        .then(fence)
+        .then(cutPiece(2)).then(receive(2)).then(ack(2))   // r2 とキー 2 は子へ移り、親の控えは消えた
+        .then(plan(1, Map(1 -> 2)))                   // 親に残る行 1 を 2 にする
+        .then(prepareAt(P, 1))                        // 親が、手元のキー 2 (もうない) で確かめて通す
+        .then(decide(1, true))
+        .expect(not(uniqueVisible))                   // r1 と r2 がどちらも 2
+}
+
+// 子が、届いていない piece のキーを「ない」と見なす (キーの位置を覆う piece を pull しない)
+module m22_red_key_unarrived {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = true, NTXN = 2,
+                  KEY_OWNER = true, PULL_KEY = false, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+  run counterexampleTest =
+    init.then(given(Map(1 -> 0, 2 -> 1), Map(1 -> 2, 2 -> 2)))   // r2 = 1。キー 1 は piece 2
+        .then(fence)
+        .then(cutPiece(1)).then(receive(1))           // 行 1 の位置だけが子に届いている
+        .then(plan(1, Map(1 -> 1)))
+        .then(prepareAt(C, 1))                        // 子は、キー 1 (piece 2、まだ親にある) を「ない」と見て通す
+        .then(decide(1, true))
+        .expect(not(uniqueVisible))
+}
+
+// キーの行の intent を、ほかの取引の同じキーの部分が見ない (ロックがない)。確定した holder だけを確かめる
+module m22_red_no_key_lock {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = true, NTXN = 2,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = false, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+  // M16 の m16_red_body_only と同じ形。2 つの取引が、どちらも確定した状態だけを見て、同じ値を取る
+  run counterexampleTest =
+    init.then(given(Map(1 -> 0, 2 -> 0), Map(1 -> 1, 2 -> 1)))
+        .then(plan(1, Map(1 -> 1))).then(plan(2, Map(2 -> 1)))
+        .then(prepareAt(P, 1)).then(prepareAt(P, 2))
+        .then(decide(1, true)).then(decide(2, true))
+        .expect(not(uniqueVisible))
+}
+
+// キーの持ち主が、確定したキーの行を確かめない (intent だけを見る)
+module m22_red_no_key_body {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = true, NTXN = 2,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = false, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+  run counterexampleTest =
+    init.then(given(Map(1 -> 1, 2 -> 0), Map(1 -> 1, 2 -> 1)))   // r1 = 1 は確定している
+        .then(plan(1, Map(2 -> 1)))                   // r2 にも 1 を書く。キー 1 の intent はない
+        .then(prepareAt(P, 1))
+        .then(decide(1, true))
+        .expect(not(uniqueVisible))
+}
+
+// キーの行を、行と同じ 2PC に入れない。行だけで確定し、キーの行は確定の後に書く
+module m22_red_key_after_commit {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = true, NTXN = 2,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = false, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+  run counterexampleTest =
+    init.then(given(Map(1 -> 0, 2 -> 0), Map(1 -> 1, 2 -> 1)))
+        .then(plan(1, Map(1 -> 1))).then(plan(2, Map(2 -> 1)))
+        .then(prepareAt(P, 1)).then(prepareAt(P, 2))  // 行の部分だけ
+        .then(decide(1, true)).then(decide(2, true))
+        .expect(not(uniqueVisible))
+        .then(prepareAt(P, 1)).then(prepareAt(P, 2))  // 確定の後にキーの行を書く。2 つ目は断られるが、もう確定している
+        .expect(broken)
+}
+
+// 行が値を手放す (UPDATE で変える、DELETE) ときに、古い値のキーの行を消さない
+module m22_red_keep_old_key {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = true, NTXN = 2,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = false,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+  run counterexampleTest =
+    init.then(given(Map(1 -> 1, 2 -> 0), Map(1 -> 1, 2 -> 1)))
+        .then(plan(1, Map(1 -> 2)))                   // r1 を 1 から 2 へ。キー 1 の行が残る
+        .then(prepareAt(P, 1)).then(decide(1, true))
+        .expect(uniqueVisible and not(keysExact))
+        .then(applyAt(P, 1))
+        .then(plan(2, Map(2 -> 1)))                   // 誰も持っていない値 1 の INSERT が
+        .then(prepareAt(P, 2))
+        .expect(status.get(2) == "aborted")           // 残ったキーの行で断られる
+}
+
+// キーの行の intent が、キーの位置の piece ではなく、その値を持つ行の piece と一緒に動く
+module m22_red_key_intent_with_row {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = true, NTXN = 2,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = false, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+  run counterexampleTest =
+    init.then(given(Map(1 -> 0, 2 -> 0), Map(1 -> 2, 2 -> 2)))   // キー 1 の位置は piece 2
+        .then(plan(1, Map(1 -> 1)))
+        .then(prepareAt(P, 1))                        // 行 1 とキー 1 の intent を親に置く
+        .then(fence)
+        .then(cutPiece(1)).then(receive(1))           // キー 1 の intent が、行 1 と一緒に子へ行く
+        .then(decide(1, true))
+        .then(applyAt(C, 1))                          // 子が、持っていないキー 1 の行を書く
+        .expect(not(keysExact))                       // キー 1 の持ち主 (親) の行は「ない」のまま
+        .then(cutPiece(2)).then(receive(2))           // キー 1 の位置が届き、子が書いた行とぶつかる
+        .expect(broken)
+}
+
+// シャードの物理の index を UNIQUE のままにする。決着させてから切る規則 (M20 の SETTLE) がないので、piece ごとの適用で、
+// 子の物理の表に、一時的に同じ値の行が 2 つできる (m20_red_piecewise と同じ形)。見える状態は UNIQUE を守っている
+module m22_red_physical_unique {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = true, NTXN = 2,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = true, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+  run counterexampleTest =
+    init.then(given(Map(1 -> 1, 2 -> 2), Map(1 -> 1, 2 -> 2)))
+        .then(plan(1, Map(1 -> 2, 2 -> 1)))           // 値の入れ替え
+        .then(prepareAt(P, 1))
+        .then(fence)
+        .then(cutPiece(1)).then(receive(1))
+        .then(decide(1, true))
+        .then(applyAt(C, 1))                          // 子の r1 は 2
+        .then(cutPiece(2)).then(receive(2))           // 古い r2 = 2 が届く。UNIQUE の index が挿入を断る
+        .expect(broken and uniqueVisible and keysExact)
+  // 親の側。piece 2 を先に渡すと、親は控えの r2 = 2 を持ったまま、r1 を 2 にする
+  run parentSideTest =
+    init.then(given(Map(1 -> 1, 2 -> 2), Map(1 -> 1, 2 -> 2)))
+        .then(plan(1, Map(1 -> 2, 2 -> 1)))
+        .then(prepareAt(P, 1))
+        .then(fence)
+        .then(cutPiece(2)).then(receive(2))
+        .then(decide(1, true))
+        .then(applyAt(P, 1))
+        .expect(broken and uniqueVisible and keysExact)
+}
+
+// M20 の規則: 子は、グループが揃うまで、UNIQUE の値を書く取引を migrating で断る (受け入れの条件 noMigratingRefusal を破る)
+module m22_red_group_refuse {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = true, NTXN = 2,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 1, TRACK = false).*
+  run counterexampleTest =
+    init.then(given(Map(1 -> 0, 2 -> 0), Map(1 -> 1, 2 -> 1)))
+        .then(fence)
+        .then(cutPiece(1)).then(receive(1))           // 行 1 とキー 1 の位置は届いている。piece 2 は親にある
+        .then(plan(1, Map(1 -> 1)))                   // 1 行の INSERT
+        .then(prepareAt(C, 1))
+        .expect(migRefused and status.get(1) == "aborted")
+}
+
+// ---- 活性 ---------------------------------------------------------------------------
+// 取引 1 つ。移動が途中で止まっても (要らない piece が切られなくても)、計画した取引はいつか確定か中止になる
+module m22_live {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = true, NTXN = 1,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+}
+module m22_live_split {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = false, NTXN = 1,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 0, TRACK = false).*
+}
+// M20 の規則を、断らずに待つ形にしたもの: 子は、グループが揃うまで、UNIQUE の値を書く取引の部分を受けない。
+// 要らない piece が切られなければ、取引は終わらない
+module m22_live_red_group_wait {
+  import m22_core(NVAL = 2, NPIECE = 2, MOVE_ALL = true, NTXN = 1,
+                  KEY_OWNER = true, PULL_KEY = true, KEY_LOCK = true, KEY_BODY = true, KEY_IN_TXN = true, RELEASE_OLD = true,
+                  KEY_INTENT_MOVES = true, PHYS_UNIQUE = false, PARENT_UNTIL_CUT = false, CHILD_GROUP = 2, TRACK = false).*
+  run counterexampleTest =
+    init.then(given(Map(1 -> 0, 2 -> 0), Map(1 -> 1, 2 -> 1)))
+        .then(fence)
+        .then(plan(1, Map(1 -> 1)))                   // 行 1 とキー 1 の位置は piece 1 にある
+        .then(cutPiece(1)).then(receive(1))           // 要る piece は届いた
+        .expect(status.get(1) == "planned" and not(canPrepare(C, 1)) and not(canPrepare(P, 1)) and not(needed(2)))
+        // 子は受けず、piece 2 は要らないので pull されない。公平性の置かれた手は、どれも打てない
 }

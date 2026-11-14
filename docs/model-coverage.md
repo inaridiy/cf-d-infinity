@@ -27,6 +27,11 @@ Categories:
   bans and split slot ([design-catalog-epoch.md](./design-catalog-epoch.md)). Its 31 red modules (the `red` lines of
   the M21 section of `specs/check.sh`) get rows when the design is implemented. Many of them restate a red of M11 to
   M15 that already has a row here; those rows move to M21 when M12, M14 and M15 are retired.
+  M22 (`m22_unique_keys.qnt`) models every non-primary-key UNIQUE as key rows that move with their piece
+  ([design-unique-keys.md](./design-unique-keys.md)). It has 10 red modules (the `red` and `live_red` lines of the M22
+  section of `specs/check.sh`). Eight get rows, switches and replays when the design is implemented, and the rows of
+  M16 move to M22 then; `m22_red_group_refuse` and `m22_live_red_group_wait` restate M20's rule, which was never
+  implemented, and become D rows.
 
 | module | flaw modelled | fault switch | deterministic replay | cat |
 |---|---|---|---|---|
