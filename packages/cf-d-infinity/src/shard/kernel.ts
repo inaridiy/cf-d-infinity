@@ -25,7 +25,7 @@ import { keyStringExact } from "../keys";
 import { type Runtime, systemRuntime } from "../runtime";
 import { attempt, done, tail, unwrap, wait, type Effect, type Fork, type Outcome, type PeerCall, type Program, type Step } from "./step";
 import {
-  CAPTURE_TABLES, applyChanges, asSqlError, capturedChanges, checkAfter, decode, deleteRow, encode, imageSql, insertRow, pkValues, q,
+  CAPTURE_TABLES, applyChanges, asSqlError, capturedChanges, checkAfter, decode, deleteRow, encode, imageSql, insertRow, keyWhere, pkValues, q,
   returnedRows, rowwiseRestore, selectGroup, selectRow, setBasedRestore, tupleKey, typedScanList, typedValues,
 } from "./rows";
 import { parseTuple, type Tuple } from "../value";
@@ -96,6 +96,20 @@ export const SHARD_MAX_BYTES = SHARD_LIMITS.resultBytes;
 /** 取引の大きさの上限を超えた書き込みの誤り。 */
 const writeSetTooLarge = (): string =>
   `transaction too large: it changes more than ${MAX_WRITE_SET_BYTES} bytes of rows on one shard; split it into smaller transactions`;
+/**
+ * 書き込みの文を実行する。行イメージのタプルが DO の SQLite の値の長さの上限を超えると、SQLite が捕捉の中で文を止める
+ * (「string or blob too big」。BLOB は 16 進で 2 倍になり、JSON は文字を逃がす)。1 行のイメージがその上限を超える書き込みは、
+ * 取引の大きさの上限 (MAX_WRITE_SET_BYTES) も必ず超えるので、同じ誤りにする (docs/design-values.md の「大きさの勘定」)。
+ * 値そのものが上限を超える書き込みも、同じく大きすぎる。捕捉の経路 (trigger と RETURNING) は、どちらもここを通る。
+ */
+function imageFits<T>(write: () => T): T {
+  try {
+    return write();
+  } catch (e) {
+    if (e instanceof Error && /string or blob too big/i.test(e.message)) throw new SqlError(writeSetTooLarge());
+    throw e;
+  }
+}
 /** 値のおおよその大きさ (バイト)。上限の判定に使うだけで、正確である必要はない。 */
 const sizeOf = (v: Value): number =>
   typeof v === "string" ? v.length * 2 : v instanceof Uint8Array ? v.byteLength : 8;
@@ -1320,7 +1334,7 @@ export class ShardKernel {
       return this.rollback(() => {
         deleteRow(this.b, def, pk);
         insertRow(this.b, def, row);
-        const key = def.pk.map((c) => `${q(s.alias)}.${q(c)} IS ?`).join(" AND ");
+        const key = keyWhere(def.pk, `${q(s.alias)}.`);
         const sql = `SELECT 1 FROM ${q(def.name)} AS ${q(s.alias)} WHERE (${s.where}) AND ${key} LIMIT 1`;
         return this.b.exec(sql, ...s.params, ...pkValues(pk)).length > 0;
       });
@@ -1463,15 +1477,7 @@ export class ShardKernel {
 
   private runStatement(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number; bytes?: number; over?: boolean } {
     if (!req.write) return { ...this.readLimited(req), changes: [] };
-    try {
-      return this.runWrite(req);
-    } catch (e) {
-      // 行イメージのタプルが DO の SQLite の値の長さの上限を超えると、SQLite が文を止める。BLOB は 16 進で 2 倍になり、JSON は
-      // 文字を逃がす。1 行のイメージがその上限を超える書き込みは、取引の大きさの上限 (MAX_WRITE_SET_BYTES) も必ず超えるので、
-      // 同じ誤りにする (docs/design-values.md の「大きさの勘定」)。値そのものが上限を超える書き込みも、同じく大きすぎる。
-      if (e instanceof Error && /string or blob too big/i.test(e.message)) throw new SqlError(writeSetTooLarge());
-      throw e;
-    }
+    return imageFits(() => this.runWrite(req));
   }
 
   private runWrite(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number } {
@@ -1565,7 +1571,9 @@ export class ShardKernel {
       });
     } catch (e) {
       if (e === FALLBACK) return null;
-      throw e;
+      return imageFits(() => {
+        throw e;
+      });
     }
   }
 

@@ -6,7 +6,8 @@
 // 取引の書き込みは行イメージを JS の数で運ぶので、確定した値が書いた値と違う。
 // 正しい振る舞いは 2 つのどちらかである。SQLite と同じ答えを返すか、値で決まる `unsupported:` の誤りで、どの経路でもどの
 // 置き場所でも同じように断るか (AGENTS.md の規則 4)。持ち主は断るほうを選んだ (2026-11-13)。断るのは、書き込みのたびに作る
-// 行イメージを読むところ (src/shard/rows.ts の imageList と typedRow) である。
+// 行イメージを捕捉するところと、タプルを値に戻すところである (src/shard/rows.ts の assertExact と、src/value.ts の fromTypedValue。
+// 値の作り直しの段 2)。段 3 で、64 ビットの整数を通すようになる (test/open/int64.test.ts)。
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { Db } from "../src/client/db";

@@ -5,7 +5,7 @@
 // 2^53 の確かめの 1 列を足す。列の数と、型のない列の数と、1 を足して 100 を超える表では、INSERT も UPDATE も DELETE も SELECT も
 // 「too many columns in result set」で失敗する (PRIMARY KEY のない表は、rowid の列がもう 1 つ加わる)。いちばん小さい例は、
 // 主キーの 1 列と型のない 50 列の表で、結果が 102 列になる。表を作るときの確かめ (src/client/db.ts の assertReplays) は、これを見ない。
-// 式の木の深さの上限で書けない表 (test/open/wide-table-expression-depth.test.ts) と同じ穴である。表を作るときの確かめも
+// 式の木の深さの上限で書けなかった表 (test/wide-table-expression-depth.test.ts。段 2 で直った) と同じ穴である。表を作るときの確かめも
 // シミュレータも、DO の SQLite のこの 2 つの上限を知らなかった。
 //
 // 正しい振る舞いは 2 つのどちらかである。作れた表は読み書きできるか、できない表は CREATE TABLE が断るか (表定義だけで決まる
@@ -14,6 +14,9 @@
 // 2026-11-14)。それまでは、シミュレータの node:sqlite が 2,000 列まで受け付けるので、シミュレータの試験では通っていた
 // (test/shard-limits.test.ts は、64 列とも型のない表を使っていた)。本物の workerd でも同じ誤りになることを確かめた。
 // 足す列は、作り直しの段 2 と段 3 で、imageList と typeof の列と一緒になくなる。
+// 段 2 (2026-11-14) の後: 行イメージはタプル (1 列) になり、捕捉と行の読みは列を足さなくなった。INSERT、UPDATE、DELETE は通る。
+// 残るのは行を集める走査 (src/sql/plan.ts の scanSql、Scan.typed) で、型のない列ごとの typeof の列を足すので、型のない列が 50 以上の
+// 表では、複数のシャードから行を集める SELECT が「too many columns in result set」で失敗する。走査は段 3 で型つきの読みに替わる。
 import { describe, expect, it } from "vitest";
 import { Db } from "../../src/client/db";
 import { SimCluster } from "../sim";

@@ -1,6 +1,7 @@
 // どの試験にも掛かる検査。シミュレータのシャードが実行した文のうち、宣言した範囲 (span) の外の行に依存したものがあれば、
 // その試験を失敗にする。範囲の外の行は、intent の決着も commit の検証も受けないので、取引の検証が成り立たない。
 // 文の形ごとに範囲の作り方を確かめる代わりに、実行された文のすべてをこれで確かめる。
+import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { afterEach, beforeAll, beforeEach, expect } from "vitest";
@@ -42,7 +43,9 @@ afterEach(() => {
   if (!dir) return;
   const nets = tracedNets.splice(0);
   const state = expect.getState();
-  const name = `${basename(state.testPath ?? "unknown")}--${state.currentTestName ?? "unknown"}`.replace(/[^A-Za-z0-9._-]+/g, "_");
+  const full = `${basename(state.testPath ?? "unknown")}--${state.currentTestName ?? "unknown"}`;
+  // 長い試験の名前は、ファイルの名前の上限 (255 バイト) を超える。先頭を残し、名前全体の指紋を足す。
+  const name = `${full.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 160)}-${createHash("sha256").update(full).digest("hex").slice(0, 12)}`;
   mkdirSync(dir, { recursive: true });
   writeFileSync(`${dir}/${name}.txt`, nets.map((n, i) => n.log.map((m) => `${i} ${m.from}>${m.to} ${String(m.method)}\n`).join("")).join(""));
 });

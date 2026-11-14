@@ -10,6 +10,7 @@
 //   - Worker は、ShardLimit を受けたら、その文を基準経路で実行し直す (NeedsReference。切り替えは runPlanned の 1 か所)。
 //   - プランナは、自分が作る文 (行を集める走査、行ごとに分けた INSERT) をこの上限に収める。基準経路の走査は、上限を超える
 //     条件を押し下げずに表を読むので、作りとして上限に収まる。
+import { expressionDepth } from "./sql/depth";
 import type { Value } from "./types";
 import { bindTyped } from "./value";
 
@@ -23,6 +24,12 @@ export const SHARD_LIMITS = {
   compoundTerms: 5,
   /** 1 つの値 (文字列か BLOB) のバイト数。 */
   valueBytes: 2_000_000,
+  /**
+   * 式の木の深さ。公表の表にない。手元の workerd で測った (test/workerd-limits.test.ts)。数え方は src/sql/depth.ts にある。
+   * シャードは、届いた文の深さを測らない (見積もりは多めに出るので、利用者の文を断る理由にはしない)。D∞ が作る文は、
+   * 表を作るときに builtLimitOf で確かめる。
+   */
+  exprDepth: 100,
   /**
    * 1 回の要求でシャードが返す結果のバイト数 (src/shard/core.ts の sizeOf で数える)。DO の RPC の上限 (32 MiB) より十分小さい。
    * 1 つの文が集める合計の予算 (Db の BYTE_BUDGET) もこれ以下にする。そうしないと、行が 1 つのシャードに偏ったときだけ、
@@ -89,6 +96,17 @@ export function shardLimitOf(sql: string, params: Value[]): string | null {
 
 /** 文が収まるか。プランナが自分の作る文を確かめるのに使う。 */
 export const withinShardLimits = (sql: string, params: Value[]): boolean => shardLimitOf(sql, params) === null;
+
+/**
+ * D∞ が作る文 (行イメージを読み書きする文、捕捉の trigger、走査) が上限を超えるなら、その理由を返す。shardLimitOf の上限に、
+ * 式の木の深さを加える。深さも、束縛のための書き換えの後の文で測る (整数の引数を包む式は、深さを 2 足す)。
+ */
+export function builtLimitOf(sql: string, params: Value[]): string | null {
+  const over = shardLimitOf(sql, params);
+  if (over) return over;
+  const depth = expressionDepth(bindTyped(sql, params, "real").sql);
+  return depth > SHARD_LIMITS.exprDepth ? `the statement has an expression tree ${depth} deep, more than ${SHARD_LIMITS.exprDepth}` : null;
+}
 
 const PREFIX = "shard limit: ";
 

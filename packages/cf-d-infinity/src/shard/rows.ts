@@ -31,7 +31,20 @@ export const decode = <T>(s: string): T =>
       : x && typeof x === "object" && typeof x.$f === "string" ? Number(x.$f)
         : x) as T;
 
-const pkWhere = (def: TableDef) => def.pk.map((c) => `${q(c)} IS ?`).join(" AND ");
+/**
+ * 項を op でつなぐ。2 項の演算子で n 個の項をつなぐと、式の木の深さが n になる。DO の SQLite は深さを 100 までに制限しているので
+ * (src/shard-limits.ts の SHARD_LIMITS.exprDepth)、16 個を超えたら、釣り合った木に組む。深さは項の数の対数で増える。
+ * 括弧は SQLite の式の節を作らないので、括弧で組んだ形がそのまま木になる。
+ */
+export function joinTerms(terms: string[], op: "AND" | "OR"): string {
+  if (terms.length <= 16) return terms.join(` ${op} `);
+  const mid = Math.ceil(terms.length / 2);
+  return `(${joinTerms(terms.slice(0, mid), op)}) ${op} (${joinTerms(terms.slice(mid), op)})`;
+}
+
+/** 主キーの列が、束縛した値と等しい条件。prefix は列の修飾である (`"t".`)。 */
+export const keyWhere = (cols: string[], prefix = "") => joinTerms(cols.map((c) => `${prefix}${q(c)} IS ?`), "AND");
+const pkWhere = (def: TableDef) => keyWhere(def.pk);
 /** 主キーのキー文字列を、束縛する値に戻す (src/keys.ts の keyParams)。 */
 export const pkValues = (pkJson: string): Value[] => keyParams(pkJson);
 
@@ -201,8 +214,7 @@ function assertExact(table: string, t: Tuple | null): void {
 /** タプルの SQL の結果を読む。結果は 1 列の JSON の文字列である。 */
 const tupleIn = (v: Value): Tuple => parseTuple(v as string);
 
-const selectGroupSql = (def: TableDef) =>
-  `SELECT ${imageSql(def)} FROM ${q(def.name)} WHERE ${def.shardKey.map((c) => `${q(c)} IS ?`).join(" AND ")}`;
+const selectGroupSql = (def: TableDef) => `SELECT ${imageSql(def)} FROM ${q(def.name)} WHERE ${keyWhere(def.shardKey)}`;
 const selectRowSql = (def: TableDef) => `SELECT ${imageSql(def)} FROM ${q(def.name)} WHERE ${pkWhere(def)}`;
 const insertRowSql = (def: TableDef, columns: string[]) =>
   `INSERT INTO ${q(def.name)} (${columns.map((c) => ref("", c)).join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`;

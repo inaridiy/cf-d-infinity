@@ -2,7 +2,7 @@ import type {
   Change, CommitRes, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
 } from "../types";
 import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, utf8Length } from "../types";
-import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, imageAt, imageStatements, pkValues, q, scanList, tupleOfRow, typedValues } from "../shard/rows";
+import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, imageAt, imageStatements, joinTerms, pkValues, q, scanList, tupleOfRow, typedValues } from "../shard/rows";
 import type { Tuple } from "../value";
 import type { Catalog, SplitMove, SplitSlot } from "../meta";
 import { hashKey, ownerOf, regionsOf, shardsOf, type Interval, type Routing } from "../routing";
@@ -11,7 +11,7 @@ import { ident, parseStatements, text, type Node, type Params } from "../sql/cst
 import { keyStringExact } from "../keys";
 import { fromTyped } from "../value";
 import { sha256Text } from "../sha256";
-import { SHARD_LIMITS, isShardLimit, shardLimitOf, withinShardLimits } from "../shard-limits";
+import { SHARD_LIMITS, builtLimitOf, isShardLimit, withinShardLimits } from "../shard-limits";
 import { scanSql, untypedOf, SCHEMA_STATEMENTS, findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
 import { parseDdl } from "../sql/ddl";
 import { openScratch, ScratchDb, type Compiled } from "../sql/scratch";
@@ -928,7 +928,7 @@ export class Txn extends ReadScope {
       const key = `${def.name}\0${sk}`;
       const g = wanted.get(key) ?? { def, sk, conds: [] };
       wanted.set(key, g);
-      g.conds.push({ sql: `(${cols.map((c) => `${q(def.name)}.${q(c)} ${op} ?`).join(" AND ")})`, params: vals });
+      g.conds.push({ sql: `(${joinTerms(cols.map((c) => `${q(def.name)}.${q(c)} ${op} ?`), "AND")})`, params: vals });
     };
     for (const c of changes) {
       if (!c.after) continue;
@@ -970,7 +970,8 @@ export class Txn extends ReadScope {
     for (const g of wanted.values()) {
       let batch: typeof g.conds = [];
       const scanOf = (conds: typeof g.conds): Scan => {
-        const where = conds.map((x) => x.sql).join(" OR ");
+        // 問いの数だけ OR でつなぐと、式の木が問いの数だけ深くなる (DO の SQLite の上限は 100)。釣り合った木に組む。
+        const where = joinTerms(conds.map((x) => x.sql), "OR");
         const params = conds.flatMap((x) => x.params);
         return { table: g.def, sql: `SELECT ${scanList(g.def)} FROM ${q(g.def.name)} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, typed: untypedOf(g.def) };
       };
@@ -985,7 +986,7 @@ export class Txn extends ReadScope {
       if (batch.length > 0) batches.push({ def: g.def, sk: g.sk, conds: batch });
     }
     for (const g of batches) {
-      const where = g.conds.map((x) => x.sql).join(" OR ");
+      const where = joinTerms(g.conds.map((x) => x.sql), "OR");
       const params = g.conds.flatMap((x) => x.params);
       const scan: Scan = { table: g.def, sql: `SELECT ${scanList(g.def)} FROM ${q(g.def.name)} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, typed: untypedOf(g.def) };
       const { columns, rows } = await this.scan(scan);
@@ -1353,11 +1354,13 @@ export class Db {
     const parsed = parseDdl(sql, cat);
     // 基準経路は、条件を押し下げられなければ表を丸ごと読む (scanOf)。その走査と、シャードが行イメージを読み書きする文
     // (捕捉の trigger、主キーとグループの読み、行を入れ直す文。src/shard/rows.ts の imageStatements) は、作りとして DO の SQLite の
-    // 上限 (文の長さ、束縛の変数の数) に収まらなければならない。収まらない表 (極端に長い列名、多すぎる列など) は、
-    // 表定義で断る (src/shard-limits.ts、計画書の不変条件 13)。断るかどうかは表定義だけで決まる。
+    // 上限 (文の長さ、束縛の変数の数、式の木の深さ) に収まらなければならない。収まらない表 (極端に長い列名、多すぎる列など) は、
+    // 表定義で断る (src/shard-limits.ts の builtLimitOf、計画書の不変条件 13)。断るかどうかは表定義だけで決まる。
+    // 確かめを落とすと、表は CREATE TABLE を通り、後でシャードが trigger を作れないか、1 行も書けない
+    // (test/wide-table-expression-depth.test.ts)。
     for (const def of parsed.defs ?? []) {
       const statements = [{ sql: scanSql(fullScan(def)), params: [] as Value[] }, ...imageStatements(def)];
-      const over = statements.map((s) => shardLimitOf(s.sql, s.params)).find((x) => x !== null);
+      const over = statements.map((s) => builtLimitOf(s.sql, s.params)).find((x) => x !== null);
       if (over) {
         throw new SqlError(`unsupported: the table ${def.name} is too wide for a shard to scan and capture its rows within Durable Object SQLite limits (${over}); use fewer or shorter column names`);
       }
