@@ -8,8 +8,6 @@
 Read the name as "D-infinity": the D1 API your Worker already speaks, without the single-database ceiling. Add it to a Worker with one command; the Worker plans each statement, the shards are Durable Objects holding ordinary SQLite, and there is no server to run.
 
 > **Status: experimental.** A research prototype. Do not put data you cannot afford to lose in it; read [Limitations](#limitations) first.
->
-> **License note.** The code in this repository is MIT, but it uses the GPL-2.0-or-later SQL parser [`sql-parser-cst`](https://github.com/nene/sql-parser-cst) at runtime, so a Worker bundle built with D∞ is a combined work covered by the GPL (see [license](#contributing-disclaimer-and-license)). Replacing the parser is planned.
 
 ## The idea
 
@@ -358,4 +356,4 @@ Bug reports are welcome, and please open an issue before a large change; [CONTRI
 
 Not affiliated with, endorsed by or supported by Cloudflare or any vendor named above. "D∞" and `cf-d-infinity` are this project's own names, not a Cloudflare product; "Cloudflare", "D1" and the other vendors' names are trademarks of their owners and are used only to describe compatibility and to compare.
 
-MIT, see [LICENSE](LICENSE). The deployed Worker bundles third-party packages under their own licenses. The SQL parser [`sql-parser-cst`](https://github.com/nene/sql-parser-cst) is **GPL-2.0-or-later**, so a built Worker bundle is a combined work covered by the GPL; if you distribute such a bundle, you must comply with it. SQLite in the Worker comes from [sql.js](https://github.com/sql-js/sql.js) (MIT).
+MIT, see [LICENSE](LICENSE). The package has no runtime dependencies. The deployed Worker bundles one third-party package, [sql.js](https://github.com/sql-js/sql.js) (MIT), which carries SQLite (public domain) for the Worker; the SQL parser is D∞'s own code.

@@ -234,7 +234,11 @@ session にまとめた呼び出しが本番で別に課金されないことは
 ## パーサの役割
 
 文の意味は SQLite が解釈するので、Worker のパーサは経路の決定にしか使わない。
-パーサは `sql-parser-cst` で、SQLite が識別子として許す語の予約を外し、読めない構文 (`IN ()` など) は解析の前に書き換えている。
+パーサは自前で (`src/sql/parser.ts`)、SQLite の文法 (parse.y) に合わせてある。
+受け付けるかどうかは、文の一覧を本物の SQLite の構文の判定と比べて確かめている (`test/parser.test.ts`)。
+構文の誤りは、SQLite と同じ形の文言 (`near "x": syntax error`、`incomplete input`、`unrecognized token: "x"`) で断る。
+解析の前に、文面を 4 か所だけ書き換える: 識別子として使った結合の語 (`left` など) を引用符で囲む、関数の引数の `ALL` を落とす、`x IN ()` を常に偽のサブクエリにする、CR を空白にする。
+この書き換えは前のパーサ (`sql-parser-cst`) の頃からのもので、文面で見分けるので、語の間に注釈があると見誤る (`a LEFT /* c */ JOIN b` が内部結合になる。`test/open/join-word-before-comment.test.ts`)。
 
 手書きの解析が表の参照を見落とすと、空の表として黙って誤った結果を返す。
 そこで Worker の SQLite では、実行の前に `EXPLAIN` で本物のプランナが開く表を確かめ、足りない表を読み足している。

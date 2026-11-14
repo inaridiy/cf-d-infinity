@@ -12,7 +12,7 @@
 |---|---|
 | シャード内の実行 | SQLite のまま |
 | Worker 内の実行 | sql.js (SQLite の WASM ビルド) で元の SQL を実行する |
-| パーサ | `sql-parser-cst` の SQLite 方言 |
+| パーサ | 自作 (`src/sql/parser.ts`)。SQLite の方言だけを読む手書きの再帰下降で、依存はない。2026-11-14 までは `sql-parser-cst` (GPL) だった |
 | プランナ | 自作。押し下げは下記の安全規則に従う |
 | 行の置き場所 | PRIMARY KEY の先頭列のハッシュ。構文は足さない (2026-11-14 に `SHARD KEY` の句を消した) |
 | 複数シャードの UPDATE、DELETE | 明示した文だけ実行する。黙って変換しない |
@@ -37,6 +37,12 @@ WASM で元の SQL を実行すれば、この種類のバグは起きにくく�
 `node-sql-parser` は 14 件で、ON CONFLICT、UPDATE FROM、`OVER (ORDER BY ...)` もこの差に含まれる。
 代償はサイズ (627 KB) と解析時間 (1 文 368 µs、`node-sql-parser` は 80 µs) である。
 文法から自作のパーサを生成する必要はなくなった。
+
+2026-11-14 に、`sql-parser-cst` を自作のパーサに入れ替えた。
+理由はライセンスである: `sql-parser-cst` は GPL-2.0-or-later で、D∞ を組み込んだ Worker が GPL の結合著作物になっていた。
+自作のパーサは SQLite の方言だけを読み、計画の組み立てが読む木の形を `sql-parser-cst` と同じにしてある。
+入れ替えは、同じ文を両方で解析して木と文面を比べる突き合わせで確かめた (`test/parser-oracle.test.ts`。文は sqllogictest の 22 万件と、試験の全部が解析した文)。
+解析時間は、同じ計算機で sqllogictest の文を流して、1 文あたり約 1.2 ms から約 0.02 ms になった。
 
 ## 押し下げの安全規則
 

@@ -141,7 +141,9 @@ intent が残っていないこと、確定した取引が全部適用済みで�
 sql.js は `lib/cloudflare.js` に束ねる。
 sql.js の Node 向けの分岐が `fs`、`path`、`crypto` を参照するので、束ねずに出すと利用者の `wrangler.jsonc` に `alias` が要るからである。
 `src/sql-wasm.wasm` は sql.js 1.13.0 の `dist/sql-wasm.wasm` の写しで、ビルドが一致を検査する。
-`sql-parser-cst` (GPL-2.0-or-later) は束ねず、依存として参照する。束ねると配布物そのものが GPL の結合著作物になる。
+実行時の依存はない。
+SQL のパーサは自前である (`src/sql/lexer.ts`、`parser.ts`、`printer.ts`)。
+2026-11-14 までは `sql-parser-cst` (GPL-2.0-or-later) を依存として参照していて、D∞ を組み込んだ Worker は GPL の結合著作物になっていた。
 
 利用者の Worker に入る名前には、衝突を避けるために接頭辞を付けている。
 binding と変数は `DINF_`、クラスは `Dinf` で始まる。
@@ -193,7 +195,8 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `src/sql/plan.ts` | 文の実行場所の決定、条件の押し下げ |
 | `src/sql/ddl.ts` | DDL の解釈、index の配置 |
 | `src/sql/scratch.ts` | Worker の中の SQLite (sql.js) |
-| `src/sql/cst.ts` | パーサのラッパー |
+| `src/sql/lexer.ts`、`parser.ts`、`printer.ts` | SQLite の方言の字句解析、構文解析、文面への出し直し |
+| `src/sql/cst.ts` | 構文木の入口。解析の前の書き換え、引数の束縛、定数の読み取り |
 | `src/meta.ts` | 表定義、DDL 履歴、範囲表、index の作成と書き込み禁止の期限、保守の操作の枠 |
 | `src/value.ts` | 値の格納の型 (INTEGER と REAL)。束縛の関数 `bindTyped` (DO、シミュレータ、Worker の SQLite の 3 つの Backend が通す) |
 | `src/keys.ts` | キー文字列を作る関数 (`keyString` と、trigger の中の `keySql`)。SQLite の型の親和性を写す `storedAs` |
@@ -217,6 +220,8 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `test/compat.test.ts` | 本物の SQLite との差分テスト (手書き) |
 | `test/fuzz.test.ts` | 本物の SQLite との差分テスト (乱数) |
 | `test/slt.test.ts`、`test/slt-more.test.ts` | SQLite の sqllogictest |
+| `test/parser.test.ts` | パーサ。受け付けるかどうかを本物の SQLite の構文の判定と比べる。計画の組み立てが読む木の形の見本、文面への出し直し |
+| `test/parser-oracle.test.ts` | 入れ替える前のパーサ (`sql-parser-cst`、GPL) との突き合わせ。依存には入れていないので、`npm install --no-save sql-parser-cst@0.33.1` で入れたときだけ動く。`PARSER_CORPUS=<dir>` で試験の全部が解析した文を書き出し、`PARSER_ORACLE_CORPUS=<dir>` で読む |
 | `test/prod.test.ts` | 本番の Worker への確認。`PROD_URL` があるときだけ動く |
 | `test/counterexamples.test.ts` | 設計レビューと形式モデルの反例。欠陥スイッチを入れると壊れ、外すと直ることを確かめる |
 | `test/history.test.ts` | ランダムな並行実行が commit 時刻順の直列実行と一致すること (時計のずれ、遅延、再起動あり)。チェッカが欠陥を検出できることも確かめる |
