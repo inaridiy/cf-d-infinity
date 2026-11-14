@@ -235,8 +235,11 @@ The checks are layered. Each one catches what the layer before it cannot see.
 1. **Formal models.** Eighteen Quint models cover the risky protocol parts: commit and snapshot reads, read refresh, 2PC
    recovery, HLC across restarts, split fencing and live migration, row locks, garbage collection of transaction
    records, schema changes under concurrent transactions, building a cross-shard `UNIQUE` index, schema changes inside
-   transactions, table rebuilds, the ordering of schema changes and splits, `UNIQUE` across pending writes, and a transaction id reused by two continuations. TLC explores them exhaustively on small
-   instances. Each model has variants with a known bug put back, and the checker must find every one.
+   transactions, table rebuilds, the ordering of schema changes and splits, `UNIQUE` across pending writes, and a
+   transaction id reused by two continuations. Three more (M18 to M20) model a mechanism the code does not have yet:
+   moving one tenant in pieces, re-splitting a read while pieces move, and `UNIQUE` while a group moves piece by piece.
+   TLC explores them exhaustively on small instances. Each model has variants with a known bug put back, and the checker
+   must find every one.
 2. **Counterexamples replayed against the code.** A model only checks the design. For each bug variant that the
    implementation guards against, a deterministic simulator test drives the model's counterexample against the real
    code. For most of them (51 of 74) a fault switch also puts the same bug back into the code, and the test checks that

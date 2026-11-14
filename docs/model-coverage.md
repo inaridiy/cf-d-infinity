@@ -15,6 +15,14 @@ Categories:
   and 6 have a switch whose replay runs only the fixed code; for those 23 the replay checks the fixed code on the
   model's ordering, not that removing the guard breaks it. (Recounted from this table on 2026-11-13; the three M5b range-floor rows were added on 2026-11-14.)
 - D: a design alternative the implementation never had or no longer has, or a variant another mechanism already covers; no switch needed (13 rows, M16 and M17 included).
+- P: models for a mechanism that is designed but not in the code yet, so there is no guard to switch off. M18
+  (`specs/m18_subslot_split.qnt`), M19 (`m19_claim_resplit.qnt`) and M20 (`m20_unique_piecewise.qnt`) model moving one
+  tenant in pieces, stages 2 to 4 of [design-subslots.md](./design-subslots.md). Their 16 red modules get rows, switches
+  and replays together with the implementation: `m18_red_partial_answer`, `m18_red_child_partial`,
+  `m18_red_answer_held`, `m18_red_piece_without_clock`, `m18_red_write_by_slot`, `m18_red_intents_by_group`,
+  `m19_red_stale_map`, `m19_red_mixed_t`, `m19_red_gap`, `m19_red_forget_map`, `m19_red_piece_without_clock`,
+  `m19_live_red_child_waits`, `m20_red_piecewise`, `m20_red_late_intent`, `m20_red_child_early`,
+  `m20_red_child_reads_parent_per_piece`.
 
 | module | flaw modelled | fault switch | deterministic replay | cat |
 |---|---|---|---|---|
