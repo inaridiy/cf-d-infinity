@@ -339,6 +339,11 @@ export interface SimOptions {
 /** Worker と DO の間の RPC だけをシミュレートしたクラスタ。ShardCore は本物を動かす。 */
 /** このプロセスの全クラスタで見つかった、範囲の外の行に依存する文。test/setup.ts が試験ごとに確かめて空にする。 */
 export const allSpanEscapes: SpanEscape[] = [];
+/**
+ * RPC_TRACE=<ディレクトリ> のとき、このプロセスで作ったクラスタの網。test/setup.ts が試験ごとに、RPC の送り元、宛先、種類の列を
+ * 書き出して空にする。中身は書かない。変更の前後で、同じ seed の実行の RPC の列が同じかを比べるのに使う。
+ */
+export const tracedNets: SimNet[] = [];
 
 export class SimCluster implements Cluster {
   /** 起動時のシャード。増設後の一覧は catalog の routing を見る。 */
@@ -374,6 +379,7 @@ export class SimCluster implements Cluster {
     const injected = injectedFault();
     if (injected?.side === "shard") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
     this.clientFaults = injected?.side === "client" ? { ...o.clientFaults, [injected.name]: true } : o.clientFaults;
+    if (process.env.RPC_TRACE) tracedNets.push(this.net);
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
     this.runtime = this.virtual ?? systemRuntime;
     this.shardIds = o.stored ? [...o.stored.shards.keys()] : Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);

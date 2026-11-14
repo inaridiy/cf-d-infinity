@@ -1,7 +1,7 @@
 // 変更ログの世代と GC。保持窓で記憶が頭打ちになり、窓の外を必要とする読みは黙って間違えずに失敗する。
 import { describe, expect, it } from "vitest";
 import { Db } from "../src/client/db";
-import { keyString } from "../src/keys";
+import { keyStringExact } from "../src/keys";
 import { ownerOf } from "../src/routing";
 import type { Faults } from "../src/types";
 import { logRows as rowsOf, SimCluster, type SimOptions, USERS } from "./sim";
@@ -22,7 +22,7 @@ const gens = (c: SimCluster, id: string) =>
 /** 指定したシャードに載る tenant を返す。 */
 const tenantOn = async (c: SimCluster, shard: string) => {
   const { routing } = await c.catalog();
-  for (let t = 1; ; t++) if (ownerOf(routing, keyString([t])) === shard) return t;
+  for (let t = 1; ; t++) if (ownerOf(routing, keyStringExact([t])) === shard) return t;
 };
 const getN = async (q: Pick<Db, "query">, t: number, id = 1) =>
   (await q.query("SELECT n FROM users WHERE tenant_id = ? AND id = ?", [t, id])).rows[0]?.n ?? null;

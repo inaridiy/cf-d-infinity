@@ -21,11 +21,11 @@ import {
 } from "../types";
 import type { DdlEntry } from "../meta";
 import { blockOf, checkInterval, overlaps, rangeText, sameInterval, slotAligned, slotOf, tokenOf, type Interval } from "../routing";
-import { keyString } from "../keys";
+import { keyStringExact } from "../keys";
 import { type Runtime, systemRuntime } from "../runtime";
 import { attempt, done, tail, unwrap, wait, type Effect, type Fork, type Outcome, type PeerCall, type Program, type Step } from "./step";
 import {
-  CAPTURE_TABLES, applyChanges, asSqlError, assertKeyed, capturedChanges, decode, deleteRow, encode, encodeKey, insertRow, q,
+  CAPTURE_TABLES, applyChanges, asSqlError, assertKeyed, capturedChanges, decode, deleteRow, encode, encodeKey, insertRow, pkValues, q,
   rowwiseRestore, selectGroup, selectList, selectRow, setBasedRestore, imageList, typedRow, typedValues,
 } from "./rows";
 
@@ -1015,7 +1015,7 @@ export class ShardKernel {
         let read = 0;
         for (const r of rows) {
           read++;
-          add(keyString(r));
+          add(keyStringExact(r));
           if (out.length >= req.limit) {
             // NULL を含む shard key は行の比較で絞れないので、読んだ数で続きを表す。
             const next: GroupCursor = r.every((v) => v !== null)
@@ -1317,7 +1317,7 @@ export class ShardKernel {
         insertRow(this.b, def, row);
         const key = def.pk.map((c) => `${q(s.alias)}.${q(c)} IS ?`).join(" AND ");
         const sql = `SELECT 1 FROM ${q(def.name)} AS ${q(s.alias)} WHERE (${s.where}) AND ${key} LIMIT 1`;
-        return this.b.exec(sql, ...s.params, ...decode<Value[]>(pk)).length > 0;
+        return this.b.exec(sql, ...s.params, ...pkValues(pk)).length > 0;
       });
     } catch {
       return true;

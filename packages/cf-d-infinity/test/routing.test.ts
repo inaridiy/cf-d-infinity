@@ -7,7 +7,7 @@
 //   2. 区間の移動を乱択で重ねても (境目をブロックの中に置いても)、どの token にも持ち主がちょうど 1 つある。
 //   3. 行の置き場所 (slot、subslot、token) の計算。保存の形式なので、値を固定してある。
 import { describe, expect, it } from "vitest";
-import { keyString } from "../src/keys";
+import { keyStringExact } from "../src/keys";
 import {
   REGION_TOKENS, SLOTS, SUBSLOTS, TOKENS, applyMove, blockOf, checkInterval, hashKey, initialRouting, overlaps, ownerOf, ownersOf, planSplit,
   rangeText, regionsOf, shardsOf, slotAligned, slotOf, subslotOf, tokenOf, type Interval, type Routing,
@@ -77,7 +77,7 @@ describe("row placement", () => {
   it("lays out a token as region, slot and subslot: the top 16 bits of the shard key's hash, the low 16 bits of the primary key's", () => {
     expect([SLOTS, SUBSLOTS, REGION_TOKENS, TOKENS]).toEqual([2 ** 16, 2 ** 16, 2 ** 32, 2 ** 40]);
     expect(Number.isSafeInteger(TOKENS)).toBe(true);
-    for (const [sk, pk] of [[keyString([1]), keyString([1])], [keyString(["a"]), keyString(["a", 2])], [keyString([7]), keyString([7, "x"])], [keyString([null]), ""]] as const) {
+    for (const [sk, pk] of [[keyStringExact([1]), keyStringExact([1])], [keyStringExact(["a"]), keyStringExact(["a", 2])], [keyStringExact([7]), keyStringExact([7, "x"])], [keyStringExact([null]), ""]] as const) {
       expect(slotOf(sk)).toBe((hashKey(sk) >>> 16) * SUBSLOTS);
       expect(subslotOf(pk)).toBe(hashKey(pk) & 0xffff);
       expect(tokenOf(sk, pk)).toBe(slotOf(sk) + subslotOf(pk));
@@ -91,18 +91,18 @@ describe("row placement", () => {
   // 保存の形式である。値が変わると、置いてある行の持ち主が変わる (docs/storage-format.md の「行の置き場所」)。
   it("keeps placing the same key at the same slot and subslot", () => {
     const at = (key: string) => [slotOf(key) / SUBSLOTS, subslotOf(key)];
-    expect(at(keyString([1]))).toEqual([59297, 63422]);
-    expect(at(keyString([2]))).toEqual([43207, 35955]);
-    expect(at(keyString(["tenant-a"]))).toEqual([30591, 42834]);
-    expect(at(keyString([7, 1]))).toEqual([28802, 30195]);
-    expect(at(keyString([7, 2]))).toEqual([55991, 59924]);
-    expect(tokenOf(keyString([7]), keyString([7, 1]))).toBe(slotOf(keyString([7])) + 30195);
+    expect(at(keyStringExact([1]))).toEqual([59297, 63422]);
+    expect(at(keyStringExact([2]))).toEqual([43207, 35955]);
+    expect(at(keyStringExact(["tenant-a"]))).toEqual([30591, 42834]);
+    expect(at(keyStringExact([7, 1]))).toEqual([28802, 30195]);
+    expect(at(keyStringExact([7, 2]))).toEqual([55991, 59924]);
+    expect(tokenOf(keyStringExact([7]), keyStringExact([7, 1]))).toBe(slotOf(keyStringExact([7])) + 30195);
   });
 
   it("refines the 4,096 slots it replaces: an old slot is 16 of the new ones", () => {
     expect(OLD).toBe(16 * SUBSLOTS);
     for (let i = 0; i < 5000; i++) {
-      const key = keyString([i]);
+      const key = keyStringExact([i]);
       expect(Math.floor(slotOf(key) / OLD)).toBe(oldSlotOf(key));
     }
   });
@@ -112,7 +112,7 @@ describe("row placement", () => {
     const lower = new Map<number, number>();
     const total = new Map<number, number>();
     for (let i = 0; i < 200_000; i++) {
-      const key = keyString([i]);
+      const key = keyStringExact([i]);
       const bundle = Math.floor(slotOf(key) / (REGION_TOKENS / 16)); // slot を 16 個の束にまとめる
       total.set(bundle, (total.get(bundle) ?? 0) + 1);
       if (subslotOf(key) < SUBSLOTS / 2) lower.set(bundle, (lower.get(bundle) ?? 0) + 1);
@@ -147,7 +147,7 @@ describe("the range table with boundaries on the old slots", () => {
       const shards = Array.from({ length: int(rand, 1, 6) }, (_, i) => `s${i}`);
       let old = oldInitialRouting(shards);
       let now = scaled(old);
-      const keys = Array.from({ length: 200 }, (_, i) => keyString([i, seed]));
+      const keys = Array.from({ length: 200 }, (_, i) => keyStringExact([i, seed]));
       for (let step = 0; step < 40; step++) {
         const all = shardsOf(now);
         const parent = all[int(rand, 0, all.length)]!;
@@ -173,7 +173,7 @@ describe("the range table with boundaries on the old slots", () => {
         for (const sk of keys) {
           const owner = oldOwnerOf(old, sk);
           expect(ownerOf(now, sk)).toBe(owner);
-          expect(ownerOf(now, sk, keyString([sk, 1]))).toBe(owner);
+          expect(ownerOf(now, sk, keyStringExact([sk, 1]))).toBe(owner);
           expect(ownersOf(now, sk)).toEqual([owner]);
         }
         for (const shard of shardsOf(now)) {
@@ -223,14 +223,14 @@ describe("the range table with boundaries anywhere", () => {
   }
 
   it("finds the owner of a row by its primary key when a boundary falls inside the block of its shard key", () => {
-    const sk = keyString([7]);
+    const sk = keyStringExact([7]);
     const block = blockOf(sk);
     const before = initialRouting(["s0", "s1"]);
     const parent = ownerOf(before, sk);
     // ブロックの後ろ半分と、その後ろの slot 3 つを s9 へ移す。
     const r = applyMove(before, { start: block.start + SUBSLOTS / 2, end: block.end + 3 * SUBSLOTS, to: "s9" });
     expectPartition(r);
-    const pks = Array.from({ length: 400 }, (_, i) => keyString([7, i]));
+    const pks = Array.from({ length: 400 }, (_, i) => keyStringExact([7, i]));
     const low = pks.filter((pk) => subslotOf(pk) < SUBSLOTS / 2);
     expect(low.length).toBeGreaterThan(100);
     expect(pks.length - low.length).toBeGreaterThan(100);
@@ -239,10 +239,10 @@ describe("the range table with boundaries anywhere", () => {
     // 主キーがなければ、行の持ち主は 1 つに決まらない。黙ってどちらかを返さない。
     expect(() => ownerOf(r, sk)).toThrow(/is split between/);
     // 境目の入っていないブロックは、今までどおりである。
-    const others = Array.from({ length: 200 }, (_, i) => keyString([100 + i])).filter((k) => slotOf(k) !== block.start);
+    const others = Array.from({ length: 200 }, (_, i) => keyStringExact([100 + i])).filter((k) => slotOf(k) !== block.start);
     for (const k of others) {
       expect(ownersOf(r, k)).toEqual([ownerOf(r, k)]);
-      expect(ownerOf(r, k, keyString([k, 1]))).toBe(ownerOf(r, k));
+      expect(ownerOf(r, k, keyStringExact([k, 1]))).toBe(ownerOf(r, k));
     }
     expect(regionsOf(r, "s9")).toEqual([{ start: block.start + SUBSLOTS / 2, end: block.end + 3 * SUBSLOTS }]);
     // 分けたブロックを元のシャードへ戻すと、持ち主は 1 つに戻る。

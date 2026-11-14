@@ -12,7 +12,8 @@ import { DatabaseSync } from "node:sqlite";
 import initSqlJs from "sql.js";
 import { beforeAll, describe, expect, it } from "vitest";
 import { Db } from "../src/client/db";
-import { keyString, keyStringExact, keyValues, storedAs } from "../src/keys";
+import { keyStringExact, keyValues, storedAs } from "../src/keys";
+import { oldKeyString } from "./key-string-old";
 import { initStoredValue, storedValue } from "../src/sql/stored";
 import type { Affinity, Value } from "../src/types";
 import { decodeTuple, isReal, parseTuple, realOf, tupleSql, typedOf, type TypedValue } from "../src/value";
@@ -154,13 +155,13 @@ function keyDisagreements(values: Typed[], key: (v: Typed) => string | undefined
 }
 
 describe("a key string is equal exactly when SQLite takes two values for the same key", () => {
-  it("today's keyString, over the values that can be stored today", () => {
+  it("the format-1 keyString (test/key-string-old.ts), over the values that can be stored today", () => {
     // いま保存できるのは、絶対値が 2^53 未満の INTEGER と、REAL である (2^53 以上の INTEGER は断る。計画書の K1)。
     const today = (v: Typed): Value | undefined =>
       typeof v === "number" ? realOf(v) : v > -(2n ** 53n) && v < 2n ** 53n ? Number(v) : undefined;
     const r = keyDisagreements(EDGE_VALUES, (v) => {
       const x = today(v);
-      return x === undefined ? undefined : keyString([x]);
+      return x === undefined ? undefined : oldKeyString([x]);
     });
     expect(r.bad.slice(0, 10)).toEqual([]);
     // 等しい組もある (INTEGER の 5 と REAL の 5.0 など)。なければ、「どれも違う」と答える関数でも通ってしまう。
@@ -168,7 +169,7 @@ describe("a key string is equal exactly when SQLite takes two values for the sam
   });
 
   it("the new key string, over every 64-bit INTEGER and every REAL", () => {
-    // 段 2 で使い始める keyStringExact。2^53 以上の INTEGER と、その前後の REAL の組でも一致する。
+    // 段 2 から使う keyStringExact。2^53 以上の INTEGER と、その前後の REAL の組でも一致する。
     const r = keyDisagreements(EDGE_VALUES, (v) => keyStringExact([v]));
     expect(r.bad.slice(0, 10)).toEqual([]);
     // INTEGER の 2^53 と REAL の 2^53、INTEGER の -2^63 と REAL の -2^63 のような、2^53 以上で等しい組が入っている。
@@ -176,13 +177,13 @@ describe("a key string is equal exactly when SQLite takes two values for the sam
     expect(keyStringExact([2n ** 60n])).toBe(keyStringExact([2 ** 60]));
     expect(keyStringExact([2n ** 60n + 1n])).not.toBe(keyStringExact([2 ** 60]));
     expect(keyStringExact([-(2n ** 63n)])).toBe(keyStringExact([-(2 ** 63)]));
-    // 今の keyString は、JS の表記で書く。2^53 以上では、表記が同じでも値が違う INTEGER がある。
-    expect(keyString([realOf(2 ** 60)])).toBe("[1152921504606847000]");
+    // 形式 1 の keyString は、JS の表記で書く。2^53 以上では、表記が同じでも値が違う INTEGER がある。
+    expect(oldKeyString([realOf(2 ** 60)])).toBe("[1152921504606847000]");
     expect(keyStringExact([realOf(2 ** 60)])).toBe("[1152921504606846976]");
   });
 });
 
-// ---- 新しいキー文字列と、その読み戻し (値の作り直しの段 1。まだどこからも呼ばれていない) ----
+// ---- 新しいキー文字列と、その読み戻し (値の作り直しの段 1 で足し、段 2 から使う) ----
 
 const shownTyped = (v: TypedValue): string =>
   v === null ? "NULL"
@@ -191,7 +192,7 @@ const shownTyped = (v: TypedValue): string =>
         : typeof v === "string" ? `TEXT ${JSON.stringify(v)}`
           : `BLOB ${[...v].join(",")}`;
 
-describe("the new key string against today's", () => {
+describe("the new key string against the format-1 one", () => {
   it("is the same string for every value that can be stored today, except integral REALs beyond 2^53 that JS does not write exactly", () => {
     // いま保存できる値。絶対値が 2^53 未満の INTEGER、REAL、TEXT、BLOB、NULL。行の token はキー文字列から決まるので、
     // 文字列が 1 バイトでも変わると、その行の置き場所が変わる。
@@ -206,7 +207,7 @@ describe("the new key string against today's", () => {
     const bad: string[] = [];
     let changed = 0;
     for (const v of today) {
-      const [was, now] = [keyString([v]), keyStringExact([v])];
+      const [was, now] = [oldKeyString([v]), keyStringExact([v])];
       // 今の決まりの値 (整数の JS の数は INTEGER) で渡しても、型のある値 (BigInt は INTEGER) で渡しても、同じ文字列になる。
       if (keyStringExact([typedOf(v)]) !== now) bad.push(`${JSON.stringify(v)}: ${now} with today's value, ${keyStringExact([typedOf(v)])} with the typed value`);
       if (was === now) continue;
@@ -223,8 +224,8 @@ describe("the new key string against today's", () => {
     const r = prng(9);
     for (let i = 0; i < 2000; i++) {
       const key = Array.from({ length: 1 + Math.floor(r() * 3) }, () => today[Math.floor(r() * today.length)]!);
-      const changes = key.some((v) => keyString([v]) !== keyStringExact([v]));
-      if ((keyString(key) === keyStringExact(key)) === changes) bad.push(`${JSON.stringify(key)}: ${keyString(key)} and ${keyStringExact(key)}`);
+      const changes = key.some((v) => oldKeyString([v]) !== keyStringExact([v]));
+      if ((oldKeyString(key) === keyStringExact(key)) === changes) bad.push(`${JSON.stringify(key)}: ${oldKeyString(key)} and ${keyStringExact(key)}`);
     }
     expect(bad.slice(0, 10)).toEqual([]);
   });

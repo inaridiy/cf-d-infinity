@@ -15,7 +15,7 @@ import { describe, expect, it } from "vitest";
 import { drizzleMigrationsTable } from "../src/binding";
 import { D1Compatible } from "../src/client/d1";
 import { Db, type ClientFaults } from "../src/client/db";
-import { keyString } from "../src/keys";
+import { keyStringExact } from "../src/keys";
 import type { Catalog } from "../src/meta";
 import { ownerOf } from "../src/routing";
 import type { Faults } from "../src/types";
@@ -111,7 +111,7 @@ describe("the guard settles intents before it checks for changes (m14_red_no_dra
     await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)");
     await new Db(c).ddl("CREATE TABLE u(id INTEGER PRIMARY KEY, v INTEGER)");
     const { routing } = await c.catalog();
-    const on = (shard: string, from: number) => { for (let i = from; ; i++) if (ownerOf(routing, keyString([i])) === shard) return i; };
+    const on = (shard: string, from: number) => { for (let i = from; ; i++) if (ownerOf(routing, keyStringExact([i])) === shard) return i; };
     const [t1, t4, u1, u2] = [on("s0", 1), on("s0", 100), on("s1", 1), on("s1", on("s1", 1) + 1)];
     await new Db(c).query("INSERT INTO t VALUES (?, 1)", [t1]);
     await new Db(c).query("INSERT INTO u VALUES (?, 1), (?, 1)", [u1, u2]);
@@ -246,7 +246,7 @@ describe("the guard checks for changes from the time the copy read the table (m1
     await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)");
     await new Db(c).ddl("CREATE TABLE u(id INTEGER PRIMARY KEY, v INTEGER)");
     const { routing } = await c.catalog();
-    const on = (shard: string, from: number) => { for (let i = from; ; i++) if (ownerOf(routing, keyString([i])) === shard) return i; };
+    const on = (shard: string, from: number) => { for (let i = from; ; i++) if (ownerOf(routing, keyStringExact([i])) === shard) return i; };
     // 古い表の行は s0 にだけある。copy は s1 では読むだけで、書かない (copy が書いたシャードでは、実装も確定の時刻から確かめる。
     // 確定の phase 2 が、そのシャードへ確定の時刻を運ぶからである)。
     const [t1, t2, u1, t4] = [on("s0", 1), on("s0", on("s0", 1) + 1), on("s0", 1), on("s1", 100)];

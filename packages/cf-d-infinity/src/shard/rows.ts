@@ -1,6 +1,6 @@
 import type { Backend, Change, Row, TableDef, Value } from "../types";
 import { SqlError } from "../types";
-import { keySql, keyString } from "../keys";
+import { keyParams, keySql, keyStringExact, keyValues } from "../keys";
 import { realOf, wideIntegerError } from "../value";
 
 export const q = (id: string) => `"${id.replaceAll('"', '""')}"`;
@@ -23,7 +23,8 @@ export const decode = <T>(s: string): T =>
         : x) as T;
 
 const pkWhere = (def: TableDef) => def.pk.map((c) => `${q(c)} IS ?`).join(" AND ");
-export const pkValues = (pkJson: string) => decode<Value[]>(pkJson);
+/** 主キーのキー文字列を、束縛する値に戻す (src/keys.ts の keyParams)。 */
+export const pkValues = (pkJson: string): Value[] => keyParams(pkJson);
 
 /** PRIMARY KEY のない表は rowid も行イメージに含める。行の所在を決める値だからである。 */
 export const selectList = (def: TableDef) => (def.implicitRowid ? "rowid, *" : "*");
@@ -133,8 +134,8 @@ export function typedValues(def: Pick<TableDef, "columns" | "affinity"> & { name
  */
 export function encodeKey(def: TableDef, row: Row): { pk: string; sk: string } {
   return {
-    pk: keyString(def.pk.map((c) => row[c] ?? null)),
-    sk: keyString(def.shardKey.map((c) => row[c] ?? null)),
+    pk: keyStringExact(def.pk.map((c) => row[c] ?? null)),
+    sk: keyStringExact(def.shardKey.map((c) => row[c] ?? null)),
   };
 }
 
@@ -159,7 +160,7 @@ export function assertKeyed(def: TableDef, row: Row): void {
 
 /** shard key が g のグループの行を全部読む。 */
 export function selectGroup(b: Backend, def: TableDef, g: string): Row[] {
-  const vals = decode<Value[]>(g);
+  const vals = keyParams(g);
   if (vals.length !== def.shardKey.length) return [];
   const where = def.shardKey.map((c) => `${q(c)} IS ?`).join(" AND ");
   return b.exec(`SELECT ${imageList(def)} FROM ${q(def.name)} WHERE ${where}`, ...vals).map((r) => typedRow(def, r));
@@ -298,7 +299,7 @@ export function capturedChanges(b: Backend, catalog: (t: string) => TableDef): C
     // 2^53 を超える整数の主キーは、JSON.parse で桁が落ち、行を引けなくなる。引けない行は「同じ文の中で挿入して消した行」と
     // 区別できず、書き込みが黙って消えた (2026-11-13、test/wide-integers.test.ts の基準経路だけの実行)。キーの文字で見て断る。
     for (const k of [r.oldk, r.newk]) if (typeof k === "string" && hasWideInteger(k)) throw wideError(table);
-    const norm = (k: Value | undefined) => keyString(JSON.parse(k as string) as Value[]);
+    const norm = (k: Value | undefined) => keyStringExact(keyValues(k as string));
     const old = (r.oldk ?? null) === null ? null : norm(r.oldk);
     const fresh = (r.newk ?? null) === null ? null : norm(r.newk);
     if (old !== null && !net.has(`${table}\0${old}`)) {
