@@ -207,12 +207,17 @@ export async function misplacedRows(c: SimCluster, table = "acct"): Promise<stri
     .map(({ shard, row }) => `${row.tenant_id}/${row.id} on ${shard}`);
 }
 
-/** ADD COLUMN extra DEFAULT 5 の後の行。extra は既定値か、書いた値 (n と同じ) のどちらかでなければならない。 */
-export async function extraViolations(c: SimCluster): Promise<string[]> {
+/**
+ * ADD COLUMN extra DEFAULT 5 の後の行。extra は既定値か、その行に extra を書いたどれかの書き込みの値 (その書き込みの n) で
+ * なければならない。extra を書かない UPDATE (表定義の変更の前に計画した書き込み) は extra を前の値のまま残すので、extra が
+ * 最後の n と同じとは限らない。2026-11-13 までの確かめは extra と n が同じことを求め、extra を書いた書き込みの後に extra を
+ * 書かない UPDATE が届く順序で、正しい行を違反と数えた (検査の誤り。一晩分の試験の seed 900541、901960)。
+ */
+export async function extraViolations(c: SimCluster, written?: Map<string, Set<number>>): Promise<string[]> {
   const cat = await c.catalog();
   if (!cat.tables.acct?.columns.includes("extra")) return [];
   return (await rawRows(c, "acct"))
-    .filter(({ row }) => row.extra !== 5 && row.extra !== row.n)
+    .filter(({ row }) => row.extra !== 5 && row.extra !== row.n && !written?.get(`${row.tenant_id}/${row.id}`)?.has(row.extra as number))
     .map(({ row }) => `${row.tenant_id}/${row.id} extra=${row.extra} n=${row.n}`);
 }
 
@@ -483,6 +488,8 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
     reads.push({ tenant: t, value: { count: r.rows[0]!.c, sum: r.rows[0]!.s } });
   };
   type Writes = TxRecord["writes"] & { v?: (number | null)[] };
+  /** 確定した書き込みが extra に書いた値。行ごとに持つ (record が、extra を書く操作の成功のときに足す)。 */
+  const extraWritten = new Map<string, Set<number>>();
   const noteV = (writes: Writes, v: number | null) => void (writes.v = [...(writes.v ?? []), v]);
   const put = async (tx: Q, x: { t: number; i: number }, n: number, v: number | null, extra: boolean, writes: Writes) => {
     await tx.query("DELETE FROM acct WHERE tenant_id = ? AND id = ?", [x.t, x.i]);
@@ -497,8 +504,9 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
     body(tx: Q, reads: Read[], writes: Writes): Promise<void>;
     side?: { t: number; id: number; n: number };
   }
-  const record = (p: Plan, ts: number | undefined, reads: Read[], writes: Writes, begun: number, vreads: VRead[] = []) => {
+  const record = (p: Plan, ts: number | undefined, reads: Read[], writes: Writes, begun: number, vreads: VRead[] = [], extra = false) => {
     const acked_ = env.tick();
+    if (extra) for (const w of writes) if (w.value !== null) extraWritten.set(w.key, (extraWritten.get(w.key) ?? new Set()).add(w.value));
     if (writes.length) commits++;
     const wv = writes.map((_w, i) => writes.v?.[i] ?? null);
     writes.forEach((w, i) => {
@@ -583,7 +591,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
       const r = extra
         ? await db.query("UPDATE acct SET v = ?, n = ?, extra = ? WHERE tenant_id = ? AND id = ?", [v, n, n, x.t, x.i])
         : await db.query("UPDATE acct SET v = ?, n = ? WHERE tenant_id = ? AND id = ?", [v, n, x.t, x.i]);
-      if (r.changes > 0) record(p, r.ts, [], w1(), begun);
+      if (r.changes > 0) record(p, r.ts, [], w1(), begun, [], extra);
       return;
     }
     if (mode === "autoInsert") {
@@ -597,7 +605,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
         last = { tx, reads: [], writes: [] };
         await p.body(tx, last.reads, last.writes);
       });
-      record(p, last!.tx.commitTs ?? last!.tx.T, last!.reads, last!.writes, begun);
+      record(p, last!.tx.commitTs ?? last!.tx.T, last!.reads, last!.writes, begun, [], extra);
       return;
     }
     const tx = await db.begin();
@@ -616,7 +624,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
       await tx.unlockAll();
       throw e;
     }
-    record(p, tx.commitTs ?? tx.T, reads, writes, begun);
+    record(p, tx.commitTs ?? tx.T, reads, writes, begun, [], extra);
   };
 
   const worker = async () => {
@@ -727,7 +735,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   }
 
   const misplaced = await misplacedRows(c);
-  const badExtra = await extraViolations(c);
+  const badExtra = await extraViolations(c, extraWritten);
 
   const sideExists = cat.tables.side !== undefined;
   const sideRows = sideExists ? (await rawRows(c, "side")).map(({ row }) => row.n as number) : [];
