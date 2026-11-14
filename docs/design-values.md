@@ -879,4 +879,4 @@ trigger で捕捉する 1 行の UPDATE (`test/rowcost.test.ts` に足した操�
 - NUL を含む TEXT (`test/open/nul-in-text.test.ts`)。段 2 は、利用者の TEXT を素の列で読む文を足していない。シャードの `listGroups`、`exportRows`、Worker の `scanShard` と走査は、今も素の列で読む。
 - 列名の予約の `__dinf_`。`PROTOCOL_VERSION` を 5 にする。
 - 欠陥のスイッチ `unfencedRead` と `roundedImages`。
-- 利用者の文の式の木の深さ。シャードは、届いた文の深さを測らない。D∞ が作る文は表を作るときに確かめるが、深い利用者の文は、DO でだけ失敗し、シミュレータでは通る。見積もりを利用者の文の判定 (`shardLimitOf`) とシミュレータの模倣に使うかは、見積もりの多めの幅を確かめてから決める (不変条件 3)。
+- 利用者の文の式の木の深さ。シャードは、届いた文の深さを測らない。D∞ が作る文は表を作るときに確かめるが、深い利用者の文は、DO でだけ失敗し、シミュレータでは通る (`test/open/user-statement-expression-depth.test.ts`。99 列の主キーを整数の引数で引く文は、`bindTyped` の包みで深さ 102 になる)。見積もりを利用者の文の判定 (`shardLimitOf`) とシミュレータの模倣に使うかは、見積もりの多めの幅を確かめてから決める (不変条件 3)。
