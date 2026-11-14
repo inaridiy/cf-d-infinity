@@ -686,6 +686,8 @@ describe("a bug in whole-table reads that the same workload found (not specific 
     const moved = await tenantOn(c, "s2");
     await new Db(c).query("INSERT INTO t VALUES (?, 2, 7, 0)", [moved]);
     // 基準経路だけの実行では、UPDATE も行を集めて実行するので、古い範囲表の読みが、COMMIT より前に、この文で断られる。
+    // この文で `not owner` になるのは、取引が分割をまたげないこと (計画書の未解決の問題 37) と同じ形である。37 を直したら、ここを
+    // COMMIT で断られる形に戻せるかを確かめる。
     const update = await outcome(tx.query("UPDATE t SET n = ? WHERE tenant_id = ? AND id = 1", [n, kept]));
     return { n, inRange: kept <= 30 && moved <= 30, commit: update === "ok" ? await outcome(tx.commit()) : update };
   };
