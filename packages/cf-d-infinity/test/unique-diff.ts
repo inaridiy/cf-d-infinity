@@ -550,11 +550,14 @@ export const KNOWN_OPEN: Known[] = [
     tables: (step, ours, sqlite) => /\bOR REPLACE\b/.test(step.sql) && multiRow(step) && ours.kind === "ok" && sqlite.kind === "ok",
   },
   {
-    // 部分 index の UNIQUE もある表 (p) で、シャードの中の UNIQUE の衝突を OR REPLACE で解く文を、UNIQUE の誤りで断る。文の変更を
-    // 1 行ずつ物理の UNIQUE index に当てると、一時的な重複ができる (見立て)。sim の seed 430。
-    id: "OR REPLACE on a table with a partial UNIQUE is refused",
+    // ある行が UNIQUE の値を、OR REPLACE で消す行から受け取る変更の集まりを、UNIQUE の誤りで断る。部分 index の UNIQUE もある表 (p) の
+    // 文 (sim の seed 430) と、取引の COMMIT (`UNIQUE constraint failed (unique: ...)`、sim の seed 533) に出る。変更を 1 行ずつ物理の
+    // UNIQUE index に当てると、一時的な重複ができる (見立て)。
+    id: "a row that takes the UNIQUE value of a row OR REPLACE deletes is refused",
     repro: "test/open/local-unique-replace-trial.test.ts",
-    answer: (step, ours, sqlite) => step.table === "p" && /\bOR REPLACE\b/.test(step.sql) && uniqueTable(ours) === "p" && sqlite.kind === "ok",
+    answer: (step, ours, sqlite, steps) => sqlite.kind === "ok" && uniqueTable(ours) !== null &&
+      [step, ...inBlock(steps, step)].some((x) => /\bOR REPLACE\b/.test(x.sql)) &&
+      ((ours.kind === "error" && /^UNIQUE constraint failed \(unique: /.test(ours.message)) || step.table === "p"),
   },
 ];
 
