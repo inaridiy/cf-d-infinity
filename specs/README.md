@@ -865,8 +865,10 @@ witness は 4 つである。`witnessCrossAppliedThenMoved` は、2 つの piece
 ### M21 `m21_catalog_epoch.qnt` — Meta の版と排他を、1 本の epoch の列と 2 相の遷移にまとめる
 
 2026-11-14 に書いた。
-実装より先に書いたモデルで、対応する実装はまだない。
+実装より先に書いたモデルである。
 設計は [docs/design-catalog-epoch.md](../docs/design-catalog-epoch.md) にある。
+2026-11-15 に設計の段 1 (Meta の `__epoch` の列と、`src/catalog.ts` の畳み込み) が入った。
+遷移の条件は `src/catalog.ts` の `refusal()` に書き、このモデルの乱択の実行と突き合わせている (`test/catalog-m21.test.ts`) が、Meta が条件として使うのは段 3 と段 4 からである。
 
 いまの Meta は、5 つの版と排他を別々に持っている。
 DDL の版と事後の取り消し、シャードをまたぐ UNIQUE の index を作る間の書き込み禁止 (M12)、DROP の前の書き込み禁止 (M14)、分割と DDL の枠 (M15)、範囲表の版である。
