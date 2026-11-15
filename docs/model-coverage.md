@@ -10,10 +10,10 @@ Test references are `packages/cf-d-infinity/test/<file>.test.ts:<line>` or a tes
 counterexample.
 
 Categories:
-- A: the implementation has the guard, and a deterministic replay exists (74 rows; every row with a guard).
-  Of these, 51 also have a fault switch, and the replay checks that the switch produces the violation. 17 have no switch,
-  and 6 have a switch whose replay runs only the fixed code; for those 23 the replay checks the fixed code on the
-  model's ordering, not that removing the guard breaks it. (Recounted from this table on 2026-11-13; the three M5b range-floor rows were added on 2026-11-14.)
+- A: the implementation has the guard, and a deterministic replay exists (78 rows; every row with a guard).
+  Of these, 53 also have a fault switch, and the replay checks that the switch produces the violation. 19 have no switch,
+  and 6 have a switch whose replay runs only the fixed code; for those 25 the replay checks the fixed code on the
+  model's ordering, not that removing the guard breaks it. (Recounted from this table on 2026-11-13; the three M5b range-floor rows were added on 2026-11-14, the four M21 rows of catalog epoch stage 2 on 2026-11-15.)
 - D: a design alternative the implementation never had or no longer has, or a variant another mechanism already covers; no switch needed (13 rows, M16 and M17 included).
 - P: models for a mechanism that is designed but not in the code yet, so there is no guard to switch off. M18
   (`specs/m18_subslot_split.qnt`), M19 (`m19_claim_resplit.qnt`) and M20 (`m20_unique_piecewise.qnt`) model moving one
@@ -26,7 +26,10 @@ Categories:
   M21 (`m21_catalog_epoch.qnt`) models one epoch log in Meta in place of today's separate schema versions, write
   bans and split slot ([design-catalog-epoch.md](./design-catalog-epoch.md)). Its 31 red modules (the `red` lines of
   the M21 section of `specs/check.sh`) get rows when the design is implemented. Many of them restate a red of M11 to
-  M15 that already has a row here; those rows move to M21 when M12, M14 and M15 are retired.
+  M15 that already has a row here; those rows move to M21 when M12, M14 and M15 are retired. Stage 2 (requests carry
+  the epoch and the schema epoch, 2026-11-15) gave rows to the four it reaches: `m21_red_no_recheck`, `m21_red_stale`,
+  `m21_red_owner_unchecked` and `m21_red_strict_epoch` (category A, in the table below). The other 27 stay in P until
+  stages 3 and 4.
   M22 (`m22_unique_keys.qnt`) models every non-primary-key UNIQUE as key rows that move with their piece
   ([design-unique-keys.md](./design-unique-keys.md)). It has 10 red modules (the `red` and `live_red` lines of the M22
   section of `specs/check.sh`). Eight get rows, switches and replays when the design is implemented, and the rows of
@@ -122,6 +125,10 @@ Categories:
 | m17_red_impl | the transaction id is the 2PC id, and neither side tells two continuations apart | commitIdIsTxn | baton-reuse ("put back m17_red_impl ...", sequential and concurrent) | A |
 | m17_red_prepare_only | the transaction id is the 2PC id; the anchor returns the earlier outcome to a COMMIT with other writes | none (design no longer in the code) | none | D |
 | m17_red_commit_only | the transaction id is the 2PC id; a participant answers ok to a second prepare of the same id with other writes | none (design no longer in the code) | none | D |
+| m21_red_no_recheck | the shard does not check the request's schema epoch again after a wait, so a plan older than a schema change applied meanwhile is accepted (M11's BUG-3) | noSchemaRecheck | stale-plan-after-wait ("put back: without the re-check after the wait ..."); ddl-concurrent:416 (m11_impl_wait). Since catalog epoch stage 2 (2026-11-15) the re-check compares the schema epoch | A |
+| m21_red_stale | the shard accepts a plan made on an older schema epoch | none (the check in `schemaStep`, src/shard/kernel.ts) | epoch-requests ("refuses a request planned on an older schema epoch, whatever epoch it carries"; fixed, guard-only; added 2026-11-15) | A |
+| m21_red_owner_unchecked | the shard does not look ownership up in its own snapshot | ignoreFence (widened in stage 2: it now also turns off the snapshot check, next to the `__fenced` refusal) | epoch-requests ("refuses a row that its snapshot gives to another shard ..." and "put back with ignoreFence ..."; added 2026-11-15); migration ("a parent that ignores the fence accepts a write the child never sees") for the parent's side | A |
+| m21_red_strict_epoch | the shard requires the request's epoch to equal its own, so a split refuses unmoved rows of transactions planned before it (not a safety flaw) | none | transaction-on-unmoved-rows-across-split (four tests, through the Worker); epoch-requests ("serves an unmoved row to a request planned before a split that the shard has applied" and "... a newer epoch ... without fetching the log"; added 2026-11-15) | A |
 
 ## Switches that match no red module
 
@@ -139,7 +146,9 @@ Categories:
   a Worker that declares less than its statement writes. The nearest is `m18_red_write_by_slot` (a shard accepts a write
   of a piece it does not own), but its flaw is the granularity of the check, slot instead of piece, which the code cannot
   show while every piece is a whole slot; it stays in P. Used in write-guard ("with the guard off (ignoreWriteClaim),
-  both new shards take every row ..." and "puts back the old behaviour with ignoreWriteClaim ...").
+  a resent old plan puts every row on both new shards ..." and "puts back the old behaviour with ignoreWriteClaim ...").
+  Since catalog epoch stage 2 the Worker no longer resends an old plan (it plans again on the retry's snapshot), so the
+  first test sends the resent request to the shards directly.
 - `unfencedRead` (a shard fault, `Faults`): the shard wraps a read for the typed read without the `LIMIT -1 OFFSET 0` fence,
   so SQLite inlines the wrapped statement and evaluates `random()` once for the type and again for the value (values rework,
   stage 3, `docs/design-values.md`). No model covers value encoding. Used in typed-diff ("finds a typed read without its fence

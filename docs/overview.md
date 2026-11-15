@@ -165,9 +165,12 @@ declaration or onto a shard that does not own the row.
 
 ## Schema changes
 
-DDL goes through `DinfMeta`, which versions the schema. The change is applied on every shard before the statement
-returns, and every request carries the schema version it was planned with; a shard rejects a request planned
-against an older schema, so a Worker with a stale cache cannot write through a dropped table.
+DDL goes through `DinfMeta`, which records schema changes and range moves in one append-only epoch log
+([design-catalog-epoch.md](./design-catalog-epoch.md)). The change is applied on every shard before the statement
+returns, and every request carries the epoch of the snapshot it was planned on and the epoch at which the schema last
+changed. A shard keeps a copy of the part of the log it has applied and rejects a request planned against an older
+schema, so a Worker with a stale cache cannot write through a dropped table. A request planned on a snapshot where
+only the range table moved is not stale.
 
 `DinfMeta` runs the shard statements of a change in its own SQLite, on empty copies of the tables, and records the
 change only if they succeed. A statement that parses but that SQLite rejects is therefore refused up front. A
@@ -235,7 +238,11 @@ it at a time when the rows still existed.
 Ownership moves before the data does, which sheds load from a hot parent immediately instead of making it also pay
 for a bulk copy first. A Worker whose range table predates the split is told so: a request for a moved shard key, and
 a whole-table read that still believes the parent owns the moved slots, both get `NotOwner`, and the Worker refetches
-the range table. See [scaling.md](./scaling.md) for the timestamp rules that keep this serializable.
+the range table and plans the statement again. A transaction keeps the schema it started with and swaps in the newer
+range table. A shard looks ownership up in its own copy of the epoch log; a child that has not yet applied the move
+applies it when a request planned on a newer snapshot reaches it. A transaction that read the moved range before the
+split cannot yet move its read time past the move (open problem 37). See [scaling.md](./scaling.md) for the timestamp
+rules that keep this serializable.
 
 ## How it is checked
 

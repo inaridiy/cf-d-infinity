@@ -28,12 +28,14 @@
 //   - 最後の表の中身: 置き場所の全部で同じで、モデルとも同じでなければならない。どの行も、範囲表の持ち主のシャードにだけある。
 //
 // 置き場所 (placementsFor): シャード 1、2、4 と、1 シャードから seed で選んだ slot の境目で 3 回分割した 4 シャード (同じ数で、
-// 行の分け方が違う)。もう 1 つは、2 シャードで台本の途中 (7 割は取引の途中) に 1 回分割する。分割の後の取引の文と COMMIT は、
-// やり直してよい誤り (`not owner`、範囲の床の `read too old`。docs/overview.md の Growing) を許す。文書は、分割をまたいだ取引が
-// 続けられるとは約束していない。Db.begin() と SQL の BEGIN の取引は、自分の範囲表を持ち続けるので、動いた範囲に触れる文は
-// 取引の終わりまで `not owner` になる。baton は要求ごとに範囲表を取り直すので文は通るが、COMMIT は `not owner` で断られることが
-// ある (2026-11-14、seed 1 から 300 で数えた)。だからこの置き場所が分割の後に確かめるのは、ほぼ autocommit の文と、取引の文が
-// 通ったときの答えだけである。分割の前の手順だけをほかと比べ、後はモデルとだけ比べる。
+// 行の分け方が違う)。もう 1 つは、2 シャードで台本の途中 (7 割は取引の途中) に 1 回分割する。分割の後の取引の文は、競合
+// (`conflict`、範囲の床の `read too old`) だけを許し、`not owner` は違いとして報告する。Epoch の段 2 から、取引の文が範囲の移動で
+// 断られると、取引は範囲表を取り替えて文を計画し直す (2026-11-15、seed 1 から 300 で、分割の後の文の `not owner` は 3 つの実行の
+// 形のどれでも 0 になった。前は sim で 406)。文書の約束 (docs/sql-language.md の「取引」) のうち、まだ守らないのは 2 つで、どちらも
+// ここでは許す。分割の前に動いた範囲を読んだ取引の文は、移動の時刻より前の時刻で読もうとして `read too old` で断られる
+// (未解決の問題 37)。COMMIT は、取引が分割の前に動いた範囲を読むか書くかしていると、`not owner` か `read too old` の競合で
+// 断られる (同じく 37。test/open/locking-transaction-commit-after-split.test.ts)。COMMIT の競合はもともと許しているので、ここは緩いまま
+// である。分割の前の手順だけをほかと比べ、後はモデルとだけ比べる。
 //
 // モデルの状態の列が台本の順序と同じになるように、手順の間で仮想の時刻を進める (GAP_MS)。HLC は物理の ms を上位に持つので、
 // 後の手順の時刻は前の手順のどの時刻よりも大きい。半分の台本 (lag) は、確定の phase 2 の配送を遅らせ、手順の間で背後の仕事を
@@ -708,7 +710,14 @@ export function checkTrace(s: Script, t: Trace, m: Model): Verdict {
     }
     if (step.kind === "stmt") {
       if (got.kind === "error" && got.cls === "busy" && relaxed(i)) {
-        // 分割の後の、範囲の床と移動の拒否 (docs/overview.md の Growing)。やり直してよい誤りで、文は何も変えていない。
+        // 分割の後の文は、`not owner` では失敗しない (docs/sql-language.md の「取引」。Epoch の段 2 から、取引は範囲表を取り替えて、
+        // 文を新しい持ち主で計画し直す)。分割は終えてから次の手順へ進むので、移動の途中の拒否 (`migrating`) もない。
+        if (!/^(conflict|read too old)/.test(got.message)) {
+          fail(i, `tx ${step.sql} ${JSON.stringify(step.params)}: after the split, the statement failed with ${show(got)}; a statement of a transaction across a split fails only with a conflict`);
+          break;
+        }
+        // 分割の後の、範囲の床の拒否 (docs/overview.md の Growing)。やり直してよい誤りで、文は何も変えていない。分割の前に動いた範囲を
+        // 読んだ取引は、読んだ行が変わっていなくても、ここで断られる (未解決の問題 37、test/open/transaction-across-split.test.ts)。
         // ただし、取引の最初の文なら、断られる前に読む時点 T が決まっていることがある (複数シャードの読みは、送る前に T を選ぶ)。
         // 次の文は、この時点から後のどこでも読んでよいものとする。
         if (first) {
