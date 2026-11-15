@@ -24,12 +24,14 @@ const DDL = [
 ];
 
 type Rnd = () => number;
-const int = (r: Rnd, n: number) => 1 + Math.floor(r() * n);
+// 整数の引数は INTEGER (bigint) で渡す。D∞ は JS の数を REAL として束縛するので、数で渡すと、整数の束縛 (`(CAST(? AS INTEGER)+0)`)
+// を並行の下で通らない (列の型の親和性が整数に戻すので、答えは変わらない)。
+const int = (r: Rnd, n: number) => BigInt(1 + Math.floor(r() * n));
 const tenant = (r: Rnd) => int(r, 4);
 const id = (r: Rnd) => int(r, 5);
 const email = (r: Rnd) => (r() < 0.15 ? null : `e${int(r, 6)}`);
 const code = (r: Rnd) => (r() < 0.15 ? null : `c${int(r, 4)}`);
-const v = (r: Rnd) => int(r, 4) - 1;
+const v = (r: Rnd) => int(r, 4) - 1n;
 const flatId = (r: Rnd) => int(r, 12);
 const tag = (r: Rnd) => `t${int(r, 3)}`;
 
