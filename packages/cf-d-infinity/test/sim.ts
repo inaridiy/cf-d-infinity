@@ -489,6 +489,19 @@ export const allWriteEscapes: WriteEscape[] = [];
  * 書き出して空にする。中身は書かない。変更の前後で、同じ seed の実行の RPC の列が同じかを比べるのに使う。
  */
 export const tracedNets: SimNet[] = [];
+/**
+ * いまの試験が、実時間で動くクラスタ (realTime か now) を作ったか。test/setup.ts が試験ごとに戻す。作っていない試験が本物の
+ * 時計と乱数 (systemRuntime) を使ったら、setup.ts が試験を落とす (同じ seed で同じ実行にならないので)。
+ */
+export const realTimeCluster = { now: false };
+
+/**
+ * クラスタの呼び出しの一部だけを差し替えた包み。差し替えない性質 (仮想の実行環境 runtime、基準経路だけで流す印 reference、
+ * ほかの呼び出し) は、そのまま引き継ぐ。Cluster を手で並べ直すと、それらを落とす (test/setup.ts の決定性の検査が見つける)。
+ */
+export function withOverrides(c: SimCluster, over: Partial<Cluster>): Cluster {
+  return new Proxy(c as unknown as Cluster, { get: (t, p, r) => (p in over ? (over as Record<string | symbol, unknown>)[p] : Reflect.get(t, p, r)) });
+}
 /** 行イメージの検査を、いまの試験の間だけ止めているか (SimOptions の noImageCheck)。test/setup.ts が試験ごとに戻す。 */
 export const imageCheckOff = { now: false };
 
@@ -579,6 +592,7 @@ export class SimCluster implements Cluster {
     if (process.env.RPC_TRACE) tracedNets.push(this.net);
     if (o.noImageCheck) imageCheckOff.now = true;
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
+    if (!this.virtual) realTimeCluster.now = true;
     this.runtime = this.virtual ?? systemRuntime;
     this.shardIds = o.stored ? [...o.stored.shards.keys()] : Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
     this.metaBackend = new SqliteBackend(o.stored?.meta);

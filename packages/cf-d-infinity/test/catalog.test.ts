@@ -14,7 +14,7 @@ import { planSplit, REGION_TOKENS, type Interval } from "../src/routing";
 import type { Runtime } from "../src/runtime";
 import type { Faults, ShardApi } from "../src/types";
 import { MetaCore as OldMeta } from "./meta-old";
-import { prng, seedsOr, SimCluster, SqliteBackend } from "./sim";
+import { prng, seedsOr, SimCluster, SqliteBackend, VirtualRuntime } from "./sim";
 
 /** 答えを比べられる文字列にする。誤りは、型の名前、文、持っている値 (SchemaMoved の version など)。 */
 async function outcome(f: () => unknown): Promise<string> {
@@ -270,7 +270,7 @@ describe("Meta on the epoch log answers exactly as the Meta before it (stage 1, 
 describe("the epoch log", () => {
   it("stores one record per epoch: the first range table at 0, then DDL versions, switches and returned split slots", async () => {
     const b = new SqliteBackend();
-    const meta = new MetaCore(b, ["s0", "s1"]);
+    const meta = new MetaCore(b, ["s0", "s1"], { runtime: new VirtualRuntime(1) });
     await meta.applyDdl("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT)");
     const range = planSplit((await meta.catalog()).routing, "s0")!;
     const slot = await meta.beginSplit({ parent: "s0", child: "s2", ...range }, 1);
@@ -296,7 +296,7 @@ describe("the epoch log", () => {
 
   it("opens the table's transition at an index build or a lock, and closes it at the next version", async () => {
     const b = new SqliteBackend();
-    const meta = new MetaCore(b, ["s0", "s1"]);
+    const meta = new MetaCore(b, ["s0", "s1"], { runtime: new VirtualRuntime(1) });
     await meta.applyDdl("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT)");
     await meta.applyDdl("CREATE UNIQUE INDEX ta ON t(a)");
     expect(fold(readEpochs(b)).open).toMatchObject({ epoch: 2, mode: "build", fence: ["t"] });
@@ -344,7 +344,7 @@ describe("the epoch log", () => {
   // 通すと、Meta の列そのものを作り変えるか消す (段 1 より前は、この名前の表を作れた)。
   it("refuses user DDL that names __epoch, and leaves the log as it was", async () => {
     const b = new SqliteBackend();
-    const meta = new MetaCore(b, ["s0", "s1"]);
+    const meta = new MetaCore(b, ["s0", "s1"], { runtime: new VirtualRuntime(1) });
     await meta.applyDdl("CREATE TABLE t(id INTEGER PRIMARY KEY)");
     const before = JSON.stringify(readEpochs(b));
     for (const sql of [

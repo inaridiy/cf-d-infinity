@@ -9,7 +9,8 @@ import { spanFaults } from "../src/client/spans";
 import { imageChecks, imageFaults } from "../src/shard/rows";
 import { parseObserver } from "../src/sql/cst";
 import { openScratch } from "../src/sql/scratch";
-import { allDriverIntegers, allSpanEscapes, allWriteEscapes, imageCheckOff, injectedFault, tracedNets } from "./sim";
+import { systemRuntime } from "../src/runtime";
+import { allDriverIntegers, allSpanEscapes, allWriteEscapes, imageCheckOff, injectedFault, realTimeCluster, tracedNets } from "./sim";
 
 // PARSER_CORPUS=<ディレクトリ> を付けて流すと、試験が解析に渡した文を、プロセスごとの 1 行 1 文の JSON のファイルに書き出す。
 // パーサの突き合わせ (test/parser-oracle.test.ts) が、これを文の集まりとして読む。同じ文は、プロセスの中で 1 度だけ書く。
@@ -92,4 +93,26 @@ afterEach(() => {
 afterEach(() => {
   const found = [...new Set(allDriverIntegers.splice(0))];
   expect(found.slice(0, 5), "statements through query that read an INTEGER as a driver number (a read that is not typed)").toEqual([]);
+});
+
+// 決定性の検査。シミュレータの試験は、時計、待ち、乱数、取引の ID を、クラスタの仮想の実行環境から取る (AGENTS.md)。本物の
+// systemRuntime を呼んだ試験は、同じ seed でも実行ごとに要求の中身が変わる (2026-11-15、Cluster を手で包んだ試験が runtime を
+// 渡さず、Db が systemRuntime の取引の ID と時刻を使っていた)。実時間のクラスタ (realTime か now) を作った試験だけは許す。
+const systemCalls: string[] = [];
+for (const name of ["now", "after", "random", "uuid"] as const) {
+  const real = systemRuntime[name] as (...a: unknown[]) => unknown;
+  (systemRuntime as unknown as Record<string, unknown>)[name] = (...a: unknown[]) => {
+    systemCalls.push(name);
+    return real(...a);
+  };
+}
+beforeEach(() => {
+  systemCalls.length = 0;
+  realTimeCluster.now = false;
+});
+afterEach(() => {
+  const used = [...new Set(systemCalls)];
+  systemCalls.length = 0;
+  if (used.length === 0 || realTimeCluster.now) return;
+  throw new Error(`this test used the real clock or randomness (systemRuntime.${used.join(", ")}) without a real-time cluster; pass the cluster's runtime (a Cluster wrapper must keep \`runtime\`)`);
 });

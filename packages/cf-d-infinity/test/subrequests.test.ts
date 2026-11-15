@@ -12,26 +12,23 @@ function capped(c: SimCluster, limit: number): { cluster: Cluster; used: () => n
   const hit = () => {
     if (++n > limit) throw new Error("Too many subrequests.");
   };
-  const cluster: Cluster = {
-    shard: (id) => new Proxy({} as ShardApi, {
-      get: (_t, method: keyof ShardApi) => async (req: never) => {
-        hit();
-        return (c.shard(id)[method] as (r: never) => Promise<unknown>)(req);
-      },
-    }),
-    catalog: async () => (hit(), c.catalog()),
-    applyDdl: async (sql, basedOn) => (hit(), c.applyDdl(sql, basedOn)),
-    publishIndex: async (t, name, version, at) => (hit(), c.publishIndex(t, name, version, at)),
-    revokeDdl: async (version, reason) => (hit(), c.revokeDdl(version, reason)),
-    renewLock: async (version) => (hit(), c.renewLock(version)),
-    lockTables: async (tables, basedOn) => (hit(), c.lockTables(tables, basedOn)),
-    finishLock: async (version, sql) => (hit(), c.finishLock(version, sql)),
-    beginSplit: async (move, basedOn) => (hit(), c.beginSplit(move, basedOn)),
-    endSplit: async (id) => (hit(), c.endSplit(id)),
-    splits: async () => (hit(), c.splits()),
-    allocate: async (t, k, min) => (hit(), c.allocate(t, k, min)),
-    switchRange: async (m) => (hit(), c.switchRange(m)),
-  };
+  // 呼び出しを数える包み。クラスタの性質 (仮想の実行環境 runtime、基準経路だけで流す印 reference) は、そのまま引き継ぐ。
+  // 手で並べ直すと、それを落として、Db が本物の時計と乱数を使う (同じ seed で実行が変わる。2026-11-15)。
+  const cluster = new Proxy(c as unknown as Cluster, {
+    get: (target, p, receiver) => {
+      const v = Reflect.get(target, p, receiver);
+      if (p === "shard") {
+        return (id: string) => new Proxy({} as ShardApi, {
+          get: (_t, method: keyof ShardApi) => async (req: never) => {
+            hit();
+            return (c.shard(id)[method] as (r: never) => Promise<unknown>)(req);
+          },
+        });
+      }
+      if (typeof v !== "function") return v;
+      return async (...args: unknown[]) => (hit(), (v as (...a: unknown[]) => unknown).apply(target, args));
+    },
+  });
   return { cluster, used: () => n };
 }
 
