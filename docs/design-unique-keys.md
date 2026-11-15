@@ -390,6 +390,119 @@ M22 の赤と、欠陥のスイッチの対応は次のとおりである。
 
 使い捨てのスクリプトは、この形の node:sqlite の部分だけを流し、上の「正規形」の節の結果を得た。
 
+## 段 0 の結果 (2026-11-15)
+
+`b875aa5` (ブランチ `foundation-2`) の上で、4 つの検査を足した。`src/` は変えていない。
+時間は、`--maxWorkers=2` で、ほかの試験と同時に流さないときのものである。
+
+| 検査 | ファイル | 流す所 | 既定の実行 |
+|---|---|---|---|
+| (a) 照合順序のキー | `test/unique-keys.ts`、`test/unique-keys.test.ts`、`test/unique-keys-workerd.test.ts` | node:sqlite、sql.js (sim)、手元の workerd (workerd) | 1 秒ほど |
+| (b) 列の解決 | `test/unique-columns.ts`、`test/unique-columns.test.ts`、`test/open/unique-columns-case.test.ts` | DDL の解釈と node:sqlite の PRAGMA (sim) | seed 400 個、1 秒ほど |
+| (c) UNIQUE の文の差分 | `test/unique-diff.ts`、`test/unique-diff.test.ts` | シャード 1、2、4 と分割で切った 4 シャード。sim、reference-scans、reference-full | seed 43 個、1 つの実行が 25 秒ほど |
+| (d) 書いた行の数 | `test/unique-rowcost.test.ts` | 手元の workerd (workerd) | 5 秒ほど |
+
+### (a) 照合順序のキー
+
+キーの関数は段 1 で入るので、検査は関数を引数に取る (`KeyFn`)。
+値は SQL の literal で書き、束縛しない (DO は JS の数を REAL で束縛し、BigInt を束縛できない。sql.js は小さな整数の値の数を INTEGER で束縛する)。
+SQLite の類は、UNIQUE のある表への `INSERT OR IGNORE` で残った行と、`=` で等しい組の 2 つで取る。どちらも SQLite の中で決め、ドライバから読むのは番号と ASCII の文字だけである。
+「比べ方」の項の `WHERE x = ?` は、列どうしの比べ方にした。`CAST(x'..' AS TEXT)` の literal と比べると、右辺の TEXT の親和性が、型のない列の数を TEXT に変え、INTEGER の 1 と TEXT の '1' が等しくなる。
+
+値は 278 個 (TEXT 223 個。決まったもの 103 個と、乱択の短いもの 120 個。INTEGER 17 個、REAL 25 個、BLOB 11 個、NULL 2 個) で、2 列の組は 28 個の値の直積の 784 組である。
+照合順序の場面は 6 つ (1 列の BINARY、NOCASE、RTRIM と、照合順序を混ぜた 2 列の組 3 つ。照合順序を列に書く形と、CREATE UNIQUE INDEX に書く形)。
+
+- 3 つのエンジンで、入った値は作ったとおりで、UNIQUE の index と `=` は同じ類を作り、類はエンジンの間で同じだった。エンジンの違いはなかった。
+- 参照の実装 (「正規形」の表のとおり) は、3 つのエンジンの全部の場面で一致した。NOCASE の NUL の規則 (`'a' || char(0) || 'x'` と `'A' || char(0) || 'y'` が等しい) は、手元の workerd の DO の SQLite でも成り立つ。
+- 壊した実装 6 つは、3 つのエンジンのどれでも落ちた。Unicode の小文字、空白を全部落とす、`trimEnd`、NUL の規則なし、NULL を含む組にキーを作る、REAL を JS の表記で書く (2^62 + 1024 の REAL と、同じ表記の INTEGER 4611686018427389000 を同じと見なす)。
+
+本番の DO の SQLite では流していない (「決めたこと」の 7)。
+
+### (b) 列の解決
+
+DDL の解釈 (`parseDdl`) が読む列、主キー、rowid の別名、shard key、主キーと UNIQUE の列と照合順序、部分 index を、同じ DDL を node:sqlite で実行して `PRAGMA table_xinfo`、`index_list`、`index_xinfo` で読んだものと比べる。
+既定の 400 個の seed で、比べた文は 464 個だった。問題 31 の形を作らない生成で、seed 1 から 20,000 まで違いはなかった。
+SQLite が断る DDL は比べない。`Db.ddl` は、記録の前に Worker の SQLite で利用者の文を実行する (`Db.assertReplays`) からである (seed 4986 の、食い違う ON CONFLICT の UNIQUE を 2 つ持つ表は、この区別がなかったときの検査の誤りだった)。
+
+見つけた欠陥は 3 つで、既定の実行では生成の指定で作らず、指定を入れると見つかることを既定の実行が確かめる。
+
+| 生成の指定 | 欠陥 | 再現 | 持ち主 |
+|---|---|---|---|
+| `caseVariants` | 未解決の問題 31 (100 個の seed で 75 件) | `test/open/unique-columns-case.test.ts`、`test/open/constraint-column-case.test.ts` | `ddl.ts` の `createTable`、`createIndex` |
+| `tableCase` | 新。`CREATE INDEX i ON T (...)` (表は `t`) を `no such table: main.T` で断る。問題 31 と同じ種類で、表の名前の解決である | `test/open/create-index-table-case.test.ts` | `ddl.ts` の `createIndex` (`existingTable`) |
+| `primaryKeyDesc` | 新。列の定義の `x INTEGER PRIMARY KEY DESC` を rowid の別名として記録する。SQLite では別名にならず、値を省くと NULL が入る。D∞ は番号を振る | `test/open/integer-primary-key-desc.test.ts` | `ddl.ts` の `createTable` (`rowidAlias`)。不変条件 6 と 11 |
+
+段 1 の `resolveConstraints` は、問題 31 と表の名前の形を直し、rowid の別名も PRAGMA (主キーの index の有無) から読めば 3 つ目も直る。
+
+### (c) UNIQUE の文の差分
+
+表の形は 10 個 (`FAMILIES`) で、文の形は 14 個 (`SHAPES`) である。
+置き場所は 4 つ (シャード 1、2、4 と、1 シャードを slot の境目で 3 回分割した 4 シャード)。
+行を訪ねる順で答えが変わる文は、2 行だけに触れる形に限り、SQLite のふつうの順と `PRAGMA reverse_unordered_selects` の逆の順のどちらかに一致すれば合格にした。
+印のない文 (順に依らない文) で、下の欠陥のほかの違いは出なかった。ただし、いまのシャードの物理の index は一意なので、「シャードの中」の節の仮定 (一意でない index の表では、シャードの SQLite が別の順で行を訪ねる) が試されるのは段 3 からである。この比べ方は、そのときもそのまま使える。
+流した seed は、sim で 1 から 900、reference-scans で 1 から 250、reference-full で 1 から 300 である。
+
+いま断る形の一覧 (`REFUSED`) は次のとおりである。どれも表定義の形で決まり、どの置き場所とどの実行でも同じに断る。一覧の形を受け付けるようになると、既定の実行が落ちるので、一覧から外す。
+
+| 断る形 | 文言 | 受け付ける段 |
+|---|---|---|
+| shard key を含まない UNIQUE の、列の定義の NOCASE と RTRIM | `unsupported: COLLATE NOCASE on column ... of a UNIQUE constraint that does not include the shard key` | 2 |
+| shard key を含まない CREATE UNIQUE INDEX の、列の COLLATE | `unsupported: a UNIQUE partial or expression index ...` (列の COLLATE は式と同じに扱われる) | 2 |
+| shard key を含まない部分 index の UNIQUE | 同上 | 2 |
+| 式の UNIQUE index。shard key を含んでも断る | 同上 | 2 |
+| 表の UNIQUE の列の COLLATE (`UNIQUE (tenant COLLATE NOCASE, code)`) | `near "COLLATE": syntax error` (パーサの拒否。`unsupported:` ではない) | 2 |
+| shard key の列を COLLATE で比べる CREATE UNIQUE INDEX | `unsupported: a UNIQUE partial or expression index ...` | 2 |
+
+見つけた欠陥は 6 つで、どれも 1 シャードでも起きる (置き場所に依らない)。
+既定の実行では伏せるか (文の答えか表の中身で当たったら、その置き場所の比較を打ち切る)、文を流さずに避け (`KNOWN_OPEN`)、`OPEN=1` で伏せない。
+
+| 欠陥 | 再現 | 起きる実行 | 持ち主 |
+|---|---|---|---|
+| 1 つの文に UNIQUE の衝突が 2 つ以上あると、誤りの文言に SQLite と違う制約を書く (文はどちらも失敗する) | `test/open/unique-error-first-conflict.test.ts` | 全部 (基準経路だけの実行では複数行の文) | Worker の `Txn.indexChanges` と `assertUnique` (文の後で、変更の順 × 表定義の index の順に確かめる) |
+| OR ROLLBACK が衝突すると、autocommit では `no such savepoint` (手元の workerd の DO では `internal error`) になり、取引の中では取引が終わらない | `test/open/or-rollback.test.ts` | autocommit は通常の実行、取引の中は全部 | 文の原子性の SAVEPOINT (シャードの `Backend.tx`、DO の `transactionSync`) と `Txn` |
+| 表の制約の UNIQUE の ON CONFLICT (`UNIQUE (email) ON CONFLICT IGNORE`) を記録しない。シャードをまたぐ UNIQUE では衝突が誤りになり、シャードの中の UNIQUE の REPLACE では捕捉が消えた行を知らない (行イメージの検査が落ちる) | `test/open/unique-constraint-on-conflict.test.ts` | 通常の実行だけ | `ddl.ts` の `createTable` と文の計画 |
+| OR FAIL の文が衝突すると、衝突の前の行の変更まで取り消す | `test/open/or-fail-keeps-earlier-rows.test.ts` | 全部 (手元の workerd でも) | 文の原子性 (シャードの SAVEPOINT、Worker の SQLite の `src/sql/scratch.ts`) |
+| 複数行の OR REPLACE で、後の行に消される行が消した行が残る | `test/open/global-unique-replace-chain.test.ts` | 全部 (基準経路の書き込み) | 基準経路の書き込み `Txn.wasmWrite` の、REPLACE が消した行の捕捉 |
+| 部分 index の UNIQUE もある表で、シャードの中の UNIQUE の衝突を解く OR REPLACE を、UNIQUE の誤りで断る | `test/open/local-unique-replace-trial.test.ts` | 全部 | 変更の集まりを物理の UNIQUE index に 1 行ずつ当てる所 (見立て)。M22 の `m22_red_physical_unique` と同じ種類で、piece の移動がなくても 1 つの文で起きる |
+
+計画書の番号のついた不変条件で、これらに当たるものはない (どれも置き場所に依らない)。
+6 つは 1 つの場所、衝突の処理 (ON CONFLICT の 5 つの処理、制約に書いた既定、1 文の中の衝突の順) に集まっている。
+持ち主の規則 1 に従って、1 件ずつ直さず、次の形を提案する。
+
+- 不変条件を 1 つ足す。「衝突の処理を持つ文の答えと効果は、同じ行の上で SQLite が実行したものと同じである。衝突の処理を決めるのは SQLite だけである」。
+- 持ち主は文の意味の層 (「文の意味」の節) にする。シャードと Worker の最適化の経路は、衝突が起きたことだけを見つけて `NeedsReference` を投げ、基準経路で SQLite に決めさせる。基準経路は、SQLite が実行した文の効果 (REPLACE が消した行、OR FAIL が残した行、OR ROLLBACK が終わらせた取引) を全部捕捉する。
+- それまでの範囲の削り方として、OR FAIL、OR ROLLBACK、制約の ON CONFLICT を、文の形と表定義で断る (`unsupported:`) 手がある。決まった形で断るので、規則 4 に反しない。
+
+6 つ目は、段 3 (物理の index を一意でなくする) で起きなくなる見込みである。
+
+### 設計の本文と、いまのコードの食い違い
+
+- 「部分 index と式の index」の節は、shard key を含むものはシャードの SQLite が守っていると書く。部分 index はそのとおりだが、式の UNIQUE index は shard key を含んでも断る (`createIndex` は、列が名前だけの index だけを shard key を含むと見る)。
+- 表の UNIQUE の列の COLLATE、ASC、DESC、文字列の literal は、パーサが構文の誤りで断る。段 1 の `resolveConstraints` を入れても、パーサを変えないと受け付けない。
+- shard key の列を NOCASE で比べる UNIQUE (「刷新案からのずれ」の 3) は、表の制約の形も CREATE UNIQUE INDEX の形も、いまは作れない。差分の検査は、'a' と 'A' のテナントが別のシャードにある置き場所 (シャード 2 と 4) で、受け付けるようになったときに比べる。
+- いまの分割は slot の境目でしか切れないので、1 つのテナントが 2 つのシャードにある置き場所は作れない。段 0 の (c) は、その置き場所を含まない。
+- 「文の意味」の表は、OR FAIL と OR ROLLBACK をシャードへそのまま送れる文に入れている。いまは、どちらも SQLite と違う答えになる (上の欠陥の表)。
+
+### (d) 書いた行の数
+
+手元の workerd で、操作を 20 回ずつ流し、DO の `rowsWritten` を文の種類と表ごとに合計して割った (シャード 4 つ。HLC の `__meta` の行は除く)。
+8 回と、計算機に負荷を掛けた 3 回で同じだった。2 つの範囲は、実行ごとに変わる数である (操作の間で intent と未適用の確定がなくなるまで待っても変わったので、前の操作の後始末の遅れではない。どこから来るかは分かっていない)。
+内訳は `test/unique-rowcost.test.ts` の `PINNED` にある。段 3 は、この表と比べる。
+
+| 操作 | シャードの中の UNIQUE (tenant_id, code) | シャードをまたぐ UNIQUE (email) |
+|---|---|---|
+| INSERT | 4 | 15 |
+| UNIQUE の値を変える UPDATE | 7 | 20.95 |
+| ほかの列を変える UPDATE | 2 | 4 |
+| 衝突する INSERT OR IGNORE | 1 | 0 |
+| 衝突しない INSERT OR IGNORE | 9 | 12.5 |
+| 行を置き換える INSERT OR REPLACE | 11 | 19.35 から 20.35 (測った値は 19.55 から 19.9) |
+| UNIQUE の upsert (衝突して UPDATE) | 6 | 9 から 11.25 (測った値は 10.05 から 10.5) |
+| DELETE | 2 | 11.5 |
+
+シャードの中の UNIQUE の値を変える UPDATE (7 行) と衝突しない INSERT OR IGNORE (9 行) は、捕捉の trigger の下書きと巻き戻しの分が大きい (内訳の `UPDATE lu` 5 行と `INSERT lu` 7 行)。
+段 3 で試適用と下書きが減り、キーの行が足される。
+
 ## 危険
 
 - **upsert の費用**：主キー以外の UNIQUE を対象にした `ON CONFLICT (...) DO UPDATE` が、どの表でも基準経路になる。upsert を多く使う作業負荷では、往復と Worker の SQLite での実行が増える。段 3 で測る。

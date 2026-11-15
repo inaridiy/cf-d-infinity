@@ -523,11 +523,8 @@ export const KNOWN_OPEN: Known[] = [
     // SQLite では取引が終わっているので、後の COMMIT と ROLLBACK が `no transaction is active` になる。
     id: "OR ROLLBACK",
     repro: "test/open/or-rollback.test.ts",
-    // 当たると、その置き場所の比較が終わってしまう (OR ROLLBACK は 6 つの衝突の処理の 1 つで、多くの台本に出る)。既定の実行では
-    // OR ROLLBACK の文を流さず、ほかの文を比べ続ける。
-    answer: (step, ours, sqlite, steps) =>
-      (/\bOR ROLLBACK\b/.test(step.sql) && ours.kind === "error" && /^no such savepoint/.test(ours.message)) ||
-      (/^(COMMIT|ROLLBACK)$/.test(step.sql) && sqlite.kind === "error" && /no transaction is active/.test(sqlite.message) && inBlock(steps, step).some((x) => /\bOR ROLLBACK\b/.test(x.sql))),
+    // 伏せると、当たった置き場所の比較がそこで終わってしまう (OR ROLLBACK は 6 つの衝突の処理の 1 つで、多くの台本に出る)。既定の
+    // 実行では OR ROLLBACK の文を流さず、ほかの文を比べ続ける。
     skip: (step) => /\bOR ROLLBACK\b/.test(step.sql),
   },
   {
