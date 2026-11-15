@@ -300,6 +300,27 @@ describe("facts about workerd and the Durable Object SQLite that the value rewor
     expect(plain!.rows).toEqual([[["number", "5"], ["string", "real"]]]);
   });
 
+  it("reads every type whole from RETURNING with the element expression that carries TEXT as a BLOB (stage 3)", async () => {
+    // 利用者の RETURNING の要素の式 (src/value.ts の returningElemSql)。DO のドライバが返す JS の値を見る。TEXT はバイトで届き、NUL も
+    // 空の文字列も残る。ほかの型は、印のついた文字列で届く。INTEGER は ±2^63 の端まで、10 進の文字列を包んで束縛する。
+    const [, r] = await p.run([
+      { sql: "CREATE TABLE re(id INTEGER PRIMARY KEY, v, r REAL)" },
+      {
+        sql: `INSERT INTO re(id, v, r) VALUES (1, 'a' || char(0) || 'b', 5), (2, '', 0.5), (3, x'00ff', NULL), (4, NULL, NULL), (5, (CAST(?1 AS INTEGER)+0), NULL), (6, (CAST(?2 AS INTEGER)+0), NULL) RETURNING ${returningElem("v")}, ${returningElem("r")}`,
+        params: [INT64_MAX, INT64_MIN],
+      },
+    ]);
+    expect(r!.error).toBeUndefined();
+    expect(r!.rows).toEqual([
+      [["blob", "610062"], ["string", "r5.0"]],
+      [["blob", ""], ["string", "r0.5"]],
+      [["string", "b00FF"], ["null"]],
+      [["null"], ["null"]],
+      [["string", `i${INT64_MAX}`], ["null"]],
+      [["string", `i${INT64_MIN}`], ["null"]],
+    ]);
+  });
+
   it("evaluates a RETURNING expression once when it is read through a fenced subquery", async () => {
     const once = `(SELECT typeof("x") || ':' || substr(${selectElem('"x"')}, 1, 1) FROM (SELECT CASE WHEN random() % 2 THEN id ELSE 'x' || id END AS "x" LIMIT -1 OFFSET 0))`;
     // 式は行の列を参照する。参照しない式は、文に 1 回だけ評価されて、どの行にも同じ値が返る。
