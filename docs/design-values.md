@@ -1048,6 +1048,12 @@ DO の SQLite と Workers の CPU では測っていない。
 5. **CLI の `sql` の引数と結果。** 設計書になかった入口である。使い捨ての Worker とのあいだは JSON なので、引数と結果の値を要素で運び、結果は intMode `"bigint"` で受け取る。`--json` は INTEGER を数字を全部書いた JSON の数にする (読み戻すときは reviver の `context.source` で正確に読める)。BLOB は `{"$b": "16 進"}`、REAL の無限大は `9.0e+999` と書く。
 6. **分析の行。** 「表定義の列名を付け直してから出す」とだけ書いていた。値は要素のまま出す (`src/shard/rows.ts` の `rowOf` は使わない)。DuckDB は印を外せば 64 ビットの整数を正確に読む (`substr(row->>'n', 2)::BIGINT`)。
 
+### 検査の結果
+
+`364c5d5` で、`npm run typecheck`、4 つの組の `npx vitest run --project <組> --maxWorkers=2` (sim 905、reference-scans 307、reference-full 307、workerd 97 の試験が通った。飛ばしたのは前からの印の付いたもの)、`packages/create-cf-d-infinity` の `npm test` (13) が通った。
+`test/determinism.test.ts` も通る。
+`test/export-import.test.ts` は、1、2、4 シャードから別の数のシャードへ、頁の大きさ 1、3、1000 で、±(2^63 - 1)、-2^63、2^53 ± 1 と NUL を含む TEXT を主キーと値の両方に置いて往復させ、値と `typeof` が元と同じになる。
+
 ### 段 4 で残ったこと
 
 - `src/shard/rows.ts` の `rowOf` は、どこからも呼ばれなくなったが、`{ $int }` と `{ real }` を作るまま残っている。この段では `src/shard/` に触らない取り決めだったので、消していない。
