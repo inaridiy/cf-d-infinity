@@ -399,7 +399,7 @@ async function status(opts) {
       ? `${r.start / SUBSLOTS}-${r.end / SUBSLOTS - 1}` : `tokens ${r.start}-${r.end - 1}`);
     for (const r of s.routing.ranges) slots.set(r.shard, [...(slots.get(r.shard) ?? []), range(r)]);
     const health = new Map(s.health.map((h) => [h.id, h]));
-    console.log(`${s.shards.length} shards, schema version ${s.schema}, routing version ${s.routing.version}`);
+    console.log(`${s.shards.length} shards, schema epoch ${s.schema}, routing version ${s.routing.version}`);
     console.log(table(["shard", "slots", "size", "waiting", "unapplied", "moving"], s.shards.map((id) => {
       const h = health.get(id);
       return [id, (slots.get(id) ?? []).join(", "), h ? bytes(h.bytes) : "?", h?.intents ?? "?", h?.unapplied ?? "?",
