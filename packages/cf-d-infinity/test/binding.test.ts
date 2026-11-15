@@ -134,10 +134,10 @@ describe("64-bit integers and NUL through the binding and HTTP", () => {
   it("refuses a wide INTEGER in the result by default, and returns every INTEGER as bigint or string with intMode", async () => {
     const r = await call("wide");
     for (const k of ["plainScan", "plainKey", "plainRaw"]) expect(r[k], k).toMatch(/cannot hold exactly/);
-    expect(r.lastRowPlain).toMatch(/last_row_id .*cannot hold exactly/);
+    expect(r.returningPlain).toMatch(/cannot hold exactly/);
     expect(r.tooWide).toMatch(/does not fit in 64 bits/);
     expect(r.badMode).toMatch(/intMode/);
-    const { plainScan: _a, plainKey: _b, plainRaw: _c, lastRowPlain: _d, tooWide: _e, badMode: _f, ...exact } = r;
+    const { plainScan: _a, plainKey: _b, plainRaw: _c, returningPlain: _d, tooWide: _e, badMode: _f, ...exact } = r;
     expect(exact).toEqual({
       safe: { id: 1, s: NUL },
       bigScan: [
@@ -155,6 +155,8 @@ describe("64-bit integers and NUL through the binding and HTTP", () => {
       batch: [{ n: `${MIN}n` }],
       inTx: [{ n: `${MIN}n` }],
       afterTx: "4611686018427387905n",
+      // RETURNING のない INSERT は成功し、既定の last_row_id は丸めずに 0 (返す rowid がない) になる。
+      lastRowPlain: 0,
       lastRowBig: "1152921504606846977n",
       lastRowStr: "1152921504606846978",
       // 安全な範囲の外の整数の値の JS の数は REAL である (決めたことの 2)。INTEGER の列は、型の親和性で整数にする。
@@ -167,7 +169,7 @@ describe("64-bit integers and NUL through the binding and HTTP", () => {
     const r = await call("httpWide");
     expect(r.plain).toMatchObject({ status: 400, error: expect.stringMatching(/cannot hold exactly/) });
     expect(r.batchPlain).toMatchObject({ status: 400, error: expect.stringMatching(/cannot hold exactly/) });
-    expect(r.lastRowPlain).toMatchObject({ status: 400, error: expect.stringMatching(/last_row_id .*cannot hold exactly/) });
+    expect(r.lastRowPlain).toMatchObject({ status: 200, changes: 1, lastInsertRowid: null });
     expect(r.bigint).toMatchObject({ status: 400, error: expect.stringMatching(/JSON cannot carry a bigint/) });
     expect(r.bad).toMatchObject({ status: 400, error: expect.stringMatching(/intMode/) });
     expect(r.str).toMatchObject({

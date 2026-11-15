@@ -7,7 +7,10 @@ interface Meta {
   rows_read: number;
   rows_written: number;
   duration: number;
-  /** intMode の形の INTEGER。行を入れなかった文は 0 (D1 と同じ)。 */
+  /**
+   * intMode の形の INTEGER。行を入れなかった文は 0 (D1 と同じ)。"number" で JS の数にできない rowid も、丸めずに 0 にする
+   * (返す rowid がない。Service Binding と同じ)。
+   */
   last_row_id: number | bigint | string;
   changed_db: boolean;
   size_after: number;
@@ -25,7 +28,7 @@ export interface D1Options {
 
 const meta = (r: QueryResult, mode: IntMode): Meta => ({
   changes: r.changes, rows_read: r.values.length, rows_written: r.changes, duration: 0,
-  last_row_id: rowidOut(r.lastInsertRowid ?? 0n, mode)!, changed_db: r.changes > 0, size_after: 0,
+  last_row_id: rowidOut(r.lastInsertRowid, mode) ?? (mode === "bigint" ? 0n : mode === "string" ? "0" : 0), changed_db: r.changes > 0, size_after: 0,
 });
 
 /**
@@ -52,8 +55,8 @@ export class Statement {
     return this.all<T>();
   }
   async first<T = Row>(column?: string): Promise<T | null> {
-    const r = await this.db.query(this.sql, this.params);
-    const row = rowsOut(r.columns, r.values.slice(0, 1), this.mode)[0];
+    // 全部の行を変える。Service Binding (src/entrypoint.ts) と同じく、誤りにするかどうかは結果の全体で決まる。
+    const row = (await this.all<Row>()).results[0];
     if (!row) return null;
     return (column === undefined ? row : row[column]) as T;
   }

@@ -22,6 +22,7 @@ export interface RemoteResult<M extends IntMode = IntMode> {
   rows: Row[];
   values: Value[][];
   changes: number;
+  /** 行を入れなかった文は null。"number" で JS の数にできない rowid も null である。 */
   lastInsertRowid: IntOf<M> | null;
   /** この接続が見た最新の時刻 (HLC)。次の呼び出しへ渡すと、自分の書き込みが必ず見える。 */
   token: number;
@@ -51,7 +52,7 @@ export interface D1Meta<M extends IntMode = "number"> {
   rows_read: number;
   rows_written: number;
   duration: number;
-  /** 行を入れなかった文は 0 (D1 と同じ)。 */
+  /** 行を入れなかった文は 0 (D1 と同じ)。"number" で JS の数にできない rowid も、丸めずに 0 にする (返す rowid がない)。 */
   last_row_id: IntOf<M>;
   changed_db: boolean;
   size_after: number;

@@ -196,7 +196,7 @@ SQL では `json_array(要素, ...)` で作る。
 | 境界 | 入る向き | 出る向き |
 |---|---|---|
 | Hrana | `integer` は `BigInt(文字列)` で INTEGER。`float` は REAL | INTEGER は `integer` (10 進の文字列)、REAL は `float` |
-| D1 互換の API、Service Binding、HTTP の `/sql` と `/batch` | `bigint` は INTEGER。`number` は、安全な整数なら INTEGER、ほかは REAL。真偽値は INTEGER。HTTP の JSON の、数字だけで書いた literal は、64 ビットに収まれば INTEGER (段 4) | 既定は、安全な範囲の INTEGER を `number` で返し、範囲の外は誤りにする。`intMode` で `bigint` か文字列を選べる。`last_row_id` も同じ。HTTP は `bigint` を選べない |
+| D1 互換の API、Service Binding、HTTP の `/sql` と `/batch` | `bigint` は INTEGER。`number` は、安全な整数なら INTEGER、ほかは REAL。真偽値は INTEGER。HTTP の JSON の、数字だけで書いた literal は、64 ビットに収まれば INTEGER (段 4) | 既定は、安全な範囲の INTEGER を `number` で返し、範囲の外は誤りにする。`intMode` で `bigint` か文字列を選べる。範囲の外の `last_row_id` は、既定では「返す rowid がない」(`null`、D1 の `meta` では 0。段 4)。HTTP は `bigint` を選べない |
 | Worker の SQLite (sql.js) | 下の「束縛」の表 | `useBigInt` で読む。INTEGER は `bigint`、REAL は `number` |
 | DO の SQL の API | 下の「束縛」の表 | 行イメージはタプル (文字列)、結果は型つきの読み |
 | シミュレータの node:sqlite | DO と同じ | DO と同じ (丸めて読む模倣を残す) |
@@ -327,7 +327,7 @@ D1 互換の API、Service Binding、HTTP の `/sql` と `/batch` は、`intMode
 既定の `"number"` は、D1 と同じく INTEGER を `number` で返し、安全な範囲の外の INTEGER は誤りにする (@libsql/client の既定と同じ)。
 `intMode` を `"bigint"` にすると INTEGER をすべて `bigint` で、`"string"` にするとすべて 10 進の文字列で返す。
 HTTP の `/sql` は JSON なので、`"bigint"` は選べない (誤りにする)。
-`last_row_id` (`lastInsertRowid`) も INTEGER なので同じ規則で返す。`"number"` で JS の数にできない `last_row_id` は、文を実行した後で誤りになる (段 4 の結果に理由を書いた)。
+`last_row_id` (`lastInsertRowid`) は、`"bigint"` と `"string"` では正確な値で返す。`"number"` で JS の数にできない `last_row_id` は、丸めずに「返す rowid がない」として扱う (`lastInsertRowid` は `null`、D1 の `meta.last_row_id` は行を入れなかった文と同じ 0)。誤りにはしない。RETURNING のない INSERT は結果の行を持たず、SQLite では成功するからである (段 4 の結果の「設計書から変えた点」の 2)。
 Service Binding は、呼び出し元の `intMode` を RPC の引数で運び (`query`、`batch`、`begin`)、`DinfDatabase` の側で変える。structured clone は `bigint` を運ぶので、`"bigint"` の結果もそのまま返る。
 誤りにするかどうかは値で決まり、行の置き場所には依らない。
 
@@ -1012,3 +1012,45 @@ DO の SQLite と Workers の CPU では測っていない。
 - `bin/dump.js` と `importRows` と CLI とのあいだの JSON をタプルにする (段 3 の `{ $int }` の間に合わせを消す)。
 - `src/analytics.ts` の出す行 (段 3 は、段 1 までの形に `{ $int }` を足した)。
 - `test/export-import.test.ts` に、64 ビットの整数と NUL を含む文字列を足す (`test/int64.test.ts` の書き出しの場面は、段 3 で通る)。
+
+## 段 4 の結果 (2026-11-15)
+
+入口と書き出しを、64 ビットの整数と NUL を含む TEXT について正確にした。
+利用者の値を JSON か JS の値にする場所と、利用者の入力を値にする場所を全部並べ、どれも ±(2^63 - 1)、-2^63、2^53 ± 1 と NUL を含む TEXT を、置き場所 (1、2、4 シャード) に関わらず正確に通すことを確かめた。
+段 3 の 2 つの間に合わせ (書き出しの JSON の `{ $int }` と、結果の数の決まった変換) はなくなった。
+並行の仕組みは足していないので、Quint のモデルは書いていない (規則 3)。
+
+| 入口 | 前 | 後 |
+|---|---|---|
+| D1 互換の API の結果 (`src/client/d1.ts`) | INTEGER は JS の数。2^53 を超えると誤り。`last_row_id` は黙って丸めた (2^60 が `1152921504606847000`) | `new D1Compatible(db, { intMode })`。既定は前と同じ。`last_row_id` も intMode の形で、`"number"` で JS の数にできなければ、行を入れなかった文と同じ 0 |
+| D1 互換の API の引数 | 安全な整数の JS の数は INTEGER、ほかの数は REAL、`bigint` は INTEGER、64 ビットの外の `bigint` は断る | 変えていない。安全な範囲の外の整数の値の JS の数が、Worker の SQLite でもシャードでも REAL になることを、検査に足した (決めたことの 2) |
+| Service Binding (`src/entrypoint.ts`、`src/binding.ts`) | 結果は D1 と同じ形に決まっていた | `connect(binding, { intMode })`。`query`、`batch`、`begin` が intMode を RPC の引数で運び、`DinfDatabase` が変える。`withSession` と取引も引き継ぐ |
+| HTTP の `/sql` と `/batch` (`src/worker.ts`、`src/entry.ts`) | 結果は JS の数に決まっていた。引数の `9223372036854775807` は `JSON.parse` が丸め、REAL の 2^63 になった | 本文の `intMode` (`"number"` か `"string"`。`"bigint"` は断る)。数字だけの literal で 64 ビットに収まるものは INTEGER |
+| エクスポートの頁と取り込み (`src/transfer.ts`) | 段 2 までの形に `{ $int }` を足した形。JSON を通すと ±無限大が NULL になった。版がなかった | 要素のタプルと `format`。要素でない値と違う版を、書く前に断る |
+| エクスポートの file (`bin/dump.js`、`bin/cli.js`) | 版の行がなかった。`(1-2)` のような literal を NaN として読んだ | 1 行目が版の行で、取り込みは何かを実行する前に確かめる。literal は SQLite と同じ読み方で要素にし、読めない literal の行は SQL として送る |
+| CLI の `sql` (`bin/cli.js`) | `--param` を `Number()` で丸めた (`--param 9223372036854775807` が REAL の 2^63 と比べて 1 行も返さなかった)。2^53 を超える INTEGER は、表にも `--json` にも出せなかった | CLI と使い捨ての Worker のあいだを要素で運ぶ。`--json` の INTEGER は数字を全部書いた JSON の数である |
+| 分析の行 (`src/analytics.ts`) | 段 1 までの形に `{ $int }`。無限大は JSON で `null` | 列名から要素への object |
+| Hrana | 段 3 で正確になった | 変えていない |
+
+### 検査を先に書いた (規則 2)
+
+入口を変える前に、今の損失を示す場面を書いて流し、落ちることを確かめてからコミットした (`7149fc4`)。
+エクスポートは、頁、続きの位置、取り込む行を JSON に 1 度通す。CLI が JSON で運ぶからで、通さないと JSON で運べない値の損失が見えない。
+前のコードで落ちたのは、±無限大 (NULL になった)、`(1-2)` の literal (NaN として読んだ)、intMode の全部 (D1 互換の API、Service Binding、HTTP)、`last_row_id` の丸め、HTTP の引数の丸め、CLI の `--param` と `--json`、分析の行の `{ $int }` と無限大である。
+64 ビットの整数と NUL を含む TEXT のエクスポート、既定の誤り、64 ビットの外の `bigint` の拒否は、前のコードでも通った。退行を見張る検査として残した。
+
+### 設計書から変えた点
+
+1. **HTTP の JSON の整数の literal。** 「境界」の表は、HTTP の引数を D1 互換の API と同じ JS の数の規則で書いていた (2^53 以上の INTEGER を正確に渡すには `bigint` か Hrana)。HTTP では、本文の文面を JS の数に丸めるのは D∞ 自身なので、数字だけの literal で 64 ビットに収まるものを INTEGER として読むことにした (`src/entry.ts` の `exactIntegers`。reviver の `context.source` を使う)。決めたことの 2 (JS の数の引数) からは外れる。JS のクライアントが `JSON.stringify` で 2^60 の double を送ると、Service Binding では REAL、HTTP では同じ値の INTEGER になる。値は等しく、違うのは格納の型だけである。戻すなら、`src/worker.ts` の `readJson(request, exactIntegers)` の 2 つ目の引数を外す 1 行である。
+2. **`last_row_id`。** 設計書は決めていなかった。初めは結果の値と同じく、`"number"` で JS の数にできなければ誤りにした。`test/int64.test.ts` の、D1 互換の API で `bigint` の id を入れる場面が落ちた。RETURNING のない INSERT は結果の行を持たず、SQLite では成功する。誤りにすると、確定した書き込みが失敗に見え、呼び出し元がやり直すかもしれない。`"number"` では、「返す rowid がない」として扱うことにした。Service Binding と HTTP の `lastInsertRowid` は `null`、D1 の `meta.last_row_id` は行を入れなかった文と同じ 0 である。丸めない、書き込みを失敗に見せない、JSON に書ける、の 3 つを満たす。D1 の `meta` を `null` にしなかったのは、D1 の型が数で、Service Binding のクライアントは `lastInsertRowid` の `null` から「行を入れなかった」と「JS の数にできない」を見分けられないからである (見分けるには、RPC の形にもう 1 つ項目が要る)。`"bigint"` と `"string"` は正確な値を返す。行の中の INTEGER (RETURNING を含む) は、今までどおり誤りにする。
+3. **Service Binding の変換の場所。** 変換は `DinfDatabase` の側 (`pack`) で行い、クライアントは intMode を運ぶだけにした。アプリの Worker に入るクライアントにプランナーや変換のコードを入れないためである (`test/binding.test.ts` が 10 KB 未満を確かめる。今は約 4.8 KB)。
+4. **エクスポートの形式の版。** 設計書は file の形式を変えないと書いていた。CLI と Worker のあいだの JSON と file が、どちらも公開の後に版の違う相手と出会うので (古い CLI と新しい Worker、古い file と新しい CLI)、両方に版 (`EXPORT_FORMAT` = 1) を持たせた。版の行のない file (段 3 までの CLI が書いたもの) は断る (公開の前なので後方互換を持たない)。無限大の literal は `9e999` から `9.0e+999` (`realText`) になった。取り込みはどちらも読む。
+5. **CLI の `sql` の引数と結果。** 設計書になかった入口である。使い捨ての Worker とのあいだは JSON なので、引数と結果の値を要素で運び、結果は intMode `"bigint"` で受け取る。`--json` は INTEGER を数字を全部書いた JSON の数にする (読み戻すときは reviver の `context.source` で正確に読める)。BLOB は `{"$b": "16 進"}`、REAL の無限大は `9.0e+999` と書く。
+6. **分析の行。** 「表定義の列名を付け直してから出す」とだけ書いていた。値は要素のまま出す (`src/shard/rows.ts` の `rowOf` は使わない)。DuckDB は印を外せば 64 ビットの整数を正確に読む (`substr(row->>'n', 2)::BIGINT`)。
+
+### 段 4 で残ったこと
+
+- `src/shard/rows.ts` の `rowOf` は、どこからも呼ばれなくなったが、`{ $int }` と `{ real }` を作るまま残っている。この段では `src/shard/` に触らない取り決めだったので、消していない。
+- `packages/cf-d-infinity/DEVELOPMENT.md` の入口の表の `/sql` と `/batch` の本文に、`intMode` がない。
+- HTTP の `/sql` と `/batch` の JSON は、BLOB をバイトの番号を鍵にした object に、REAL の ±無限大を `null` にする。64 ビットの整数と NUL の外の話なので、直さずに `docs/sql-language.md` に書いた。
+- `--json` と HTTP の JSON は、整数の値の REAL を `5` と書く (`JSON.stringify` のまま)。値は同じで、型だけが JSON に残らない。

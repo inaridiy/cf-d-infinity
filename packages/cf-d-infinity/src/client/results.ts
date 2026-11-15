@@ -5,7 +5,10 @@
 // (絶対値が 2^53 - 1 を超えるもの) は、黙って隣の値にせずに誤りにする (持ち主の判断の 1)。"bigint" は INTEGER をすべて bigint で、
 // "string" はすべて 10 進の文字列で返す。REAL、TEXT、BLOB、NULL は、どの intMode でもそのままである。
 // 誤りにするかどうかは値で決まり、行の置き場所にも、答えたのがシャードか Worker の SQLite かにも依らない。
-// last_row_id も INTEGER なので、同じ規則で返す。"number" で JS の数にできない last_row_id は、文を実行した後で誤りになる。
+// last_row_id は、"bigint" と "string" では正確な値を返す。"number" で JS の数にできない last_row_id (利用者が 2^53 を超える rowid を
+// 明示して入れたとき) は、丸めずに「返す rowid がない」として扱う (lastInsertRowid は null、D1 の meta.last_row_id は 0)。誤りにすると、
+// RETURNING のない INSERT (結果の行がなく、SQLite では成功する) が、確定した後で失敗に見えるからである (docs/design-values.md の
+// 段 4 の結果)。
 import type { IntMode } from "../binding";
 import { SqlError, type Row, type Value } from "../types";
 
@@ -43,6 +46,9 @@ export const rowsOut = (columns: readonly string[], values: readonly Value[][], 
 /** 結果の行を、値の配列のまま intMode の形にする (D1 の raw)。 */
 export const valuesOut = (values: readonly Value[][], mode: IntMode): Value[][] => values.map((r) => r.map((v) => valueOut(v, mode)));
 
-/** last_insert_rowid を intMode の形にする。行を入れなかった文は null。 */
-export const rowidOut = (id: bigint | null, mode: IntMode): number | bigint | string | null =>
-  id === null ? null : integer(id, mode, "the statement ran, but its last_row_id is the integer");
+/** last_insert_rowid を intMode の形にする。行を入れなかった文は null。"number" で JS の数にできない rowid も null である。 */
+export function rowidOut(id: bigint | null, mode: IntMode): number | bigint | string | null {
+  if (id === null) return null;
+  if (mode === "number" && (id > MAX_SAFE || id < -MAX_SAFE)) return null;
+  return integer(id, mode, "the last_row_id is the integer");
+}

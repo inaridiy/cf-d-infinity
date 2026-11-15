@@ -101,14 +101,18 @@ describe("64-bit integers and NUL through the D1 compatible API", () => {
     });
   }
 
-  it("returns last_row_id in the intMode, and refuses by default an explicit rowid that a JS number cannot hold", async () => {
+  it("returns last_row_id in the intMode, and by default 0 (no rowid to report) for an explicit rowid that a JS number cannot hold", async () => {
     const c = new SimCluster({ shards: 2 });
     const plain = new D1Compatible(new Db(c));
     await plain.prepare(T).run();
     expect((await plain.prepare("INSERT INTO w(id, n) VALUES (?, 1)").bind(7).run()).meta.last_row_id).toBe(7);
-    // 文は実行され、確定している。結果の last_row_id を JS の数にできないので、誤りにする (丸めた数は返さない)。
-    await expect(plain.prepare("INSERT INTO w(id, n) VALUES (?, 1)").bind(2n ** 60n).run()).rejects.toThrow(/last_row_id .*cannot hold exactly/);
+    expect((await plain.prepare("UPDATE w SET n = 2 WHERE id = 7").run()).meta.last_row_id).toBe(0);
+    // RETURNING のない INSERT は、SQLite と同じく成功する。last_row_id は丸めずに、行を入れなかった文と同じ 0 にする
+    // (Service Binding と同じ。binding の lastInsertRowid と HTTP は null)。
+    expect((await plain.prepare("INSERT INTO w(id, n) VALUES (?, 1)").bind(2n ** 60n).run()).meta.last_row_id).toBe(0);
     expect(await new D1Compatible(new Db(c), { intMode: "string" }).prepare("SELECT count(*) AS c FROM w WHERE id = ?").bind(2n ** 60n).first("c")).toBe("1");
+    // RETURNING で読めば結果の値なので、既定では誤りになる。
+    await expect(plain.prepare("INSERT INTO w(id, n) VALUES (?, 1) RETURNING id").bind(2n ** 60n + 9n).all()).rejects.toThrow(/cannot hold exactly/);
     const big = new D1Compatible(new Db(c), { intMode: "bigint" });
     expect((await big.prepare("INSERT INTO w(id, n) VALUES (?, 1)").bind(2n ** 61n).run()).meta.last_row_id).toBe(2n ** 61n);
     const str = new D1Compatible(new Db(c), { intMode: "string" });

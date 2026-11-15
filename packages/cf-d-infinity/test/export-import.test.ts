@@ -61,7 +61,7 @@ async function roundTrip(bodies: Value[]): Promise<void> {
   expect(await all(dst)).toEqual(await all(src));
 }
 
-const I64 = [0n, 1n, -1n, 2n ** 53n - 1n, 2n ** 53n, 2n ** 53n + 1n, -(2n ** 53n) - 1n, 2n ** 63n - 1n, -(2n ** 63n), 1541815603606036480n];
+const I64 = [0n, 1n, -1n, 2n ** 53n - 1n, 2n ** 53n, 2n ** 53n + 1n, -(2n ** 53n) - 1n, 2n ** 63n - 1n, -(2n ** 63n) + 1n, -(2n ** 63n), 1541815603606036480n];
 const TEXTS = ["a\u0000b", "\u0000", "nul\u0000inside\u0000", "", "x", "i5", "r1.0", "t", "b00", "it's", "x\ny\r\nz"];
 /** 型ごとの値。REAL の 5 は、Db の引数では JS の数なので REAL である。 */
 const VALUES: Value[] = [
