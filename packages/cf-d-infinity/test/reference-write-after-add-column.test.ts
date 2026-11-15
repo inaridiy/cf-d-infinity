@@ -29,4 +29,35 @@ describe("a reference-path write planned before an ADD COLUMN", () => {
     await stale.query("UPDATE t SET n = n + 1 WHERE id = 1");
     expect((await other.query("SELECT id, n, extra FROM t")).rows).toEqual([{ id: 1, n: 1, extra: "v" }]);
   });
+
+  // 計画し直した試みが、競合で断られた後も、古い計画に戻らない。やり直す試みのスナップショットは、計画し直したときと同じだが、
+  // 最初の計画のときとは違う。最初の計画を送ると、足された列を既定値で上書きする。
+  it("keeps the added column when the attempt planned again is refused by a conflict and tried once more", async () => {
+    const c = new SimCluster({ shards: 2 });
+    const stale = new Db(c, { reference: "full" });
+    await stale.ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)");
+    await stale.query("INSERT INTO t VALUES (1, 0)");
+    const other = new Db(c);
+    await other.ddl("ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'd'");
+    await other.query("UPDATE t SET extra = 'v' WHERE id = 1");
+    // 古い接続の文の、計画し直した試みの確定を止め、その間に別の接続が同じ行を書く。止めた確定は競合で断られる。
+    let held = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let reached!: () => void;
+    const hit = new Promise<void>((r) => (reached = r));
+    c.net.gate = (m) => {
+      if ((m.method !== "commitLocal" && m.method !== "commit") || m.from !== "client" || held) return undefined;
+      held = true;
+      reached();
+      return gate;
+    };
+    const write = stale.query("UPDATE t SET n = n + 1 WHERE id = 1").then(() => "ok", (e: Error) => e.message);
+    await hit;
+    c.net.gate = () => undefined;
+    await other.query("UPDATE t SET extra = 'w' WHERE id = 1");
+    release();
+    expect(await write).toBe("ok");
+    expect((await other.query("SELECT id, n, extra FROM t")).rows).toEqual([{ id: 1, n: 1, extra: "w" }]);
+  });
 });

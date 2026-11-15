@@ -672,12 +672,23 @@ export class Txn extends ReadScope {
    * plannedWith は、断られた試みを計画したスナップショットである。その間に、同じ取引の別の文 (計画の途中の読み) が取り替えていれば、
    * 取り直さずに true を返す。
    * 取り替えるのは範囲表だけである。取引が溜めた読みと書き込みは、それを読んだか計画したシャードのものとして残る。
+   * そのため、溜めた書き込みの行が、新しい範囲表で別のシャードのものになっていれば、取り替えずに競合で断る。取り替えると、新しい
+   * 持ち主へ送る文の overlay に、その行の書き込みが入らず、行ロックを取る文 (最新の状態で実行する) が、取引自身の書き込みを見ないまま
+   * 答える (test/transaction-own-writes-across-split.test.ts)。溜めた書き込みと読みを新しい持ち主へ移して続ける規則は、移動をまたぐ
+   * 読みの確かめ直しと一緒に、モデルを書いてから入れる (未解決の問題 37)。
    */
   async reroute(e: unknown, plannedWith: Catalog): Promise<boolean> {
     if (!isRouteRefusal(e)) return false;
     if (this.cat !== plannedWith) return true;
     const fresh = await this.db.freshCatalog();
     if (fresh.schema !== this.planned || fresh.epoch <= this.cat.epoch) return false;
+    for (const [shard, m] of this.writes) {
+      for (const c of m.values()) {
+        if (ownerOf(fresh.routing, c.sk) !== shard) {
+          throw new ConflictError(`rows this transaction wrote moved to another shard in a split (${c.table} ${c.pk} is now on ${ownerOf(fresh.routing, c.sk)}); roll back and run the transaction again`);
+        }
+      }
+    }
     this.cat = fresh;
     return true;
   }
@@ -2191,18 +2202,18 @@ export class Db {
     // 取引として実行した autocommit の文にも、確定の時刻を付けて返す。読みだけなら、読んだ時刻である。
     let at: (() => Ts | undefined) | undefined;
     // 計画を終えたときの採番の控え。計画し直すときに、捨てる計画が採番した番号を戻す (idsUndo)。
-    let planned = this.idsMark();
-    let plannedOn = cat;
-    let plan = p;
+    let planned: IdsMark | null = this.idsMark();
     const r = await this.transaction(async (tx) => {
       const now = tx.catalog;
       let out: QueryResult;
-      if (now.epoch === plannedOn.epoch && now.schema === plannedOn.schema) out = await tx.execute(plan);
+      // p は cat で計画したものである。試みのスナップショットが cat と違えば、その試みでも、後の試みでも、p は使わない
+      // (計画し直した試みが競合で断られた後に p へ戻ると、古い計画を送り直すことになる)。
+      if (now.epoch === cat.epoch && now.schema === cat.schema) out = await tx.execute(p);
       else {
-        this.idsUndo(again.before, planned);
-        plannedOn = now;
+        // 戻すのは、最初の計画の採番だけである。計画し直した試みの採番は、その試みが計画を終えた後の控えを持たないので戻さない。
+        if (planned) this.idsUndo(again.before, planned);
+        planned = null;
         out = await tx.statement(parseStatements(again.source)[0], again.params);
-        planned = this.idsMark();
       }
       at = () => tx.commitTs ?? tx.T;
       return out;
