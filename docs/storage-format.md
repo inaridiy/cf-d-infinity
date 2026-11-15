@@ -1,6 +1,6 @@
 # 保存と通信の形式
 
-状態：Early 版で固める形式の一覧 (2026-11-12)。2026-11-14 に、行の置き場所を token の区間にした ([design-subslots.md](./design-subslots.md))。同じ日に、行イメージをタプルにし、キー文字列の数の書き方を決めた ([design-values.md](./design-values.md) の段 2。保存の形式の版 2、通信の版 4)。値の JS の型を格納の型にし、シャードの結果を型つきで読むようにした (同じ設計書の段 3。通信の版 5。保存の形式は変わらない)。2026-11-15 に、エクスポートの行を要素のタプルにし、形式の版を file と CLI とのあいだの JSON に持たせた (同じ設計書の段 4。エクスポートの形式の版 1)
+状態：Early 版で固める形式の一覧 (2026-11-12)。2026-11-14 に、行の置き場所を token の区間にした ([design-subslots.md](./design-subslots.md))。同じ日に、行イメージをタプルにし、キー文字列の数の書き方を決めた ([design-values.md](./design-values.md) の段 2。保存の形式の版 2、通信の版 4)。値の JS の型を格納の型にし、シャードの結果を型つきで読むようにした (同じ設計書の段 3。通信の版 5。保存の形式は変わらない)。2026-11-15 に、エクスポートの行を要素のタプルにし、形式の版を file と CLI とのあいだの JSON に持たせた (同じ設計書の段 4。エクスポートの形式の版 1)。2026-11-15 に、Meta の表定義の版と範囲表を、epoch の列 1 本にした ([design-catalog-epoch.md](./design-catalog-epoch.md) の段 1。保存の形式の版 3。シャードの形式は変わらない)
 
 D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker と Durable Object のあいだを RPC でつなぐ。
 公開した後に新しい版を置くと、古い版が書いたデータを新しい版が開き、古い版と新しい版の Worker と Durable Object がしばらく混ざって動く。
@@ -40,7 +40,7 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 | `__moved(g, lo, hi, after, up_to, m, dest, acked)` | 渡した piece。主キーは `(g, lo, after)`。`g` は shard key のキー文字列、`[lo, hi)` は fence の区間、`(after, up_to]` は位置の区間、`m` は手放した時刻である | 固定 |
 | `__moved_txn(txn, g, lo, after, dest)` | 渡した piece に intent を持っていた取引。決着を渡した先へ転送するのに使う | 固定 |
 | `__arrived(g, lo, hi, after, up_to, m)` | 受け取った piece と、渡した側が手放した時刻 | 固定 |
-| `__cap(seq, tbl, old, new)`、`__cap_on`、trigger `__cap_<表>_I/U/D` | 1 つの文の変更を捕まえる表。trigger が、変更前と変更後の行のタプルを JSON で書く。文の外では空である | 作り直せる (trigger は表定義の版を適用するときに作る。Meta の `__ddl` の版は、その trigger の文を含む) |
+| `__cap(seq, tbl, old, new)`、`__cap_on`、trigger `__cap_<表>_I/U/D` | 1 つの文の変更を捕まえる表。trigger が、変更前と変更後の行のタプルを JSON で書く。文の外では空である | 作り直せる (trigger は表定義の版を適用するときに作る。Meta の `__epoch` の `commit` の記録が運ぶ版は、その trigger の文を含む) |
 
 移動の単位は piece で、グループ `g` の行のうち、token が fence の区間に入り、位置が区間 `(after, up_to]` に入るものである。
 いまのコードは、形式だけを持つ (設計書の段 1)。
@@ -52,10 +52,9 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 
 | 表 | 中身 | 区分 |
 |---|---|---|
-| `__ddl(version, entry)` | 表定義の版の履歴 (`DdlEntry` の JSON。取り消し、index の作成と公開、書き込み禁止を含む) | 固定 |
-| `__routing(version, body)` | 範囲表 (`Routing` の JSON。token の区間からシャードの名前 `<cluster>-<番号>` へ)。項目は `{ start, end, shard }` で、全部の項目が region 0 の token `[0, 2^32)` を重なりなく覆う | 固定 |
+| `__epoch(epoch, rec)` | epoch の列 (`src/catalog.ts`)。追記だけで、1 行が 1 つの epoch である。`rec` は `EpochRecord` の JSON。epoch 0 は最初の範囲表 (`{ kind: "genesis", routing }`。`Routing` の JSON で、項目は `{ start, end, shard }`。全部の項目が region 0 の token `[0, 2^32)` を重なりなく覆う。最初に範囲表を引いたときに書く)。epoch 1 から後は、表定義の版 1 つ (`{ kind: "commit", ddl }`。`ddl` は `DdlEntry` の JSON で、取り消し、index の作成と公開、書き込み禁止を含む)、範囲表の切り替え (`{ kind: "move-start", from, to, start, end }`。移す token の区間と、渡す側と受け取る側のシャード)、分割の枠を返したこと (`{ kind: "move-end", of }`。`of` はその移動の `move-start` の epoch) のどれかである。表定義、範囲表、開いている遷移と移動は、列を先頭から畳んで作る。範囲表の版は、最初の範囲表の版に `move-start` の数を足したもの、表定義の版は `DdlEntry.version` である。`prepare` と `abort` と、`of` のある `commit` は、段 3 から書く | 固定 |
 | `__seq(name, next)` | 採番 | 固定 |
-| `__meta(k, v)` | `format`、`shadow`、`splits` (保守の操作の枠の JSON。分割が移す範囲は token の区間 `start`、`end`)、`build_lease` (index の作成の期限の JSON) | 固定 |
+| `__meta(k, v)` | `format`、`shadow` (Meta の SQLite に表定義の文を写し終えた epoch)、`splits` (保守の操作の枠の JSON。分割が移す範囲は token の区間 `start`、`end`)、`build_lease` (index の作成の期限の JSON)、`baton_secret` | 固定 |
 | `__slow(...)` | 遅い文の記録 | 作り直せる |
 
 ## Autoscaler (`DinfAutoscaler`)

@@ -1,9 +1,12 @@
 import { compoundTerms, depthOf, SHARD_LIMITS } from "../src/shard-limits";
 import { createHash } from "node:crypto";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { Db, type ClientFaults, type Cluster } from "../src/client/db";
 import { keyString } from "../src/keys";
+import { fold, type EpochRecord } from "../src/catalog";
 import { MetaCore, type SplitMove, type SplitSlot } from "../src/meta";
+import { MetaCore as OldMeta } from "./meta-old";
 import { initialRouting, shardsOf, tokenOf, type Interval, type Routing } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
@@ -489,6 +492,54 @@ export const tracedNets: SimNet[] = [];
 /** 行イメージの検査を、いまの試験の間だけ止めているか (SimOptions の noImageCheck)。test/setup.ts が試験ごとに戻す。 */
 export const imageCheckOff = { now: false };
 
+/**
+ * META_SHADOW=<ディレクトリ> のとき、Meta の呼び出しを、段 1 より前の Meta (test/meta-old.ts) にも同じ順で流し、答えを比べる
+ * (docs/design-catalog-epoch.md の段 1 の検査 (b))。違えば、呼び出しと 2 つの答えを、そのディレクトリのプロセスごとのファイルに書く。
+ * 返すのは新しい Meta の答えなので、実行は変わらない。古い Meta には時計だけを渡し、乱数を渡さない。baton の鍵の乱数を取り合うと、
+ * 実行が変わるからである。そのため baton の鍵は比べない。保存データから起動するクラスタ (stored) には掛けない。
+ */
+function shadowMeta(next: MetaCore, old: OldMeta, dir: string): MetaCore {
+  const show = (x: unknown) => JSON.stringify(x, (_k, v) => (typeof v === "bigint" ? `${v}n` : v)) ?? "undefined";
+  const outcome = (r: PromiseSettledResult<unknown>): string => {
+    if (r.status === "fulfilled") return show(r.value);
+    const e = r.reason as Error;
+    return `throws ${e?.constructor?.name}: ${e?.message} ${show({ ...e })}`;
+  };
+  const settle = (f: () => unknown): Promise<unknown> => {
+    try {
+      return Promise.resolve(f());
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  };
+  mkdirSync(dir, { recursive: true });
+  return new Proxy(next, {
+    get(target, k, receiver) {
+      const f = Reflect.get(target, k, receiver) as unknown;
+      if (typeof f !== "function" || k === "batonSecret") return f;
+      const g = Reflect.get(old, k) as (...a: unknown[]) => unknown;
+      return (...args: unknown[]) => {
+        const copy = structuredClone(args);
+        let out: unknown;
+        let thrown: { e: unknown } | null = null;
+        try {
+          out = (f as (...a: unknown[]) => unknown).apply(target, args);
+        } catch (e) {
+          thrown = { e };
+        }
+        const mine = thrown ? Promise.reject(thrown.e) : Promise.resolve(out);
+        void Promise.allSettled([mine, settle(() => g.apply(old, copy))]).then(([a, b]) => {
+          const x = outcome(a!);
+          const y = outcome(b!);
+          if (x !== y) appendFileSync(`${dir}/${process.pid}.txt`, `${String(k)} ${show(copy)}\n  new: ${x}\n  old: ${y}\n`);
+        });
+        if (thrown) throw thrown.e;
+        return out;
+      };
+    },
+  });
+}
+
 export class SimCluster implements Cluster {
   /** 起動時のシャード。増設後の一覧は catalog の routing を見る。 */
   shardIds: string[];
@@ -532,6 +583,12 @@ export class SimCluster implements Cluster {
     this.shardIds = o.stored ? [...o.stored.shards.keys()] : Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
     this.metaBackend = new SqliteBackend(o.stored?.meta);
     this.meta = new MetaCore(this.metaBackend, this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs, faults: o.faults });
+    if (process.env.META_SHADOW && !o.stored) {
+      const rt = this.runtime;
+      const clock: Runtime = { now: () => rt.now(), after: (ms, fn) => rt.after(ms, fn), cancel: (h) => rt.cancel(h), random: () => 0, uuid: () => "shadow" };
+      const old = new OldMeta(new SqliteBackend(), this.shardIds, { runtime: clock, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs, faults: o.faults });
+      this.meta = shadowMeta(this.meta, old, process.env.META_SHADOW);
+    }
     for (const id of this.shardIds) this.core(id);
   }
 
@@ -680,10 +737,14 @@ export class SimCluster implements Cluster {
     return this.routingOwner(token) === shard;
   }
 
-  /** Meta の今の範囲表で、token を持つシャード。範囲表がまだなければ、最初の範囲表で決める。 */
+  /**
+   * Meta の今の範囲表で、token を持つシャード。範囲表がまだなければ、最初の範囲表で決める。
+   * 範囲表は、Meta の epoch の列を SQLite から直に読んで畳む。MetaCore の入口は、期限切れの取り消しを記録し得るので使わない。
+   */
   private routingOwner(token: number): string | undefined {
-    const r = this.metaBackend.db.prepare(`SELECT body FROM __routing ORDER BY version DESC LIMIT 1`).get() as { body: string } | undefined;
-    const routing: Routing = r ? (JSON.parse(r.body) as Routing) : initialRouting(this.shardIds);
+    const rows = this.metaBackend.db.prepare(`SELECT epoch, rec FROM __epoch ORDER BY epoch`).all() as { epoch: number; rec: string }[];
+    const log = fold(rows.map((r) => ({ epoch: r.epoch, rec: JSON.parse(r.rec) as EpochRecord })));
+    const routing: Routing = rows.some((r) => r.epoch === 0) ? log.routing : initialRouting(this.shardIds);
     return routing.ranges.find((x) => token >= x.start && token < x.end)?.shard;
   }
 

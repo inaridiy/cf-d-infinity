@@ -41,7 +41,7 @@ export interface ParsedDdl {
 
 /** 内部の表は `__` で始まる。利用者の表と名前が衝突すると、内部の状態を利用者の SQL で書き換えられる。 */
 const INTERNAL_NAMES = new Set([
-  "__arrived", "__cap", "__cap_on", "__ddl", "__fenced", "__incoming", "__intents", "__meta", "__moved", "__moved_txn",
+  "__arrived", "__cap", "__cap_on", "__ddl", "__epoch", "__fenced", "__incoming", "__intents", "__meta", "__moved", "__moved_txn",
   "__p", "__raw", "__routing", "__seq", "__slow", "__txn",
 ]);
 /**

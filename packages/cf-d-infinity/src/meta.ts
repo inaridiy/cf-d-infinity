@@ -1,24 +1,11 @@
 import { SqlError, checkStorageFormat, type Backend, type Faults, type TableDef, type Ts } from "./types";
-import { parseDdl, publishBuild, type IndexInfo, type ParsedDdl, type SchemaView } from "./sql/ddl";
+import { parseDdl, publishBuild, type IndexInfo, type SchemaView } from "./sql/ddl";
 import { systemRuntime, type Runtime } from "./runtime";
 import { CAPTURE_TABLES } from "./shard/rows";
-import { applyMove, checkInterval, contains, initialRouting, overlaps, rangeText, sameInterval, type Interval, type Routing } from "./routing";
+import { checkInterval, contains, initialRouting, overlaps, rangeText, sameInterval, type Interval, type Routing } from "./routing";
+import { fold, splitId, type DdlEntry, type EpochRecord, type Logged, type Snapshot } from "./catalog";
 
-export interface DdlEntry extends ParsedDdl {
-  version: number;
-  /** この版が取り消す版。取り消された版をまだ適用していないシャードは、両方を飛ばす。 */
-  reverts?: number;
-  /** 取り消しの理由。シャードが適用に失敗したときの SQLite のメッセージ。 */
-  reason?: string;
-  /** 取引が読んだ表を DROP する前に、その表を書き込み禁止にする版。次の版が、その DROP か、取り消しである (finishLock)。 */
-  guard?: { tables: string[] };
-  /**
-   * index を公開する版が運ぶ時刻。シャードは、この版を適用するときに、時計をここまで進める。
-   * index を使わずに確定した書き込みは、どれもこの時刻以下である。index を使う文は、この版を適用したシャードで読むので、
-   * この時刻より後になる。公開が、時刻の順の中の 1 点になる (specs/m12_unique_index_build.qnt の m12_clock)。
-   */
-  at?: Ts;
-}
+export type { DdlEntry } from "./catalog";
 
 /**
  * 既存の行から index を作る間は、表への書き込みが止まる。その止め方の期限。
@@ -47,6 +34,23 @@ export interface Catalog {
   routing: Routing;
   /** 最新の版が取り消しなら、取り消された版と理由。DDL を出した側が、失敗を利用者へ返すのに使う。 */
   revoked?: { version: number; reason: string };
+}
+
+/**
+ * スナップショットを、Worker とシャードに渡す今の形 (Catalog) にする。epoch、表定義の epoch、開いている遷移と移動は、
+ * 段 1 では Meta の外に出さない。要求が epoch を運ぶのは段 2 からである。
+ */
+function catalogOf(s: Snapshot): Catalog {
+  const cat: Catalog = { version: s.version, tables: s.tables, views: s.views, indexes: s.indexes, ddl: s.ddl, routing: s.routing };
+  if (s.revoked) cat.revoked = s.revoked;
+  return cat;
+}
+
+/** Meta の epoch の列を読む。after より後の epoch を、昇順で返す。Meta の外 (シミュレータの検査) も、これで読む。 */
+export function readEpochs(b: Backend, after = -1): Logged[] {
+  return b
+    .exec(`SELECT epoch, rec FROM __epoch WHERE epoch > ? ORDER BY epoch`, after)
+    .map((r) => ({ epoch: r.epoch as number, rec: JSON.parse(r.rec as string) as EpochRecord }));
 }
 
 /** index を作っている最中で、別の表定義の変更を記録できない。終わるのを待ってやり直す。 */
@@ -88,7 +92,11 @@ function describe(e: DdlEntry): string {
   return e.build ? `CREATE INDEX ${e.build.index}` : `the lock on ${e.guard!.tables.join(", ")} before DROP TABLE`;
 }
 
-/** 表定義、DDL 履歴、範囲表、rowid の採番を持つ。hot path には載せない。 */
+/**
+ * 表定義、DDL 履歴、範囲表、rowid の採番を持つ。hot path には載せない。
+ * 表定義の版と範囲表の切り替えは、epoch の列 (__epoch、src/catalog.ts) に記録し、答えは列を畳んで作る (段 1。
+ * docs/design-catalog-epoch.md)。入口の名前と答えは、列を入れる前と同じである。
+ */
 export class MetaCore {
   private rt: Runtime;
   private leaseMs: number;
@@ -103,8 +111,7 @@ export class MetaCore {
     this.leaseMs = opts.leaseMs ?? INDEX_LEASE_MS;
     this.buildMaxMs = opts.buildMaxMs ?? INDEX_BUILD_MAX_MS;
     this.faults = opts.faults ?? {};
-    b.exec(`CREATE TABLE IF NOT EXISTS __ddl(version INTEGER PRIMARY KEY, entry TEXT NOT NULL)`);
-    b.exec(`CREATE TABLE IF NOT EXISTS __routing(version INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
+    b.exec(`CREATE TABLE IF NOT EXISTS __epoch(epoch INTEGER PRIMARY KEY, rec TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __seq(name TEXT PRIMARY KEY, next INTEGER NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __meta(k TEXT PRIMARY KEY, v)`);
     checkStorageFormat(b, "__meta", "schema object");
@@ -116,23 +123,25 @@ export class MetaCore {
    * シャードで実行する文を、Meta 自身の SQLite の空の表でも実行しておく。新しい DDL は、ここで通ってから記録する。
    * 構文は通るが SQLite が拒否する文 (NOT NULL で既定値のない ADD COLUMN、重複した列名など) を記録すると、
    * 全シャードが適用に失敗し続け、直すための DDL も通らなくなる。
+   * 写し終えた位置 (__meta の shadow) は epoch である。
    */
   private replayShadow(): void {
     const done = (this.b.exec(`SELECT v FROM __meta WHERE k = 'shadow'`)[0]?.v as number | undefined) ?? 0;
-    for (const e of this.entries(done)) {
+    for (const { epoch, rec } of readEpochs(this.b, done)) {
+      if (rec.kind !== "commit" || !("ddl" in rec)) continue;
       // この仕組みより前に記録された文は、通らなくても記録を変えられない。できるだけ追従する。
-      for (const s of e.sql) {
+      for (const s of rec.ddl.sql) {
         try {
           this.b.exec(s);
         } catch {
           // 続ける
         }
       }
-      this.shadowAt(e.version);
+      this.shadowAt(epoch);
     }
   }
-  private shadowAt(version: number): void {
-    this.b.exec(`INSERT INTO __meta(k, v) VALUES ('shadow', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, version);
+  private shadowAt(epoch: number): void {
+    this.b.exec(`INSERT INTO __meta(k, v) VALUES ('shadow', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, epoch);
   }
 
   /** 最初の範囲表に使うシャードを指定する。範囲表ができた後は効かない。 */
@@ -140,12 +149,29 @@ export class MetaCore {
     this.initialShards = shards;
   }
 
+  /** 列の最後に記録を足し、その epoch を返す。呼び出し側が、必要なら同じ取引の中で呼ぶ。 */
+  private record(rec: EpochRecord): number {
+    const last = this.b.exec(`SELECT max(epoch) AS e FROM __epoch`)[0]?.e as number | null | undefined;
+    const epoch = (last ?? 0) + 1;
+    this.b.exec(`INSERT INTO __epoch(epoch, rec) VALUES (?, ?)`, epoch, JSON.stringify(rec));
+    return epoch;
+  }
+
+  /** 列の最後まで畳んだもの。最初の範囲表は作らない。 */
+  private snapshot(): Snapshot {
+    return fold(readEpochs(this.b));
+  }
+
+  /** 最初の範囲表を、まだなければ epoch 0 に書く。範囲表を最初に引いたときに作るのは、列を入れる前と同じである。 */
+  private ensureGenesis(): void {
+    if (this.b.exec(`SELECT 1 FROM __epoch WHERE epoch = 0`).length > 0) return;
+    const rec: EpochRecord = { kind: "genesis", routing: initialRouting(this.initialShards) };
+    this.b.exec(`INSERT INTO __epoch(epoch, rec) VALUES (0, ?)`, JSON.stringify(rec));
+  }
+
   private routing(): Routing {
-    const r = this.b.exec(`SELECT body FROM __routing ORDER BY version DESC LIMIT 1`)[0];
-    if (r) return JSON.parse(r.body as string) as Routing;
-    const first = initialRouting(this.initialShards);
-    this.b.exec(`INSERT INTO __routing(version, body) VALUES (?, ?)`, first.version, JSON.stringify(first));
-    return first;
+    this.ensureGenesis();
+    return this.snapshot().routing;
   }
 
   /** 範囲表を切り替える。これが増設の線形化点である。移すのは token の区間で、区間の境目は、どの token にも置ける。 */
@@ -160,25 +186,24 @@ export class MetaCore {
     if (move.from !== undefined && !(owners.length === 1 && owners[0] === move.from)) {
       throw new SqlError(`${rangeText(move)} are owned by ${owners.join(", ")}, not by ${move.from}`);
     }
-    const next = applyMove(current, move);
-    this.b.exec(`INSERT INTO __routing(version, body) VALUES (?, ?)`, next.version, JSON.stringify(next));
-    return next;
+    // 渡す側を省いた切り替え (試験が直に呼ぶ) は、区間の持ち主が 1 つなら、それを渡す側として記録する。
+    const from = move.from ?? (owners.length === 1 ? owners[0] : undefined);
+    this.record({ kind: "move-start", ...(from === undefined ? {} : { from }), to: move.to, start: move.start, end: move.end });
+    return this.snapshot().routing;
   }
 
+  /** 表定義の版の履歴。after より後の版を返す。 */
   private entries(after = 0): DdlEntry[] {
-    return this.b
-      .exec(`SELECT entry FROM __ddl WHERE version > ? ORDER BY version`, after)
-      .map((r) => JSON.parse(r.entry as string) as DdlEntry);
+    return readEpochs(this.b).flatMap(({ rec }) => (rec.kind === "commit" && "ddl" in rec && rec.ddl.version > after ? [rec.ddl] : []));
   }
 
   /**
    * 表への書き込みを止めている作業 (index の作成か、DROP の前の書き込み禁止) を記録した版。最新の版がそれであるときだけ、作業の最中である。
    * 作業の間は、ほかの表定義の変更を記録しない。だから、終わり方 (公開、DROP、取り消し) は「最新の版がこの版のまま」のときだけ
-   * 次の版を積み、どれか 1 つしか起きない。
+   * 次の版を積み、どれか 1 つしか起きない。列の上では、開いている表定義の遷移 (Snapshot.open) である。
    */
-  private building(all = this.entries()): DdlEntry | null {
-    const last = all.at(-1);
-    return last?.build || last?.guard ? last : null;
+  private building(): DdlEntry | null {
+    return (this.snapshot().open?.ddl as DdlEntry | undefined) ?? null;
   }
 
   /**
@@ -233,7 +258,7 @@ export class MetaCore {
     if (h.exclusive) throw new SchemaBusy(describe(h.exclusive));
     assertInterval(move);
     const slot: SplitSlot = {
-      id: `split:${move.parent}:${move.child}:${move.start}:${move.end}`,
+      id: splitId(move),
       parent: move.parent, child: move.child, start: move.start, end: move.end, version: cat.version, started: false, until: this.rt.now() + this.leaseMs,
     };
     this.setSplitSlots([...list, slot]);
@@ -263,9 +288,20 @@ export class MetaCore {
     }
   }
 
-  /** 分割が終わった。枠を返す。 */
+  /**
+   * 分割が終わった。枠を返し、その分割の移動 (範囲表の切り替えの move-start) が開いていれば、move-end を記録する。
+   * 移動は、枠の名前 (親、子、区間) で引く。枠が期限で消えていても (欠陥のスイッチ startWithoutSlot)、移動は閉じる。
+   */
   async endSplit(id: string): Promise<void> {
-    this.setSplitSlots(this.splitSlots().filter((x) => x.id !== id));
+    const list = this.splitSlots();
+    const slot = list.find((x) => x.id === id);
+    const move = this.snapshot().moves.find((m) =>
+      (m.from !== undefined && splitId({ parent: m.from, child: m.to, start: m.start, end: m.end }) === id) ||
+      (slot !== undefined && m.to === slot.child && sameInterval(m, slot) && (m.from === undefined || m.from === slot.parent)));
+    this.b.tx(() => {
+      this.setSplitSlots(list.filter((x) => x.id !== id));
+      if (move) this.record({ kind: "move-end", of: move.epoch });
+    });
   }
 
   /** 進行中の分割の枠。Autoscaler が、止まった分割を再開するのに使う。 */
@@ -324,23 +360,8 @@ export class MetaCore {
   }
 
   private current(): Catalog {
-    const cat: Catalog = { version: 0, tables: {}, views: {}, indexes: {}, ddl: [], routing: this.routing() };
-    const all = this.entries();
-    const reverted = new Set(all.flatMap((e) => (e.reverts === undefined ? [] : [e.reverts, e.version])));
-    for (const e of all) {
-      cat.version = e.version;
-      for (const d of e.defs) cat.tables[d.name] = d;
-      for (const n of e.drops) delete cat.tables[n];
-      Object.assign(cat.views, e.views);
-      for (const n of e.dropViews ?? []) delete cat.views[n];
-      Object.assign(cat.indexes, e.indexes);
-      for (const n of e.dropIndexes ?? []) delete cat.indexes[n];
-      // 取り消された文と取り消す文は、Worker の SQLite で再生しない。
-      if (e.user && !reverted.has(e.version)) cat.ddl.push(e.user);
-    }
-    const last = all.at(-1);
-    if (last?.reverts !== undefined) cat.revoked = { version: last.reverts, reason: last.reason ?? "" };
-    return cat;
+    this.ensureGenesis();
+    return catalogOf(this.snapshot());
   }
 
   async ddlSince(version: number): Promise<{ version: number; ddl: DdlEntry[] }> {
@@ -349,6 +370,7 @@ export class MetaCore {
     return { version: ddl.at(-1)?.version ?? version, ddl };
   }
 
+  /** 表定義の版を 1 つ、commit の記録として足す。シャードで実行する文は、同じ取引の中で Meta の SQLite でも実行する。 */
   private append(p: Omit<DdlEntry, "version">, version: number): void {
     const entry: DdlEntry = { ...p, version };
     this.b.tx(() => {
@@ -357,8 +379,7 @@ export class MetaCore {
       } catch (e) {
         throw new SqlError((e as Error).message);
       }
-      this.b.exec(`INSERT INTO __ddl(version, entry) VALUES (?, ?)`, entry.version, JSON.stringify(entry));
-      this.shadowAt(version);
+      this.shadowAt(this.record({ kind: "commit", ddl: entry }));
     });
   }
 
@@ -391,18 +412,15 @@ export class MetaCore {
   }
 
   private revoke(version: number, reason: string): number | null {
-    const all = this.entries();
-    const done = all.find((e) => e.reverts === version);
-    if (done) return done.version;
-    const e = all.at(-1);
-    if (!e || e.version !== version || !e.undo || e.reverts !== undefined) return null;
-    const before: SchemaView = { tables: {}, views: {}, indexes: {} };
-    for (const x of all.slice(0, -1)) {
-      for (const d of x.defs) before.tables[d.name] = d;
-      for (const n of x.drops) delete before.tables[n];
-      Object.assign(before.indexes, x.indexes);
-      for (const n of x.dropIndexes ?? []) delete before.indexes[n];
-    }
+    const log = readEpochs(this.b);
+    const all = log.flatMap(({ epoch, rec }) => (rec.kind === "commit" && "ddl" in rec ? [{ epoch, e: rec.ddl }] : []));
+    const done = all.find((x) => x.e.reverts === version);
+    if (done) return done.e.version;
+    const last = all.at(-1);
+    const e = last?.e;
+    if (!last || !e || e.version !== version || !e.undo || e.reverts !== undefined) return null;
+    // 取り消す版の直前の表定義。列を、その版の 1 つ前の epoch まで畳む。
+    const before: SchemaView = fold(log, last.epoch - 1);
     const names = e.defs.map((d) => d.name);
     this.append({
       sql: e.undo.sql,
