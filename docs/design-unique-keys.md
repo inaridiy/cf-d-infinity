@@ -432,7 +432,7 @@ SQLite が断る DDL は比べない。`Db.ddl` は、記録の前に Worker の
 | `tableCase` | 新。`CREATE INDEX i ON T (...)` (表は `t`) を `no such table: main.T` で断る。問題 31 と同じ種類で、表の名前の解決である | `test/open/create-index-table-case.test.ts` | `ddl.ts` の `createIndex` (`existingTable`) |
 | `primaryKeyDesc` | 新。列の定義の `x INTEGER PRIMARY KEY DESC` を rowid の別名として記録する。SQLite では別名にならず、値を省くと NULL が入る。D∞ は番号を振る | `test/open/integer-primary-key-desc.test.ts` | `ddl.ts` の `createTable` (`rowidAlias`)。不変条件 6 と 11 |
 
-段 1 の `resolveConstraints` は、問題 31 と表の名前の形を直し、rowid の別名も PRAGMA (主キーの index の有無) から読めば 3 つ目も直る。
+段 1 の `resolveConstraints` で問題 31 は直る見込みである。表の名前も同じ関数で解決し、rowid の別名も PRAGMA (主キーの index の有無) から読めば、残りの 2 つも直る (提案で、確かめていない)。
 
 ### (c) UNIQUE の文の差分
 
@@ -440,13 +440,13 @@ SQLite が断る DDL は比べない。`Db.ddl` は、記録の前に Worker の
 置き場所は 4 つ (シャード 1、2、4 と、1 シャードを slot の境目で 3 回分割した 4 シャード)。
 行を訪ねる順で答えが変わる文は、2 行だけに触れる形に限り、SQLite のふつうの順と `PRAGMA reverse_unordered_selects` の逆の順のどちらかに一致すれば合格にした。
 印のない文 (順に依らない文) で、下の欠陥のほかの違いは出なかった。ただし、いまのシャードの物理の index は一意なので、「シャードの中」の節の仮定 (一意でない index の表では、シャードの SQLite が別の順で行を訪ねる) が試されるのは段 3 からである。この比べ方は、そのときもそのまま使える。
-流した seed は、sim で 1 から 900、reference-scans で 1 から 250、reference-full で 1 から 300 である。
+流した seed は、sim で 1 から 900、reference-scans で 1 から 250、reference-full で 1 から 300 で、どれも伏せる欠陥と文の形を最後に変えた後に流して通った (欠陥の 6 つ目は、この掃引の seed 430 と 533 で見つけた)。
 
 いま断る形の一覧 (`REFUSED`) は次のとおりである。どれも表定義の形で決まり、どの置き場所とどの実行でも同じに断る。一覧の形を受け付けるようになると、既定の実行が落ちるので、一覧から外す。
 
 | 断る形 | 文言 | 受け付ける段 |
 |---|---|---|
-| shard key を含まない UNIQUE の、列の定義の NOCASE と RTRIM | `unsupported: COLLATE NOCASE on column ... of a UNIQUE constraint that does not include the shard key` | 2 |
+| shard key を含まない UNIQUE の、列の定義の NOCASE (RTRIM は下の CREATE UNIQUE INDEX の形で流す) | `unsupported: COLLATE NOCASE on column ... of a UNIQUE constraint that does not include the shard key` | 2 |
 | shard key を含まない CREATE UNIQUE INDEX の、列の COLLATE | `unsupported: a UNIQUE partial or expression index ...` (列の COLLATE は式と同じに扱われる) | 2 |
 | shard key を含まない部分 index の UNIQUE | 同上 | 2 |
 | 式の UNIQUE index。shard key を含んでも断る | 同上 | 2 |
@@ -466,6 +466,7 @@ SQLite が断る DDL は比べない。`Db.ddl` は、記録の前に Worker の
 | ある行が UNIQUE の値を、OR REPLACE で消す行から受け取る変更の集まりを、UNIQUE の誤りで断る。部分 index の UNIQUE もある表への OR REPLACE の文と、先に値を受け取る行に触れてから UPDATE OR REPLACE する取引の COMMIT に出る | `test/open/local-unique-replace-trial.test.ts` | 全部 | 変更の集まりを、溜めた順に物理の UNIQUE index に 1 行ずつ当てる所 (見立て)。M22 の `m22_red_physical_unique` と同じ種類で、piece の移動がなくても 1 つの取引で起きる |
 
 計画書の番号のついた不変条件で、これらに当たるものはない (どれも置き場所に依らない)。
+6 つの再現の形の後で、`quiescentProblems` (`test/invariants.ts`) は、3 つの実行のどれでも問題を報告しなかった。intent は残らず、グローバル index は行と一致した (OR REPLACE で残る行も、index の項目を持つ)。内部の状態は壊れず、答えと表の中身が SQLite と違う。
 6 つは 1 つの場所、衝突の処理 (ON CONFLICT の 5 つの処理、制約に書いた既定、1 文の中の衝突の順) に集まっている。
 持ち主の規則 1 に従って、1 件ずつ直さず、次の形を提案する。
 

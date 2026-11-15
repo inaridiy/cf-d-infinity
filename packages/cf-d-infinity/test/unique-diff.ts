@@ -346,7 +346,7 @@ export interface Refusal {
 
 export const REFUSED: Refusal[] = [
   {
-    id: "NOCASE or RTRIM on a column of a UNIQUE without the shard key (column definition)",
+    id: "NOCASE on a column of a UNIQUE without the shard key (column definition)",
     sql: /^CREATE TABLE gn\(/, message: /^unsupported: COLLATE NOCASE on column email of a UNIQUE constraint that does not include the shard key$/, stage: 2,
   },
   {
