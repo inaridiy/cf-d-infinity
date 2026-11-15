@@ -15,9 +15,9 @@ import { checkSeed, KNOWN_OPEN, REFUSED, SHAPES } from "./unique-diff";
 import { seedsOr, SimCluster } from "./sim";
 
 const OPEN = Boolean(process.env.OPEN);
-// 1 から 40 と、OR REPLACE の 2 つの欠陥 (KNOWN_OPEN の最後の 2 つ) に当たる 61、71、430。最後の試験が、伏せた欠陥に既定の seed で
-// 当たることを確かめる。
-const DEFAULTS = [...Array.from({ length: 40 }, (_v, i) => i + 1), 61, 71, 430];
+// 1 から 40 と、OR REPLACE が消す行の値を受け取る欠陥 (KNOWN_OPEN の最後) に当たる 152 と 378。最後の試験が、伏せた欠陥に既定の seed で
+// 当たることを確かめる。生成を変えると seed の台本が変わるので、ここを選び直す (2026-11-15 に OR FAIL と OR ROLLBACK を生成から外した)。
+const DEFAULTS = [...Array.from({ length: 40 }, (_v, i) => i + 1), 152, 378];
 const seeds = seedsOr(DEFAULTS);
 const listed = KNOWN_OPEN.length ? KNOWN_OPEN.map((k) => `${k.id} (${k.repro})`).join("; ") : "none";
 

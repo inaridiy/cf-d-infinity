@@ -1,7 +1,7 @@
 import type { Affinity, GlobalIndexDef, TableDef } from "../types";
 import { SqlError } from "../types";
 import { captureDdl, dropCaptureDdl, q } from "../shard/rows";
-import { affinityOf, ident, parseStatements, text, type Node } from "./cst";
+import { affinityOf, ident, parseStatements, text, walk, type Node } from "./cst";
 
 export interface IndexInfo {
   table: string;
@@ -147,8 +147,28 @@ export function assertPlainCreateTable(stmt: Node): void {
   if ((stmt.clauses ?? []).some((c: Node) => c.type === "as_clause")) unsupported("CREATE TABLE ... AS SELECT; create the table, then INSERT ... SELECT");
 }
 
+/**
+ * 衝突の処理は、文の意味である。SQLite だけが決め、D∞ は SQLite が実行した結果を捕捉して運ぶ (計画書の不変条件 14)。
+ * それを確かめきるまで、次の 2 つは形で断る (2026-11-15、UNIQUE の段 0 の差分の検査が、どちらも SQLite と違う答えを見つけた)。
+ * - 制約に書いた衝突の処理 (`UNIQUE ... ON CONFLICT REPLACE` など。既定の ABORT は書いても同じなので受け付ける)。D∞ は記録せず、
+ *   文の既定として効かせていなかった (test/open/unique-constraint-on-conflict の再現は、これで断る形になった)。
+ * - 文の `OR FAIL` と `OR ROLLBACK` (planStatement)。
+ * 文に書く衝突の処理 (OR IGNORE、OR REPLACE、REPLACE、ON CONFLICT DO) は使える。
+ */
+export function assertNoConstraintConflictAction(stmt: Node): void {
+  let found: string | undefined;
+  walk(stmt, (n) => {
+    const action = n.type === "on_conflict_clause" ? (n.resolutionKw?.name as string | undefined) : undefined;
+    if (action && action !== "ABORT") found ??= action;
+  });
+  if (found) {
+    unsupported(`ON CONFLICT ${found} on a constraint; write the conflict handling in the statement instead (INSERT OR IGNORE, INSERT OR REPLACE, or INSERT ... ON CONFLICT DO)`);
+  }
+}
+
 function createTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
   assertPlainCreateTable(stmt);
+  assertNoConstraintConflictAction(stmt);
   // TEMP の表は接続ごとのもので、シャードにも、Worker の SQLite にも置き場がない。普通の表として作ってしまうと、消えない。
   const kind = stmt.kind?.kindKw?.name;
   const schemaName = stmt.name?.type === "member_expr" ? ident(stmt.name.object).toLowerCase() : null;
@@ -442,7 +462,9 @@ export function parseDdl(source: string, schema: SchemaView): ParsedDdl {
     case "create_index_stmt": return createIndex(clean, stmt, schema);
     case "drop_table_stmt": return dropTable(clean, stmt, schema);
     case "drop_index_stmt": return dropIndex(clean, stmt, schema);
-    case "alter_table_stmt": return alterTable(clean, stmt, schema);
+    case "alter_table_stmt":
+      assertNoConstraintConflictAction(stmt);
+      return alterTable(clean, stmt, schema);
     // trigger は受け付けない。本体が他の表を読み書きするので、1 シャードでは発火できない。
     case "create_trigger_stmt": return unsupported("CREATE TRIGGER");
     case "drop_trigger_stmt": {

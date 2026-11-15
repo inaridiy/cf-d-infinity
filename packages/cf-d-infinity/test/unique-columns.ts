@@ -29,6 +29,8 @@ export interface Refusal {
 }
 
 export const REFUSALS: Refusal[] = [
+  // 制約に書いた衝突の処理は、ABORT のほかは形で断る (src/sql/ddl.ts の assertNoConstraintConflictAction。計画書の不変条件 14)。
+  { id: "ON CONFLICT other than ABORT on a constraint", message: /^unsupported: ON CONFLICT (IGNORE|REPLACE) on a constraint; / },
   { id: "COLLATE other than BINARY on a primary key column", message: /^unsupported: COLLATE \w+ on the primary key or shard key column / },
   { id: "COLLATE other than BINARY on a column of a table UNIQUE without the shard key", message: /^unsupported: COLLATE \w+ on column \S+ of a UNIQUE constraint that does not include the shard key$/ },
   { id: "COLLATE other than BINARY on a column of a UNIQUE index without the shard key", message: /^unsupported: COLLATE \w+ on column \S+ of a UNIQUE index that does not include the shard key$/ },

@@ -9,7 +9,7 @@ import { bindParams, constant, ident, render, text, walk, type Node, type Params
 import { keyString } from "../keys";
 import { returningElemSql } from "../value";
 import { SHARD_LIMITS, withinReadLimits, withinShardLimits } from "../shard-limits";
-import { assertPlainCreateTable, isInternalName } from "./ddl";
+import { assertNoConstraintConflictAction, assertPlainCreateTable, isInternalName } from "./ddl";
 import { returningClause, rewriteReturning } from "./returning";
 import { storedValue } from "./stored";
 
@@ -1036,7 +1036,19 @@ export async function planStatement(stmt: Node, input: Params, cat: Catalog, ctx
     // 文の形だけで断る CREATE TABLE (仮想表、CREATE TABLE ... AS SELECT) は、ここで断る。DDL の入口 (Db.ddl) は、開いている取引を
     // 確定してから文を解釈するので、そこまで行くと、断る文が取引を確定してしまう。断る条件と文言は ddl.ts の 1 か所にある。
     if (stmt.type === "create_table_stmt") assertPlainCreateTable(stmt);
+    if (stmt.type === "create_table_stmt" || stmt.type === "alter_table_stmt") assertNoConstraintConflictAction(stmt);
     return { kind: "ddl", sql: text(stmt) };
+  }
+  // 文の OR FAIL と OR ROLLBACK は、形で断る (ddl.ts の assertNoConstraintConflictAction の注釈。計画書の不変条件 14)。
+  // OR FAIL は、衝突した行より前の行の変更を残して文を失敗させるが、D∞ の文の原子性は文の変更を全部取り消していた。
+  // OR ROLLBACK は、DO の SQLite では DO の savepoint を壊し、内部の誤りになっていた。
+  if (stmt.type === "insert_stmt" || stmt.type === "update_stmt") {
+    const head = (stmt.clauses ?? []).find((c: Node) => c.type === "insert_clause" || c.type === "update_clause");
+    const action = head?.orAction?.actionKw?.name as string | undefined;
+    if (action === "FAIL" || action === "ROLLBACK") {
+      const verb = head.type === "insert_clause" ? "INSERT" : "UPDATE";
+      throw new SqlError(`unsupported: ${verb} OR ${action}; use OR ABORT (the default), OR IGNORE or OR REPLACE`);
+    }
   }
   switch (stmt.type) {
     case "select_stmt":

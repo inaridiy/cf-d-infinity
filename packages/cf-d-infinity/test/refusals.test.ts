@@ -31,10 +31,12 @@ const REFUSALS = [
   "sql/ddl.ts: ALTER TABLE ... RENAME COLUMN",
   "sql/ddl.ts: ALTER TABLE ... DROP COLUMN",
   "sql/ddl.ts: a UNIQUE partial or expression index that does not include the shard key",
+  "sql/ddl.ts: ON CONFLICT ${found} on a constraint",
   // 文の形で決まる
   "sql/ddl.ts: CREATE TABLE ... AS SELECT",
   "sql/ddl.ts: CREATE VIRTUAL TABLE",
   "client/db.ts: a statement that writes cannot read sqlite_master or a PRAGMA function",
+  "sql/plan.ts: ${verb} OR ${action}",
   "client/db.ts: BEGIN, COMMIT, ROLLBACK and SAVEPOINT inside a transaction object",
   "client/db.ts: a schema change inside a transaction",
   "client/db.ts: the table ${def.name} is too wide for a shard to scan",

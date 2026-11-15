@@ -7,7 +7,7 @@
 // 何を比べるか:
 // - 文ごとの答え。書き込みは変更した行の数、読みは行、誤りは文言。`unsupported:` で断った文は、REFUSED の一覧にあれば、断った形として
 //   数え、SQLite でも実行しない (test/diff.ts と同じ約束。SQLite と同じ答えを返すか、文の形と表定義で断るか)。一覧にない拒否は違いである。
-// - 表の中身。取引の外の書き込みの後 (誤りで終わったものも。OR FAIL は誤りの前の行の変更を残す)、取引の終わり、台本の終わりに、
+// - 表の中身。取引の外の書き込みの後 (誤りで終わったものも)、取引の終わり、台本の終わりに、
 //   全部の表を読んで比べる。値は typeof() と hex() と quote() で読む (NOCASE や RTRIM の表で、どの綴りの行が残ったかまで比べる。
 //   ドライバは TEXT を NUL で切るので、hex() で読む)。
 // - 断った形は、どの置き場所でも同じである。
@@ -231,7 +231,8 @@ export interface Script {
   steps: Step[];
 }
 
-const CONFLICTS = ["", "OR IGNORE ", "OR REPLACE ", "OR ABORT ", "OR FAIL ", "OR ROLLBACK "];
+// OR FAIL と OR ROLLBACK は、文の形で断る (src/sql/plan.ts。計画書の不変条件 14)。断ることは test/conflict-actions-refused.test.ts が確かめる。
+const CONFLICTS = ["", "OR IGNORE ", "OR REPLACE ", "OR ABORT "];
 
 /** 文の形。名前は、最後の数え上げに使う。 */
 export const SHAPES = [
@@ -340,11 +341,16 @@ export interface Refusal {
   /** 断ってよい文。 */
   sql: RegExp;
   message: RegExp;
-  /** 受け付けるようになる段 (docs/design-unique-keys.md の「段」)。 */
-  stage: number;
+  /** 受け付けるようになる段 (docs/design-unique-keys.md の「段」)。null は UNIQUE の段の外 (計画書の不変条件 14 の作業で受け付ける)。 */
+  stage: number | null;
 }
 
 export const REFUSED: Refusal[] = [
+  {
+    // 制約に書いた衝突の処理は、形で断る (src/sql/ddl.ts の assertNoConstraintConflictAction。計画書の不変条件 14)。
+    id: "ON CONFLICT on a UNIQUE constraint",
+    sql: /^CREATE TABLE (oc|og)\(/, message: /^unsupported: ON CONFLICT (REPLACE|IGNORE) on a constraint; /, stage: null,
+  },
   {
     id: "NOCASE on a column of a UNIQUE without the shard key (column definition)",
     sql: /^CREATE TABLE gn\(/, message: /^unsupported: COLLATE NOCASE on column email of a UNIQUE constraint that does not include the shard key$/, stage: 2,
@@ -505,42 +511,16 @@ export interface Known {
 const uniqueTable = (o: Outcome) => (o.kind === "error" ? /^UNIQUE constraint failed(?: \(unique: UNIQUE constraint failed)?: (?:index '\w+'|(\w+)\.)/.exec(o.message)?.[1] ?? null : null);
 /** 2 行以上を書き得る文 (複数行の VALUES、INSERT ... SELECT、2 行を名指しする UPDATE)。 */
 const multiRow = (step: Step) => /\), \(|\bSELECT\b|\bIN \(/.test(step.sql);
-const orFail = (step: Step) => /\bOR FAIL\b/.test(step.sql);
 
 export const KNOWN_OPEN: Known[] = [
   {
     // 1 つの文の中で、UNIQUE に当たる行や制約が 2 つ以上あると、SQLite と違うものを誤りの文言に書く。SQLite は行ごとに、後で作った
     // index から確かめる (`u INTEGER UNIQUE, ..., UNIQUE (email)` なら email が先)。D∞ は、主キーを全部の行で先に確かめ、シャードを
-    // またぐ UNIQUE は表定義の順に確かめる。文はどちらも失敗し、表の中身は同じである (OR FAIL を除く。下の OR FAIL の欠陥)。
+    // またぐ UNIQUE は表定義の順に確かめる。文はどちらも失敗し、表の中身は同じである。
     id: "the UNIQUE error names another conflict",
     repro: "test/open/unique-error-first-conflict.test.ts",
     answer: (_step, ours, sqlite) => uniqueTable(ours) !== null && uniqueTable(ours) === uniqueTable(sqlite),
     keepGoing: true,
-  },
-  {
-    // OR ROLLBACK の文は、衝突すると、SQLite の取引を丸ごと巻き戻す。シャードは文を自分の SAVEPOINT の中で実行するので、その
-    // SAVEPOINT も消え、`no such savepoint` で落ちる。取引の中では、文は SQLite と同じ誤りを返すことがあるが、取引は終わらない。
-    // SQLite では取引が終わっているので、後の COMMIT と ROLLBACK が `no transaction is active` になる。
-    id: "OR ROLLBACK",
-    repro: "test/open/or-rollback.test.ts",
-    // 伏せると、当たった置き場所の比較がそこで終わってしまう (OR ROLLBACK は 6 つの衝突の処理の 1 つで、多くの台本に出る)。既定の
-    // 実行では OR ROLLBACK の文を流さず、ほかの文を比べ続ける。
-    skip: (step) => /\bOR ROLLBACK\b/.test(step.sql),
-  },
-  {
-    // 表の制約の UNIQUE に書いた衝突の処理 (`UNIQUE (email) ON CONFLICT IGNORE`) を、DDL の解釈が記録しない。シャードをまたぐ UNIQUE
-    // (og) では、衝突の処理を書かない文が、IGNORE されずに UNIQUE の誤りになる。シャードの中の UNIQUE (oc の ON CONFLICT REPLACE) では、
-    // シャードの SQLite が REPLACE で行を消すが、D∞ の捕捉はそれを知らず、行イメージの検査 (test/setup.ts) が落ちる。行イメージの検査は
-    // 伏せられないので、既定の実行では、この 2 つの表の文を流さない。
-    id: "the ON CONFLICT clause of a UNIQUE constraint",
-    repro: "test/open/unique-constraint-on-conflict.test.ts",
-    skip: (step) => step.table === "og" || step.table === "oc",
-  },
-  {
-    // OR FAIL の複数行の文は、衝突した行の前の行の変更を残す。D∞ は文の変更を全部取り消す (OR ABORT と同じになる)。
-    id: "OR FAIL",
-    repro: "test/open/or-fail-keeps-earlier-rows.test.ts",
-    tables: (step, ours, sqlite) => orFail(step) && ours.kind === "error" && sqlite.kind === "error",
   },
   {
     // 複数行の OR REPLACE を基準経路で実行すると、文の後の行に消される行が消した行が、消えずに残る。シャードをまたぐ UNIQUE の表 (g) は
@@ -550,14 +530,14 @@ export const KNOWN_OPEN: Known[] = [
     tables: (step, ours, sqlite) => /\bOR REPLACE\b/.test(step.sql) && multiRow(step) && ours.kind === "ok" && sqlite.kind === "ok",
   },
   {
-    // ある行が UNIQUE の値を、OR REPLACE で消す行から受け取る変更の集まりを、UNIQUE の誤りで断る。部分 index の UNIQUE もある表 (p) の
-    // 文 (sim の seed 430) と、取引の COMMIT (`UNIQUE constraint failed (unique: ...)`、sim の seed 533) に出る。変更を 1 行ずつ物理の
-    // UNIQUE index に当てると、一時的な重複ができる (見立て)。
+    // ある行が UNIQUE の値を、OR REPLACE で消す行から受け取る変更の集まりを、UNIQUE の誤りで断る。シャードの中の UNIQUE の表 (p、cn、cr)
+    // の文 (sim の seed 152、378) と、取引の COMMIT (`UNIQUE constraint failed (unique: ...)`、sim の seed 533) に出る。変更を 1 行ずつ
+    // 物理の UNIQUE index に当てると、一時的な重複ができる (見立て)。2026-11-15 に表 p だけから広げた (seed 378 は cn の NOCASE の UNIQUE)。
     id: "a row that takes the UNIQUE value of a row OR REPLACE deletes is refused",
     repro: "test/open/local-unique-replace-trial.test.ts",
     answer: (step, ours, sqlite, steps) => sqlite.kind === "ok" && uniqueTable(ours) !== null &&
       [step, ...inBlock(steps, step)].some((x) => /\bOR REPLACE\b/.test(x.sql)) &&
-      ((ours.kind === "error" && /^UNIQUE constraint failed \(unique: /.test(ours.message)) || step.table === "p"),
+      ((ours.kind === "error" && /^UNIQUE constraint failed \(unique: /.test(ours.message)) || ["p", "cn", "cr"].includes(step.table ?? "")),
   },
 ];
 
@@ -601,7 +581,9 @@ export async function runPlacement(s: Script, p: Placement, o: { mask: boolean; 
           const known = REFUSED.find((x) => x.sql.test(sql) && x.message.test(ours.message));
           if (known) trace.refused[known.id] = (trace.refused[known.id] ?? 0) + 1;
           else trace.problems.push(`${p.name}: ${sql}\n  refused: ${ours.message}`);
-          if (k === 0) missing.add(/^CREATE TABLE (\w+)/.exec(sql)![1]!);
+          // 断った CREATE TABLE の表は作られない (同じ場面の 2 つ目の表でも)。その表の文は流さない。
+          const created = /^CREATE TABLE (\w+)/.exec(sql);
+          if (created) missing.add(created[1]!);
           continue;
         }
         const want = forSql(sql, ref.run(sql));
@@ -669,7 +651,7 @@ export async function runPlacement(s: Script, p: Placement, o: { mask: boolean; 
         mask(known);
         if (!known.keepGoing) return;
       }
-      // 書き込みの後と取引の終わりに、表の中身を比べる。誤りで終わった書き込みも比べる (OR FAIL は、誤りの前の行の変更を残す)。
+      // 書き込みの後と取引の終わりに、表の中身を比べる。誤りで終わった書き込みも比べる (誤りの前の行の変更が残っていないかを見る)。
       const ends = step.sql === "COMMIT" || step.sql === "ROLLBACK";
       if ((!step.inTxn && writes(step.sql)) || ends) {
         const differ = await tablesDiffer(dumps.map((d) => referenceDump(ref.db, d)));

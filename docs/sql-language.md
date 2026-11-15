@@ -66,6 +66,7 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 | 主キーの列に NULL のある行 | 断る。SQLite は INTEGER でない主キーに NULL をいくつでも入れられるが、行を主キーの値で名指しするので区別できない。`INTEGER PRIMARY KEY` に NULL を渡すと rowid が入るのは SQLite と同じである |
 | 書き込みの文の中の `sqlite_master` と PRAGMA の関数 (`pragma_table_info(...)` など) | 断る。読みの文の中なら、利用者の表定義について答える (シャードの内部の表は見えない) |
 | shard key を含まない、UNIQUE の部分 index と式の index | 断る (`unsupported:`)。シャードをまたぐ UNIQUE の index の表は、列の値だけで項目を作るからである |
+| 文の `OR FAIL` と `OR ROLLBACK` (INSERT と UPDATE)、制約に書いた `ON CONFLICT` (ABORT 以外) | 断る (`unsupported:`)。OR FAIL は衝突した行より前の行の変更を残し、OR ROLLBACK は取引を終え、制約の ON CONFLICT は文の既定の衝突の処理を変える。どれも、D∞ はまだ SQLite と同じに運べない (2026-11-15 に差分の検査が見つけた)。断るのは文の形と表定義で決まる。文に書く `OR IGNORE`、`OR REPLACE`、`REPLACE`、`ON CONFLICT DO` は使える |
 | 名前が `__dinf_` で始まる表 | 断る。D∞ が文に足す CTE の名前 (型つきの読みの `__dinf_r`) と取り違えないためである。列の名前は予約しない。`$` で始まる列名は、行イメージが列名を持たなくなったので使え、`__dinf_` で始まる列名は、文に列の別名を足さなくなったので使える (2026-11-14) |
 
 ### DO の SQLite の制限
