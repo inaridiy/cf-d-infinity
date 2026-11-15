@@ -548,6 +548,12 @@ red     $f m23_green_ro readOnlyBelowStart              # 上限のない確か�
 green   $f m23_green_bounded m23Safe
 green   $f m23_green_ro_bounded m23Safe
 green   $f m23_green_ro_bounded readOnlyBelowStart      # 上限を切れば、読むだけの取引が失敗するのは、窓 (from, 床] に確定があるときだけである
+# 推奨の組み合わせ (設計 1、段 2 の直後の親、確かめの上限)
+green   $f m23_green_rec m23Safe
+green   $f m23_green_rec_pess m23Safe
+witness $f m23_green_rec_pess witnessBelowArrival
+live    $f m23_live_rec refreshTerminates
+green   $f m23_live_rec readOnlyBelowStart
 # 設計 2 (退けた案): Worker が親と子の両方に尋ね、親は要求の epoch で確かめる
 green   $f m23_alt_green m23Safe
 green   $f m23_alt_green_ro m23Safe

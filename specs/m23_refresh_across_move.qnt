@@ -569,7 +569,7 @@ module m23_core {
   val readConsistent = not(g.badRead)
   val placementIndependent = x.st != ABORTED or g.whyChange or (WRITE and g.whyIntent)
   // 読むだけの X が失敗するのは、refresh の窓 (from, to] に、読んだ行の別の取引の確定があったときだけである。to は、子が答えられる
-  // いちばん古い時刻 (移動による ReadTooOld の refresh) なので、この確定は子も親も答えられない時刻にあり、避けられない
+  // いちばん古い時刻 (移動による ReadTooOld の refresh) なので、範囲の床の規則の下では、この確定は避けられない
   val readOnlyBelowStart = WRITE or x.st != ABORTED or g.whyBelow
   val boundedRefusals = g.refusals <= 1
   val parentFrozen = not(g.frozenBroken)
@@ -857,6 +857,23 @@ module m23_green_fenced {
         .then(xAnswer(K2, false, C)).then(xAnswer(K2, true, C))
         .then(xPrepareC).then(xPrepareP).then(xApply)
         .expect(x.st == COMMITTED and m23Safe)
+}
+
+// 推奨の組み合わせ: 設計 1、いまの親 (FENCE_REFUSES)、確かめの上限 (BOUNDED)。楽観と悲観の取引、活性
+module m23_green_rec {
+  import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = true, FENCE_REFUSES = true,
+                  SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
+}
+module m23_green_rec_pess {
+  import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = true, FENCE_REFUSES = true,
+                  SCAN2 = false, WRITE = true, PESSIMISTIC = true, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
+}
+module m23_live_rec {
+  import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = true, FENCE_REFUSES = true,
+                  SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = true, HAS_W = false, HAS_Y = true, TICKS = 0, T_MAX = 3).*
 }
 
 // 確かめの上限を to で切る案 (BOUNDED)。書く取引と、読むだけの取引

@@ -1163,6 +1163,7 @@ Worker は、それで T を進める refresh を始める。
 この設計を段 2 の直後に入れると、親はまだ前者なので、両方を確かめた。
 `BOUNDED` は、refresh の確かめが (from, to] の変更だけを見る案である (今の `changedSince` は to より後も数える)。
 この案では、移動による `ReadTooOld` の refresh が通らなければ取引は失敗し、ほかの refresh が通らなくても、後の refresh を止めない。
+推奨は、設計 1 に、今のコードの親 (`FENCE_REFUSES`) と `BOUNDED` を合わせた形で、`m23_green_rec`、`m23_green_rec_pess`、`m23_live_rec` が確かめる。
 
 `m23Safe` は次の 5 つである。
 
@@ -1173,7 +1174,7 @@ Worker は、それで T を進める refresh を始める。
 - `parentFrozen`: 親の K2 の記録は、pull の後は変わらない。設計 1 で、子が親に尋ねる手を、子が答える手と同じ 1 手にしてある理由である。
 
 `answersSafe` は `serializable` と `readConsistent` で、今の実装が、断るだけで答えを誤らないことを確かめる。
-`readOnlyBelowStart` は、読むだけの X が失敗するのは、refresh の窓 (読んだ時刻, to] に、読んだ行の別の取引の確定があったときだけである、という性質である。移動による refresh の to は、子が答えられるいちばん古い時刻 (到着の m か床) なので、この確定は避けられない。`BOUNDED` の案を比べるのに使う。
+`readOnlyBelowStart` は、読むだけの X が失敗するのは、refresh の窓 (読んだ時刻, to] に、読んだ行の別の取引の確定があったときだけである、という性質である。移動による refresh の to は、子が答えられるいちばん古い時刻 (到着の m か床) なので、範囲の床の規則の下では、この確定は避けられない。`BOUNDED` の案を比べるのに使う。
 時相の性質 `refreshTerminates` は、始めた refresh がいつか終わること (通るか、競合で終わる) である。
 公平性は、確かめの手 (親と子の答えと断り)、`pull`、`recv`、Y の phase 2 に、弱い公平性を置いた。
 
@@ -1215,6 +1216,9 @@ Worker は、それで T を進める refresh を始める。
 | `m23_green_bounded` | `m23Safe` | `m23_green` で、確かめの上限を to で切る (`BOUNDED`) | 10,499,956 | 30 | No violation |
 | `m23_green_ro_bounded` | `m23Safe` / `readOnlyBelowStart` | `m23_green_ro` で `BOUNDED` | 7,792,045 | 29 | No violation |
 | `m23_green_ro` | `readOnlyBelowStart` | 上限のない確かめ | 239,191 で反例 | 12 | 反例 (W が床より後の c で確定し、読むだけの X が失敗する) |
+| `m23_green_rec` | `m23Safe` | 推奨の組み合わせ。`m23_green` で `FENCE_REFUSES` と `BOUNDED` | 10,642,708 | 30 | No violation |
+| `m23_green_rec_pess` | `m23Safe` | 同上で、全表を 1 回読み、K2 を悲観で書く | 3,884,852 | 27 | No violation |
+| `m23_live_rec` | `refreshTerminates` (時相) / `readOnlyBelowStart` | `m23_live` で `FENCE_REFUSES` と `BOUNDED` | 60,014 | 22 | No violation |
 | `m23_alt_green` | `m23Safe` | 設計 2。`m23_green` と同じ形 | 8,066,377 | 33 | No violation |
 | `m23_alt_green_ro` / `m23_alt_green_pess` | `m23Safe` | 設計 2。読むだけ / 悲観 | 5,968,248 / 3,534,389 | 32 / 29 | No violation |
 | `m23_impl_pinned` | `answersSafe` | 設計 0、範囲表を取り直さない、`FENCE_REFUSES` | 3,936,872 | 25 | No violation |
@@ -1241,7 +1245,7 @@ Worker は、それで T を進める refresh を始める。
 状態数は、4 workers、heap 2.5 GB で、ほかの TLC の検査と同時に流して測った。
 green は 1 本 1 分から 3 分、赤は 15 秒から 1 分である。
 赤の状態数は、TLC が反例を見つけるまでに数えた数である。
-2026-11-15 に、`check.sh` の M23 の節を `HEAVY=1` で流し、60 件 (TLC の検査 42 件と run の試験 18 件) がすべて期待どおりだった。
+2026-11-15 に、`check.sh` の M23 の節を `HEAVY=1` で流し、60 件 (TLC の検査 42 件と run の試験 18 件) がすべて期待どおりだった。その後で足した推奨の組み合わせの 5 件 (`m23_green_rec`、`m23_green_rec_pess` と、その `witnessBelowArrival`、`m23_live_rec` の 2 件) は、1 本ずつ流して期待どおりだった。節の全体は、ほかの TLC の検査と同時に流して、`HEAVY=1` で 45 分ほど、なしで 40 分ほどかかる。
 
 witness は 7 つ (9 本) で、どれも到達した。
 
