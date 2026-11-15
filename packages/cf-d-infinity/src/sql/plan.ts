@@ -2,7 +2,7 @@
 // 1 シャードに収まる文はそのシャードの SQLite へ、それ以外は行を集めて Worker の SQLite へ渡す。
 import type { Catalog } from "../meta";
 import { ownerOf } from "../routing";
-import { encode, imageColumns, q, scanList } from "../shard/rows";
+import { encode, imageColumns, predicateRowSql, q, scanList } from "../shard/rows";
 import type { GlobalIndexDef, TableDef, Value, WritePlan } from "../types";
 import { SqlError, utf8Length } from "../types";
 import { bindParams, constant, ident, render, text, walk, type Node, type Params } from "./cst";
@@ -41,8 +41,14 @@ export interface Scan {
 /** 表を読む走査の結果の列名 (scanList の並び)。 */
 export const scanColumns = (def: TableDef): string[] => imageColumns(def);
 
-/** 走査が、シャードが実行する形 (型つきの読み) で DO の SQLite の上限に収まるか。 */
-export const scanFits = (s: Pick<Scan, "sql" | "params" | "columns">): boolean => withinReadLimits(s.sql, s.params, s.columns.length);
+/**
+ * 走査が、シャードが実行する形 (型つきの読み) で DO の SQLite の上限に収まるか。押し下げた条件は、取引の検証で、シャードが
+ * 行イメージを判定する文 (src/shard/rows.ts の predicateRowSql) にも入るので、その文も収まらなければならない。収まらないと、
+ * シャードは判定できず、関係のない変更でも競合にする。
+ */
+export const scanFits = (s: Pick<Scan, "sql" | "params" | "columns" | "where" | "table">): boolean =>
+  withinReadLimits(s.sql, s.params, s.columns.length)
+  && (!s.where || withinShardLimits(predicateRowSql(s.table, s.where.alias, s.where.sql), [...s.where.params, ...s.table.pk.map(() => 0n)]));
 
 export interface WriteTarget {
   route: Route;

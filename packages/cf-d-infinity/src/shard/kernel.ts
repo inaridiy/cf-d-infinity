@@ -25,7 +25,7 @@ import { keyString } from "../keys";
 import { type Runtime, systemRuntime } from "../runtime";
 import { attempt, done, tail, unwrap, wait, type Effect, type Fork, type Outcome, type PeerCall, type Program, type Step } from "./step";
 import {
-  CAPTURE_TABLES, applyChanges, asSqlError, capturedChanges, checkAfter, decode, deleteRow, encode, imageSql, insertRow, keyWhere, pkValues, q,
+  CAPTURE_TABLES, applyChanges, asSqlError, capturedChanges, checkAfter, decode, deleteRow, encode, imageSql, insertRow, pkValues, predicateRowSql, q,
   queryAll, returnedRows, rowwiseRestore, selectGroup, selectRow, setBasedRestore, tupleKey,
 } from "./rows";
 import { decodeElem, decodeReturned, decodeTuple, parseTuple, selectElemSql, tupleSql, typedReadSql, type Tuple } from "../value";
@@ -139,6 +139,9 @@ function declares(s: Span, c: Pick<Change, "table" | "pk" | "sk">): boolean {
   const token = tokenOf(c.sk, c.pk);
   return s.claim.some((x) => token >= x.start && token < x.end);
 }
+/** 型つきの読みに包んだ文。同じ形の読みが何度も届くので、文ごとに覚える (ShardKernel.executed)。 */
+const wrappedReads = new Map<string, string>();
+
 /**
  * 値のおおよその大きさ (バイト)。上限の判定に使うだけで、正確である必要はない。値に戻した後で数える (INTEGER と REAL は 8 バイト)。
  * 型つきの読みの印 (`i`、`t`) は数えないので、段 2 までと同じ数になり、集める予算の配り方は変わらない。
@@ -1381,10 +1384,8 @@ export class ShardKernel {
       return this.rollback(() => {
         deleteRow(this.b, def, pk);
         insertRow(this.b, def, row);
-        const key = keyWhere(def.pk, `${q(s.alias)}.`);
         // 利用者の表に触る文なので、query で読む。結果に INTEGER を返さない (query は INTEGER をドライバの数で読む文を受けない)。
-        const sql = `SELECT NULL FROM ${q(def.name)} AS ${q(s.alias)} WHERE (${s.where}) AND ${key} LIMIT 1`;
-        return queryAll(this.b, sql, [...s.params, ...pkValues(pk)]).length > 0;
+        return queryAll(this.b, predicateRowSql(def, s.alias, s.where), [...s.params, ...pkValues(pk)]).length > 0;
       });
     } catch {
       return true;
@@ -1618,7 +1619,15 @@ export class ShardKernel {
   private executed(req: Pick<ExecReq, "sql" | "columns" | "write">): string {
     if (req.write) return req.sql;
     if (req.columns.length === 0) throw new SqlError("a read must name its result columns (protocol 5); please report this");
-    return typedReadSql(req.sql, req.columns.length, selectElemSql, !this.faults.unfencedRead);
+    const fenced = !this.faults.unfencedRead;
+    const key = `${req.columns.length}\0${fenced}\0${req.sql}`;
+    let hit = wrappedReads.get(key);
+    if (hit === undefined) {
+      hit = typedReadSql(req.sql, req.columns.length, selectElemSql, fenced);
+      if (wrappedReads.size >= 512) wrappedReads.delete(wrappedReads.keys().next().value!);
+      wrappedReads.set(key, hit);
+    }
+    return hit;
   }
 
   /** 読み取りの文を実行し、上限を超えた時点で打ち切る。全行を集めてから数えると、数える前にメモリが尽きる。 */

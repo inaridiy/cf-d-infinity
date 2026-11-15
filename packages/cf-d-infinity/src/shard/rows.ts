@@ -46,6 +46,19 @@ export function joinTerms(terms: string[], op: "AND" | "OR"): string {
 
 /** 主キーの列が、束縛した値と等しい条件。prefix は列の修飾である (`"t".`)。 */
 export const keyWhere = (cols: string[], prefix = "") => joinTerms(cols.map((c) => `${prefix}${q(c)} IS ?`), "AND");
+
+/**
+ * UNIQUE の列が、束縛した値と等しい条件 (書き込みが UNIQUE の検査で読む行の範囲。src/client/spans.ts)。`=` は列の照合順序で比べる。
+ * 列が多いと、つないだ条件の深さが列の数だけ増えるので、釣り合った木に組む (joinTerms)。
+ */
+export const uniqueWhere = (table: string, cols: string[]) => joinTerms(cols.map((c) => `${q(table)}.${q(c)} = ?`), "AND");
+
+/**
+ * 行イメージが条件の範囲 (pred の span) を満たすかを、本物の表で判定する文 (ShardKernel.rowMatches)。主キーで 1 行に絞る。
+ * 条件と主キーの条件の深さを足した深さになるので、プランナは走査の条件をこの形でも上限に収める (src/sql/plan.ts の scanFits)。
+ */
+export const predicateRowSql = (def: Pick<TableDef, "name" | "pk">, alias: string, where: string): string =>
+  `SELECT NULL FROM ${q(def.name)} AS ${q(alias)} WHERE (${where}) AND ${keyWhere(def.pk, `${q(alias)}.`)} LIMIT 1`;
 const pkWhere = (def: TableDef) => keyWhere(def.pk);
 /** 主キーのキー文字列を、束縛する値に戻す (src/keys.ts の keyValues)。 */
 export const pkValues = (pkJson: string): Value[] => keyValues(pkJson);
@@ -203,6 +216,8 @@ export function imageStatements(def: TableDef): { sql: string; params: Value[] }
     { sql: selectRowSql(def), params: zeros(def.pk.length) },
     { sql: selectGroupSql(def), params: zeros(def.shardKey.length) },
     { sql: insertRowSql(def, imageColumns(def)), params: zeros(imageColumns(def).length) },
+    // 書き込みが UNIQUE の検査で読む行の範囲を、行イメージで判定する文 (src/client/spans.ts の規則 3、ShardKernel.rowMatches)。
+    ...def.uniques.map((cols) => ({ sql: predicateRowSql(def, def.name, uniqueWhere(def.name, cols)), params: zeros(cols.length + def.pk.length) })),
   ];
 }
 

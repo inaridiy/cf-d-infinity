@@ -1,4 +1,4 @@
-import { compoundTerms } from "../src/shard-limits";
+import { compoundTerms, depthOf, SHARD_LIMITS } from "../src/shard-limits";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Db, type ClientFaults, type Cluster } from "../src/client/db";
@@ -29,6 +29,16 @@ export const DO_MAX_VALUE_BYTES = 2_000_000;
 export const DO_MAX_RESULT_COLUMNS = 100;
 function checkDoColumns(count: number): void {
   if (count > DO_MAX_RESULT_COLUMNS) throw new Error("too many columns in result set: SQLITE_ERROR");
+}
+/**
+ * DO の SQLite は、式の木の深さを 100 までに制限している (test/workerd-limits.test.ts)。node:sqlite は 1,000 まで受け付けるので、
+ * ここで模す (段 3 で足した。計画書の未解決の問題 39)。深さは、シャードが文を測るのと同じ見積もり (src/sql/depth.ts) で数える。
+ * 見積もりは SQLite の数え方より小さくならないので、ここで断る文は、DO でも断られ得る。シャードの入口 (src/shard-limits.ts) と
+ * プランナは同じ見積もりで文を上限に収めるので、ここに当たるのは、確かめを通らずにシャードが実行した文だけである。
+ */
+function checkDoDepth(sql: string): void {
+  const depth = depthOf(sql);
+  if (depth > SHARD_LIMITS.exprDepth) throw new Error(`Expression tree is too large (maximum depth ${SHARD_LIMITS.exprDepth}; this statement is estimated at ${depth}): SQLITE_ERROR`);
 }
 function checkDoLimits(sql: string, params: Value[] = []): void {
   // 本物の DO は複合 SELECT の項を数える。シャードの側の確かめ (src/shard-limits.ts) と同じ数え方にする。引用符の中の識別子まで
@@ -221,6 +231,7 @@ export class SqliteBackend implements Backend {
     // DO の SQLite は BigInt を束縛できない。束縛の書き換え (bindTyped) が、いつも数か文字列にする。
     for (const p of b.params) if (typeof p === "bigint") throw new TypeError("a BigInt reached the driver; the DO SQLite cannot bind it");
     checkDoLimits(b.sql, b.params);
+    checkDoDepth(b.sql);
     const st = this.db.prepare(b.sql);
     const p = b.params as never[];
     const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
