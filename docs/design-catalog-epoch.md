@@ -710,19 +710,19 @@ meta の呼び出しは RPC の列に出ないので、`ddlSince` から `epochs
 | 欠陥 | 段 | replay | history | ddl-concurrent |
 |---|---|---|---|---|
 | (なし) | 前 (`44306cf`) | 0/120 | 0/240 | 0/520 |
-| (なし) | 後 (`b3ec805`) | 0/120 | 0/240 | 0/520 |
+| (なし) | 後 (`04a0c9e`) | 0/120 | 0/240 | 0/520 |
 | `noSchemaRecheck` | 前 | 0/120 | 0/240 | 37/520 |
-| `noSchemaRecheck` | 後 | 0/120 | 0/240 | 38/520 |
+| `noSchemaRecheck` | 後 | 0/120 | 0/240 | 39/520 |
 | `ignoreFence` | 前 | 0/120 | 82/240 | 80/520 |
 | `ignoreFence` | 後 | 0/120 | 82/240 | 80/520 |
 | `staleWideRead` | 前 | 0/120 | 0/240 | 16/520 |
-| `staleWideRead` | 後 | 0/120 | 0/240 | 17/520 |
+| `staleWideRead` | 後 | 0/120 | 0/240 | 16/520 |
 | `childKeepsOldSchema` | 前 | 0/120 | 0/240 | 0/520 |
 | `childKeepsOldSchema` | 後 | 0/120 | 0/240 | 0/520 |
 
 `noSchemaRecheck` と `staleWideRead` の ddl-concurrent は、落ちる seed の顔ぶれが少し変わった (同じ seed でも、計画し直しと追いつきで実行が変わる)。
 `childKeepsOldSchema` は、前も後も、乱択の検査では見つからない (`docs/model-coverage.md` の「Switches that match no red module」のとおり)。
-表を取ったのは `b3ec805` で、その後の `bce136d` は、計画し直した試みが最初の計画へ戻らないことと、取引自身の書き込みが動いたときに範囲表を取り替えないことを足した。
+途中の `b3ec805` (計画し直した試みが最初の計画へ戻らないことと、取引自身の書き込みが動いたときに範囲表を取り替えないことを足す前) でも取り、`noSchemaRecheck` が 38、`staleWideRead` が 17 で、ほかは同じだった。
 
 置き場所の差分の検査の「台本の途中で 1 回分割する」置き場所で、分割の後の取引の文と `COMMIT` の結果を、seed 1 から 300 で数えた (3 つの実行の形)。
 取引の出し方は、`Db.begin()` (表の object)、SQL の `BEGIN` (sql)、Hrana の baton (baton) である。
