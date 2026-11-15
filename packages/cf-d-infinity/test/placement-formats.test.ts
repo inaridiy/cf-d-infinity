@@ -81,7 +81,7 @@ describe("Meta", () => {
 
   it("identifies a split by the token range it moves", async () => {
     const c = new SimCluster({ shards: 1 });
-    const { version } = await c.catalog();
+    const { version, schema } = await c.catalog();
     const range = { start: REGION_TOKENS / 2, end: REGION_TOKENS };
     const slot = await c.beginSplit({ parent: "s0", child: "s1", ...range }, version);
     expect(slot).toEqual({ id: `split:s0:s1:${range.start}:${range.end}`, parent: "s0", child: "s1", ...range, version, started: false, until: slot.until });
@@ -92,7 +92,7 @@ describe("Meta", () => {
     const part = await c.beginSplit({ parent: "s0", child: "s2", ...cut }, version);
     expect(part.id).toBe(`split:s0:s2:${cut.start}:${cut.end}`);
     expect(await outcome(c.meta.startSplit(part.id, { parent: "s0", child: "s2", start: cut.start, end: cut.end + 1 }))).toMatch(/no such split slot/);
-    expect(await c.meta.startSplit(part.id, { parent: "s0", child: "s2", ...cut })).toEqual({ version });
+    expect(await c.meta.startSplit(part.id, { parent: "s0", child: "s2", ...cut })).toEqual({ version, schema });
     expect(await outcome(c.meta.checkSplit(part.id, { parent: "s0", child: "s2", start: cut.start, end: cut.end + 1 }))).toMatch(/split slot is not held/);
     expect(await outcome(c.meta.checkSplit(part.id, { parent: "s0", child: "s2", ...cut }))).toBe("ok");
     expect(await outcome(c.beginSplit({ parent: "s0", child: "s3", start: 5, end: 5 }, version))).toMatch(/invalid token range/);
@@ -198,7 +198,7 @@ describe("a shard", () => {
     expect(await outcome(c.shard("s0").pull({ start: range.start, end: range.end - SUBSLOTS, want: [{ g, from: null }], to: "s2", maxBytes: 1_000_000 }))).toMatch(/unfenced/);
     const [piece] = await c.shard("s0").pull({ ...range, want: [{ g, from: null }], to: "s2", maxBytes: 1_000_000 });
     expect({ ...piece, m: 0, rows: piece!.rows.length, intents: piece!.intents.length }).toEqual({
-      g, range, after: null, upTo: null, m: 0, rows: 1, intents: 0, schema: (await c.catalog()).version,
+      g, range, after: null, upTo: null, m: 0, rows: 1, intents: 0, schema: (await c.catalog()).schema,
     });
     // グループの一部だけの piece を受け取ると、届いていない行のあるグループを「到着した」と記録してしまう。
     const receive = (p: PiecePayload) => (c.cores.get("s2") as unknown as { receive(p: PiecePayload[]): Promise<void> }).receive([p]);

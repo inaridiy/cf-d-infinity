@@ -1,6 +1,6 @@
 # 保存と通信の形式
 
-状態：Early 版で固める形式の一覧 (2026-11-12)。2026-11-14 に、行の置き場所を token の区間にした ([design-subslots.md](./design-subslots.md))。同じ日に、行イメージをタプルにし、キー文字列の数の書き方を決めた ([design-values.md](./design-values.md) の段 2。保存の形式の版 2、通信の版 4)。値の JS の型を格納の型にし、シャードの結果を型つきで読むようにした (同じ設計書の段 3。通信の版 5。保存の形式は変わらない)。2026-11-15 に、エクスポートの行を要素のタプルにし、形式の版を file と CLI とのあいだの JSON に持たせた (同じ設計書の段 4。エクスポートの形式の版 1)。2026-11-15 に、Meta の表定義の版と範囲表を、epoch の列 1 本にした ([design-catalog-epoch.md](./design-catalog-epoch.md) の段 1。保存の形式の版 3。シャードの形式は変わらない)
+状態：Early 版で固める形式の一覧 (2026-11-12)。2026-11-14 に、行の置き場所を token の区間にした ([design-subslots.md](./design-subslots.md))。同じ日に、行イメージをタプルにし、キー文字列の数の書き方を決めた ([design-values.md](./design-values.md) の段 2。保存の形式の版 2、通信の版 4)。値の JS の型を格納の型にし、シャードの結果を型つきで読むようにした (同じ設計書の段 3。通信の版 5。保存の形式は変わらない)。2026-11-15 に、エクスポートの行を要素のタプルにし、形式の版を file と CLI とのあいだの JSON に持たせた (同じ設計書の段 4。エクスポートの形式の版 1)。2026-11-15 に、Meta の表定義の版と範囲表を、epoch の列 1 本にした ([design-catalog-epoch.md](./design-catalog-epoch.md) の段 1。保存の形式の版 3。シャードの形式は変わらない)。同じ日に、シャードの `__ddl` を Meta の列の写し `__epoch` にし、要求が epoch と表定義の epoch を運ぶようにした (同じ設計書の段 2。保存の形式の版 4、通信の版 6)
 
 D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker と Durable Object のあいだを RPC でつなぐ。
 公開した後に新しい版を置くと、古い版が書いたデータを新しい版が開き、古い版と新しい版の Worker と Durable Object がしばらく混ざって動く。
@@ -31,7 +31,7 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 | 利用者の表 | 利用者が書いた表定義 | 固定 (利用者の形式) |
 | `__gidx_<index>(k, pk, sk)` | シャードをまたぐ UNIQUE の index。`k` は値のキー文字列 | 固定。中身は index を作り直せば戻るが、作り直す手順は Early 版にない |
 | `__meta(k, v)` | `format` (保存の形式の版)、`epoch`、`ceiling`、`flushed`、`log_low_water`、`ddl_floor`、`log_gens` (変更ログの世代の JSON の配列) | 固定 |
-| `__ddl(version, entry)` | Meta から受け取った表定義の版。`entry` は `DdlEntry` の JSON (`TableDef` を含む) | 固定 |
+| `__epoch(epoch, rec)` | Meta の epoch の列 (Meta の `__epoch`) のうち、このシャードが適用した分の写し。epoch 0 (最初の範囲表) から隙間なく続き、行は Meta の行と同じ記録の JSON である。シャードは、表定義と、所有を引く範囲表を、これを畳んで作る (`src/catalog.ts` の `fold`)。表定義の記録は、文を実行してから足す。範囲の記録 (`move-start`、`move-end`) は、新しい epoch の要求が、自分のスナップショットでは自分のものでない行に触ったときに足す | 固定 |
 | `__log_g<世代>(commit_ts, txn, blob)` | 確定した取引の変更ログ。`blob` は `Change[]` の JSON。世代は物理時刻で分ける | 固定 |
 | `__intents(tbl, pk, sk, txn, anchor, prepare_ts, change)` | 2 相の確定の途中の書き込み。`change` は `Change` の JSON | 固定 |
 | `__txn(txn, status, c, participants, done, at)` | anchor が持つ取引の決着 | 固定 |
@@ -65,7 +65,7 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 
 | 形式 | 中身 | 区分 |
 |---|---|---|
-| Worker と Durable Object の RPC | 要求と応答の object (`ShardApi`、`src/types.ts`)。要求は版を運ぶ。版 3 から、範囲は token の区間で、読む範囲は `claim` (区間の組) を、範囲の移動は piece (`Piece`、`PieceWant`、`PiecePayload`) を運ぶ。版 4 から、行イメージ (`Change` の `before` と `after`、`PiecePayload` の `rows`、取引が溜める変更) はタプルである。版 5 から、値は `bigint` を含む `Value` (structured clone が運ぶ) で、読みの要求は結果の列名 (`ExecReq.columns`) を運ぶ。シャードは読みを型つきの読みに包み (`src/value.ts` の `typedReadSql`)、型のある値を返す。利用者の RETURNING は Worker が要素の式に書き換えて送る | 版で守る (`PROTOCOL_VERSION` = 5。版 4 以前は受け付けない) |
+| Worker と Durable Object の RPC | 要求と応答の object (`ShardApi`、`src/types.ts`)。要求は版を運ぶ。版 3 から、範囲は token の区間で、読む範囲は `claim` (区間の組) を、範囲の移動は piece (`Piece`、`PieceWant`、`PiecePayload`) を運ぶ。版 4 から、行イメージ (`Change` の `before` と `after`、`PiecePayload` の `rows`、取引が溜める変更) はタプルである。版 5 から、値は `bigint` を含む `Value` (structured clone が運ぶ) で、読みの要求は結果の列名 (`ExecReq.columns`) を運ぶ。シャードは読みを型つきの読みに包み (`src/value.ts` の `typedReadSql`)、型のある値を返す。利用者の RETURNING は Worker が要素の式に書き換えて送る 版 6 から、要求 (`ExecReq`、`PrepareReq`、`CommitReq`) は、Worker のスナップショットの epoch (`epoch`) と、表定義が最後に変わった epoch (`schema`) を運ぶ。`schema` の数は `DdlEntry.version` ではなく epoch である。`syncSchema` は `{ schema }` を受ける | 版で守る (`PROTOCOL_VERSION` = 6。版 5 以前は受け付けない) |
 | Hrana の baton | 開いている取引の書き出し (`Db.dump`) を JSON にして署名したもの | 作り直せる。読めない baton は `BATON_INVALID` で断り、クライアントは取引をやり直す |
 | 読みの session token | `Ts` の数 | 固定 |
 | エクスポートの file | 1 行目が形式の版の注釈 `-- cf-d-infinity export format 1` で、続く注釈の行の後に、表定義の文 (利用者が実行した文面) と、1 行に 1 文の `INSERT INTO "表"("列", ...) VALUES (...), ...;` が並ぶ。値は SQLite がその literal を読むと同じ型の同じ値になる形で書く (`bin/dump.js` の `literal`)。INTEGER は 10 進の数字 (64 ビットの端まで)、REAL は小数点か指数を付けた表記 (無限大は `9.0e+999`)、TEXT は `'...'` で、改行 (`\n`、`\r`) と NUL は `' \|\| char(n) \|\| '` の連結、BLOB は `X'大文字の 16 進'`、NULL は `NULL`。取り込み (`npx cf-d-infinity import`) は、何かを実行する前に版の行を確かめ、版の行がない file と、ほかの版の file を断る (最初の公開の前は後方互換を持たない) | 固定 (利用者の形式。版は `bin/dump.js` の `EXPORT_FORMAT`) |

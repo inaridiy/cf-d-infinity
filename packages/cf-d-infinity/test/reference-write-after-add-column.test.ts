@@ -1,17 +1,18 @@
-// 未解決: 計画した後に ADD COLUMN が入ると、基準経路の書き込みが、足された列の値を既定値で上書きする。
+// 計画した後に ADD COLUMN が入っても、基準経路の書き込みは、足された列の確定した値を残す (計画書の未解決の問題 38。Epoch の段 2 で
+// 直した。docs/design-catalog-epoch.md の「段 2 の結果」)。
 //
-// Db.transaction は、やり直すたびに表定義を取り直すが、文の計画 (Plan) は最初のものを使い続ける。基準経路の書き込み
+// 段 2 より前は、Db.transaction がやり直すたびに表定義を取り直すのに、文の計画 (Plan) は最初のものを使い続けた。基準経路の書き込み
 // (Txn.wasmWrite) は、Worker の SQLite を新しい表定義 (取引の catalog) で作り、行を集める走査は計画の表定義の列だけを読む
-// (src/sql/plan.ts の scanList)。足された列は集めた行に入らないので、Worker の SQLite では既定値になる。文がその列に触らなくても、
-// 捕捉した変更後の行は既定値を持ち、シャードの確定した値を上書きする。
-// 段 1 までは、変更後の行を Worker の SQLite の本体から読み直していたので、同じく既定値を書いた。段 2 のタプルの捕捉も同じである
-// (trigger は取引の catalog で作る。src/client/db.ts の wasmWrite)。値の作り直しの段 2 で、行イメージの検査を基準経路だけの実行の
+// (src/sql/plan.ts の scanList)。足された列は集めた行に入らないので、Worker の SQLite では既定値になり、捕捉した変更後の行が、
+// シャードの確定した値を既定値で上書きした。値の作り直しの段 2 で、行イメージの検査を基準経路だけの実行の
 // test/ddl-concurrent.test.ts に掛けたときに、計画と取引の表定義の食い違いとして見つけた (2026-11-14)。
+// いまは、やり直す試みのスナップショットの表定義の epoch が、計画したものと違えば、計画を捨てて、その試みの表定義で文を計画し直す
+// (Db.dispatch)。
 //
 // 正しい振る舞い: 文が触らない列の値は、確定した値のまま残る。
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { SimCluster } from "../sim";
+import { Db } from "../src/client/db";
+import { SimCluster } from "./sim";
 
 describe("a reference-path write planned before an ADD COLUMN", () => {
   it("keeps the value of the added column that the statement does not touch", async () => {

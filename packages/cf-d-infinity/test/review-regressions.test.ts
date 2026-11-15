@@ -187,9 +187,10 @@ describe("a schema change while a committed transaction is waiting to be applied
 });
 
 describe("a connection whose range table is from before a split", () => {
-  // 取引の中の文はやり直さないので、古い範囲表のまま「not owner」を返す。そのとき範囲表を捨てておかないと、
-  // 利用者が取引をやり直しても、同じ接続では同じ誤りが続く。
-  it("drops it when a statement inside a transaction fails, so retrying the transaction works", async () => {
+  // 取引の中の文が、古い範囲表のまま「not owner」で断られたら、範囲表を捨てて取り直さないと、利用者が取引をやり直しても、
+  // 同じ接続では同じ誤りが続く。段 2 (docs/design-catalog-epoch.md) から、取引は表定義が同じなら範囲表を取り替えて、文を
+  // 新しい持ち主で計画し直す (Txn.reroute)。取り直した範囲表は、接続にも残る。
+  it("sends the statement inside a transaction to the new owner, and keeps the new range table for the next transaction", async () => {
     const c = new SimCluster({ shards: 2 });
     await c.client().ddl(USERS);
     for (let t = 1; t <= 40; t++) await new Db(c).query("INSERT INTO users(tenant_id,id,n) VALUES (?,1,?)", [t, t]);
@@ -200,13 +201,17 @@ describe("a connection whose range table is from before a split", () => {
     let moved = 1;
     while (ownerOf(routing, JSON.stringify([moved])) !== "s2") moved++;
 
-    await db.query("BEGIN");
-    await expect(db.query("SELECT n FROM users WHERE tenant_id = ?", [moved])).rejects.toThrow(/not owner/);
-    if (db.inTransaction) await db.query("ROLLBACK");
-
+    const from = c.net.failed.length;
     await db.query("BEGIN");
     expect((await db.query("SELECT n FROM users WHERE tenant_id = ?", [moved])).rows).toEqual([{ n: moved }]);
     await db.query("COMMIT");
+    expect(c.net.failed.slice(from).map((x) => `${x.m.to} ${x.message}`)).toEqual(["s0 not owner: s2"]);
+
+    const again = c.net.failed.length;
+    await db.query("BEGIN");
+    expect((await db.query("SELECT n FROM users WHERE tenant_id = ?", [moved])).rows).toEqual([{ n: moved }]);
+    await db.query("COMMIT");
+    expect(c.net.failed.slice(again)).toEqual([]);
   });
 });
 

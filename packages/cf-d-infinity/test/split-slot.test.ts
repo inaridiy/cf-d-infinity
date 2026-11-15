@@ -103,7 +103,7 @@ describe("a split takes its slot only after every shard applied the latest versi
     await db.query("INSERT INTO p VALUES (?, 1, 'z', 1), (?, 2, 'z', 1)", [bad, bad]);
     const before = (await c.catalog()).version;
     // DDL を記録した側は、全シャードに適用させる前に止まった (記録の直後)。
-    await c.applyDdl("CREATE UNIQUE INDEX ux ON p(tenant_id, code) WHERE gone IS NOT NULL", before);
+    const failing = (await c.applyDdl("CREATE UNIQUE INDEX ux ON p(tenant_id, code) WHERE gone IS NOT NULL", before)).schema;
     // 分割は、親が fence して範囲表を切り替えた後、子が範囲を運び終えるところで止める。
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
@@ -127,7 +127,7 @@ describe("a split takes its slot only after every shard applied the latest versi
     // 分割の版。取り消しより後の版なら、取り消しは枠より前に入った。
     const slot = (await c.splits())[0];
     // s1 が最新の版を適用し、失敗して取り消しを記録する (直したコードでは、もう済んでいる)。
-    await outcome(c.shard("s1").syncSchema({ version: before + 1 }));
+    await outcome(c.shard("s1").syncSchema({ schema: failing }));
     const cat = await c.catalog();
     // 取り消しの版で計画した読み。親に残る行と、子へ移る行。
     const read = (t: number) => outcome(new Db(c, { retries: 2 }).query("SELECT code FROM p WHERE tenant_id = ? AND id = 1", [t]));
@@ -169,13 +169,14 @@ describe("a child that starts receiving after the split slot lapsed (m15_red_lat
     const begun = await c.shard("s1").beginIncoming({ ...range, from: "s0", slot: slot.id }).then((r) => r, (e: Error) => e);
     const started = begun instanceof Error ? begun.message : "ok";
     // DDL を記録した後、その版が親へ届くのを止める。その間に、分割を進める側の fence が親に届く。
-    const next = (await c.catalog()).version + 1;
+    // 段 2 から syncSchema は表定義の epoch を運ぶ。範囲表は切り替えていないので、次の記録の epoch は、いまの epoch に 1 を足したもの。
+    const next = (await c.catalog()).epoch + 1;
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     let reached!: () => void;
     const hit = new Promise<void>((r) => (reached = r));
     c.net.gate = (m) => {
-      if (m.method !== "syncSchema" || m.to !== "s0" || (m.req as { version: number }).version !== next) return undefined;
+      if (m.method !== "syncSchema" || m.to !== "s0" || (m.req as { schema: number }).schema !== next) return undefined;
       reached();
       return held;
     };

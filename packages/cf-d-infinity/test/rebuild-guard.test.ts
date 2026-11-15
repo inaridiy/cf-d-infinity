@@ -26,7 +26,8 @@ import { SimCluster } from "./sim";
 const outcome = (p: Promise<unknown>) => p.then(() => "ok", (e: Error) => e.message);
 
 /**
- * 版 version がシャードへ届くのを止める。止めている間に write を流し、それから届ける。
+ * 表定義の epoch version (段 2 から、syncSchema は表定義の epoch を運ぶ) がシャードへ届くのを止める。止めている間に write を流し、
+ * それから届ける。この試験の間は分割がないので、次の表定義の記録の epoch は、いまの epoch に 1 を足したものである。
  * capture を渡すと、その版がシャードへ届くときの表定義を取っておき、write に渡す。書き込む側が、書き込み禁止の 1 つ前の版を持つためである。
  * 新しい表定義を取りに行くと、その要求が、書き込み禁止の版をシャードに適用させてしまう。
  */
@@ -38,7 +39,7 @@ function writeWhileHeld(c: SimCluster, version: number, write: (cat?: Catalog) =
   let snapshot: Promise<Catalog> | undefined;
   c.net.gate = (m) => {
     if (m.method !== "syncSchema") return undefined;
-    const v = (m.req as { version: number }).version;
+    const v = (m.req as { schema: number }).schema;
     if (v === capture) snapshot ??= c.catalog();
     if (v !== version) return undefined;
     reached();
@@ -66,7 +67,7 @@ describe("a transaction that rebuilds a table another connection writes to", () 
     // 別の接続は、DROP の前の、いまの表定義を持っている。
     const other = new Db(c);
     await other.query("SELECT count(*) FROM t");
-    const next = (await c.catalog()).version + 1;
+    const next = (await c.catalog()).epoch + 1;
     const written = writeWhileHeld(c, next, () => other.query("INSERT INTO t VALUES (4, 4)"));
     const drop = await outcome(db.query("DROP TABLE t"));
     const rename = drop === "ok" ? await outcome(db.query("ALTER TABLE __new_t RENAME TO t")) : "skipped";
@@ -128,7 +129,7 @@ describe("the guard settles intents before it checks for changes (m14_red_no_dra
     await w.query("INSERT INTO t VALUES (?, 4)", [t4]);
     // DROP は、写した部分を先に確定し、それから書き込み禁止の版を記録してシャードに適用させる。その適用を止めている間に、
     // 別の取引を確定させる。写した部分の確定の後なので、その検証には当たらない。
-    const lock = (await c.catalog()).version + 1;
+    const lock = (await c.catalog()).epoch + 1;
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     let releaseLock!: () => void;
@@ -137,7 +138,7 @@ describe("the guard settles intents before it checks for changes (m14_red_no_dra
     const hit = new Promise<void>((r) => (reached = r));
     c.net.gate = (m) => {
       if (m.method === "finalize" && m.to === "s0") return held;
-      if (m.method === "syncSchema" && (m.req as { version: number }).version === lock) {
+      if (m.method === "syncSchema" && (m.req as { schema: number }).schema === lock) {
         reached();
         return lockHeld;
       }
@@ -267,7 +268,7 @@ describe("the guard checks for changes from the time the copy read the table (m1
     // anchor の時計が進む (モデルの tick)。s1 の時計は 5 秒遅れていて、読みの要求が運んだ時刻のまま進まない。
     await c.sleep(100);
     // copy の確定の phase 2 が s1 に届くのを止める。書き込み禁止の版の適用を止めている間に、別の接続が s1 へ書く。
-    const lock = (await c.catalog()).version + 1;
+    const lock = (await c.catalog()).epoch + 1;
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     let releaseLock!: () => void;
@@ -278,7 +279,7 @@ describe("the guard checks for changes from the time the copy read the table (m1
     c.net.gate = (m) => {
       if (m.method === "commit") anchor ??= m.to;
       if (m.method === "finalize" && m.to === "s1") return held;
-      if (m.method === "syncSchema" && (m.req as { version: number }).version === lock) {
+      if (m.method === "syncSchema" && (m.req as { schema: number }).schema === lock) {
         reached();
         return lockHeld;
       }
@@ -338,7 +339,7 @@ describe("the guard, through other ways of running the same statements", () => {
     // 別の接続は、いまの表定義を持っている。新しい表定義を取りに行くと、その要求が書き込み禁止の版をシャードに適用させてしまう。
     const other = new Db(c);
     await other.query("SELECT count(*) FROM t");
-    const next = (await c.catalog()).version + 1;
+    const next = (await c.catalog()).epoch + 1;
     const written = writeWhileHeld(c, next, () => other.query("INSERT INTO t VALUES (4, 4)"));
     const r = await outcome(d1.batch([
       d1.prepare("INSERT INTO __new_t SELECT id, v FROM t"), d1.prepare("DROP TABLE t"), d1.prepare("ALTER TABLE __new_t RENAME TO t"),
@@ -373,7 +374,7 @@ describe("a Drizzle migration that rebuilds a table while the application writes
     await client.execute("INSERT INTO users(id, email, name, age) VALUES (1, 'a@x', 'A', 30), (2, 'b@x', NULL, 40)");
     // 作り直しの移行は、PRAGMA、新しい表の作成 (+1)、行を写す、古い表の DROP の前の書き込み禁止 (+2) の順に進む。
     // アプリは、新しい表を作った版の表定義を持って書く (capture)。
-    const v = (await c.catalog()).version;
+    const v = (await c.catalog()).epoch;
     const app = (cat?: Catalog) => new Db(c, { catalog: cat }).query("INSERT INTO users(id, email, name) VALUES (3, 'c@x', 'C')");
     return { c, client, app, lock: v + 2, capture: v + 1 };
   };

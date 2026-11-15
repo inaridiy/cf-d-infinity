@@ -10,7 +10,8 @@ import { ConflictError } from "../types";
 import type { Interval } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import type { Effect, Fork, Outcome, PeerCall, Program } from "./step";
-import type { DdlEntry, SplitMove } from "../meta";
+import type { Logged } from "../catalog";
+import type { SplitMove } from "../meta";
 import { ShardKernel, WOUND_DELAY_MS, type KernelDeps, type Sig, type Waiter } from "./kernel";
 
 export {
@@ -22,11 +23,12 @@ export {
 export interface ShardDeps extends KernelDeps {
   peer(id: string): ShardApi;
   meta: {
-    ddlSince(v: number): Promise<{ version: number; ddl: DdlEntry[] }>;
+    /** Meta の epoch の列の、epoch が after より後の記録 (meta.ts の epochsSince)。シャードは、これを自分の写し __epoch に足す。 */
+    epochsSince(after: number): Promise<Logged[]>;
     /** 適用できなかった版の取り消しを求める。取り消す版の番号か、取り消せなければ null が返る。 */
     revokeDdl(version: number, reason: string): Promise<number | null>;
-    /** 分割の枠を示して、子が受け取り始める。分割の版が返る (meta.ts の startSplit)。 */
-    startSplit(id: string, move: SplitMove): Promise<{ version: number }>;
+    /** 分割の枠を示して、子が受け取り始める。分割の版と、その表定義の epoch が返る (meta.ts の startSplit)。 */
+    startSplit(id: string, move: SplitMove): Promise<{ version: number; schema: number }>;
     /** 分割の枠が生きていて、子が受け取り始めていることを確かめる (meta.ts の checkSplit)。 */
     checkSplit(id: string, move: SplitMove): Promise<void>;
   };
@@ -273,7 +275,7 @@ export class ShardCore implements ShardApi {
   drain(req: Interval): Promise<{ groups: number; rows: number; bytes: number }> {
     return this.start("drain", { req });
   }
-  syncSchema(req: { version: number }): Promise<{ moving: boolean }> {
+  syncSchema(req: { schema: number }): Promise<{ moving: boolean }> {
     return this.start("syncSchema", { req });
   }
   /** alarm の本体。未完了の仕事が残っていれば true を返す。呼び出し側 (DO の alarm) は true なら次の alarm を予約する。 */

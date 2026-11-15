@@ -7,6 +7,7 @@ import { checkHistory, type Read, type TxRecord, type Violation } from "./histor
 import { Db, type Txn } from "../src/client/db";
 import { split } from "../src/autoscaler";
 import { ownerOf, planSplit, shardsOf } from "../src/routing";
+import { fold, type EpochRecord } from "../src/catalog";
 import { decode, encode } from "../src/shard/rows";
 import { decodeElem } from "../src/value";
 import type { Change, Faults, Row } from "../src/types";
@@ -174,22 +175,24 @@ export async function duplicates(c: SimCluster, table = "acct", col = "v"): Prom
 }
 
 /**
- * 各シャードが適用した表定義の版。最新の版を持つ読み取りを全シャードへ送った後で呼ぶ。
+ * 各シャードが適用した表定義の epoch (シャードの __epoch の写しを畳んだ Snapshot.schema) と、Meta の表定義の epoch。
+ * 最新の表定義を持つ読み取りを全シャードへ送った後で呼ぶ。
  * 期限切れで取り消された index の版などは、シャードへ押し出されないので、送る前は遅れていてよい。
  */
 export async function schemaVersions(c: SimCluster): Promise<{ meta: number; shards: Record<string, number> }> {
   const cat = await c.catalog();
   const shards: Record<string, number> = {};
   for (const id of shardsOf(cat.routing)) {
-    shards[id] = (c.backends.get(id)!.exec(`SELECT max(version) v FROM __ddl`)[0]?.v as number | null) ?? 0;
+    const rows = c.backends.get(id)!.exec(`SELECT epoch, rec FROM __epoch ORDER BY epoch`);
+    shards[id] = fold(rows.map((r) => ({ epoch: r.epoch as number, rec: JSON.parse(r.rec as string) as EpochRecord }))).schema;
   }
-  return { meta: cat.version, shards };
+  return { meta: cat.schema, shards };
 }
 
 /** 全シャードへ最新の版の要求を送る。 */
 export async function touchAll(c: SimCluster): Promise<void> {
   const cat = await c.catalog();
-  await Promise.all(shardsOf(cat.routing).map((id) => c.shard(id).syncSchema({ version: cat.version })));
+  await Promise.all(shardsOf(cat.routing).map((id) => c.shard(id).syncSchema({ schema: cat.schema })));
 }
 
 /**

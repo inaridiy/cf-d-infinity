@@ -238,11 +238,15 @@ describe("counterexamples from m5b_live_migration", () => {
     await c.settle();
     expect(await getN(reader, t).catch((e: Error) => e.message)).not.toBe(1); // T の時点の真の値は w が書いた 1 である
   });
-  it("a fenced parent refuses the read of a moved group", async () => {
+  // 段 2 (docs/design-catalog-epoch.md) から、断られた取引は範囲表を取り替えて、文を子で計画し直す。読み手は移動の前の時点で
+  // ほかのグループ (s1) を読んだだけなので、その読みは移す時刻 m まで変わっておらず、時点を m へ進めて、子が w の書き込みを答える。
+  it("a fenced parent refuses the read of a moved group, and the reader reads it at the child", async () => {
     const { c, t, range, reader } = await pendingIntent({}, true);
     await c.shard("s2").drain(range);
     await c.settle();
-    await expect(getN(reader, t)).rejects.toThrow(/not owner|moved at/);
+    const from = c.net.failed.length;
+    expect(await getN(reader, t)).toBe(1);
+    expect(c.net.failed.slice(from).filter((x) => x.m.to === "s0").map((x) => x.message)).toEqual(["not owner: s2"]);
   });
 
   const fencedWrite = async (faults: Faults) => {

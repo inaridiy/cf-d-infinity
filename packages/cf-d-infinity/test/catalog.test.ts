@@ -13,15 +13,23 @@ import { MetaCore, readEpochs, type SplitMove } from "../src/meta";
 import { planSplit, REGION_TOKENS, type Interval } from "../src/routing";
 import type { Runtime } from "../src/runtime";
 import type { Faults, ShardApi } from "../src/types";
-import { MetaCore as OldMeta } from "./meta-old";
+import { MetaCore as OldMeta, stage1Answer, stage1Error } from "./meta-old";
 import { prng, seedsOr, SimCluster, SqliteBackend, VirtualRuntime } from "./sim";
 
-/** 答えを比べられる文字列にする。誤りは、型の名前、文、持っている値 (SchemaMoved の version など)。 */
-async function outcome(f: () => unknown): Promise<string> {
+/**
+ * 答えを比べられる文字列にする。誤りは、型の名前、文、持っている値 (SchemaMoved の version など)。stage1 なら、段 2 で新しい Meta の
+ * 答えに足したもの (meta-old.ts の stage1Answer、stage1Error) を落とす。
+ */
+async function outcome(f: () => unknown, stage1 = false): Promise<string> {
   try {
-    return `ok ${JSON.stringify(await f()) ?? "undefined"}`;
+    const v = await f();
+    return `ok ${JSON.stringify(stage1 ? stage1Answer(v) : v) ?? "undefined"}`;
   } catch (e) {
     const err = e as Error;
+    if (stage1) {
+      const x = stage1Error(e);
+      return `throws ${x.name}: ${x.message} ${JSON.stringify(x.fields)}`;
+    }
     return `throws ${err.constructor.name}: ${err.message} ${JSON.stringify({ ...err })}`;
   }
 }
@@ -67,7 +75,7 @@ class Pair {
   }
   async call<K extends keyof Api>(k: K, ...args: Parameters<Api[K]>): Promise<string> {
     const what = `${String(k)} ${JSON.stringify(args)}`;
-    const a = await outcome(() => (this.next[k] as (...x: unknown[]) => unknown)(...structuredClone(args)));
+    const a = await outcome(() => (this.next[k] as (...x: unknown[]) => unknown)(...structuredClone(args)), true);
     const b = await outcome(() => (this.old[k] as (...x: unknown[]) => unknown)(...structuredClone(args)));
     this.log.push(`${what} -> ${a.slice(0, 160)}`);
     if (a !== b) this.diffs.push(`${what}\n  new: ${a.slice(0, 600)}\n  old: ${b.slice(0, 600)}\n  after: ${this.log.slice(-12, -1).join("\n    ")}`);

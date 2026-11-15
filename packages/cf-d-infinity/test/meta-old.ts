@@ -2,6 +2,8 @@
 // 段 1 の Meta (src/meta.ts) は、入口の名前も答えも、これと同じでなければならない (docs/design-catalog-epoch.md の段 1 の検査 (b))。
 // 比べる試験は 2 つある。test/catalog.test.ts の乱択の列と、META_SHADOW を付けたシミュレータ (test/sim.ts の shadowMeta) である。
 // 中身は直さない。直すと、比べる相手が変わる。段 3 で表定義の遷移を 2 相にするときに消す。
+// 段 2 で Meta の答えに足したもの (Catalog の epoch と schema、startSplit の schema、SchemaMoved の表定義の epoch) は、比べる前に、
+// 新しい Meta の答えから落とす (stage1Answer、stage1Error)。段 2 で足した入口 (epochsSince) は、ここにないので比べない。
 import { SqlError, checkStorageFormat, type Backend, type Faults, type TableDef, type Ts } from "../src/types";
 import { parseDdl, publishBuild, type IndexInfo, type ParsedDdl, type SchemaView } from "../src/sql/ddl";
 import { systemRuntime, type Runtime } from "../src/runtime";
@@ -482,4 +484,29 @@ export class MetaCore {
     );
     return start;
   }
+}
+
+/** 新しい Meta の答えから、段 2 で足したものを落とす。Catalog の epoch と schema、startSplit の答えの schema である。 */
+export function stage1Answer(v: unknown): unknown {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return v;
+  const o = v as Record<string, unknown>;
+  if ("routing" in o && "tables" in o && "version" in o) {
+    const { epoch: _epoch, schema: _schema, ...rest } = o;
+    return rest;
+  }
+  const keys = Object.keys(o);
+  if (keys.length === 2 && "version" in o && "schema" in o) return { version: o.version };
+  return v;
+}
+
+/** 新しい Meta の誤りの、比べる形 (型の名前、文、持っている値)。SchemaMoved の表定義の epoch (文と値) を落とす。 */
+export function stage1Error(e: unknown): { name: string; message: string; fields: Record<string, unknown> } {
+  const err = e as Error;
+  const fields: Record<string, unknown> = { ...(err as unknown as Record<string, unknown>) };
+  let message = err?.message ?? String(e);
+  if (err?.constructor?.name === "SchemaMoved") {
+    delete fields.schema;
+    message = message.replace(/ \(schema epoch \d+\)$/, "");
+  }
+  return { name: err?.constructor?.name ?? "?", message, fields };
 }

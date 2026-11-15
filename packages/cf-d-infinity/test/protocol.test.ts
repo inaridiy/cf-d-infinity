@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { keyString } from "../src/keys";
 import { SUBSLOTS, type Interval } from "../src/routing";
 import { encode } from "../src/shard/rows";
-import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type Piece, type PiecePayload, type PieceWant, type Span } from "../src/types";
+import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type ExecReq, type Piece, type PiecePayload, type PieceWant, type Span } from "../src/types";
 import { encodeTuple } from "../src/value";
 
 /**
@@ -17,7 +17,11 @@ function wireSample(): string {
   // 行イメージは、表定義の列の順のタプルである (版 4 から)。
   const change = { table: "t", pk: keyString([1n]), sk: keyString(["a"]), before: null, after: encodeTuple(values) };
   // 読みの要求は、結果の列名を運ぶ (版 5 から)。条件の範囲の引数には bigint が入る。
-  const read = { sql: "SELECT a, b FROM t WHERE a = ?", params: [5n], columns: ["a", "b"], spans: [{ kind: "pred", table: "t", alias: "t", where: "a = ?", params: [5n, 2.5] }] };
+  // 要求は、Worker のスナップショットの epoch と、表定義の epoch を運ぶ (版 6 から。schema の数は DdlEntry.version ではない)。
+  const read = {
+    sql: "SELECT a, b FROM t WHERE a = ?", params: [5n], columns: ["a", "b"], spans: [{ kind: "pred", table: "t", alias: "t", where: "a = ?", params: [5n, 2.5] }],
+    schema: 4, epoch: 7,
+  } satisfies Partial<ExecReq>;
   return [
     JSON.stringify(values, (_k, x) => (x instanceof Uint8Array ? { u8: [...x] } : typeof x === "bigint" ? { int: String(x) } : typeof x === "number" && !Number.isFinite(x) ? String(x) : x)),
     encode(change),
@@ -51,6 +55,7 @@ const WIRE: Record<number, string> = {
   3: "9dadba1e69298e9c",
   4: "dfb952441f2824e0",
   5: "9f3b7b3e9eaa9b09",
+  6: "3ef766de45822d5c",
 };
 
 describe("protocol version", () => {

@@ -180,7 +180,18 @@ export interface ExecReq {
   lock?: LockOwner;
   /** 読み取りでロックを取る行。BEGIN IMMEDIATE の主キー読みに使う。 */
   lockRows?: { table: string; pk: string }[];
+  /**
+   * 要求を計画した表定義の epoch (Worker のスナップショットの Catalog.schema。表定義が最後に変わった epoch)。シャードは、自分の
+   * スナップショットの表定義の epoch と等しいことを確かめる。大きければ Meta の列を適用してから確かめ直し、小さければ古い計画として断る
+   * (docs/design-catalog-epoch.md の「要求ごとの確かめ」)。
+   */
   schema: number;
+  /**
+   * 要求を計画した Worker のスナップショットの epoch (Catalog.epoch)。シャードは、これが自分の epoch より大きく、要求の行が自分の
+   * スナップショットでは自分のものでないときに、Meta の列を適用してから所有を確かめ直す。等しいことは求めない。範囲表だけが進んだ
+   * epoch は、動いていない行の要求を古くしない (M21 の pinnedSurvives)。
+   */
+  epoch: number;
 }
 
 export interface LockOwner {
@@ -222,7 +233,9 @@ export interface PrepareReq {
   writes: Change[];
   spans: Span[];
   anchor: string;
+  /** 取引の表定義の epoch と、取引のスナップショットの epoch (ExecReq と同じ)。 */
   schema: number;
+  epoch: number;
 }
 export type PrepareRes = { ok: true; prepareTs: Ts } | { ok: false; reason: string };
 
@@ -236,7 +249,9 @@ export interface CommitReq {
   txn: string;
   T: Ts;
   participants: Participant[];
+  /** 取引の表定義の epoch と、取引のスナップショットの epoch (ExecReq と同じ)。参加者への prepare も、これを運ぶ。 */
   schema: number;
+  epoch: number;
 }
 export type CommitRes = { ok: true; c: Ts } | { ok: false; reason: string };
 
@@ -254,7 +269,7 @@ export interface ShardApi {
   prepare(req: PrepareReq): Promise<PrepareRes>;
   refresh(req: { txn: string; spans: Span[]; from: Ts; to: Ts }): Promise<{ ok: boolean; reason?: string }>;
   /**
-   * 表を消す前の確認。schema の版 (表の書き込み禁止) を適用した後で、spans に from より後の変更も intent もないかを答える。
+   * 表を消す前の確認。schema の表定義の epoch (表の書き込み禁止) を適用した後で、spans に from より後の変更も intent もないかを答える。
    * from は、取引がその範囲を読んだ時刻である。読みの要求が時刻を運ぶので、このシャードは from を見ている。
    */
   unchanged(req: { spans: Span[]; from: Ts; schema: number }): Promise<{ ok: boolean; reason?: string }>;
@@ -267,8 +282,8 @@ export interface ShardApi {
   // 範囲の移動の要求は、範囲を token の区間 (Interval) で運ぶ。
   // いまのシャードは、両端が slot の境目にある区間の移動だけを受ける (ShardCore の wholeSlotsOnly)。
   /** 子が受け入れの準備をする。親の fence より先に呼ぶ。 */
-  /** 範囲を受け取る準備をする。子の表定義の版を返す。親は、fence の前にその版まで追いつく。 */
-  /** 子が範囲を受け取り始める。slot は Meta が分割に渡した枠で、子は Meta に枠を示し、Meta が返す版で受け取り始める。 */
+  /** 範囲を受け取る準備をする。子の表定義の epoch を返す。親は、fence の前にその epoch まで追いつく。 */
+  /** 子が範囲を受け取り始める。slot は Meta が分割に渡した枠で、子は Meta に枠を示し、Meta が返す表定義で受け取り始める。 */
   beginIncoming(req: Interval & { from: string; slot: string }): Promise<{ schema: number }>;
   /** 親がスロットの受理を止める。以後は NotOwner を返す。 */
   /** 親が範囲を送り出し始める。slot は分割の枠で、子が受け取り始めていなければ断る。 */
@@ -299,8 +314,8 @@ export interface ShardApi {
   exportRows(req: { table: string; after: Value[] | null; limit: number; skip?: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }>;
   /** 取引の rollback でロックを手放す。届かなくても TTL で消える。 */
   unlock(req: { txn: string }): Promise<void>;
-  /** DDL を適用する。全シャードへ適用してから DDL を完了させる。 */
-  syncSchema(req: { version: number }): Promise<{ moving: boolean }>;
+  /** 表定義の epoch schema まで、Meta の列を適用する。DDL は、全シャードへ適用させてから完了を返す。 */
+  syncSchema(req: { schema: number }): Promise<{ moving: boolean }>;
   /** 現在の HLC を返す。複数シャードの読み取りの T を決めるのに使う。 */
   now(req: Record<string, never>): Promise<Ts>;
 }
@@ -343,7 +358,7 @@ export interface PiecePayload extends Piece {
   /** 行は、変更と同じくタプルで運ぶ。 */
   rows: { table: string; row: Tuple }[];
   intents: PlainRow[];
-  /** 送り出した親の表定義の版。行はこの版の形をしている。 */
+  /** 送り出した親の表定義の epoch。行はこの表定義の形をしている。 */
   schema: number;
 }
 
@@ -362,6 +377,7 @@ export interface GroupCursor {
 /** シャードの健全性。0 でない項目があれば、運用者が見るべき状態である。 */
 export interface ShardHealth {
   id: string;
+  /** シャードのスナップショットの表定義の epoch (Catalog.schema と同じ数)。 */
   schema: number;
   format: number;
   bytes: number;
@@ -481,7 +497,10 @@ export interface Faults {
   dropIntentsOnMove?: boolean;
   /** 子が T < m の読みを答える (m5b_red_s3 の子の undo に相当する)。 */
   servePastMove?: boolean;
-  /** 親が fence 後も要求を受理する。 */
+  /**
+   * シャードが所有を確かめない。親は fence 後も要求を受理し (__fenced の拒否を外す)、どのシャードも、自分のスナップショットの範囲表で
+   * 自分のものでない行の要求を受理する (M21 の m21_red_owner_unchecked。段 2 で意味を広げた)。
+   */
   ignoreFence?: boolean;
   /** 親が、移動を終えた範囲を含む全表の読みを受理する。古い範囲表の読み手が、子へ移った行を読み落とす。 */
   staleWideRead?: boolean;
@@ -565,8 +584,12 @@ export class ReadTooOld extends Error {
 // 版 5 (2026-11-14): 値を、JS の型が格納の型である形にした (docs/design-values.md の段 3)。INTEGER は bigint、REAL は number で、
 // 整数の値の REAL の印 `{ real }` はなくなった。ExecReq に結果の列名 (columns) を足し、シャードは読みを型つきの読みに包んで、
 // 型のある値を返す。利用者の RETURNING は Worker が要素の式に書き換えて送る。版 4 の要求の数は意味が違うので、受け付けない。
-export const PROTOCOL_VERSION = 5;
-export const MIN_PROTOCOL_VERSION = 5;
+// 版 6 (2026-11-15): 要求が、Worker のスナップショットの epoch と表定義の epoch を運ぶ (docs/design-catalog-epoch.md の段 2)。
+// ExecReq、PrepareReq、CommitReq に epoch を足し、schema の数を DdlEntry.version から表定義の epoch に替えた。syncSchema は
+// { schema } を受け、beginIncoming、fence、PiecePayload の schema も表定義の epoch である。版 5 の要求の schema は意味が違うので、
+// 受け付けない。
+export const PROTOCOL_VERSION = 6;
+export const MIN_PROTOCOL_VERSION = 6;
 
 export class VersionSkew extends Error {
   readonly retryable = true;
@@ -662,8 +685,13 @@ export function utf8Length(s: string): number {
  * 版 3 (2026-11-15): Meta の __ddl と __routing を、epoch の列 __epoch(epoch, rec) の 1 表にした (docs/design-catalog-epoch.md の段 1)。
  * __meta の shadow は、版ではなく epoch を持つ。シャードの形式は変わらない。版 2 からの移行は書かない。版 2 の Meta を開くと、
  * 新しいコードは空の列を読み、表定義をなくしたように見えるので、移行がないと言って起動を拒否する。
+ *
+ * 版 4 (2026-11-15): シャードの __ddl(version, entry) を、Meta の epoch の列の写し __epoch(epoch, rec) にした
+ * (docs/design-catalog-epoch.md の段 2)。シャードは表定義と範囲表を、この写しを畳んで作る。Meta の表は変わらないが、版の数は
+ * Meta とシャードで 1 つなので、版 3 の Meta も開かない。版 3 からの移行は書かない。版 3 のシャードを開くと、新しいコードは空の写しを
+ * 読み、表定義をなくしたように見えるので、移行がないと言って起動を拒否する。
  */
-export const STORAGE_FORMAT = 3;
+export const STORAGE_FORMAT = 4;
 
 /** 版 n の保存データを版 n + 1 にする移行。鍵は n である。最初の公開の前の形式は持たない (公開前は後方互換を持たない)。 */
 const STORAGE_MIGRATIONS: Record<number, (b: Backend) => void> = {};

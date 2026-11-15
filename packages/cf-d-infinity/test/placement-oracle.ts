@@ -320,14 +320,6 @@ export const KNOWN_OPEN: Known[] = [
       step.conn === "tx" && step.kind === "stmt" && p.shards >= 2 && beforeSplit && o.kind === "error" && /^read too old: moved at/.test(o.message) &&
       (process.env.REFERENCE === "full" || !["point", "pinned group"].includes(step.shape ?? "")),
   },
-  {
-    // 分割で切る置き場所は、表定義を作った Db (分割の前の範囲表を覚えている) で初めの行を複数行の INSERT で入れると、これに当たる。
-    // 既定の実行では、分割の後に作った Db で入れる。
-    id: "a multi-row INSERT planned before a split writes its rows to two shards",
-    repro: "test/open/multi-row-insert-after-split.test.ts",
-    how: "avoided",
-    matches: () => false,
-  },
 ];
 
 const toH = (v: number) => ({ type: "integer" as const, value: String(v) });
@@ -431,8 +423,9 @@ export async function runPlacement(s: Script, p: Placement, o: { mask: boolean }
     for (const ddl of SCHEMA) await admin.ddl(ddl);
     const cuts = prng(s.seed * 977 + 3);
     for (let j = 1; j <= (p.cuts ?? 0); j++) await splitAt(c, cuts, `s${j}`);
-    // 既定の実行では、分割の後に作った Db で入れる (KNOWN_OPEN の 2 つ目)。
-    const loader = o.mask ? new Db(c) : admin;
+    // 初めの行は、表定義を作った Db (分割の前の範囲表を覚えている) で、複数行の INSERT で入れる。分割で切る置き場所では、古い範囲表で
+    // 計画した INSERT が断られ、新しい範囲表で計画し直される (未解決の問題 35。Epoch の段 2 で直した。test/multi-row-insert-after-split.test.ts)。
+    const loader = admin;
     for (const [t, rows] of Object.entries(s.rows)) {
       await loader.query(`INSERT INTO ${t} VALUES ${rows.map((row) => `(${row.join(", ")})`).join(", ")}`);
     }

@@ -74,11 +74,11 @@ describe("the span check", () => {
     await db.ddl(`CREATE TABLE q(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (tenant_id, id))`);
     await db.query("INSERT INTO p VALUES (1, 1, 'a')");
     await db.query("INSERT INTO q VALUES (1, 1)");
-    const { version } = await c.catalog();
+    const { schema, epoch } = await c.catalog();
     // 文は q も読むのに、範囲には p の 1 行しか入れていない。
     await c.shard("s0").exec({
       sql: "SELECT code, (SELECT count(*) FROM q WHERE tenant_id = 1) AS n FROM p WHERE tenant_id = 1 AND id = 1", params: [], columns: ["code", "n"],
-      spans: [{ kind: "pk", table: "p", pk: "[1,1]", sk: "[1]" }], schema: version,
+      spans: [{ kind: "pk", table: "p", pk: "[1,1]", sk: "[1]" }], schema, epoch,
     });
     expect(c.spanEscapes.length).toBe(1);
     // 同じ文を Db から出すと、q も範囲に入る。

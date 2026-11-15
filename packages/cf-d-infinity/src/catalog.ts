@@ -19,7 +19,7 @@ import { applyMove, overlaps, shardsOf, type Interval, type Routing } from "./ro
 import type { IndexInfo, ParsedDdl } from "./sql/ddl";
 import type { TableDef, Ts } from "./types";
 
-/** 表定義の版。段 1 の commit の記録が、この形のまま運ぶ。シャードは MetaCore.ddlSince で受け取り、__ddl に写す。 */
+/** 表定義の版。段 1 の commit の記録が、この形のまま運ぶ。シャードは記録ごと MetaCore.epochsSince で受け取り、__epoch に写す (段 2)。 */
 export interface DdlEntry extends ParsedDdl {
   version: number;
   /** この版が取り消す版。取り消された版をまだ適用していないシャードは、両方を飛ばす。 */
@@ -106,7 +106,8 @@ export interface Snapshot {
   aborted?: { of: number; reason: string };
 }
 
-const isDdlRecord = (r: EpochRecord): boolean => r.kind === "prepare" || r.kind === "commit" || r.kind === "abort";
+/** 表定義の記録か (prepare、commit、abort)。表定義の epoch (Snapshot.schema) は、この記録でだけ進む。 */
+export const isDdlRecord = (r: EpochRecord): boolean => r.kind === "prepare" || r.kind === "commit" || r.kind === "abort";
 
 /** 表定義の変更を、表定義と index と view に当てる。順番は今の MetaCore.current と同じ。 */
 function applyParsed(s: Snapshot, d: ParsedDdl): void {

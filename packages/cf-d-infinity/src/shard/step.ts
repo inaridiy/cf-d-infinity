@@ -47,7 +47,7 @@ export type Effect =
   /** 相手のシャードを同時に呼び、全部の応答を待つ。結果は、応答の配列である。 */
   | { kind: "peers"; calls: PeerCall[] }
   /** Meta を呼ぶ。orNull は、失敗を null の結果にする。 */
-  | { kind: "meta"; method: "ddlSince" | "revokeDdl" | "startSplit" | "checkSplit"; args: unknown[]; orNull?: true };
+  | { kind: "meta"; method: "epochsSince" | "revokeDdl" | "startSplit" | "checkSplit"; args: unknown[]; orNull?: true };
 
 /** 待たずに始めること。殻は、1 歩が返った直後に、並んだ順に始める。 */
 export type Fork =

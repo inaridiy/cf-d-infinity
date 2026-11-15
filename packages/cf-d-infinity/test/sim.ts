@@ -6,7 +6,7 @@ import { Db, type ClientFaults, type Cluster } from "../src/client/db";
 import { keyString } from "../src/keys";
 import { fold, type EpochRecord } from "../src/catalog";
 import { MetaCore, type SplitMove, type SplitSlot } from "../src/meta";
-import { MetaCore as OldMeta } from "./meta-old";
+import { MetaCore as OldMeta, stage1Answer, stage1Error } from "./meta-old";
 import { initialRouting, shardsOf, tokenOf, type Interval, type Routing } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
@@ -513,8 +513,13 @@ export const imageCheckOff = { now: false };
  */
 function shadowMeta(next: MetaCore, old: OldMeta, dir: string): MetaCore {
   const show = (x: unknown) => JSON.stringify(x, (_k, v) => (typeof v === "bigint" ? `${v}n` : v)) ?? "undefined";
-  const outcome = (r: PromiseSettledResult<unknown>): string => {
-    if (r.status === "fulfilled") return show(r.value);
+  // 新しい Meta の答えは、段 2 で足したもの (Catalog の epoch と schema など) を落としてから比べる (meta-old.ts の stage1Answer)。
+  const outcome = (r: PromiseSettledResult<unknown>, stage1: boolean): string => {
+    if (r.status === "fulfilled") return show(stage1 ? stage1Answer(r.value) : r.value);
+    if (stage1) {
+      const x = stage1Error(r.reason);
+      return `throws ${x.name}: ${x.message} ${show(x.fields)}`;
+    }
     const e = r.reason as Error;
     return `throws ${e?.constructor?.name}: ${e?.message} ${show({ ...e })}`;
   };
@@ -530,7 +535,9 @@ function shadowMeta(next: MetaCore, old: OldMeta, dir: string): MetaCore {
     get(target, k, receiver) {
       const f = Reflect.get(target, k, receiver) as unknown;
       if (typeof f !== "function" || k === "batonSecret") return f;
-      const g = Reflect.get(old, k) as (...a: unknown[]) => unknown;
+      const g = Reflect.get(old, k) as ((...a: unknown[]) => unknown) | undefined;
+      // 段 2 で足した入口 (epochsSince) は、古い Meta にないので比べない。
+      if (typeof g !== "function") return f;
       return (...args: unknown[]) => {
         const copy = structuredClone(args);
         let out: unknown;
@@ -542,8 +549,8 @@ function shadowMeta(next: MetaCore, old: OldMeta, dir: string): MetaCore {
         }
         const mine = thrown ? Promise.reject(thrown.e) : Promise.resolve(out);
         void Promise.allSettled([mine, settle(() => g.apply(old, copy))]).then(([a, b]) => {
-          const x = outcome(a!);
-          const y = outcome(b!);
+          const x = outcome(a!, true);
+          const y = outcome(b!, false);
           if (x !== y) appendFileSync(`${dir}/${process.pid}.txt`, `${String(k)} ${show(copy)}\n  new: ${x}\n  old: ${y}\n`);
         });
         if (thrown) throw thrown.e;
@@ -677,7 +684,7 @@ export class SimCluster implements Cluster {
       runtime: this.runtime,
       peer: (to) => this.stub(id, to),
       meta: {
-        ddlSince: (v) => this.meta.ddlSince(v), revokeDdl: (v, reason) => this.meta.revokeDdl(v, reason),
+        epochsSince: (after) => this.meta.epochsSince(after), revokeDdl: (v, reason) => this.meta.revokeDdl(v, reason),
         startSplit: (id, move) => this.meta.startSplit(id, move), checkSplit: (id, move) => this.meta.checkSplit(id, move),
       },
       background: (p) => {
@@ -861,7 +868,7 @@ export class SimCluster implements Cluster {
    */
   async reserveSplit(parent: string, child: string, range: Interval): Promise<SplitSlot> {
     const cat = await this.catalog();
-    for (const id of shardsOf(cat.routing)) await this.shard(id).syncSchema({ version: cat.version });
+    for (const id of shardsOf(cat.routing)) await this.shard(id).syncSchema({ schema: cat.schema });
     return this.meta.beginSplit({ parent, child, ...range }, cat.version);
   }
   finishLock(version: number, sql: string) {

@@ -4,14 +4,15 @@
 // 外れたら書き込みの全体を WriteOutsideClaim で断る。検査は、守りとは別に、Meta の範囲表とシャードの移動の記録から持ち主を決めて
 // 確かめ、守りを外しても (欠陥のスイッチ ignoreWriteClaim) 同じに報告する。
 //
-// 1 つ目の組は、未解決の問題 35 の形 (test/open/multi-row-insert-after-split.test.ts) を、守りを外した場合と掛けた場合で流す。
+// 1 つ目の組は、未解決の問題 35 の形 (test/multi-row-insert-after-split.test.ts) を、守りを外した場合と掛けた場合で流す。Epoch の段 2
+// から Worker は古い計画を送り直さないので、送り直した要求を、シャードへ直に送る。
 // 2 つ目の組は、利用者の文を実行する経路のそれぞれ (autocommit の高速経路と trigger の経路、取引の下書き、悲観的な DML) と、
 // 取引の変更を受け取る経路 (commitLocal、prepare) で、守りが断ることを、シャードへ直に要求を送って確かめる。
 import { afterEach, describe, expect, it } from "vitest";
 import { split } from "../src/autoscaler";
 import { Db } from "../src/client/db";
 import { keyString } from "../src/keys";
-import { ownerOf, planSplit, regionsOf, tokenOf } from "../src/routing";
+import { ownerOf, planSplit, regionsOf, SUBSLOTS, tokenOf } from "../src/routing";
 import { tupleOfRow } from "../src/shard/rows";
 import type { Change, Span } from "../src/types";
 import { isWriteOutsideClaim } from "../src/types";
@@ -39,42 +40,62 @@ async function staleInsertScene(c: SimCluster) {
 const stored = async (c: SimCluster) => (await rawRows(c, "t")).map((r) => `${r.row.id as number}@${r.shard}`).sort();
 
 describe("the shard's write guard on a multi-row INSERT planned before two splits (open problem 35)", () => {
-  it("with the guard off (ignoreWriteClaim), both new shards take every row, and the write check reports it", async () => {
-    const c = new SimCluster({ shards: 1, faults: { ignoreWriteClaim: true } });
+  // Epoch の段 2 から、Worker は、断られた試みを捨て、新しい範囲表で文を計画し直す (Db.dispatch)。古い計画を送り直さないので、
+  // 問題 35 は Worker の側で直った (test/multi-row-insert-after-split.test.ts)。守りは、その上の 2 つ目の守りである。
+  // 守りを確かめるために、段 2 より前の Worker が送り直した要求 (古い計画のまとめた文を、新しい範囲表のシャードごとに、そのシャードの
+  // 行だけを宣言して送る) を、シャードへ直に送る。
+  const resend = async (c: SimCluster, a: number, b: number) => {
+    const cat = await c.catalog();
+    const row = (id: number): Span => ({ kind: "pk", table: "t", pk: keyString([id]), sk: keyString([id]) });
+    const req = (id: number) => ({
+      sql: "INSERT INTO t VALUES (?, 1), (?, 2)", params: [BigInt(a), BigInt(b)], columns: [], spans: [row(id)],
+      schema: cat.schema, epoch: cat.epoch, write: { sk: null, capture: "insert" as const },
+    });
+    return Promise.all([
+      c.shard("s1").execAuto(req(a)).then(() => "ok", (e: Error) => e.message),
+      c.shard("s2").execAuto(req(b)).then(() => "ok", (e: Error) => e.message),
+    ]);
+  };
+
+  it("the Worker plans the statement again on the new range table, so each row is stored once on its owner", async () => {
+    const c = new SimCluster({ shards: 1 });
     const { db, a, b } = await staleInsertScene(c);
     await db.query("INSERT INTO t VALUES (?, 1), (?, 2)", [a, b]);
+    await c.settle();
+    expect(await stored(c)).toEqual([`${a}@s1`, `${b}@s2`].sort());
+    expect(c.writeEscapes).toEqual([]);
+  });
+
+  it("with the guard off (ignoreWriteClaim), a resent old plan puts every row on both new shards, and the write check reports it", async () => {
+    const c = new SimCluster({ shards: 1, faults: { ignoreWriteClaim: true } });
+    const { a, b } = await staleInsertScene(c);
+    expect(await resend(c, a, b)).toEqual(["ok", "ok"]);
     await c.settle();
     // 同じ主キーの行が 2 つのシャードにある。
     expect(await stored(c)).toEqual([`${a}@s1`, `${a}@s2`, `${b}@s1`, `${b}@s2`].sort());
     const read = await new Db(c).query("SELECT id, v FROM t ORDER BY id").then((r) => r.values, (e: Error) => `error ${e.message}`);
     expect(read).toMatch(/UNIQUE constraint failed/);
-    // 検査は、守りがなくても、宣言の外の行と、持ち主でないシャードに残る行を報告する。文の実行と、確定のときの受け入れの両方である。
-    const seen = c.writeEscapes.map((e) => `${e.shard} ${e.sql === null ? "commit" : "statement"} ${e.row}`);
-    expect(seen).toEqual(expect.arrayContaining([`s1 statement t [${b}]`, `s2 statement t [${a}]`, `s1 commit t [${b}]`, `s2 commit t [${a}]`]));
-    expect(c.writeEscapes.find((e) => e.shard === "s1" && e.sql !== null)?.problem).toMatch(/outside its declared spans/);
-    expect(c.writeEscapes.find((e) => e.shard === "s1" && e.sql === null)?.problem).toMatch(/does not own token/);
+    // 検査は、守りがなくても、宣言の外の行と、持ち主でないシャードに残る行を報告する。
+    const seen = c.writeEscapes.map((e) => `${e.shard} ${e.row}`);
+    expect(seen).toEqual(expect.arrayContaining([`s1 t [${b}]`, `s2 t [${a}]`]));
+    expect(c.writeEscapes.find((e) => e.shard === "s1")?.problem).toMatch(/outside its declared spans/);
     // 行を持ち主でないシャードに残さなかった書き込みは、報告しない。
-    expect(seen).not.toContain(`s1 statement t [${a}]`);
-    expect(seen).not.toContain(`s2 statement t [${b}]`);
+    expect(seen).not.toContain(`s1 t [${a}]`);
+    expect(seen).not.toContain(`s2 t [${b}]`);
   });
 
-  it("with the guard on, the new shards refuse the statement, nothing is stored, and a fresh plan stores each row once on its owner", async () => {
+  it("with the guard on, the new shards refuse a resent old plan, and nothing is stored", async () => {
     const c = new SimCluster({ shards: 1 });
-    const { db, a, b } = await staleInsertScene(c);
-    const failed = await db.query("INSERT INTO t VALUES (?, 1), (?, 2)", [a, b]).then(() => null, (e: Error) => e);
-    expect(failed?.message).toMatch(/^write outside claim: the statement wrote t row \[\d+\] \(shard key \[\d+\]\) on shard s[12], outside the spans it declared/);
-    expect(isWriteOutsideClaim(failed)).toBe(true);
+    const { a, b } = await staleInsertScene(c);
+    const [s1, s2] = await resend(c, a, b);
+    // 段 2 から、シャードは所有を自分のスナップショットで引くので、宣言の確かめより先に、持ち主でない行として断る。
+    expect(s1).toBe(`write outside claim: shard s1 does not own t row [${b}] (not owner: s2); nothing was written; the request was built wrongly, please report this`);
+    expect(s2).toBe(`write outside claim: shard s2 does not own t row [${a}] (not owner: s1); nothing was written; the request was built wrongly, please report this`);
+    expect(isWriteOutsideClaim(new Error(s1))).toBe(true);
     await c.settle();
     expect(await stored(c)).toEqual([]);
-    // 断られた書き込みも、検査は報告する。Worker の宣言の誤りだからである。
+    // 断られた書き込みも、検査は報告する。要求の作り方の誤りだからである。
     expect(c.writeEscapes.some((e) => e.shard === "s1" && e.row === `t [${b}]`)).toBe(true);
-    c.writeEscapes.length = 0;
-    allWriteEscapes.length = 0;
-    // いまの範囲表で計画し直した Db は、行を持ち主ごとの文に分けて送る。
-    await new Db(c).query("INSERT INTO t VALUES (?, 1), (?, 2)", [a, b]);
-    await c.settle();
-    expect(await stored(c)).toEqual([`${a}@s1`, `${b}@s2`].sort());
-    expect(c.writeEscapes).toEqual([]);
   });
 });
 
@@ -86,7 +107,7 @@ describe("the shard's write guard on each path that runs user SQL or takes a tra
     await db.ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
     const cat = await c.catalog();
     const row1: Span = { kind: "pk", table: "t", pk: keyString([1]), sk: keyString([1]) };
-    const req = { sql: "INSERT INTO t VALUES (1, 10), (2, 20)", params: [], columns: [], spans: [row1], schema: cat.version };
+    const req = { sql: "INSERT INTO t VALUES (1, 10), (2, 20)", params: [], columns: [], spans: [row1], schema: cat.schema, epoch: cat.epoch };
     return { c, cat, req };
   }
 
@@ -134,9 +155,9 @@ describe("the shard's write guard on each path that runs user SQL or takes a tra
     // 行 5 を名乗り、行 7 のイメージを運ぶ変更。持ち主の確かめ (enter) は行 5 について済むが、本体に入るのは行 7 である。
     const forged: Change = { table: "t", pk: keyString([5]), sk: keyString([5]), before: null, after: tupleOfRow(def, { id: 7, v: 1 }) };
     const T = await c.shard("s0").now({});
-    await expect(c.shard("s0").commitLocal({ txn: "t1", T, writes: [forged], spans: [], schema: cat.version }))
+    await expect(c.shard("s0").commitLocal({ txn: "t1", T, writes: [forged], spans: [], schema: cat.schema, epoch: cat.epoch }))
       .rejects.toThrow(/^write outside claim: a change for t row \[5\] on shard s0 carries the image of t row \[7\]/);
-    const prepared = await c.shard("s0").prepare({ txn: "t2", T, writes: [forged], spans: [], anchor: "s0", schema: cat.version });
+    const prepared = await c.shard("s0").prepare({ txn: "t2", T, writes: [forged], spans: [], anchor: "s0", schema: cat.schema, epoch: cat.epoch });
     expect(prepared).toEqual({ ok: false, reason: expect.stringMatching(/^write outside claim: a change for t row \[5\]/) });
     expect(c.backends.get("s0")!.exec(`SELECT count(*) AS n FROM __intents`)[0]!.n).toBe(0);
     expect(await stored(c)).toEqual([]);
@@ -153,7 +174,7 @@ describe("the shard's write guard on each path that runs user SQL or takes a tra
     const [mine, gone] = [on("s0"), on("s1")];
     const row: Span = { kind: "pk", table: "t", pk: keyString([mine]), sk: keyString([mine]) };
     await expect(c.shard("s0").execAuto({
-      sql: "INSERT INTO t VALUES (?, 1), (?, 2)", params: [BigInt(mine), BigInt(gone)], columns: [], spans: [row], schema: cat.version, write: { sk: null, capture: "insert" },
+      sql: "INSERT INTO t VALUES (?, 1), (?, 2)", params: [BigInt(mine), BigInt(gone)], columns: [], spans: [row], schema: cat.schema, epoch: cat.epoch, write: { sk: null, capture: "insert" },
     })).rejects.toThrow(new RegExp(`^write outside claim: shard s0 does not own t row \\[${gone}\\] \\(not owner: s1\\)`));
     expect(await stored(c)).toEqual([]);
     expect(c.writeEscapes.map((e) => e.row)).toEqual([`t [${gone}]`]);
@@ -165,12 +186,17 @@ describe("the shard's write guard on each path that runs user SQL or takes a tra
     await db.ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
     const cat = await c.catalog();
     const on = (shard: string) => { for (let i = 1; ; i++) if (ownerOf(cat.routing, keyString([i])) === shard) return i; };
-    const [mine, theirs] = [on("s0"), on("s1")];
-    // s0 の claim は、s0 が範囲表で持つ区間である。s1 の行は、s0 が手放したことのない token だが、claim の外にある。
-    const claim = regionsOf(cat.routing, "s0");
-    expect(claim.some((x) => { const t = tokenOf(keyString([theirs]), keyString([theirs])); return t >= x.start && t < x.end; })).toBe(false);
+    void on;
+    // claim は、s0 が範囲表で持つ区間の前半だけである。後半の行は、s0 の持ち物だが、claim の外にある。持ち物でない行は、
+    // 宣言を見る前に、所有の確かめ (段 2 から、自分のスナップショットで引く) が断る。
+    const [whole] = regionsOf(cat.routing, "s0");
+    const cut = whole!.start + Math.floor((whole!.end - whole!.start) / 2 / SUBSLOTS) * SUBSLOTS;
+    const claim = [{ start: whole!.start, end: cut }];
+    const tokenOfId = (id: number) => tokenOf(keyString([id]), keyString([id]));
+    const pick = (inside: boolean) => { for (let i = 1; ; i++) { const t = tokenOfId(i); if (ownerOf(cat.routing, keyString([i])) === "s0" && (t < cut) === inside) return i; } };
+    const [mine, theirs] = [pick(true), pick(false)];
     const wide: Span = { kind: "table", table: "t", claim };
-    const req = { sql: "INSERT INTO t VALUES (?, 1)", columns: [], schema: cat.version, write: { sk: null } };
+    const req = { sql: "INSERT INTO t VALUES (?, 1)", columns: [], schema: cat.schema, epoch: cat.epoch, write: { sk: null } };
     await c.shard("s0").execAuto({ ...req, params: [BigInt(mine)], spans: [wide] });
     await expect(c.shard("s0").execAuto({ ...req, params: [BigInt(theirs)], spans: [wide] }))
       .rejects.toThrow(new RegExp(`^write outside claim: the statement wrote t row \\[${theirs}\\]`));

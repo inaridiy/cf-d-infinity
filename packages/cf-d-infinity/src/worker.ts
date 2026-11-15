@@ -133,7 +133,7 @@ export class DinfShard extends DurableObject<Env> {
       clock: { now: () => Date.now() },
       peer: (id) => shardStub(env, id),
       meta: {
-        ddlSince: (v) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).ddlSince(v) as never,
+        epochsSince: (after) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).epochsSince(after) as never,
         revokeDdl: (v, reason) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).revokeDdl(v, reason),
         startSplit: (id, move) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).startSplit(id, move),
         checkSplit: (id, move) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).checkSplit(id, move),
@@ -213,6 +213,9 @@ export class DinfMeta extends DurableObject<Env> {
   }
   ddlSince(v: number) {
     return this.core.ddlSince(v);
+  }
+  epochsSince(after: number) {
+    return this.core.epochsSince(after);
   }
   /** 遅い文を記録する。直近の SLOW_KEEP 件だけ残す。 */
   recordSlow(e: SlowQuery): void {
@@ -579,14 +582,15 @@ export async function clusterStatus(env: Env, name = "shard", shards?: number) {
   const cat = await cluster.catalog();
   const ids = shardsOf(cat.routing);
   // 適用できない DDL で止まっているシャードは、適用を試みさせないと自分では気づかない (再起動で忘れる)。
-  await Promise.all(ids.map((id) => cluster.shard(id).syncSchema({ version: cat.version }).catch(() => {})));
+  await Promise.all(ids.map((id) => cluster.shard(id).syncSchema({ schema: cat.schema }).catch(() => {})));
   // 1 つのシャードが答えなくても、ほかの状態は見せる。
   const health = await Promise.all(ids.map((id) => cluster.shard(id).health({}).catch((e): ShardHealth => ({
     id, schema: -1, format: -1, bytes: 0, intents: 0, oldestIntentMs: 0, unapplied: 0,
     redriveErrors: [`does not answer: ${String((e as Error)?.message ?? e).slice(0, 200)}`], incoming: 0, outgoing: 0, logGenerations: 0,
   }))));
   return {
-    routing: cat.routing, shards: ids, schema: cat.version, health, problems: healthProblems(health),
+    // schema は表定義の epoch で、シャードの health の schema と同じ数である (段 2)。
+    routing: cat.routing, shards: ids, schema: cat.schema, health, problems: healthProblems(health),
     // 進行中の分割。終わるまで、表定義の変更は待つ。長く残っているなら、分割が進めなくなっている。
     splits: await cluster.splits(),
     scaler: await env.DINF_AUTOSCALER.getByName(name).status(),

@@ -16,15 +16,19 @@ export type { DdlEntry } from "./catalog";
 export const INDEX_LEASE_MS = 5_000;
 export const INDEX_BUILD_MAX_MS = 300_000;
 
-/** DDL の版が、呼び出し側の見た版から進んでいた。表定義を取り直してやり直す。 */
+/**
+ * DDL の版が、呼び出し側の見た版から進んでいた。表定義を取り直してやり直す。schema は、その版の表定義の epoch である。
+ * DO の間ではクラスが落ちるので、どちらの数も文に書く。
+ */
 export class SchemaMoved extends Error {
   readonly retryable = true;
-  constructor(readonly version: number) {
-    super(`schema moved to version ${version}`);
+  constructor(readonly version: number, readonly schema: number) {
+    super(`schema moved to version ${version} (schema epoch ${schema})`);
   }
 }
 
 export interface Catalog {
+  /** 表定義の版 (DdlEntry.version)。Meta の入口 (basedOn、取り消し、公開) は、段 3 まで、この数で話す。 */
   version: number;
   tables: Record<string, TableDef>;
   views: Record<string, string>;
@@ -34,15 +38,24 @@ export interface Catalog {
   routing: Routing;
   /** 最新の版が取り消しなら、取り消された版と理由。DDL を出した側が、失敗を利用者へ返すのに使う。 */
   revoked?: { version: number; reason: string };
+  /**
+   * このスナップショットの epoch (畳んだ最後の epoch)。要求が運び (ExecReq.epoch)、シャードは、これが自分より新しく、要求の行が
+   * 自分のスナップショットで自分のものでなければ、列を適用してから所有を確かめ直す (段 2)。
+   */
+  epoch: number;
+  /** 表定義が最後に変わった epoch。要求が運び (ExecReq.schema)、シャードは自分の表定義の epoch と等しいことを確かめる (段 2)。 */
+  schema: number;
 }
 
 /**
- * スナップショットを、Worker とシャードに渡す今の形 (Catalog) にする。epoch、表定義の epoch、開いている遷移と移動は、
- * 段 1 では Meta の外に出さない。要求が epoch を運ぶのは段 2 からである。
+ * スナップショットを、Worker とシャードに渡す形 (Catalog) にする。開いている遷移と移動は、まだ Meta の外に出さない。
+ * epoch と schema は、段 2 で足した (要求が運ぶ)。段 1 の比べ合い (test/meta-old.ts) は、比べる前に、この 2 つを落とす。
  */
 function catalogOf(s: Snapshot): Catalog {
-  const cat: Catalog = { version: s.version, tables: s.tables, views: s.views, indexes: s.indexes, ddl: s.ddl, routing: s.routing };
+  const cat: Catalog = { version: s.version, tables: s.tables, views: s.views, indexes: s.indexes, ddl: s.ddl, routing: s.routing } as Catalog;
   if (s.revoked) cat.revoked = s.revoked;
+  cat.epoch = s.epoch;
+  cat.schema = s.schema;
   return cat;
 }
 
@@ -157,7 +170,11 @@ export class MetaCore {
     return epoch;
   }
 
-  /** 列の最後まで畳んだもの。最初の範囲表は作らない。 */
+  /**
+   * 列の最後まで畳んだもの。最初の範囲表は作らない。
+   * 呼ばれるたびに畳む (段 1 と同じ)。答えの object は呼び出し側へそのまま渡り、シミュレータでは Worker がそれを持ち続けるので、
+   * 控えを共有しない。畳んだ結果を覚えるのは、自分の写しを持つシャードである (kernel.ts の snap)。
+   */
   private snapshot(): Snapshot {
     return fold(readEpochs(this.b));
   }
@@ -253,7 +270,7 @@ export class MetaCore {
     const same = list.find((x) => sameSplit(x, move));
     if (same) return same;
     const cat = this.current();
-    if (basedOn !== cat.version) throw new SchemaMoved(cat.version);
+    if (basedOn !== cat.version) throw new SchemaMoved(cat.version, cat.schema);
     const h = this.holders();
     if (h.exclusive) throw new SchemaBusy(describe(h.exclusive));
     assertInterval(move);
@@ -265,18 +282,32 @@ export class MetaCore {
     return slot;
   }
 
-  /** 子が受け取り始める。枠が生きていれば、期限を外して分割の版を返す。枠がなければ (期限切れ) 断る。 */
-  async startSplit(id: string, move: SplitMove): Promise<{ version: number }> {
+  /**
+   * 子が受け取り始める。枠が生きていれば、期限を外して分割の版と、その版の表定義の epoch を返す。枠がなければ (期限切れ) 断る。
+   * シャードは表定義の epoch で比べるので (段 2)、子は schema まで列を適用してから受け取り始める。
+   */
+  async startSplit(id: string, move: SplitMove): Promise<{ version: number; schema: number }> {
     this.expire();
     const list = this.splitSlots();
     const slot = list.find((x) => x.id === id);
     // 欠陥のスイッチ: 枠が期限で消えていても断らず、いまの版で受け取り始めさせる。枠のないまま分割が進み、DDL が記録される。
-    if (!slot && this.faults.startWithoutSlot) return { version: this.current().version };
+    if (!slot && this.faults.startWithoutSlot) {
+      const cat = this.current();
+      return { version: cat.version, schema: cat.schema };
+    }
     if (!slot || !sameSplit(slot, move)) {
       throw new SqlError(`split ${id}: no such split slot (it expired before the child started, or it is for another range)`);
     }
     if (!slot.started) this.setSplitSlots(list.map((x) => (x.id === id ? { ...x, started: true } : x)));
-    return { version: slot.version };
+    return { version: slot.version, schema: this.schemaOf(slot.version) };
+  }
+
+  /** 表定義の版 version を記録した commit の epoch。版 0 (表定義の変更がまだない) は 0 である。 */
+  private schemaOf(version: number): number {
+    if (version === 0) return 0;
+    const hit = readEpochs(this.b).find(({ rec }) => rec.kind === "commit" && "ddl" in rec && rec.ddl.version === version);
+    if (!hit) throw new SqlError(`schema version ${version} is not recorded`);
+    return hit.epoch;
   }
 
   /** 親が fence する前に、枠が生きていて、子が受け取り始めていることを確かめる。 */
@@ -370,6 +401,16 @@ export class MetaCore {
     return { version: ddl.at(-1)?.version ?? version, ddl };
   }
 
+  /**
+   * 列の、epoch が after より後の記録を、昇順で返す。シャードは、これを自分の写し (__epoch) に足し、同じ fold で畳む (段 2)。
+   * 最初の範囲表 (epoch 0) は、まだなければここで書く。写しの先頭は、いつも epoch 0 である。
+   */
+  async epochsSince(after: number): Promise<Logged[]> {
+    this.expire();
+    this.ensureGenesis();
+    return readEpochs(this.b, after);
+  }
+
   /** 表定義の版を 1 つ、commit の記録として足す。シャードで実行する文は、同じ取引の中で Meta の SQLite でも実行する。 */
   private append(p: Omit<DdlEntry, "version">, version: number): void {
     const entry: DdlEntry = { ...p, version };
@@ -391,7 +432,7 @@ export class MetaCore {
   async applyDdl(sql: string, basedOn?: number): Promise<Catalog> {
     this.expire();
     const cat = this.current();
-    if (basedOn !== undefined && basedOn !== cat.version) throw new SchemaMoved(cat.version);
+    if (basedOn !== undefined && basedOn !== cat.version) throw new SchemaMoved(cat.version, cat.schema);
     this.assertFreeForDdl();
     const parsed = parseDdl(sql, cat);
     if (!parsed.noop) {
@@ -455,7 +496,7 @@ export class MetaCore {
   async lockTables(tables: string[], basedOn?: number): Promise<Catalog> {
     this.expire();
     const cat = this.current();
-    if (basedOn !== undefined && basedOn !== cat.version) throw new SchemaMoved(cat.version);
+    if (basedOn !== undefined && basedOn !== cat.version) throw new SchemaMoved(cat.version, cat.schema);
     this.assertFreeForDdl();
     const defs = tables.map((t) => {
       const def = cat.tables[t];
