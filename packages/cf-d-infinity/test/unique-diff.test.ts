@@ -15,8 +15,9 @@ import { checkSeed, KNOWN_OPEN, REFUSED, SHAPES } from "./unique-diff";
 import { seedsOr, SimCluster } from "./sim";
 
 const OPEN = Boolean(process.env.OPEN);
-// 1 から 40 と、OR REPLACE の欠陥 (KNOWN_OPEN の最後) に当たる 61 と 71。最後の試験が、伏せた欠陥に既定の seed で当たることを確かめる。
-const DEFAULTS = [...Array.from({ length: 40 }, (_v, i) => i + 1), 61, 71];
+// 1 から 40 と、OR REPLACE の 2 つの欠陥 (KNOWN_OPEN の最後の 2 つ) に当たる 61、71、430。最後の試験が、伏せた欠陥に既定の seed で
+// 当たることを確かめる。
+const DEFAULTS = [...Array.from({ length: 40 }, (_v, i) => i + 1), 61, 71, 430];
 const seeds = seedsOr(DEFAULTS);
 const listed = KNOWN_OPEN.length ? KNOWN_OPEN.map((k) => `${k.id} (${k.repro})`).join("; ") : "none";
 
@@ -40,7 +41,8 @@ describe(`UNIQUE statements give SQLite's answers on every placement (${OPEN ? "
     // 断る形の一覧は、段 2 で減る。D∞ が受け付けるようになった形は、ここで落ちるので、一覧から外す。
     for (const r of REFUSED) expect(tally.refused[r.id] ?? 0, r.id).toBeGreaterThan(0);
     for (const s of SHAPES) expect(tally.shapes[s] ?? 0, s).toBeGreaterThan(0);
-    for (const k of KNOWN_OPEN) expect(tally.masked[k.id] ?? 0, k.id).toBeGreaterThan(0);
+    // 流さない (skip) ことで避けている欠陥は、数えても意味がない (その形が台本にあれば、いつも数える)。伏せている欠陥だけを見る。
+    for (const k of KNOWN_OPEN) if (!k.skip) expect(tally.masked[k.id] ?? 0, k.id).toBeGreaterThan(0);
   });
 
   it("puts the tenants 'a' and 'A' on different shards with 2 and 4 shards", async () => {

@@ -4,13 +4,17 @@
 // OR ABORT と同じで、取引の中では、取引が終わる (後の COMMIT は `cannot commit - no transaction is active` になる)。
 // - autocommit: シャードは文を自分の SAVEPOINT の中で実行する (シミュレータの SqliteBackend.tx、DO の transactionSync)。OR ROLLBACK が
 //   SQLite の取引を丸ごと巻き戻すので、SAVEPOINT が消え、`no such savepoint: sp0` で落ちる (1 シャードでも、シャードをまたぐ UNIQUE でも)。
-//   本物の DO の transactionSync で何が起きるかは確かめていない。
-// - 取引の中 (SQL の BEGIN): 文は SQLite と同じ誤りを返すが、取引は終わらない。前の文の書き込みは残り、COMMIT で確定する。
+//   手元の workerd の DO でも同じで、transactionSync の SAVEPOINT (`_cf_sync_savepoint_0`) が消え、利用者には `internal error` が返る
+//   (2026-11-15 に、D∞ の Worker の bundle を Miniflare で動かして確かめた。DO はその後も動き、/admin/status は問題を報告しない)。
+//   基準経路だけの実行 (REFERENCE=scans、full) では、Worker の SQLite が文を実行するので、SQLite と同じ誤りになる。
+// - 取引の中 (SQL の BEGIN): 文は SQLite と同じ誤りを返すか (シャードをまたぐ UNIQUE)、`no such savepoint` で落ちる (シャードの中の
+//   UNIQUE)。どちらでも取引は終わらず、前の文の書き込みは残り、COMMIT で確定する。基準経路だけの実行でも同じである。
 //
 // 見つけたのは、UNIQUE の文の差分の検査 (test/unique-diff.ts、docs/design-unique-keys.md の段 0 の (c)、2026-11-15。seed 2、3、6、8、31 ほか)。
-// 不変条件は、計画書の規則 4 (SQLite と同じ答えか、文の形で断るか) と 9 (取引の中の文は書いた順に効く)、持ち主は文の計画
-// (src/sql/plan.ts。衝突の処理を、シャードと Worker の SQLite でどう実行するか) である。直し方は 2 通りある。OR ROLLBACK を文の形で
-// 断る (`unsupported:`) か、衝突を見つけたら基準経路で SQLite に決めさせ、取引を終わらせる。
+// 計画書の番号のついた不変条件には当たらない (どの置き場所でも同じに起きる。取引の中の形は 9 の「書いた順に効く」に近い)。衝突の処理の
+// 欠陥のまとまり (設計書の「段 0 の結果」) の 1 つで、持ち主は文の原子性を作る所 (シャードの Backend.tx、DO の transactionSync) と
+// Txn (取引を終わらせない) である。直し方は 2 通りある。OR ROLLBACK を文の形で断る (`unsupported:`) か、衝突したら基準経路で
+// SQLite に決めさせ、取引を終わらせる。
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { SimCluster } from "../sim";

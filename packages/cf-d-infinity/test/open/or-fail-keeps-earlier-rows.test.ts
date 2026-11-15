@@ -1,12 +1,14 @@
 // 未解決: OR FAIL の複数行の文が制約に当たると、当たった行より前の行の変更まで取り消す (OR ABORT と同じになる)。
 //
 // SQLite の OR FAIL は、制約に当たった行で文を止めて誤りを返すが、それまでの行の変更は残す (取り消さない)。D∞ は、文の変更を全部
-// 取り消す。UNIQUE のない表の主キーの衝突でも起き、シャードの数に依らない (1 シャードでも同じ)。
+// 取り消す。UNIQUE のない表の主キーの衝突でも起き、シャードの数に依らない (1 シャードでも同じ)。基準経路だけの実行 (REFERENCE=scans、
+// full) でも、手元の workerd の DO でも同じである (2026-11-15 に確かめた)。
 //
 // 見つけたのは、UNIQUE の文の差分の検査 (test/unique-diff.ts、docs/design-unique-keys.md の段 0 の (c)、2026-11-15。seed 15)。
 // 差分の検査は、誤りで終わった書き込みの後の表の中身も比べる (OR FAIL があるので)。
-// 不変条件は、計画書の規則 4 (SQLite と同じ答えか、文の形で断るか)、持ち主は文の計画と実行 (src/sql/plan.ts と、文の原子性を作る
-// 所。シャードの SAVEPOINT と Worker の SQLite の src/sql/scratch.ts) である。直し方は 2 通りある。OR FAIL を文の形で断るか、
+// 計画書の番号のついた不変条件には当たらない (どの置き場所でも同じに起きる)。衝突の処理の欠陥のまとまり (設計書の「段 0 の結果」) の
+// 1 つで、持ち主は文の原子性を作る所 (シャードの Backend.tx と DO の transactionSync、Worker の SQLite の src/sql/scratch.ts の
+// SAVEPOINT) である。誤りで終わった文の変更を、衝突の処理に関わらず全部取り消す。直し方は 2 通りある。OR FAIL を文の形で断るか、
 // 衝突したら基準経路で SQLite に決めさせ、残った変更を書く。
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";

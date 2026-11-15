@@ -3,11 +3,13 @@
 // `INSERT OR REPLACE INTO g VALUES (100, 1, 'b@x'), (101, 4, 'd@x'), (4, 4, 'b@x')` を、行 1 から 6 (u = id、email は 'a@x' から) の
 // 表に流す。SQLite は、行 100 が u = 1 の行 1 と email 'b@x' の行 2 を消し、行 101 が email 'd@x' の行 4 を消し、最後の行 4 が、
 // 主キーで (なし)、u = 4 で行 101 を、email 'b@x' で行 100 を消す。残るのは行 3、4 ('b@x')、5、6 である。D∞ では、行 1 が残る。
-// 後の行に消される行 (100) が消した行 (1) が、消えずに残る形である。1 シャードでも同じである。
+// 後の行に消される行 (100) が消した行 (1) が、消えずに残る形である。1 シャードでも、基準経路だけの実行 (REFERENCE=scans、full) でも
+// 同じである。
 //
 // 見つけたのは、UNIQUE の文の差分の検査 (test/unique-diff.ts、docs/design-unique-keys.md の段 0 の (c)、2026-11-15。seed 61、71)。
-// 不変条件は、計画書の規則 4 (SQLite と同じ答え)、持ち主は基準経路の書き込み (src/client/db.ts の Txn.wasmWrite。REPLACE が消した行の
-// 捕捉。SQLite は REPLACE で消した行に DELETE の trigger を、recursive_triggers を有効にしたときだけ発火させる) である。
+// 計画書の番号のついた不変条件には当たらない (どの置き場所でも同じに起きる)。衝突の処理の欠陥のまとまり (設計書の「段 0 の結果」) の
+// 1 つで、持ち主は基準経路の書き込み (src/client/db.ts の Txn.wasmWrite。REPLACE が消した行の捕捉。SQLite は REPLACE で消した行に
+// DELETE の trigger を、recursive_triggers を有効にしたときだけ発火させる。原因は確かめていない) である。
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { SimCluster } from "../sim";

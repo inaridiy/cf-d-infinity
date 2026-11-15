@@ -7,12 +7,14 @@
 //   IGNORE されずに `UNIQUE constraint failed` になる。REPLACE なら、行を置き換えずに誤りになる。
 // - shard key を含む UNIQUE: シャードの SQLite は制約のとおり REPLACE で行を消すが、D∞ の捕捉 (RETURNING) は、消えた行を知らない。
 //   行イメージの検査 (test/setup.ts) が、捕捉した行と表の行の食い違いで落ちる。
-// どちらも、シャードの数に依らない (1 シャードでも同じ)。
+// どちらも、シャードの数に依らない (1 シャードでも同じ)。基準経路だけの実行 (REFERENCE=scans、full) では起きない。Worker の SQLite は
+// 利用者の DDL のとおりの制約を持ち、衝突の処理を SQLite が決めるからである。
 //
 // 見つけたのは、UNIQUE の文の差分の検査 (test/unique-diff.ts、docs/design-unique-keys.md の段 0 の (c)、2026-11-15。seed 9、27、99)。
-// 不変条件は、計画書の規則 4 (SQLite と同じ答え) と、7 (グローバル index の項目と行の一致)、持ち主は ddl.ts の createTable (制約の
-// 衝突の処理を表定義に記録しない) と、それを使わない文の計画 (src/sql/plan.ts) である。直すなら、制約の衝突の処理を表定義に記録し、
-// それのある表への書き込みを、衝突の処理を書いた文と同じに計画する。
+// 計画書の番号のついた不変条件には当たらない (どの置き場所でも同じに起きる。シャードをまたぐ形は、7 のグローバル index の項目と行の一致を
+// 破り得る)。衝突の処理の欠陥のまとまり (設計書の「段 0 の結果」) の 1 つで、持ち主は ddl.ts の createTable (制約の衝突の処理を
+// 表定義に記録しない) と、それを使わない文の計画 (src/sql/plan.ts) である。直すなら、制約の衝突の処理を表定義に記録し、それのある表への
+// 書き込みを、衝突の処理を書いた文と同じに計画する (衝突したら基準経路で SQLite に決めさせる)。
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { SimCluster } from "../sim";

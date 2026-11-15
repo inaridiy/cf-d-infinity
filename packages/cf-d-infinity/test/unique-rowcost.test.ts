@@ -79,8 +79,9 @@ type Pin = number | [number, number];
  *
  * シャードをまたぐ UNIQUE の表への OR REPLACE と upsert (どちらも基準経路で、Worker の SQLite が衝突を決める) は、利用者の表への
  * INSERT と DELETE の行の数が、実行ごとに変わる (8 回で、OR REPLACE の DELETE gu は 1.25 から 1.55、upsert の INSERT gu は 0.7 から 1、
- * DELETE gu は 0.35 から 0.5)。ほかの内訳は同じだった。前の操作の確定の後始末が、次の操作の時点で済んでいるかどうかで変わると見ている
- * (確かめていない)。この 2 つは範囲で固定する。
+ * DELETE gu は 0.35 から 0.5)。ほかの内訳は同じだった (計算機に負荷を掛けた 3 回も同じだった)。操作の間で、全部のシャードの intent と
+ * 未適用の確定がなくなるまで待っても、変わり方は同じだったので、前の操作の後始末の遅れではない。どこから来るかは分かっていない。
+ * この 2 つは範囲で固定する。
  */
 const PINNED: Record<string, { written: Pin; parts: Record<string, Pin> }> = {
   "local: insert": { written: 4, parts: { "INSERT lu": 3, "INSERT __log": 1 } },

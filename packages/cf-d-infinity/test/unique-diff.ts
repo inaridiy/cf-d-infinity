@@ -276,10 +276,12 @@ export function makeScript(seed: number, length = 30): Script {
       () => ({ ...base, shape: "insert three rows", sql: `INSERT ${c}INTO ${s.table}(${cols}) VALUES ${[0, 1, 2].map(() => s.row(r, { tenant: tenant(), id: id(), uniq: v() })).join(", ")}` }),
       () => {
         // 2 つの値を入れ替える。UPDATE t SET u = 3 - u は、どちらの順で訪ねても、1 行目で UNIQUE に当たる。OR REPLACE だけは、
-        // どちらの行が残るかが順で決まる。
+        // どちらの行が残るかが順で決まる。部分 index の UNIQUE (partial) では、index の外の行が同じ値を持てるので、3 行以上に当たる。
+        // そのときの OR FAIL は、最初の衝突の前に訪ねた index の外の行の変更を残すので、順で答えが変わり、2 つの順では覆えない。作らない。
         const [a, b] = [nonNull(), nonNull()];
+        const how = s.partial && c === "OR FAIL " ? "OR ABORT " : c;
         const set = s.uniq.int ? `${s.uniq.col} = (${a} + ${b}) - ${s.uniq.col}` : `${s.uniq.col} = CASE WHEN ${s.uniq.col} = ${a} THEN ${b} ELSE ${a} END`;
-        return { ...base, shape: "swap two values", sql: `UPDATE ${c}${s.table} SET ${set} WHERE ${where(tenant())}${s.uniq.col} IN (${a}, ${b})`, order: c === "OR REPLACE " };
+        return { ...base, shape: "swap two values", sql: `UPDATE ${how}${s.table} SET ${set} WHERE ${where(tenant())}${s.uniq.col} IN (${a}, ${b})`, order: how === "OR REPLACE " };
       },
       () => {
         const [i, j] = [existing(), existing()];
@@ -499,7 +501,10 @@ export interface Known {
   skip?(step: Step): boolean;
 }
 
-const uniqueError = (o: Outcome) => o.kind === "error" && /^UNIQUE constraint failed: /.test(o.message);
+/** UNIQUE の誤りの表の名前。UNIQUE の誤りでなければ null。 */
+const uniqueTable = (o: Outcome) => (o.kind === "error" ? /^UNIQUE constraint failed(?: \(unique: UNIQUE constraint failed)?: (?:index '\w+'|(\w+)\.)/.exec(o.message)?.[1] ?? null : null);
+/** 2 行以上を書き得る文 (複数行の VALUES、INSERT ... SELECT、2 行を名指しする UPDATE)。 */
+const multiRow = (step: Step) => /\), \(|\bSELECT\b|\bIN \(/.test(step.sql);
 const orFail = (step: Step) => /\bOR FAIL\b/.test(step.sql);
 
 export const KNOWN_OPEN: Known[] = [
@@ -509,7 +514,7 @@ export const KNOWN_OPEN: Known[] = [
     // またぐ UNIQUE は表定義の順に確かめる。文はどちらも失敗し、表の中身は同じである (OR FAIL を除く。下の OR FAIL の欠陥)。
     id: "the UNIQUE error names another conflict",
     repro: "test/open/unique-error-first-conflict.test.ts",
-    answer: (_step, ours, sqlite) => uniqueError(ours) && uniqueError(sqlite),
+    answer: (_step, ours, sqlite) => uniqueTable(ours) !== null && uniqueTable(ours) === uniqueTable(sqlite),
     keepGoing: true,
   },
   {
@@ -541,10 +546,18 @@ export const KNOWN_OPEN: Known[] = [
     tables: (step, ours, sqlite) => orFail(step) && ours.kind === "error" && sqlite.kind === "error",
   },
   {
-    // シャードをまたぐ UNIQUE の表への複数行の OR REPLACE で、文の後の行に消される行が消した行が、消えずに残る。
+    // 複数行の OR REPLACE を基準経路で実行すると、文の後の行に消される行が消した行が、消えずに残る。シャードをまたぐ UNIQUE の表 (g) は
+    // いつも基準経路で、シャードの中の UNIQUE の表 (p など) は、基準経路だけの実行 (REFERENCE=scans、full) で当たる (reference-full の seed 300)。
     id: "OR REPLACE that displaces a row it inserted",
     repro: "test/open/global-unique-replace-chain.test.ts",
-    tables: (step, ours, sqlite) => step.table === "g" && /\bOR REPLACE\b/.test(step.sql) && ours.kind === "ok" && sqlite.kind === "ok",
+    tables: (step, ours, sqlite) => /\bOR REPLACE\b/.test(step.sql) && multiRow(step) && ours.kind === "ok" && sqlite.kind === "ok",
+  },
+  {
+    // 部分 index の UNIQUE もある表 (p) で、シャードの中の UNIQUE の衝突を OR REPLACE で解く文を、UNIQUE の誤りで断る。文の変更を
+    // 1 行ずつ物理の UNIQUE index に当てると、一時的な重複ができる (見立て)。sim の seed 430。
+    id: "OR REPLACE on a table with a partial UNIQUE is refused",
+    repro: "test/open/local-unique-replace-trial.test.ts",
+    answer: (step, ours, sqlite) => step.table === "p" && /\bOR REPLACE\b/.test(step.sql) && uniqueTable(ours) === "p" && sqlite.kind === "ok",
   },
 ];
 
