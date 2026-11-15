@@ -542,7 +542,7 @@ M21 は、進める側がどこで止まっても、次の 2 つが成り立つ�
 - 開いている移動を、範囲表の項目の印ではなく `moves` の一覧で持つ。
 - `move-start` の `from` は省けることがある。今の `switchRange` は `from` を省けるので、区間の持ち主が 1 つに決まらなければ記録しない。段 4 の `startMove` では必ず持つ。
 - 段 1 の `open` は、`prepare` の記録ではなく、最新の版の印 (`DdlEntry.build`、`DdlEntry.guard`) から畳む。行で失敗し得る DDL (段 3 の `trial`) は、段 1 では遷移を開かない。今と同じく、1 つの版で記録し、失敗すれば取り消しの版を積む。
-- Meta は利用者の DDL を自分の SQLite でも実行するので、`__epoch` を内部の名前に足した (`src/sql/ddl.ts` の `INTERNAL_NAMES`)。足さないと、利用者の `DROP TABLE __epoch` が Meta の列を消す。
+- Meta は利用者の DDL を自分の SQLite でも実行するので、`__epoch` を内部の名前に足した (`src/sql/ddl.ts` の `INTERNAL_NAMES`)。足さないと、利用者の `DROP TABLE __epoch` が Meta の列を消す。段 1 で利用者に見える変化は、これだけである。段 1 より前は `__epoch` という名前の表を作れたが、いまは「reserved for internal use」で断る (`test/catalog.test.ts`)。
 - 保存の形式を版 3 にした (`src/types.ts` の `STORAGE_FORMAT`)。シャードの形式は変わらない。版 2 からの移行は書かない。
 
 ### 検査
@@ -552,12 +552,15 @@ M21 は、進める側がどこで止まっても、次の 2 つが成り立つ�
 列は全部同じだった。
 違いは 2 種類で、どちらも変更によるものではない。
 1 つ目は更新の試験の 2 件で、材料の版が 2 から 3 に変わり、試験の名前が変わった。列も要求の中身も同じである。
-2 つ目は 3 件 (`basic` の「非決定的な SQL」と、`subrequests` の index の作成の 2 件) で、要求の中身の指紋だけが違った。変更の前のコードを 3 回流すと、3 件とも毎回違う値になる。`basic` は、文の `random()` の値が後の要求に入る。`subrequests` の原因は調べていない。
+2 つ目は 3 件 (`basic` の「非決定的な SQL」と、`subrequests` の index の作成の 2 件) で、要求の中身の指紋だけが違った。変更の前のコードを 3 回流すと、3 件とも毎回違う値になる。`basic` の試験は、文の中で `random()` を使う。`subrequests` の 2 件の原因は調べていない。
+
+未解決の問題の再現 (`test/open/`、8 ファイル 10 件) も、変更の前後で流した。10 件とも前後で落ち、最初の誤りの文も同じだった。
 
 (b) 今の答えとの一致。段 1 より前の Meta を `test/meta-old.ts` に写して残した。
 `test/catalog.test.ts` は、乱択の並び (60 seed、120 手) を 2 つの Meta に同じ順で流し、どの入口の答えも誤りの文まで同じであることを確かめる。
 並びは、期限と上限をまたぐ時計、延ばし続ける期限、index の作成と公開と取り消し、DROP の前の書き込み禁止、古い `basedOn`、失敗する DDL と何もしない DDL、枠のある分割とない切り替え、Meta の開き直し、欠陥のスイッチ (`startWithoutSlot`、`fenceWithoutSlot`、`dropAfterExpiry`) を含む。
 `META_SHADOW` を付けると、シミュレータのすべての Meta の呼び出しを古い Meta にも流して比べる (`test/sim.ts` の `shadowMeta`)。sim の全試験で、違いは 0 件だった。
+`move-end` には古い Meta に当たるものがないので、別に確かめた。分割を進める側を各段の前で止めて再開すると、列には、その移動の `move-start` と `move-end` が 1 つずつあり、開いている移動は残らない (7 つの段のどれで止めても)。
 検査が欠陥を見つけることは、段 1 の Meta に欠陥を 1 つずつ入れて確かめた (取り消された文を履歴に残す、書き込み禁止で遷移を開かない、同じ切り替えを 2 度記録する、取り消しの前の表定義を 1 epoch 先まで畳む、`ddlSince` の境目をずらす、取り消しの印を次の版で消さない。6 つとも乱択の比べ合いが落ちた)。比べ合いの shadow も、わざと入れた違いを見つけた。
 
 (c) M21 との突き合わせ。`test/fixtures/m21/generate.mjs` が、M21 の乱択の経路 (`quint run --mbt`) の各状態で、Meta の手の候補を model 自身に試させる (`quint test` の run。条件を TypeScript に写さない)。

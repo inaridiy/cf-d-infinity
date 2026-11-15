@@ -96,42 +96,54 @@ function modelOnly(c: string, p: Probe): string | null {
   return null;
 }
 
+/** インスタンスの全部の状態で、model の答えと refusal の答えを比べる。違いと、受けた数、断った数 (条件ごと)、数えなかった数を返す。 */
+function check(inst: Probes["instances"][number]): { wrong: string[]; accepted: number; skipped: number; refused: Map<Refusal["rule"], number> } {
+  const out = { wrong: [] as string[], accepted: 0, skipped: 0, refused: new Map<Refusal["rule"], number>() };
+  for (const p of inst.states) {
+    const snap = fold(logOf(p));
+    if (snap.epoch !== p.len) out.wrong.push(`the log of ${JSON.stringify(p)} folds to epoch ${snap.epoch}`);
+    for (const [c, ok] of Object.entries(p.verdicts)) {
+      const { rec, acks } = candidate(c, p);
+      const r = refusal(snap, rec, acks);
+      const at = `${c} at len ${p.len} prepE ${JSON.stringify(p.prepE)} commitE ${JSON.stringify(p.commitE)} abortE ${JSON.stringify(p.abortE)} acks ${JSON.stringify(p.acks)}`;
+      if (ok) {
+        if (r) out.wrong.push(`the model takes ${at}, but refusal says ${r.rule}`);
+        else out.accepted++;
+      } else if (r) {
+        out.refused.set(r.rule, (out.refused.get(r.rule) ?? 0) + 1);
+      } else if (modelOnly(c, p)) {
+        out.skipped++;
+      } else {
+        out.wrong.push(`the model refuses ${at}, but refusal accepts it`);
+      }
+    }
+  }
+  return out;
+}
+
 describe("the epoch log's transition conditions (src/catalog.ts) against M21", () => {
   it("uses answers made from the current model", () => {
     const model = readFileSync(join(import.meta.dirname, "..", "..", "..", probes.model), "utf8");
     expect(createHash("sha256").update(model).digest("hex"), "specs/m21_catalog_epoch.qnt changed: run test/fixtures/m21/generate.mjs again").toBe(probes.sha256);
   });
 
-  const refused = new Map<Refusal["rule"], number>();
-  let accepted = 0;
-  let skipped = 0;
   for (const inst of probes.instances) {
     it(`${inst.name}: refuses what the model refuses, and accepts what it accepts (${inst.states.length} states)`, () => {
-      const wrong: string[] = [];
-      for (const p of inst.states) {
-        const snap = fold(logOf(p));
-        expect(snap.epoch).toBe(p.len);
-        for (const [c, ok] of Object.entries(p.verdicts)) {
-          const { rec, acks } = candidate(c, p);
-          const r = refusal(snap, rec, acks);
-          const at = `${c} at len ${p.len} prepE ${JSON.stringify(p.prepE)} commitE ${JSON.stringify(p.commitE)} abortE ${JSON.stringify(p.abortE)} acks ${JSON.stringify(p.acks)}`;
-          if (ok) {
-            if (r) wrong.push(`the model takes ${at}, but refusal says ${r.rule}`);
-            else accepted++;
-          } else if (r) {
-            refused.set(r.rule, (refused.get(r.rule) ?? 0) + 1);
-          } else if (modelOnly(c, p)) {
-            skipped++;
-          } else {
-            wrong.push(`the model refuses ${at}, but refusal accepts it`);
-          }
-        }
-      }
-      expect(wrong.slice(0, 10)).toEqual([]);
+      expect(check(inst).wrong.slice(0, 10)).toEqual([]);
     });
   }
 
   it("checks every condition at least once", () => {
+    // 数え直す。ほかの it が先に走ったことに頼らない (-t で 1 つだけ流しても同じ数になる)。
+    const refused = new Map<Refusal["rule"], number>();
+    let accepted = 0;
+    let skipped = 0;
+    for (const inst of probes.instances) {
+      const r = check(inst);
+      accepted += r.accepted;
+      skipped += r.skipped;
+      for (const [k, n] of r.refused) refused.set(k, (refused.get(k) ?? 0) + n);
+    }
     console.log(JSON.stringify({ accepted, skipped, refused: Object.fromEntries(refused) }));
     for (const rule of ["one-open", "ddl-waits-move", "move-waits-ddl", "one-exit", "all-acks", "owner", "move-not-open"] as const) {
       expect(refused.get(rule) ?? 0, `refusals by ${rule}`).toBeGreaterThan(0);
