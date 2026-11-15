@@ -220,6 +220,21 @@ export class SqliteBackend implements Backend {
   rt: Runtime = systemRuntime;
   constructor(readonly db = new DatabaseSync(":memory:")) {}
   /**
+   * 用意した文を、文面ごとに覚えて使い回す。シミュレータの時間の大半は文を用意することで、利用者の表の読みは、元の文 (結果の
+   * 列名を知るため) と包み直した文の 2 つを用意する。文を読み終えるまで同じ Backend に別の文を挟まない約束 (Backend.iterate) が
+   * あるので、同じ文を 2 か所で同時に読むことはない。表定義が変わると、SQLite が文を用意し直す。
+   */
+  private statements = new Map<string, ReturnType<DatabaseSync["prepare"]>>();
+  private statement(sql: string): ReturnType<DatabaseSync["prepare"]> {
+    let st = this.statements.get(sql);
+    if (st === undefined) {
+      st = this.db.prepare(sql);
+      if (this.statements.size >= 512) this.statements.delete(this.statements.keys().next().value!);
+      this.statements.set(sql, st);
+    }
+    return st;
+  }
+  /**
    * 文を用意して、結果の列名と、行を読む関数を返す。結果のない文は、ここで実行する。
    * node:sqlite も DO の SQLite と同じく、JS の数を REAL として束縛する。束縛の仕方は DO と同じにする (src/value.ts)。
    * DO の上限は、束縛のために書き換えた後の文に掛かる (書き換えで文が長くなる)。
@@ -232,7 +247,7 @@ export class SqliteBackend implements Backend {
     for (const p of b.params) if (typeof p === "bigint") throw new TypeError("a BigInt reached the driver; the DO SQLite cannot bind it");
     checkDoLimits(b.sql, b.params);
     checkDoDepth(b.sql);
-    const st = this.db.prepare(b.sql);
+    const st = this.statement(b.sql);
     const p = b.params as never[];
     const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
     checkDoColumns(columns.length);
@@ -250,7 +265,7 @@ export class SqliteBackend implements Backend {
       convert = (v) => (typeof v === "bigint" ? integer(v) : (v as Plain));
       if (READS_ROWS.test(b.sql)) {
         try {
-          reader = this.db.prepare(wholeTextSql(b.sql, columns.length));
+          reader = this.statement(wholeTextSql(b.sql, columns.length));
           convert = (v) => (v instanceof Uint8Array ? utf8Text.decode(v) : typeof v === "string" ? fromHex(v) : typeof v === "bigint" ? integer(v) : (v as Plain));
         } catch (e) {
           // WITH で始まる DML (RETURNING のある書き込み) は包めない。そのまま読む。ほかの文が包めないのは、包み方の誤りなので投げる

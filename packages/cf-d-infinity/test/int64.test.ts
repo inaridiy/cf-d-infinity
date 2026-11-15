@@ -359,7 +359,8 @@ const SCENARIOS: Record<string, (r: Run) => Promise<void>> = {
         const again = await read(id);
         // 基準経路だけの実行は、主キーの読みでも全シャードから行を集める。2 つ以上のシャードで行が変わっているので、いまは
         // 競合で失敗する (上の未解決の欠陥)。競合は取引の正しい結末の 1 つなので、ここでは認める。答えたなら、古い行でなければならない。
-        if (r.reference !== undefined && /"error":"read too old/.test(again)) break;
+        // 環境変数 REFERENCE で流すと、「普通」の実行もクラスタの指定で基準経路になる (SimCluster.reference)。
+        if ((r.reference !== undefined || r.c.reference !== undefined) && /"error":"read too old/.test(again)) break;
         expect(again, `the transaction reads id ${id} as it was at its read time`).toBe(before[i]);
       }
     } finally {
