@@ -512,6 +512,50 @@ for m in m22_track m22_track_split m22_green3_one m22_red_key_at_row m22_red_key
          m22_red_key_after_commit m22_red_keep_old_key m22_red_key_intent_with_row m22_red_physical_unique m22_red_group_refuse \
          m22_live_red_group_wait; do tests $f $m; done
 
+echo "== M23 refresh across move (範囲の移動をまたぐ取引の read refresh と、子での確定。実装より先に書いたモデル)"
+f=m23_refresh_across_move.qnt
+# 設計 1 (推奨): Worker は今の持ち主へ送り、子が、到着より前の窓を親の記録で埋める
+green   $f m23_green m23Safe                            # 全表を 2 回読み、動いた行を楽観で書く (再現の形)。W と Y、範囲表の古い Worker の refresh あり
+green   $f m23_green_ro m23Safe                         # 読むだけの取引
+green   $f m23_green_pess m23Safe                       # 悲観の取引。T は最初の読みのまま、子で確定する
+red     $f m23_red_parent_alone serializable            # 親が、渡したグループの確かめに、自分の記録だけで答える (範囲表の古い Worker は子に尋ねない)
+red     $f m23_red_child_from_floor serializable        # 子が、自分の記録を床から確かめる (到着の後、床の前の確定を見落とす)
+red     $f m23_red_child_from_arrival serializable      # 子が、到着の m から確かめる (pull に乗った intent を m 以下の c で適用したものを見落とす)
+red     $f m23_red_no_peer serializable                 # 子が、到着より前からの窓を、親の記録で埋めない
+red     $f m23_red_prepare_alone serializable           # 確定の検証でだけ、親の記録で埋めない (失われた更新)
+red     $f m23_red_no_bump serializable                 # 確かめに答えたシャードが、時計を to まで進めない
+red     $f m23_red_no_push placementIndependent         # 確かめが、c の決まっていない intent で失敗する (読むだけの取引が、移動のために失敗する)
+red     $f m23_impl_pinned placementIndependent         # いまの実装: 取引が範囲表を取り直さず、動いた行の文が not owner で失敗する
+red     $f m23_impl placementIndependent                # 範囲表だけ取り直す: 確かめは読んだシャードへ行き、親は not owner、子は床で断る
+green   $f m23_impl_pinned answersSafe                  # どちらも、断るだけで、答えは誤らない
+green   $f m23_impl answersSafe
+red     $f m23_live_red_pingpong boundedRefusals        # 子が「前の持ち主へ」と断り、親が「渡した」と断る
+live    $f m23_live refreshTerminates                   # 活性: 始めた refresh は、いつか終わる
+live_red $f m23_live_red_pingpong refreshTerminates
+witness $f m23_green witnessRefreshAcross               # 移動の時刻をまたいで T を進めた refresh が通り、確定する
+witness $f m23_green witnessCommitAcross                # 移動の前に親で読んだ取引が、動いた行を子で書いて確定する
+witness $f m23_green witnessReproduction                # 再現の形 (test/open/transaction-across-split.test.ts の 1 つ目) が確定する
+witness $f m23_green witnessConflictBelowFloor          # 子が到着の後、床の前に確定した書き込みで、取引が競合になる
+witness $f m23_green witnessBelowArrival                # T が到着の m より小さいまま、子で確定する
+witness $f m23_green witnessRefusedThenCommitted        # 親が範囲表の古い取引の確かめを断り、取引が範囲表を直して確定する
+witness $f m23_green_pess witnessBelowArrival
+witness $f m23_green_ro witnessAborted                  # 読むだけの取引が、移動の後の読み直しで競合になる (持ち主の判断 1)
+# 設計 2 (退けた案): Worker が親と子の両方に尋ね、親は要求の epoch で確かめる
+green   $f m23_alt_green m23Safe
+red     $f m23_alt_red_parent_alone serializable        # Worker が、読んだシャード (親) だけに尋ねる
+red     $f m23_alt_red_no_epoch serializable            # 親が、要求の epoch を見ずに答える
+red     $f m23_alt_red_child_from_floor serializable
+red     $f m23_alt_red_unarrived serializable           # 子が、グループが届く前に答える (飛んでいる intent を、親も子も見ない)
+red     $f m23_alt_red_prepare_alone serializable       # 確定で、Worker が親を検証に入れない
+live    $f m23_alt_live refreshTerminates
+witness $f m23_alt_green witnessReproduction
+if [ "${HEAVY:-0}" = "1" ]; then                        # tick 2 回、T の上限 6
+  green $f m23_green_wide m23Safe
+fi
+for m in m23_green m23_green_pess m23_red_parent_alone m23_red_child_from_floor m23_red_child_from_arrival m23_red_no_peer \
+         m23_red_prepare_alone m23_red_no_bump m23_red_no_push m23_impl_pinned m23_impl m23_live_red_pingpong \
+         m23_alt_green m23_alt_red_parent_alone m23_alt_red_no_epoch m23_alt_red_unarrived; do tests $f $m; done
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect
