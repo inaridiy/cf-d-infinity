@@ -241,7 +241,8 @@ a whole-table read that still believes the parent owns the moved slots, both get
 the range table and plans the statement again. A transaction keeps the schema it started with and swaps in the newer
 range table. A shard looks ownership up in its own copy of the epoch log; a child that has not yet applied the move
 applies it when a request planned on a newer snapshot reaches it. A transaction that read the moved range before the
-split cannot yet move its read time past the move (open problem 37). See [scaling.md](./scaling.md) for the timestamp
+split cannot yet move its read time past the move, and one that wrote or lock-read a moved row before the split fails
+its next statement as a conflict (open problem 37). See [scaling.md](./scaling.md) for the timestamp
 rules that keep this serializable.
 
 ## How it is checked

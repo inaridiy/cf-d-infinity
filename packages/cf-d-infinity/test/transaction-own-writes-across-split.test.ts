@@ -29,6 +29,24 @@ async function scene() {
   return { c, moving, splitIt: () => split(c, "s0", "s1", { range: { start: cut, end: r.end } }) };
 }
 
+describe("a transaction whose locked read moved to another shard in a split", () => {
+  // BEGIN IMMEDIATE の主キーの読みは、行ロックを取って最新を読む。ロックは、読んだシャード (親) のメモリにだけある。行が子へ動くと、
+  // 別の接続は子で行を書ける。取引が範囲表を取り替えて同じ行を子で読み直すと、別の接続の書き込みが見え、同じ取引の 2 つの読みが
+  // 食い違う。そこで、行ロックを取った読み (since のある範囲) が新しい範囲表で別のシャードのものになっていれば、取り替えずに競合で断る。
+  it("does not read the row again at the new owner after another connection changed it", async () => {
+    const { c, moving, splitIt } = await scene();
+    const db = new Db(c, { retries: 0 });
+    await db.query("BEGIN IMMEDIATE");
+    expect((await db.query("SELECT v FROM t WHERE id = ?", [moving])).rows).toEqual([{ v: moving }]);
+    await splitIt();
+    await new Db(c).query("UPDATE t SET v = -1 WHERE id = ?", [moving]);
+    const again = await outcome(db.query("SELECT v FROM t WHERE id = ?", [moving]).then((r) => r.rows));
+    expect(again).not.toEqual({ ok: [{ v: -1 }] });
+    if ("ok" in again) expect(again.ok).toEqual([{ v: moving }]);
+    await outcome(db.query("ROLLBACK"));
+  });
+});
+
 describe("a transaction whose own write moved to another shard in a split", () => {
   for (const begin of ["BEGIN", "BEGIN IMMEDIATE"]) {
     it(`does not answer from the new owner without its own write (${begin})`, async () => {

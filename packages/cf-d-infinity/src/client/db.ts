@@ -149,6 +149,18 @@ const isRouteRefusal = (e: unknown): boolean => {
   return /^not owner: /.test(m) && !/^not owner: stale schema/.test(m);
 };
 
+/** 区間 x の全体が、区間の組 parts (重ならない) の和に入るか。 */
+function covered(x: Interval, parts: Interval[]): boolean {
+  let at = x.start;
+  for (const p of [...parts].sort((a, b) => a.start - b.start)) {
+    if (p.end <= at) continue;
+    if (p.start > at) return false;
+    at = p.end;
+    if (at >= x.end) return true;
+  }
+  return false;
+}
+
 /** 採番のブロックの控え (Db.idsMark)。表ごとの次の番号とブロックの終わり。 */
 type IdsMark = Map<string, { next: number; end: number }>;
 
@@ -672,10 +684,13 @@ export class Txn extends ReadScope {
    * plannedWith は、断られた試みを計画したスナップショットである。その間に、同じ取引の別の文 (計画の途中の読み) が取り替えていれば、
    * 取り直さずに true を返す。
    * 取り替えるのは範囲表だけである。取引が溜めた読みと書き込みは、それを読んだか計画したシャードのものとして残る。
-   * そのため、溜めた書き込みの行が、新しい範囲表で別のシャードのものになっていれば、取り替えずに競合で断る。取り替えると、新しい
-   * 持ち主へ送る文の overlay に、その行の書き込みが入らず、行ロックを取る文 (最新の状態で実行する) が、取引自身の書き込みを見ないまま
-   * 答える (test/transaction-own-writes-across-split.test.ts)。溜めた書き込みと読みを新しい持ち主へ移して続ける規則は、移動をまたぐ
-   * 読みの確かめ直しと一緒に、モデルを書いてから入れる (未解決の問題 37)。
+   * そのため、次のどちらかがあれば、取り替えずに競合で断る (test/transaction-own-writes-across-split.test.ts)。
+   *   溜めた書き込みの行が、新しい範囲表で別のシャードのものになった。取り替えると、新しい持ち主へ送る文の overlay に、その行の
+   *     書き込みが入らず、行ロックを取る文 (最新の状態で実行する) が、取引自身の書き込みを見ないまま答える。
+   *   行ロックを取って読んだ範囲 (since のある範囲) が、新しい範囲表で、読んだシャードのものでなくなった。ロックは読んだシャードの
+   *     メモリにだけあるので、新しい持ち主では別の接続が書ける。取り替えて同じ行を読み直すと、同じ取引の 2 つの読みが食い違う。
+   * 時刻 T で読んだ範囲 (since のない範囲) は、新しい持ち主が T を範囲の床と比べて断るので、取り替えてよい。溜めた書き込みと読みを
+   * 新しい持ち主へ移して続ける規則は、移動をまたぐ読みの確かめ直しと一緒に、モデルを書いてから入れる (未解決の問題 37)。
    */
   async reroute(e: unknown, plannedWith: Catalog): Promise<boolean> {
     if (!isRouteRefusal(e)) return false;
@@ -687,6 +702,15 @@ export class Txn extends ReadScope {
         if (ownerOf(fresh.routing, c.sk) !== shard) {
           throw new ConflictError(`rows this transaction wrote moved to another shard in a split (${c.table} ${c.pk} is now on ${ownerOf(fresh.routing, c.sk)}); roll back and run the transaction again`);
         }
+      }
+    }
+    for (const [shard, spans] of this.spans) {
+      const mine = regionsOf(fresh.routing, shard);
+      const kept = (x: Interval) => covered(x, mine);
+      for (const sp of spans) {
+        if (sp.since === undefined) continue;
+        const moved = isWideSpan(sp) ? (sp.claim ?? []).some((x) => !kept(x)) : sp.kind !== "table" && sp.sk !== undefined && ownerOf(fresh.routing, sp.sk) !== shard;
+        if (moved) throw new ConflictError(`rows this transaction read under a lock moved to another shard in a split (${sp.table}); roll back and run the transaction again`);
       }
     }
     this.cat = fresh;

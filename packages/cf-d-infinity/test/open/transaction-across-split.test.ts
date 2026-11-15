@@ -14,13 +14,16 @@
 // いなくても失敗するので、成否が置き場所で変わる。
 //   1 つ目の試験: 2 文目の読みが `read too old: moved at m` で失敗する。
 //   2 つ目の試験: 別の接続が書いたときの失敗 (`read too old`) は、書かなかったときにも同じに起きる (後半が失敗する)。
+//   3 つ目の試験: 分割の前に動いた行を書いた (か、行ロックを取って読んだ) 取引は、次の文が競合で断られる。範囲表を取り替えると、
+//     溜めた書き込みと行ロックが、書いたときのシャードのものとして残り、新しい持ち主の文から見えないので、段 2 は取り替えずに断る
+//     (Txn.reroute。test/transaction-own-writes-across-split.test.ts が、断ることを確かめる)。
 // 親が移動の前の時刻を、子が受け取った後の時刻を受け持って確かめ直す規則はモデルにない (M21 の取引は動いた行で断られ、M18 は
 // 移動をまたぐ取引の検証を扱っていない)。規則 3 により、そのモデル (M5b を広げる) を先に書く。持ち主は Epoch の段 2 の後の作業。
 import { describe, expect, it } from "vitest";
 import { split } from "../../src/autoscaler";
 import { Db } from "../../src/client/db";
 import { keyString } from "../../src/keys";
-import { ownerOf, SUBSLOTS } from "../../src/routing";
+import { ownerOf, SUBSLOTS, tokenOf } from "../../src/routing";
 import { SimCluster } from "../sim";
 
 const ROWS = 40;
@@ -75,5 +78,20 @@ describe("a transaction that a split crosses", () => {
     expect(changed).not.toMatch(/not owner/);
     expect(changed).toMatch(/^(conflict|read too old)/);
     expect(await run(false)).toBe("ok");
+  });
+
+  it("keeps going after the split when it wrote a moved row before it, and sees its own write", async () => {
+    const c = await seeded();
+    const { routing } = await c.catalog();
+    const r = routing.ranges.find((x) => x.shard === "s0")!;
+    const cut = Math.floor((r.start + r.end) / 2 / SUBSLOTS) * SUBSLOTS;
+    const id = Array.from({ length: ROWS }, (_v, i) => i + 1).find((x) => tokenOf(keyString([BigInt(x)]), keyString([BigInt(x)])) >= cut)!;
+    const db = new Db(c, { retries: 0 });
+    await db.query("BEGIN");
+    await db.query("UPDATE t SET v = v + 100 WHERE id = ?", [id]);
+    await split(c, "s0", "s1", { range: { start: cut, end: r.end } });
+    expect(await db.query("SELECT v FROM t WHERE id = ?", [id]).then((x) => x.rows, (e: Error) => e.message)).toEqual([{ v: id + 100 }]);
+    expect(await outcome(db.query("COMMIT"))).toBe("ok");
+    expect((await new Db(c).query("SELECT v FROM t WHERE id = ?", [id])).rows).toEqual([{ v: id + 100 }]);
   });
 });

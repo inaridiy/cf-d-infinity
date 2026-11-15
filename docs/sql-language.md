@@ -137,7 +137,7 @@ Serializable は保たれ、書き込みがあれば `COMMIT` の検証で競合
 動いた範囲を移動の時刻より前の読み取り時刻で読む文は、それまでの読みが今も成り立てば読み取り時刻を進めて読み、成り立たなければ競合 (`SQLITE_BUSY`) になる。
 どちらも、移動がなく、同じ行が別の接続に書かれたときと同じ扱いなので、答えは行の置き場所で変わらない。
 `not owner` で失敗することはない。
-(2026-11-15 に決めた約束である。今のコードが守るのは一部である。動いた行への文は、範囲表を取り直して新しい持ち主へ送り、`not owner` では失敗しない。`Db.begin()` の取引は、分割の前に動いた範囲を読んでも書いてもいなければ、確定まで通る。まだ守らないのは 2 つで、どちらも読んだ行が変わっていなくても失敗する。分割の前に動いた範囲を読んだ取引は、その範囲を移動の時刻より前の時刻で読む文が `read too old` で失敗する (`test/open/transaction-across-split.test.ts`)。SQL の `BEGIN` の取引は、分割の後に動いた行を書くと、`COMMIT` が `SQLITE_BUSY` (`read too old`) で失敗する (`test/open/locking-transaction-commit-after-split.test.ts`)。)
+(2026-11-15 に決めた約束である。今のコードが守るのは一部である。動いた行への文は、範囲表を取り直して新しい持ち主へ送り、`not owner` では失敗しない。`Db.begin()` の取引は、分割の前に動いた範囲を読んでも書いてもいなければ、確定まで通る。まだ守らないのは 3 つで、どれも読んだ行が変わっていなくても失敗する。分割の前に動いた範囲を読んだ取引は、その範囲を移動の時刻より前の時刻で読む文が `read too old` で失敗する。分割の前に動いた行を書いたか、行ロックを取って読んだ取引は、次の文が `SQLITE_BUSY` (競合) で失敗する (どちらも `test/open/transaction-across-split.test.ts`)。SQL の `BEGIN` の取引は、分割の後に動いた行を書くと、`COMMIT` が `SQLITE_BUSY` (`read too old`) で失敗する (`test/open/locking-transaction-commit-after-split.test.ts`)。)
 
 ### 取引の中の DDL
 
