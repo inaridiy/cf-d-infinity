@@ -1,6 +1,6 @@
 # CatalogEpoch による Meta の一本化の設計
 
-状態：設計。実装はまだない。モデルは M21 (`specs/m21_catalog_epoch.qnt`) にあり、結果は [specs/README.md](../specs/README.md) の M21 の節に書いた。持ち主の判断が要ることを末尾にまとめた。
+状態：設計。段 1 (列と畳み込み) を実装した (2026-11-15、末尾の「段 1 の結果」)。段 2 から段 4 の実装はまだない。モデルは M21 (`specs/m21_catalog_epoch.qnt`) にあり、結果は [specs/README.md](../specs/README.md) の M21 の節に書いた。持ち主の判断が要ることと決めたことは、「段 1 の結果」の前にまとめた。
 作成日：2026-11-14
 前提：[overview.md](./overview.md)、[design-subslots.md](./design-subslots.md)、[specs/README.md](../specs/README.md) の M11 から M15、M18、M19、M5b
 
@@ -498,3 +498,100 @@ M21 は、進める側がどこで止まっても、次の 2 つが成り立つ�
 5. 順序は計画書の順番のとおりにする。値の作り直しの段 3 の後、token の区間の段 2 の前に、段 1 から段 4 を入れる。
 6. 表定義の epoch は、`prepare`、`commit`、`abort` のどれでも進める (M21 が全部の赤を確かめた形)。`commit` だけで進める案は、取引を古くする回数が減るので、実装の後で、赤をその案の上でも確かめ直してから採るかを決める。
 7. 実装が入ったら、M12、M14、M15 を M21 で置き換える。M11 と M13 は残す。
+
+## 段 1 の結果 (2026-11-15)
+
+段 1 の Meta は、表定義の版と範囲表を `__epoch(epoch, rec)` の 1 表に記録し、どの答えも列を畳んで作る (`src/catalog.ts` の `fold`)。
+入口の名前、確かめ、答え、誤りの文は、段 1 より前と同じである。
+シャードと Worker は変えていない。要求が epoch を運ぶのは段 2 からである。
+
+### 列が記録するもの
+
+段 1 の Meta が書く記録は 3 種類で、どれも今の手順の 1 手に当たる。
+
+| 今の手 | 記録 |
+|---|---|
+| 表定義の版を 1 つ積む (`applyDdl`、`publishIndex`、`lockTables`、`finishLock`、取り消し) | `{ kind: "commit", ddl }`。`ddl` は今の `DdlEntry` のままで、`of` を持たない。取り消しも、逆操作の文を持つ次の版の `commit` である |
+| 範囲表を切り替える (`switchRange`) | `{ kind: "move-start", from, to, start, end }`。同じ切り替えをもう一度呼んでも、記録は増えない |
+| 分割の枠を返す (`endSplit`) | `{ kind: "move-end", of }`。枠の名前 (親、子、区間) で開いている移動を引き、なければ記録しない |
+
+最初の範囲表は、epoch 0 の記録 (`{ kind: "genesis", routing }`) にした。
+上の「保存」の節の「epoch 0 のスナップショットが持つもの」を、列の 1 行として持つ形である。
+今と同じく、最初に範囲表を引いたときに書く。
+
+`prepare`、`abort`、`of` のある `commit` は、型と畳み込みと遷移の条件 (`refusal`) だけを、いまから持つ。
+段 1 の Meta は、これらを書かず、`refusal` も呼ばない。
+記録を足してよいかは、今の仕組み (分割の枠、期限、`basedOn`、最新の版の確かめ) が決める。
+分割の枠は範囲表の切り替えより前に取られ、記録を残さずに期限で消えるので、列だけからは決められないからである。
+
+### 畳み込みと今の状態
+
+| スナップショット | 今の Meta の何に当たるか |
+|---|---|
+| `version`、`tables`、`views`、`indexes`、`ddl`、`revoked` | `MetaCore.current` の答え。`version` は段 1 の間だけ持つ `DdlEntry.version` で、シャードと Worker はまだこれを比べる。取り消された版の文を `ddl` から除く処理は、取り消しの `commit` を畳むときに行う |
+| `open` | `building()`。最新の表定義の版が index の作成 (mode `build`) か DROP の前の書き込み禁止 (mode `guard`) なら、その版が遷移を開いている。次の版が閉じる |
+| `routing` | `__routing` の最新の行。版は、最初の範囲表の版に `move-start` の数を足したもので、今の `Routing.version` と同じになる |
+| `moves` | 開いている移動 (`move-start` の後、`move-end` の前)。設計の `routing.ranges[].moving` の代わりに、範囲表とは別に持つ。範囲表を今の `Routing` の形のまま返せる |
+| `epoch`、`schema` | 新しい。Meta の外には出さない |
+
+`MetaCore.catalog` は、スナップショットから今の `Catalog` の形 (キーの順まで同じ) を作って返す。
+
+### 設計の本文からずれたところ
+
+- 最初の範囲表を、5 種類の記録とは別の `genesis` の記録として epoch 0 に置いた。
+- 開いている移動を、範囲表の項目の印ではなく `moves` の一覧で持つ。
+- `move-start` の `from` は省けることがある。今の `switchRange` は `from` を省けるので、区間の持ち主が 1 つに決まらなければ記録しない。段 4 の `startMove` では必ず持つ。
+- 段 1 の `open` は、`prepare` の記録ではなく、最新の版の印 (`DdlEntry.build`、`DdlEntry.guard`) から畳む。行で失敗し得る DDL (段 3 の `trial`) は、段 1 では遷移を開かない。今と同じく、1 つの版で記録し、失敗すれば取り消しの版を積む。
+- Meta は利用者の DDL を自分の SQLite でも実行するので、`__epoch` を内部の名前に足した (`src/sql/ddl.ts` の `INTERNAL_NAMES`)。足さないと、利用者の `DROP TABLE __epoch` が Meta の列を消す。
+- 保存の形式を版 3 にした (`src/types.ts` の `STORAGE_FORMAT`)。シャードの形式は変わらない。版 2 からの移行は書かない。
+
+### 検査
+
+(a) RPC の列。`test/history.test.ts` と `test/replay.test.ts` に限らず、sim の全試験 (889 件、RPC 418,136 回) と、基準経路の 2 組の `history` と `replay` (59 件ずつ) を、変更の前後で `RPC_TRACE` を付けて流し、送り元、宛先、種類の列を比べた。
+要求の中身の SHA-256 も一緒に比べた (一時的に `test/setup.ts` に足し、比べた後で戻した)。
+列は全部同じだった。
+違いは 2 種類で、どちらも変更によるものではない。
+1 つ目は更新の試験の 2 件で、材料の版が 2 から 3 に変わり、試験の名前が変わった。列も要求の中身も同じである。
+2 つ目は 3 件 (`basic` の「非決定的な SQL」と、`subrequests` の index の作成の 2 件) で、要求の中身の指紋だけが違った。変更の前のコードを 3 回流すと、3 件とも毎回違う値になる。`basic` は、文の `random()` の値が後の要求に入る。`subrequests` の原因は調べていない。
+
+(b) 今の答えとの一致。段 1 より前の Meta を `test/meta-old.ts` に写して残した。
+`test/catalog.test.ts` は、乱択の並び (60 seed、120 手) を 2 つの Meta に同じ順で流し、どの入口の答えも誤りの文まで同じであることを確かめる。
+並びは、期限と上限をまたぐ時計、延ばし続ける期限、index の作成と公開と取り消し、DROP の前の書き込み禁止、古い `basedOn`、失敗する DDL と何もしない DDL、枠のある分割とない切り替え、Meta の開き直し、欠陥のスイッチ (`startWithoutSlot`、`fenceWithoutSlot`、`dropAfterExpiry`) を含む。
+`META_SHADOW` を付けると、シミュレータのすべての Meta の呼び出しを古い Meta にも流して比べる (`test/sim.ts` の `shadowMeta`)。sim の全試験で、違いは 0 件だった。
+検査が欠陥を見つけることは、段 1 の Meta に欠陥を 1 つずつ入れて確かめた (取り消された文を履歴に残す、書き込み禁止で遷移を開かない、同じ切り替えを 2 度記録する、取り消しの前の表定義を 1 epoch 先まで畳む、`ddlSince` の境目をずらす、取り消しの印を次の版で消さない。6 つとも乱択の比べ合いが落ちた)。比べ合いの shadow も、わざと入れた違いを見つけた。
+
+(c) M21 との突き合わせ。`test/fixtures/m21/generate.mjs` が、M21 の乱択の経路 (`quint run --mbt`) の各状態で、Meta の手の候補を model 自身に試させる (`quint test` の run。条件を TypeScript に写さない)。
+`test/catalog-m21.test.ts` は、model の列の 3 つの表から epoch の列を組み立てて畳み、同じ候補を `refusal` に尋ねる。
+model が受ける手は関数も受け、model が断る手は関数も断ることを確かめる。
+model にしかない条件 (操作は 1 度だけ、進める側が止まった、表が消えた後の DDL は構文の確かめが断る、子が受け取り終えた) で断られた手は数えない。
+インスタンスは、決めた設計の 7 つ (`m21_green_build`、`_check`、`_ddl2`、`_drop`、`_split`、`_split_txns`、`_split_build`) と、`m21_green_split` の定数で 4 つの操作を全部入れたもの (specs/ にはない) の 8 つで、それぞれ 40 手の経路を 12 本作った。
+試した状態は 3,936 (Meta の手に関わる変数で 294 通り) で、候補の答えのうち、関数も受けたものが 258、関数も断ったものが 1,687 (条件ごとに `one-exit` 860、`one-open` 283、`move-not-open` 153、`all-acks` 117、`owner` 94、`ddl-waits-move` 93、`move-waits-ddl` 87)、model にしかない条件で数えなかったものが 161 だった。違いは 0 件だった。
+`refusal` に欠陥を 1 つずつ入れると (`one-open`、`ddl-waits-move`、`move-waits-ddl`、`all-acks`、`move-not-open`、commit の `one-exit`、abort の `one-exit` を外す 7 つと、ok を比べるシャードの集合を範囲表から取らない 1 つ)、8 つとも試験が落ちた。
+結果は「M21 の条件と段」の表に書いた。
+
+(d) 更新の試験。材料を作り直した (`test/fixtures/storage/format-3.json`)。変更の前のコードで同じ作業負荷から作った材料と比べると、シャードの写しと答えは、形式の印のほかは同じで、Meta の写しは、`__ddl` と `__routing` が `__epoch` に替わったほかは同じだった。`commit` の記録が運ぶ `DdlEntry` は、`__ddl` の行と同じである。
+
+### M21 の条件と段
+
+| M21 の条件 | `refusal` の rule | 段 1 の Meta で守るもの | 列の上で Meta が守る段 |
+|---|---|---|---|
+| `ONE_OPEN` (表定義の遷移は 1 つずつ) | `one-open` | `assertFreeForDdl` の `building()`。判定は `open` と同じ | 段 3 |
+| `ONE_EXIT` (終わり方は 1 つ) | `one-exit` | `publishIndex`、`finishLock`、取り消し、`renewLock` が、最新の版を確かめる | 段 3 |
+| `ALL_ACKS` (全シャードの ok の後で確定) | `all-acks` (ok の集合を引数で受ける) | Meta ではなく Worker (`Db` の `syncAll`) | 段 3 |
+| `DDL_WAITS_MOVE` (移動の間は遷移を開かない) | `ddl-waits-move` | 分割の枠。枠は、開いている移動より長く持たれる | 段 4 |
+| `MOVE_WAITS_DDL` (遷移の間は移動を開かない) | `move-waits-ddl` | `beginSplit` が `building()` で断り、枠の間は DDL を記録しない | 段 4 |
+| `END_AFTER_DRAIN` (受け取り終えてから閉じる) | なし (列からは決まらない) | Autoscaler の手順の順序 | 段 4 (受け取り終えた子が `move-end` を記録させる) |
+| 移す区間の持ち主 (M21 は場面で固定) | `owner` | `switchRange` の確かめ (今と同じ) | 段 4 |
+| 移動どうし、子が持つ範囲 (M21 にない) | `moves-overlap`、`child-owns` | シャードの手元の記録と、Autoscaler の `split` | 段 4 |
+
+行で失敗し得る DDL (`CHECK` の場面) の遷移は、段 1 の Meta にはない。
+`refusal` は、`prepare` の記録 (mode `trial`) として、この場面も突き合わせた。
+
+### 段 2 に要るもの
+
+- `Catalog` に `epoch` と `schema` を足し、要求 (`ExecReq`、`PrepareReq`、`CommitReq`、`refresh`、`unchanged`) に運ばせる。`PROTOCOL_VERSION` を上げる。
+- `MetaCore.epochsSince(epoch)` を足す。シャードは `__ddl` を `__epoch` (Meta の列の写し) にし、同じ `fold` で自分のスナップショットを作る。シャードの形式が変わるので、保存の形式を上げる。
+- シャードの所有を、自分のスナップショットの `routing` と `moves` で引く。
+- 表定義の版を比べる値を、`DdlEntry.version` から `schema` に替える。段 1 の `commit` の記録が運ぶ `DdlEntry.version` は、段 3 で記録の形を変えるときに消す。
+- 畳み込みの費用。段 1 の Meta は、呼ばれるたびに列の全部を読んで畳む (今も `__ddl` の全部を読んでいた)。シャードも畳むようになるので、最後の epoch で覚えておく形を考える。
+- 古い Meta の写し (`test/meta-old.ts`) と `META_SHADOW` は、段 3 で表定義の遷移を 2 相にするまで残す。答えが変わる段 2 の変更 (`Catalog` に足すもの) は、比べる前に古い答えに合わせて落とす。
