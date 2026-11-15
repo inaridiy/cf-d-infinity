@@ -463,7 +463,7 @@ SQLite が断る DDL は比べない。`Db.ddl` は、記録の前に Worker の
 | 表の制約の UNIQUE の ON CONFLICT (`UNIQUE (email) ON CONFLICT IGNORE`) を記録しない。シャードをまたぐ UNIQUE では衝突が誤りになり、シャードの中の UNIQUE の REPLACE では捕捉が消えた行を知らない (行イメージの検査が落ちる) | `test/open/unique-constraint-on-conflict.test.ts` | 通常の実行だけ | `ddl.ts` の `createTable` と文の計画 |
 | OR FAIL の文が衝突すると、衝突の前の行の変更まで取り消す | `test/open/or-fail-keeps-earlier-rows.test.ts` | 全部 (手元の workerd でも) | 文の原子性 (シャードの SAVEPOINT、Worker の SQLite の `src/sql/scratch.ts`) |
 | 複数行の OR REPLACE で、後の行に消される行が消した行が残る | `test/open/global-unique-replace-chain.test.ts` | 全部 (基準経路の書き込み) | 基準経路の書き込み `Txn.wasmWrite` の、REPLACE が消した行の捕捉 |
-| 部分 index の UNIQUE もある表で、シャードの中の UNIQUE の衝突を解く OR REPLACE を、UNIQUE の誤りで断る | `test/open/local-unique-replace-trial.test.ts` | 全部 | 変更の集まりを物理の UNIQUE index に 1 行ずつ当てる所 (見立て)。M22 の `m22_red_physical_unique` と同じ種類で、piece の移動がなくても 1 つの文で起きる |
+| ある行が UNIQUE の値を、OR REPLACE で消す行から受け取る変更の集まりを、UNIQUE の誤りで断る。部分 index の UNIQUE もある表への OR REPLACE の文と、先に値を受け取る行に触れてから UPDATE OR REPLACE する取引の COMMIT に出る | `test/open/local-unique-replace-trial.test.ts` | 全部 | 変更の集まりを、溜めた順に物理の UNIQUE index に 1 行ずつ当てる所 (見立て)。M22 の `m22_red_physical_unique` と同じ種類で、piece の移動がなくても 1 つの取引で起きる |
 
 計画書の番号のついた不変条件で、これらに当たるものはない (どれも置き場所に依らない)。
 6 つは 1 つの場所、衝突の処理 (ON CONFLICT の 5 つの処理、制約に書いた既定、1 文の中の衝突の順) に集まっている。
