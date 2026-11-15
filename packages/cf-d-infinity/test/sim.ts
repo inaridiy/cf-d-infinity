@@ -222,10 +222,19 @@ export class SqliteBackend implements Backend {
   /**
    * 用意した文を、文面ごとに覚えて使い回す。シミュレータの時間の大半は文を用意することで、利用者の表の読みは、元の文 (結果の
    * 列名を知るため) と包み直した文の 2 つを用意する。文を読み終えるまで同じ Backend に別の文を挟まない約束 (Backend.iterate) が
-   * あるので、同じ文を 2 か所で同時に読むことはない。表定義が変わると、SQLite が文を用意し直す。
+   * あるので、同じ文を 2 か所で同時に読むことはない。
+   * 表定義を変える文が来たら、覚えた文を全部捨てる。SQLite は古い文を実行するときに用意し直すが、実行の前に読む結果の列名
+   * (columns()) は古い表定義のままで、`SELECT *` の列が足りなくなる。表定義を変えた後の巻き戻しも、表定義を戻すので、捨てる。
    */
   private statements = new Map<string, ReturnType<DatabaseSync["prepare"]>>();
+  /** 表定義を変える文を用意した回数。巻き戻しが表定義も戻したかを知るのに使う。 */
+  private schemaChanges = 0;
   private statement(sql: string): ReturnType<DatabaseSync["prepare"]> {
+    if (/^\s*(CREATE|ALTER|DROP)\b/i.test(sql)) {
+      this.statements.clear();
+      this.schemaChanges++;
+      return this.db.prepare(sql);
+    }
     let st = this.statements.get(sql);
     if (st === undefined) {
       st = this.db.prepare(sql);
@@ -304,6 +313,7 @@ export class SqliteBackend implements Backend {
   }
   tx<T>(fn: () => T): T {
     const name = `sp${this.depth++}`;
+    const schema = this.schemaChanges;
     this.db.exec(`SAVEPOINT ${name}`);
     try {
       const out = fn();
@@ -312,6 +322,7 @@ export class SqliteBackend implements Backend {
     } catch (e) {
       this.db.exec(`ROLLBACK TO ${name}`);
       this.db.exec(`RELEASE ${name}`);
+      if (this.schemaChanges !== schema) this.statements.clear();
       throw e;
     } finally {
       this.depth--;
@@ -333,6 +344,7 @@ export class SqliteBackend implements Backend {
   dropUnsynced(): void {
     if (this.holding !== "open") return;
     this.db.exec("ROLLBACK");
+    this.statements.clear();
     this.holding = "lost";
   }
   /** quorum の確定には本番で約 10 ms かかる。ここで処理が譲られないと、待ちの間のレースを再現できない。 */

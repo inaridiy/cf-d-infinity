@@ -453,8 +453,8 @@ describe("64-bit integers", () => {
   let memo: Promise<Found[]> | undefined;
   const all = () => (memo ??= runAll(WIDE));
 
-  // いまの決まりで説明できる食い違いは、3 種類である。断る (`unsupported:`)、保存していない値を丸めて返す、D1 互換の API が
-  // BigInt を受け取れない。それ以外の食い違いは、作り直しを待たずに直すべき欠陥である。
+  // 段 2 までの決まりで説明できた食い違いは、3 種類だった。断る (`unsupported:`)、保存していない値を丸めて返す、D1 互換の API が
+  // BigInt を受け取れない。段 3 からは、どれも起きない (3 つ目の試験)。それ以外の食い違いは、いつでも欠陥である。
   it("never answer differently from SQLite in a way that today's documented limits do not explain", async () => {
     expect((await all()).filter((f) => f.kind === "other").map(show)).toEqual([]);
   }, 300_000);
