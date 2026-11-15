@@ -44,8 +44,8 @@ npx wrangler deploy
 | `POST /v3/pipeline` | API | Hrana over HTTP | `@libsql/client` の `https://` の入口 |
 | WebSocket の upgrade | API (hello の jwt) | Hrana over WebSocket (hrana2) | `@libsql/client` の `wss://` の入口 |
 | `POST /ddl` | API | `{ sql }` | DDL を実行する |
-| `POST /sql` | API | `{ sql, params, token }` | 1 文を autocommit で実行する |
-| `POST /batch` | API | `{ statements, token }` | 全文を 1 取引で実行する |
+| `POST /sql` | API | `{ sql, params, token, intMode? }` | 1 文を autocommit で実行する。`intMode` は `"number"` (既定。2^53 を超える INTEGER は誤り) か `"string"` |
+| `POST /batch` | API | `{ statements, token, intMode? }` | 全文を 1 取引で実行する。`intMode` は `/sql` と同じ |
 | `POST /admin/split` | ADMIN | `{ cluster, parent, child }` | 手動で増設する |
 | `POST /admin/status` | ADMIN | `{ cluster }` | 範囲表と Autoscaler の履歴を返す |
 | `POST /admin/slow` | ADMIN | `{ cluster, limit }` | 遅い文の記録を新しい順に返す |

@@ -134,22 +134,6 @@ export function imageAt(def: TableDef, t: Tuple, column: string): Value {
   return i < t.length ? valueAt(t[i]) : null;
 }
 
-/**
- * 列名から値への行にする (分析へ出す行。src/analytics.ts)。出す先は JSON なので、段 1 までの行イメージと同じ形にする。INTEGER は
- * JS の数で、型のない列の整数の値の REAL だけに `{ real }` の印を付ける。JS の数で正確に表せない INTEGER は `{ $int: "数字" }` に
- * する。分析の出口は段 4 で作り直す (docs/design-values.md の「段」)。
- * 変更ログの古い行を、いまの表定義で読むので、長さの違いは食い違いとして報告しない。ADD COLUMN の前の行は短い。
- */
-export function rowOf(def: TableDef, t: Tuple): Record<string, unknown> {
-  const columns = columnsOf(def, t, false);
-  return Object.fromEntries(columns.map((c, i) => {
-    const v = valueAt(t[i]);
-    const untyped = (def.affinity[c] ?? "BLOB") === "BLOB";
-    if (typeof v === "bigint") return [c, Number.isSafeInteger(Number(v)) ? Number(v) : { $int: String(v) }];
-    return [c, typeof v === "number" && untyped && Number.isInteger(v) ? { real: v } : v];
-  }));
-}
-
 /** 列名から値への行を、タプルにする。JS で作るのは、index の表の項目 (`__gidx_*`) だけである。 */
 export function tupleOfRow(def: TableDef, row: Row): Tuple {
   return imageColumns(def).map((c) => encodeElem(row[c] ?? null));
