@@ -22,7 +22,7 @@ import { D1Compatible } from "../src/client/d1";
 import { imageFaults } from "../src/shard/rows";
 import { Db } from "../src/client/db";
 import type { Reference } from "../src/sql/plan";
-import { exportPage, importRows, type ExportCursor } from "../src/transfer";
+import { EXPORT_FORMAT, exportPage, importRows, type ExportCursor } from "../src/transfer";
 import { clientOf } from "./libsql";
 import { SimCluster } from "./sim";
 
@@ -382,11 +382,11 @@ const SCENARIOS: Record<string, (r: Run) => Promise<void>> = {
   "export, then import into another cluster": async (r) => {
     await r.h(T);
     await fill(r);
-    // 書き出しの文面 (bin/dump.js) を取り込み、別の数のシャードのクラスタへ入れる。
+    // 書き出しの文面 (bin/dump.js) を取り込み、別の数のシャードのクラスタへ入れる。頁と続きの位置は、CLI と同じく JSON を通す。
     const lines: string[] = [];
     try {
       for (let cursor: ExportCursor | null = null, pages = 0; ; ) {
-        const page = await exportPage(r.c, "t", cursor, 3);
+        const page: Awaited<ReturnType<typeof exportPage>> = JSON.parse(JSON.stringify(await exportPage(r.c, "t", JSON.parse(JSON.stringify(cursor)), 3)));
         if (page.rows.length) lines.push(...(insertLines("t", page.columns, page.rows) as string[]));
         cursor = page.cursor;
         if (cursor === null) break;
@@ -402,7 +402,7 @@ const SCENARIOS: Record<string, (r: Run) => Promise<void>> = {
     for (const line of lines) {
       const insert = parseInsert(line) as { table: string; columns: string[]; rows: unknown[][] } | null;
       if (!insert) throw new Error(`not an exported INSERT: ${line.slice(0, 80)}`);
-      for (const batch of importBatches(insert.rows) as unknown[][][]) await importRows(new Db(other.c, { reference: r.reference }), insert.table, insert.columns, batch);
+      for (const batch of importBatches(insert.rows) as unknown[][][]) await importRows(new Db(other.c, { reference: r.reference }), insert.table, insert.columns, JSON.parse(JSON.stringify(batch)), EXPORT_FORMAT);
     }
     // 取り込んだ先を、元の表を持つ基準の SQLite と比べる。
     const want = JSON.stringify((() => {

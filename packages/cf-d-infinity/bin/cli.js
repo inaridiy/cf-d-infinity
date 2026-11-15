@@ -5,7 +5,7 @@
 //   status  シャードと範囲表、Autoscaler の履歴を見る
 // 使い捨ての Worker を miniflare で立て、DinfDatabase への Service Binding を dev registry 経由で張る。
 // HTTP の入口もトークンも使わない。binding を張れることが権限である。
-import { importBatches, insertLines, parseInsert } from "./dump.js";
+import { EXPORT_FORMAT, exportHeader, fileFormat, importBatches, insertLines, parseInsert } from "./dump.js";
 import { spawn } from "node:child_process";
 import { createWriteStream, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -30,7 +30,8 @@ Options:
   --remote        target the deployed Worker. Needs Wrangler in the project and \`wrangler login\`
   --worker <NAME> the Worker that exports DinfDatabase (default: "name" in ./wrangler.jsonc or ./cloudflare.config.ts)
   --file <PATH>   sql: read the statements from a file
-  --param <V>     sql: a bound parameter for "?" placeholders; repeat for more (numbers and null are typed)
+  --param <V>     sql: a bound parameter for "?" placeholders; repeat for more. Digits are an INTEGER (exact to
+                  64 bits), digits with a decimal point a number, null is NULL, anything else is TEXT
   --limit <N>     slow: number of entries (default 20)
   --out <PATH>    export: write to this file instead of standard output
   --json          print JSON instead of a table
@@ -68,11 +69,21 @@ function parseArgs(argv) {
   return out;
 }
 
-/** --param の値。数と null はその型で、ほかは文字列で渡す。 */
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+/** REAL を要素の文字列にする (src/value.ts の realText と同じ)。 */
+const realText = (x) => (x === Infinity ? "9.0e+999" : x === -Infinity ? "-9.0e+999" : ((s) => (/[.e]/.test(s) ? s : `${s}.0`))(String(x === 0 ? 0 : x)));
+
+/**
+ * --param の値を要素 (src/value.ts) にする。使い捨ての Worker とのあいだは JSON なので、64 ビットの整数を数字のまま運ぶ。
+ * 数字だけなら INTEGER (64 ビットに収まらなければ、SQLite の literal と同じく REAL)、小数点のある数字は JS の数、null は NULL、
+ * ほかは TEXT である。値は Service Binding の引数として束縛される (JS の数は、安全な整数なら INTEGER、ほかは REAL)。
+ */
 function typed(v) {
   if (v === "null") return null;
-  if (/^-?\d+(\.\d+)?$/.test(v)) return Number(v);
-  return v;
+  if (/^-?\d+$/.test(v)) return BigInt(v) >= INT64_MIN && BigInt(v) <= INT64_MAX ? `i${BigInt(v)}` : `r${realText(Number(v))}`;
+  if (/^-?\d+\.\d+$/.test(v)) return `r${realText(Number(v))}`;
+  return `t${v}`;
 }
 
 /** コメントと末尾のカンマを許す JSON を読む。wrangler.jsonc から Worker の名前を取るためだけに使う。 */
@@ -141,13 +152,38 @@ async function loadMiniflare(cwd, tool) {
   throw new Fail(`cannot find miniflare in this project (looked through ${tried.join(", ")}). Install wrangler or cf here; the command uses the same local runtime as your dev server.`);
 }
 
+// 使い捨ての Worker。CLI とのあいだは JSON なので、query の引数と結果の値は要素 (src/value.ts) で運ぶ。JSON は bigint を書けず、
+// 2^53 を超える整数を丸めるからである。結果は intMode "bigint" で受け取り、INTEGER を要素の数字にする。exportRows と importRows の
+// 行は、はじめから要素のタプルである (src/transfer.ts)。
 const CONSOLE_WORKER = `
 const OPS = new Set(["query", "slowQueries", "status", "schemaSql", "tables", "exportRows", "importRows"]);
+const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("").toUpperCase();
+const real = (x) => x === Infinity ? "9.0e+999" : x === -Infinity ? "-9.0e+999" : ((s) => /[.e]/.test(s) ? s : s + ".0")(String(x === 0 ? 0 : x));
+const enc = (v) => v === null || v === undefined ? null
+  : typeof v === "bigint" ? "i" + v
+  : typeof v === "number" ? (Number.isNaN(v) ? null : "r" + real(v))
+  : typeof v === "string" ? "t" + v
+  : "b" + hex(v instanceof ArrayBuffer ? new Uint8Array(v) : v);
+const dec = (e) => {
+  if (e === null) return null;
+  const rest = String(e).slice(1);
+  switch (String(e)[0]) {
+    case "i": return BigInt(rest);
+    case "r": return Number(rest);
+    case "t": return rest;
+    case "b": return Uint8Array.from(rest.match(/../g) || [], (h) => parseInt(h, 16));
+  }
+  throw new Error("not an element: " + JSON.stringify(e));
+};
 export default {
   async fetch(request, env) {
     const { op, args } = await request.json();
     if (!OPS.has(op)) return Response.json({ error: "unknown operation " + op });
     try {
+      if (op === "query") {
+        const r = await env.DINF_DB.query(args[0], args[1].map(dec), 0, "bigint");
+        return Response.json({ ok: { columns: r.columns, values: r.values.map((row) => row.map(enc)), changes: r.changes, lastInsertRowid: enc(r.lastInsertRowid) } });
+      }
       return Response.json({ ok: await env.DINF_DB[op](...args) });
     } catch (e) {
       return Response.json({ error: String((e && e.message) || e) });
@@ -263,7 +299,41 @@ async function call(opts, op, args) {
   }
 }
 
-const cell = (v) => (v === null || v === undefined ? "NULL" : typeof v === "object" ? JSON.stringify(v) : String(v));
+const hexOf = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("").toUpperCase();
+
+/** 使い捨ての Worker が返した要素を値に戻す。INTEGER は bigint、REAL は JS の数、BLOB は Uint8Array。 */
+function value(e) {
+  if (e === null || e === undefined) return null;
+  const rest = e.slice(1);
+  switch (e[0]) {
+    case "i": return BigInt(rest);
+    case "r": return Number(rest);
+    case "t": return rest;
+    case "b": return Uint8Array.from(rest.match(/../g) ?? [], (h) => parseInt(h, 16));
+  }
+  throw new Fail(`the Worker returned ${JSON.stringify(e).slice(0, 40)}, which is not a value; use the cf-d-infinity command of the same version as the Worker`);
+}
+
+const cell = (v) => (v === null || v === undefined ? "NULL"
+  : v instanceof Uint8Array ? `X'${hexOf(v)}'` : typeof v === "object" ? JSON.stringify(v) : String(v));
+
+/**
+ * JSON.stringify(v, null, 2) と同じ形で書く。ただし INTEGER (bigint) は数字を全部書いた JSON の数にする (JSON の数は桁に上限がない。
+ * JS で読み戻すと 2^53 を超える整数は丸まるので、正確に読むには reviver の context.source を使う)。REAL の無限大は `9.0e+999`、
+ * BLOB は `{"$b": "16 進"}` (docs/storage-format.md の、値を JSON にする形) である。
+ */
+function exactJson(v, indent = "") {
+  const next = `${indent}  `;
+  if (typeof v === "bigint") return String(v);
+  if (typeof v === "number" && !Number.isFinite(v) && !Number.isNaN(v)) return realText(v);
+  if (v instanceof Uint8Array) return exactJson({ $b: hexOf(v) }, indent);
+  if (Array.isArray(v)) return v.length === 0 ? "[]" : `[\n${v.map((x) => next + exactJson(x ?? null, next)).join(",\n")}\n${indent}]`;
+  if (v !== null && typeof v === "object") {
+    const entries = Object.entries(v).filter(([, x]) => x !== undefined);
+    return entries.length === 0 ? "{}" : `{\n${entries.map(([k, x]) => `${next}${JSON.stringify(k)}: ${exactJson(x, next)}`).join(",\n")}\n${indent}}`;
+  }
+  return JSON.stringify(v) ?? "null";
+}
 
 function table(columns, rows) {
   if (columns.length === 0) return "";
@@ -286,10 +356,15 @@ async function sql(opts) {
     : process.stdin.isTTY ? "" : await readStdin();
   if (text.trim() === "") throw new Fail("no SQL: pass it as an argument, with --file, or on standard input");
   const r = await call(opts, "query", [text, opts.params]);
-  if (opts.json) return console.log(JSON.stringify({ columns: r.columns, rows: r.rows, changes: r.changes, lastInsertRowid: r.lastInsertRowid }, null, 2));
+  const values = r.values.map((row) => row.map(value));
+  if (opts.json) {
+    // 同名の列は後の列が勝つ (D1 と同じ)。
+    const rows = values.map((row) => Object.fromEntries(r.columns.map((c, i) => [c, row[i]])));
+    return console.log(exactJson({ columns: r.columns, rows, changes: r.changes, lastInsertRowid: value(r.lastInsertRowid) }));
+  }
   if (r.columns.length > 0) {
-    console.log(table(r.columns, r.rows.map((row) => r.columns.map((c) => row[c]))));
-    console.log(`(${r.rows.length} ${r.rows.length === 1 ? "row" : "rows"})`);
+    console.log(table(r.columns, values));
+    console.log(`(${values.length} ${values.length === 1 ? "row" : "rows"})`);
   } else {
     console.log(`OK, ${r.changes} ${r.changes === 1 ? "row" : "rows"} changed`);
   }
@@ -345,21 +420,26 @@ async function status(opts) {
   if (s.problems.length > 0) process.exitCode = 2;
 }
 
-/** 値を SQL のリテラルにする。1 文が 1 行に収まるよう、改行は char() の連結にする。 */
+/**
+ * 表定義と全部の行を SQL にする。1 行目は形式の版で (bin/dump.js の exportHeader)、import が確かめる。行は要素のタプルで受け取り、
+ * literal にする。1 文が 1 行に収まるよう、改行と NUL は char() の連結にする。
+ */
 async function exportAll(opts) {
   const s = await call(opts, "status", []);
   const moving = s.health.filter((h) => h.incoming + h.outgoing > 0).map((h) => h.id);
   if (moving.length > 0) throw new Fail(`a shard split is moving data (${moving.join(", ")}); rows would be exported twice or missed. Try again when it has finished.`);
   const out = opts.out ? createWriteStream(opts.out) : process.stdout;
   const write = (line) => new Promise((resolve, reject) => out.write(`${line}\n`, (e) => (e ? reject(e) : resolve())));
-  await write("-- cf-d-infinity logical export. One statement per line. Not a consistent snapshot unless writes were stopped.");
-  await write("-- Load it into an empty database with: npx cf-d-infinity import <this file>");
+  for (const line of exportHeader()) await write(line);
   for (const ddl of await call(opts, "schemaSql", [])) await write(`${ddl.replace(/\s*\n\s*/g, " ").replace(/;\s*$/, "")};`);
   let total = 0;
   for (const name of await call(opts, "tables", [])) {
     let cursor = null;
     do {
       const page = await call(opts, "exportRows", [name, cursor, 1000]);
+      if (page.format !== EXPORT_FORMAT) {
+        throw new Fail(`the Worker returns rows in export format ${page.format ?? "(none)"}, and this command writes export format ${EXPORT_FORMAT}; use the cf-d-infinity command of the same version as the Worker`);
+      }
       cursor = page.cursor;
       for (const line of insertLines(name, page.columns, page.rows)) await write(line);
       total += page.rows.length;
@@ -374,7 +454,15 @@ async function exportAll(opts) {
 async function importFile(opts) {
   const file = opts.positional[0];
   if (!file) throw new Fail("import needs a file written by export");
-  const lines = readFileSync(file, "utf8").split("\n").map((l) => l.trim()).filter((l) => l !== "" && !l.startsWith("--"));
+  const all = readFileSync(file, "utf8").split("\n").map((l) => l.trim());
+  // 形式の版の行を、何かを実行する前に確かめる。
+  let format;
+  try {
+    format = fileFormat(all);
+  } catch (e) {
+    throw new Fail(`${file}: ${e.message}`);
+  }
+  const lines = all.filter((l) => l !== "" && !l.startsWith("--"));
   let statements = 0;
   let rows = 0;
   for (const line of lines) {
@@ -387,7 +475,7 @@ async function importFile(opts) {
       continue;
     }
     for (const batch of importBatches(insert.rows)) {
-      await call(opts, "importRows", [insert.table, insert.columns, batch]);
+      await call(opts, "importRows", [insert.table, insert.columns, batch, format]);
       rows += batch.length;
     }
   }

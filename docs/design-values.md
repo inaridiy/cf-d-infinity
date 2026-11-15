@@ -1,6 +1,6 @@
 # 値と行イメージの作り直しの設計
 
-状態：設計。段 0 (検査)、段 1 (符号とキー)、段 2 (行イメージと捕捉)、段 3 (値の型と型つきの読み) を実装した。段 4 はまだない。決めたことと、段 0 から段 3 の結果は末尾に記した。段 3 で変えた節 (「要素」、「利用者の RETURNING」、「Worker の SQLite」、「シミュレータ」、「エクスポートと取り込み」) は、本文を直し、変えた理由を段 3 の結果に書いた
+状態：5 段をすべて実装した。段 0 (検査)、段 1 (符号とキー)、段 2 (行イメージと捕捉)、段 3 (値の型と型つきの読み)、段 4 (入口と書き出し)。決めたことと、段 0 から段 4 の結果は末尾に記した。段 3 で変えた節 (「要素」、「利用者の RETURNING」、「Worker の SQLite」、「シミュレータ」、「エクスポートと取り込み」) と、段 4 で変えた節 (「境界」の表、「D1 互換の API、Service Binding、HTTP の JSON」、「エクスポートと取り込み」) は、本文を直し、変えた理由をそれぞれの段の結果に書いた
 作成日：2026-11-14
 前提：[storage-format.md](./storage-format.md)、[sql-language.md](./sql-language.md) の「値」、[design-subslots.md](./design-subslots.md)
 
@@ -196,13 +196,14 @@ SQL では `json_array(要素, ...)` で作る。
 | 境界 | 入る向き | 出る向き |
 |---|---|---|
 | Hrana | `integer` は `BigInt(文字列)` で INTEGER。`float` は REAL | INTEGER は `integer` (10 進の文字列)、REAL は `float` |
-| D1 互換の API、Service Binding、HTTP の `/sql` と `/batch` | `bigint` は INTEGER。`number` は、安全な整数なら INTEGER、ほかは REAL。真偽値は INTEGER | 既定は、安全な範囲の INTEGER を `number` で返し、範囲の外は誤りにする。`intMode` で `bigint` か文字列を選べる |
+| D1 互換の API、Service Binding、HTTP の `/sql` と `/batch` | `bigint` は INTEGER。`number` は、安全な整数なら INTEGER、ほかは REAL。真偽値は INTEGER。HTTP の JSON の、数字だけで書いた literal は、64 ビットに収まれば INTEGER (段 4) | 既定は、安全な範囲の INTEGER を `number` で返し、範囲の外は誤りにする。`intMode` で `bigint` か文字列を選べる。`last_row_id` も同じ。HTTP は `bigint` を選べない |
 | Worker の SQLite (sql.js) | 下の「束縛」の表 | `useBigInt` で読む。INTEGER は `bigint`、REAL は `number` |
 | DO の SQL の API | 下の「束縛」の表 | 行イメージはタプル (文字列)、結果は型つきの読み |
 | シミュレータの node:sqlite | DO と同じ | DO と同じ (丸めて読む模倣を残す) |
 | Worker とシャードの RPC | `Value` をそのまま (structured clone が BigInt を運ぶ。DO の RPC が運ばなければ、引数と結果を要素の形で運ぶ) | 同じ |
 | JSON にする場所 (baton、2PC の ID の hash) | `bigint` は `{"$i":"数字"}`、BLOB は `{"$b":"16 進"}`、無限大は `{"$f":...}` | 同じ |
-| エクスポートのファイル | 整数の literal は INTEGER、小数点か指数のある literal は REAL | 形式は今のまま。19 桁までの整数が書けるようになる |
+| エクスポートのファイル | 整数の literal は INTEGER、小数点か指数のある literal は REAL | 1 行目に形式の版を書く (段 4)。19 桁までの整数が書けるようになる |
+| CLI と Worker のあいだの JSON (エクスポートの頁、取り込みの行、`sql` の引数と結果) | 要素 (段 4) | 要素 (段 4) |
 
 ### 束縛
 
@@ -314,12 +315,20 @@ D∞ が丸めるのではなく、渡された double をそのまま入れる 
 断るなら、2^53 以上 2^63 未満の整数の値だけになるが、その範囲の REAL (1e17 など) を渡す文も断ることになる。
 2^53 以上の INTEGER を正確に渡すには、`bigint` を渡すか、Hrana を使う。
 
-出る向きは、`QueryResult` (`src/client/db.ts:110`) が 2 つの形を持つ。
-`values` は `Value` のままで、Hrana と Worker の中の計算が使う。
-`rows` (列名から値への object) は、D1 と同じく INTEGER を `number` で返し、D1 互換の API、Service Binding、HTTP の `/sql` が使う。
-安全な範囲の外の INTEGER は、既定では誤りにする (`intMode: "number"`。@libsql/client の既定と同じ)。
+HTTP の本文は JSON で、`JSON.parse` は数を JS の数に丸める。数字だけで書いた literal のうち、安全な整数の外にあって 64 ビットに収まるものは、reviver が受け取る元の文面 (`context.source`) から `bigint` にする (`src/entry.ts` の `exactIntegers`。段 4)。
+ほかの literal (安全な整数、小数点か指数のあるもの、64 ビットに収まらないもの) は、JS の数のまま `toValue` を通る。
+JS の `JSON.stringify` は 1e21 未満の整数の値を数字だけで書くので、JS のクライアントが HTTP で 2^60 の double を送ると、Service Binding では REAL、HTTP では同じ値の INTEGER になる。値は等しく、違うのは格納の型だけである。
+HTTP の JSON では文面が値であり、数字だけの literal を整数として読むのは、JSON を読む多くの言語の決まりと同じである。
+Hrana の本文には reviver を掛けない (`float` の数は REAL である)。
+
+出る向きは、`QueryResult` (`src/client/db.ts`) の `values` (`Value` のまま) を、入口が `src/client/results.ts` の 1 か所で変える。
+Hrana と Worker の中の計算は `values` をそのまま使う。
+D1 互換の API、Service Binding、HTTP の `/sql` と `/batch` は、`intMode` を受け取り、`rowsOut`、`valuesOut`、`rowidOut` を通す。
+既定の `"number"` は、D1 と同じく INTEGER を `number` で返し、安全な範囲の外の INTEGER は誤りにする (@libsql/client の既定と同じ)。
 `intMode` を `"bigint"` にすると INTEGER をすべて `bigint` で、`"string"` にするとすべて 10 進の文字列で返す。
-HTTP の `/sql` は JSON なので、`"bigint"` は選べない。
+HTTP の `/sql` は JSON なので、`"bigint"` は選べない (誤りにする)。
+`last_row_id` (`lastInsertRowid`) も INTEGER なので同じ規則で返す。`"number"` で JS の数にできない `last_row_id` は、文を実行した後で誤りになる (段 4 の結果に理由を書いた)。
+Service Binding は、呼び出し元の `intMode` を RPC の引数で運び (`query`、`batch`、`begin`)、`DinfDatabase` の側で変える。structured clone は `bigint` を運ぶので、`"bigint"` の結果もそのまま返る。
 誤りにするかどうかは値で決まり、行の置き場所には依らない。
 
 ### シミュレータ
@@ -342,13 +351,14 @@ SQLite との突き合わせの基準 (試験の中の `DatabaseSync`) は、Big
 
 ### エクスポートと取り込み
 
-ファイルの形式 (`storage-format.md` の「エクスポート」) は変えない。
+ファイルの形式 (`storage-format.md` の「エクスポートの file」) は、SQL の文の並びのままである。
 今は断っていた 2^53 以上の整数が、10 進の literal で書けるようになる。
+1 行目に形式の版の注釈 (`-- cf-d-infinity export format 1`) を書き、取り込みは何かを実行する前にそれを確かめる (段 4)。
 `exportRows` (`src/shard/kernel.ts`) は、D∞ が作る文なので、列ごとに要素の式を掛けて読む (CTE は要らない)。
-CLI とのあいだの JSON は、行をタプルで運ぶ (段 4)。
-`bin/dump.js` の `literal` は要素から literal を書き、取り込みは literal から要素を作る (`{ $blob }` と `{ real }` の印はなくなる。段 4)。
-段 3 から段 4 までの間は、CLI とのあいだの JSON は段 2 までの形 (INTEGER は JS の数、整数の値の REAL は `{ real }`、BLOB は `{ $blob }`) に、JS の数で正確に表せない INTEGER の `{ $int: "数字" }` を足した形で運ぶ (`src/transfer.ts` の `exportValue` と `importValue`)。`literal` と `parseInsert` は `$int` を読み書きする。
-REAL の literal は、今と同じく JS の最短の表記で書く。
+CLI とのあいだの JSON は、行をタプルで運ぶ (`src/transfer.ts` の `exportPage` と `importRows`。段 4)。続きの位置 (`ExportCursor.after`) もタプルで、頁と取り込みの呼び出しは形式の版 (`format`) を運ぶ。
+`bin/dump.js` の `literal` は要素から literal を書き、`parseInsert` は literal から SQLite と同じ読み方で要素を作る (`{ $blob }`、`{ real }`、`{ $int }` の印はなくなった。段 4)。
+REAL の literal は、JS の最短の表記に、小数点も指数もなければ `.0` を足して書く (`realText`)。無限大は `9.0e+999` である (段 3 までは `9e999`。取り込みはどちらも読む)。
+段 3 から段 4 までの間は、CLI とのあいだの JSON は段 2 までの形に `{ $int: "数字" }` を足した形で運んでいた。
 
 ## 行イメージ
 

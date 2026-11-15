@@ -34,14 +34,35 @@ export function sameToken(a: string, b: string): boolean {
   return x === 0;
 }
 
-/** 本文を JSON として読む。大きすぎれば 413、JSON でなければ 400 で断る。 */
-export async function readJson(request: Request): Promise<unknown> {
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+
+/**
+ * JSON の整数の literal を正確に読む reviver (HTTP の /sql と /batch。docs/design-values.md の「D1 互換の API、Service Binding、
+ * HTTP の JSON」)。JSON.parse は数を JS の数に丸めるので、`9223372036854775807` は隣の double になる。数字だけで書かれた literal
+ * のうち、JS の安全な整数の外にあり 64 ビットに収まるものを、元の文面 (reviver の context.source) から bigint にする。bigint は
+ * INTEGER として束縛される。ほかの数 (安全な整数、小数点か指数のある数、64 ビットに収まらない数) は JSON.parse の数のままで、
+ * D1 互換の API と同じく、安全な整数は INTEGER、ほかは REAL になる。元の文面を受け取れない実行環境では、JS の数のままである。
+ */
+export function exactIntegers(_key: string, value: unknown, context?: { source?: string }): unknown {
+  if (typeof value !== "number" || Number.isSafeInteger(value)) return value;
+  const source = context?.source;
+  if (typeof source !== "string" || !/^-?[0-9]+$/.test(source)) return value;
+  const big = BigInt(source);
+  return big >= INT64_MIN && big <= INT64_MAX ? big : value;
+}
+
+/**
+ * 本文を JSON として読む。大きすぎれば 413、JSON でなければ 400 で断る。reviver は、利用者の値を運ぶ本文 (/sql と /batch) にだけ
+ * 渡す (exactIntegers)。Hrana の本文は型を書いた値 (`float` の数は REAL) を運ぶので、渡さない。
+ */
+export async function readJson(request: Request, reviver?: typeof exactIntegers): Promise<unknown> {
   const declared = Number(request.headers.get("content-length") ?? 0);
   if (declared > ENTRY_LIMITS.bodyChars) throw new BadRequest(413, `request body is larger than ${ENTRY_LIMITS.bodyChars} bytes`);
   const text = await request.text();
   if (text.length > ENTRY_LIMITS.bodyChars) throw new BadRequest(413, `request body is larger than ${ENTRY_LIMITS.bodyChars} characters`);
   try {
-    return JSON.parse(text);
+    return JSON.parse(text, reviver as Parameters<typeof JSON.parse>[1]);
   } catch {
     throw new BadRequest(400, "request body is not JSON");
   }

@@ -133,8 +133,8 @@ const scenarios: Record<string, (db: Connection, env: Env) => Promise<unknown>> 
   },
   /** 64 ビットの整数と NUL を含む文字列を、binding の 3 つの intMode で読む。 */
   async wide(db, env) {
-    const big = connect(env.DINF_DB, { intMode: "bigint" } as never);
-    const str = connect(env.DINF_DB, { intMode: "string" } as never);
+    const big = connect(env.DINF_DB, { intMode: "bigint" });
+    const str = connect(env.DINF_DB, { intMode: "string" });
     await db.prepare("CREATE TABLE IF NOT EXISTS w(id INTEGER PRIMARY KEY, n INTEGER, v, s TEXT)").run();
     await db.batch(WIDE.map((n, i) => db.prepare("INSERT OR REPLACE INTO w(id, n, v, s) VALUES (?, ?, ?, ?)").bind(i + 1, n, n, NUL)));
     const scan = "SELECT id, n, v, s FROM w WHERE id <= 3 ORDER BY id";

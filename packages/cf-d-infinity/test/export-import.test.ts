@@ -28,7 +28,7 @@ async function dump(c: SimCluster, table: string, limit = 1000): Promise<{ lines
   const lines: string[] = [];
   let pages = 0;
   for (let cursor: ExportCursor | null = null; ; ) {
-    const page = viaJson(await exportPage(c, table, viaJson(cursor), limit));
+    const page: transfer.ExportPage = viaJson(await exportPage(c, table, viaJson(cursor), limit));
     if (page.rows.length) lines.push(...insertLines(table, page.columns, page.rows));
     cursor = page.cursor;
     if (cursor === null) break;
@@ -204,7 +204,9 @@ describe("the export format", () => {
     const c = new SimCluster({ shards: 1 });
     const db = new Db(c);
     await db.ddl(V);
-    const put = (rows: unknown, format: unknown = FORMAT) => (importRows as (...a: unknown[]) => Promise<number>)(new Db(c), "v", ["id", "x"], rows, format);
+    const put = (rows: unknown, ...format: unknown[]) =>
+      (importRows as (...a: unknown[]) => Promise<number>)(new Db(c), "v", ["id", "x"], rows, ...(format.length ? format : [FORMAT]));
+    // 版を渡さない呼び出し (版を持たない頃の CLI) と、知らない版。
     await expect(put([["i1", "tx"]], undefined)).rejects.toThrow(/export format/);
     await expect(put([["i1", "tx"]], 999)).rejects.toThrow(/export format/);
     // 版 0 の形 (INTEGER は JS の数、BLOB と REAL と 64 ビットの整数は印の object) と、印のない文字列。

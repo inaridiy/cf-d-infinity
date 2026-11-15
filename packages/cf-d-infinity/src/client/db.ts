@@ -17,6 +17,7 @@ import { initStoredValue, storedValueReady } from "../sql/stored";
 import { parseDdl } from "../sql/ddl";
 import { openScratch, ScratchDb, type Compiled } from "../sql/scratch";
 import { groupSpan, rowSpan, scanSpans, statementSpans, tableSpan } from "./spans";
+import { rowsOut } from "./results";
 
 export interface Cluster {
   shard(id: string): ShardApi;
@@ -111,20 +112,6 @@ export function cleanToken(token: unknown): Ts {
 
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 
-/**
- * D1 と同じ形の値。INTEGER を JS の数で返す (D1 互換の API、Service Binding、HTTP の `/sql`。docs/design-values.md の「D1 互換の
- * API、Service Binding、HTTP の JSON」)。JS の数で正確に表せない INTEGER は、黙って隣の値にせずに誤りにする (持ち主の判断の 1。
- * @libsql/client の intMode "number" と同じ)。誤りにするかどうかは値で決まり、行の置き場所には依らない。
- * bigint か文字列で返す口 (intMode) は、段 4 で足す。
- */
-export function d1Value(v: Value): Exclude<Value, bigint> {
-  if (typeof v !== "bigint") return v;
-  if (v > MAX_SAFE || v < -MAX_SAFE) {
-    throw new SqlError(`the result holds the integer ${v}, which a JavaScript number cannot hold exactly; read it through Hrana (@libsql/client with intMode "bigint") or CAST it to TEXT`);
-  }
-  return Number(v);
-}
-
 export class QueryResult {
   constructor(
     readonly columns: string[],
@@ -135,17 +122,12 @@ export class QueryResult {
     /** 読み取りの T、または autocommit の commit 時刻。 */
     readonly ts?: Ts,
   ) {}
-  /** 列名で引ける行。同名の列は後の列が勝つ。値は D1 と同じ形で、INTEGER は JS の数である (d1Value)。 */
+  /**
+   * 列名で引ける行。同名の列は後の列が勝つ。値は D1 と同じ形で、INTEGER は JS の数である (src/client/results.ts の intMode "number"。
+   * JS の数で正確に表せない INTEGER は誤りにする)。入口は、利用者の選んだ intMode で rowsOut を呼ぶ。
+   */
   get rows(): Row[] {
-    return this.values.map((v) => Object.fromEntries(this.columns.map((c, i) => [c, d1Value(v[i] ?? null)])));
-  }
-  /** values を D1 と同じ形にしたもの (D1 互換の API の raw)。 */
-  get d1Values(): Value[][] {
-    return this.values.map((r) => r.map(d1Value));
-  }
-  /** D1 の meta.last_row_id と HTTP の JSON。JS の数で返す。 */
-  get lastRowId(): number | null {
-    return this.lastInsertRowid === null ? null : Number(this.lastInsertRowid);
+    return rowsOut(this.columns, this.values, "number");
   }
 }
 

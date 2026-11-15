@@ -82,7 +82,7 @@ describe("64-bit integers and NUL through the D1 compatible API", () => {
       // 安全な範囲の INTEGER は、既定では JS の数である。
       expect((await plain.prepare("SELECT id, s FROM w WHERE id = ?").bind(1).all()).results).toEqual([{ id: 1, s: NUL }]);
 
-      const big = new D1Compatible(new Db(c), { intMode: "bigint" } as never);
+      const big = new D1Compatible(new Db(c), { intMode: "bigint" });
       expect((await big.prepare(READS.byKey).bind(1).all()).results).toEqual([{ id: 1n, n: WIDE[0], v: WIDE[0], s: NUL }]);
       expect((await big.prepare(READS.scan).all()).results).toEqual(WIDE.map((n, i) => ({ id: BigInt(i + 1), n, v: n, s: NUL })));
       expect(await big.prepare(READS.scan).raw()).toEqual(WIDE.map((n, i) => [BigInt(i + 1), n, n, NUL]));
@@ -91,7 +91,7 @@ describe("64-bit integers and NUL through the D1 compatible API", () => {
       // REAL は、どの intMode でも JS の数である。
       expect(await big.prepare("SELECT 1.5 AS r, 2.0 AS q").first()).toEqual({ r: 1.5, q: 2 });
 
-      const str = new D1Compatible(new Db(c), { intMode: "string" } as never);
+      const str = new D1Compatible(new Db(c), { intMode: "string" });
       expect((await str.prepare(READS.scan).all()).results).toEqual(WIDE.map((n, i) => ({ id: String(i + 1), n: String(n), v: String(n), s: NUL })));
       expect(await str.prepare(READS.noTable).bind(WIDE[0], NUL).raw()).toEqual([[String(WIDE[0]), NUL]]);
 
@@ -108,17 +108,17 @@ describe("64-bit integers and NUL through the D1 compatible API", () => {
     expect((await plain.prepare("INSERT INTO w(id, n) VALUES (?, 1)").bind(7).run()).meta.last_row_id).toBe(7);
     // 文は実行され、確定している。結果の last_row_id を JS の数にできないので、誤りにする (丸めた数は返さない)。
     await expect(plain.prepare("INSERT INTO w(id, n) VALUES (?, 1)").bind(2n ** 60n).run()).rejects.toThrow(/last_row_id .*cannot hold exactly/);
-    expect(await new D1Compatible(new Db(c), { intMode: "string" } as never).prepare("SELECT count(*) AS c FROM w WHERE id = ?").bind(2n ** 60n).first("c")).toBe("1");
-    const big = new D1Compatible(new Db(c), { intMode: "bigint" } as never);
+    expect(await new D1Compatible(new Db(c), { intMode: "string" }).prepare("SELECT count(*) AS c FROM w WHERE id = ?").bind(2n ** 60n).first("c")).toBe("1");
+    const big = new D1Compatible(new Db(c), { intMode: "bigint" });
     expect((await big.prepare("INSERT INTO w(id, n) VALUES (?, 1)").bind(2n ** 61n).run()).meta.last_row_id).toBe(2n ** 61n);
-    const str = new D1Compatible(new Db(c), { intMode: "string" } as never);
+    const str = new D1Compatible(new Db(c), { intMode: "string" });
     expect((await str.prepare("INSERT INTO w(id, n) VALUES (?, 1)").bind(-(2n ** 62n)).run()).meta.last_row_id).toBe(String(-(2n ** 62n)));
   });
 
   it("binds a JS number that is an integer outside the safe range as REAL, whether a shard or the Worker's SQLite answers", async () => {
     // 決めたことの 2。渡された double をそのまま入れる。INTEGER の列は、型の親和性で整数にする (値は 2^60 のまま)。
     const c = new SimCluster({ shards: 2 });
-    const d1 = new D1Compatible(new Db(c), { intMode: "bigint" } as never);
+    const d1 = new D1Compatible(new Db(c), { intMode: "bigint" });
     await d1.prepare(T).run();
     for (const x of [2 ** 60, -(2 ** 60), 2 ** 53, 1e17, 9007199254740993]) {
       expect(await d1.prepare("SELECT typeof(?) AS t, ? AS x").bind(x, x).first(), String(x)).toEqual({ t: "real", x });

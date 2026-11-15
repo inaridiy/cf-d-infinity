@@ -1,6 +1,6 @@
 # 保存と通信の形式
 
-状態：Early 版で固める形式の一覧 (2026-11-12)。2026-11-14 に、行の置き場所を token の区間にした ([design-subslots.md](./design-subslots.md))。同じ日に、行イメージをタプルにし、キー文字列の数の書き方を決めた ([design-values.md](./design-values.md) の段 2。保存の形式の版 2、通信の版 4)。値の JS の型を格納の型にし、シャードの結果を型つきで読むようにした (同じ設計書の段 3。通信の版 5。保存の形式は変わらない)
+状態：Early 版で固める形式の一覧 (2026-11-12)。2026-11-14 に、行の置き場所を token の区間にした ([design-subslots.md](./design-subslots.md))。同じ日に、行イメージをタプルにし、キー文字列の数の書き方を決めた ([design-values.md](./design-values.md) の段 2。保存の形式の版 2、通信の版 4)。値の JS の型を格納の型にし、シャードの結果を型つきで読むようにした (同じ設計書の段 3。通信の版 5。保存の形式は変わらない)。2026-11-15 に、エクスポートの行を要素のタプルにし、形式の版を file と CLI とのあいだの JSON に持たせた (同じ設計書の段 4。エクスポートの形式の版 1)
 
 D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker と Durable Object のあいだを RPC でつなぐ。
 公開した後に新しい版を置くと、古い版が書いたデータを新しい版が開き、古い版と新しい版の Worker と Durable Object がしばらく混ざって動く。
@@ -69,6 +69,8 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 | Worker と Durable Object の RPC | 要求と応答の object (`ShardApi`、`src/types.ts`)。要求は版を運ぶ。版 3 から、範囲は token の区間で、読む範囲は `claim` (区間の組) を、範囲の移動は piece (`Piece`、`PieceWant`、`PiecePayload`) を運ぶ。版 4 から、行イメージ (`Change` の `before` と `after`、`PiecePayload` の `rows`、取引が溜める変更) はタプルである。版 5 から、値は `bigint` を含む `Value` (structured clone が運ぶ) で、読みの要求は結果の列名 (`ExecReq.columns`) を運ぶ。シャードは読みを型つきの読みに包み (`src/value.ts` の `typedReadSql`)、型のある値を返す。利用者の RETURNING は Worker が要素の式に書き換えて送る | 版で守る (`PROTOCOL_VERSION` = 5。版 4 以前は受け付けない) |
 | Hrana の baton | 開いている取引の書き出し (`Db.dump`) を JSON にして署名したもの | 作り直せる。読めない baton は `BATON_INVALID` で断り、クライアントは取引をやり直す |
 | 読みの session token | `Ts` の数 | 固定 |
-| エクスポート | 1 行に 1 文の `INSERT INTO "表"("列", ...) VALUES (...), ...;`。REAL は小数点か指数を付けて書く。BLOB は `X'...'`、無限大は `9e999`。2^53 を超える INTEGER も 10 進の数字で書く (段 3 から) | 固定 (利用者の形式) |
+| エクスポートの file | 1 行目が形式の版の注釈 `-- cf-d-infinity export format 1` で、続く注釈の行の後に、表定義の文 (利用者が実行した文面) と、1 行に 1 文の `INSERT INTO "表"("列", ...) VALUES (...), ...;` が並ぶ。値は SQLite がその literal を読むと同じ型の同じ値になる形で書く (`bin/dump.js` の `literal`)。INTEGER は 10 進の数字 (64 ビットの端まで)、REAL は小数点か指数を付けた表記 (無限大は `9.0e+999`)、TEXT は `'...'` で、改行 (`\n`、`\r`) と NUL は `' \|\| char(n) \|\| '` の連結、BLOB は `X'大文字の 16 進'`、NULL は `NULL`。取り込み (`npx cf-d-infinity import`) は、何かを実行する前に版の行を確かめ、版の行がない file と、ほかの版の file を断る (最初の公開の前は後方互換を持たない) | 固定 (利用者の形式。版は `bin/dump.js` の `EXPORT_FORMAT`) |
+| エクスポートの頁と取り込みの行 (CLI と Worker のあいだの JSON) | `DinfDatabase.exportRows(表, 続きの位置, 行数)` は `{ format, columns, rows, cursor }` を返す。`rows` は表定義の列の順の要素のタプル (`src/value.ts`。上の「行イメージと変更」と同じ要素) で、`cursor.after` も主キーの値のタプルである。要素は文字列か `null` なので、JSON を通しても 64 ビットの整数、無限大、整数の値の REAL と INTEGER の区別、NUL を含む TEXT を失わない。`importRows(表, 列, 行, format)` は同じタプルを受け、`format` が違うか、要素でない値 (JS の数、印の object、印のない文字列) を含む行があれば、何も書かずに断る | 版で守る (`format` = `EXPORT_FORMAT` = 1。`src/transfer.ts` と `bin/dump.js` が同じ値を持ち、`test/export-import.test.ts` が確かめる) |
+| 分析の行 (`src/analytics.ts` の `collect`) | 変更ログの行ごとに `{ commit_ts, table, pk, deleted, row }`。`row` は列名から要素への object で、消した行は `null`、表が消えていれば列名のないタプルである | 作り直せる (配備した Worker からはまだ呼ばれない) |
 
 利用者に見える入口 (Hrana v2 と v3、D1 互換の API、Service Binding、HTTP の `/sql`、`/batch`、`/ddl`、管理の入口、CLI) の互換は、この文書ではなく、[sql-language.md](./sql-language.md) と README が約束する。
