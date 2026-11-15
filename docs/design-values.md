@@ -1050,7 +1050,7 @@ DO の SQLite と Workers の CPU では測っていない。
 
 ### 検査の結果
 
-`364c5d5` で、`npm run typecheck`、4 つの組の `npx vitest run --project <組> --maxWorkers=2` (sim 905、reference-scans 307、reference-full 307、workerd 97 の試験が通った。飛ばしたのは前からの印の付いたもの)、`packages/create-cf-d-infinity` の `npm test` (13) が通った。
+`364c5d5` で、4 つの組の `npx vitest run --project <組> --maxWorkers=2` が通った (sim 905、reference-scans 307、reference-full 307、workerd 97 の試験。飛ばしたのは前からの印の付いたもの)。その後は文書だけを直し、`npm run typecheck` と `packages/create-cf-d-infinity` の `npm test` (13) を最後のコミットで流し直した。
 `test/determinism.test.ts` も通る。
 `test/export-import.test.ts` は、1、2、4 シャードから別の数のシャードへ、頁の大きさ 1、3、1000 で、±(2^63 - 1)、-2^63、2^53 ± 1 と NUL を含む TEXT を主キーと値の両方に置いて往復させ、値と `typeof` が元と同じになる。
 
