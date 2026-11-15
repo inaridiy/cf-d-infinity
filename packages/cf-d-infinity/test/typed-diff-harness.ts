@@ -11,6 +11,7 @@ import type { Client } from "@libsql/client";
 import { DatabaseSync } from "node:sqlite";
 import { bindParams, ident, parseStatements, render, type Node } from "../src/sql/cst";
 import { returningClause, rewriteReturning } from "../src/sql/returning";
+import type { Faults } from "../src/types";
 import { clientOf } from "./libsql";
 import { prng, SimCluster } from "./sim";
 
@@ -120,9 +121,11 @@ export interface TypedRun { problems: string[]; statements: number }
  * 台本を、D∞ (Hrana 経由) と node:sqlite に流して、結果を型ごと比べる。
  * stopAtFirst: 最初の食い違いで止める。断られた文の後は 2 つの状態が分かれるので、その後の食い違いには意味がない。
  */
-export async function runTyped(schema: string[], steps: Step[], shards: number, o: { stopAtFirst?: boolean } = {}): Promise<TypedRun> {
+export async function runTyped(
+  schema: string[], steps: Step[], shards: number, o: { stopAtFirst?: boolean; faults?: Faults; noSpanCheck?: boolean } = {},
+): Promise<TypedRun> {
   const lite = new DatabaseSync(":memory:");
-  const c = new SimCluster({ shards });
+  const c = new SimCluster({ shards, faults: o.faults, noSpanCheck: o.noSpanCheck });
   const client: Client = clientOf(c, { intMode: "bigint" });
   for (const s of schema) {
     lite.exec(s);
@@ -199,7 +202,7 @@ function valueOf2(r: () => number, o: Script2Options): Arg {
 }
 
 /** 行ごとに値の違う列 (`random()`) の結果。値そのものではなく、値が許した集まりに入っているかだけを残す。 */
-const oneOf = (allowed: Cell[]) => (rows: Cell[][]) => rows.map((row) => row.map((v) => (allowed.includes(v) ? "valid" : `unexpected ${v}`)));
+export const oneOf = (allowed: Cell[]) => (rows: Cell[][]) => rows.map((row) => row.map((v) => (allowed.includes(v) ? "valid" : `unexpected ${v}`)));
 
 /**
  * 元の生成器が作らない文。RETURNING (整数を入れた REAL の列を含む)、`random()` の列、WITH で始まる文、重なった列名、

@@ -19,6 +19,7 @@ import { describe, expect, it } from "vitest";
 import { importBatches, insertLines, parseInsert } from "../bin/dump.js";
 import { split } from "../src/autoscaler";
 import { D1Compatible } from "../src/client/d1";
+import { imageFaults } from "../src/shard/rows";
 import { Db } from "../src/client/db";
 import type { Reference } from "../src/sql/plan";
 import { exportPage, importRows, type ExportCursor } from "../src/transfer";
@@ -474,4 +475,37 @@ describe("64-bit integers", () => {
     const found = (await all()).filter((f) => f.kind !== "other" && f.shards === 1 && f.mode === "normal");
     expect(found.map((f) => `${f.kind} | ${f.scenario} | ${f.step} | ${f.ours}`)).toEqual([]);
   }, 300_000);
+});
+
+// 欠陥を戻して、この試験が気付くことを確かめる。行イメージのタプルの INTEGER を JS の数で値に戻すと (src/shard/rows.ts の
+// imageFaults.roundedImages)、確定した取引の適用と、分割で運んだ行で、2^53 を超える整数が丸まる。どちらも、文の答えは
+// シャードの本体から読むので、丸まった値が後の読みに現れる。値は主キーでない列に置く (主キーが丸まると、行が重なって適用が止まる)。
+describe("a check that row images keep 64-bit integers", () => {
+  const scenes: Record<string, (r: Run) => Promise<void>> = {
+    "a transaction across shards": async (r) => {
+      await r.h(T);
+      await r.tx([1n, 2n, 3n, 4n].map((id): [string, Arg[]] => ["INSERT INTO t(id, v, n) VALUES (?, 'x', ?)", [id, r.v.ABOVE + id]]));
+      await r.h(READ);
+    },
+    "rows moved by a shard split": async (r) => {
+      await r.h(T);
+      for (let i = 1n; i <= 30n; i++) await r.h("INSERT INTO t(id, v, n) VALUES (?, 'x', ?)", [i, r.v.MAX - i]);
+      await split(r.c, "s0", `s${r.shards}`);
+      await r.h(READ);
+    },
+  };
+  for (const [name, scene] of Object.entries(scenes)) {
+    it(`finds the rounding in ${name} (roundedImages), and passes the same scene without it`, async () => {
+      await scene(new Run(WIDE, 2, undefined));
+      imageFaults.roundedImages = true;
+      try {
+        // 丸まった値は、隣の整数か (rounded)、64 ビットの外へ丸まって REAL として入る (other。typeof が real になる)。どちらでも、
+        // 上の試験が落ちる。
+        const kind = await scene(new Run(WIDE, 2, undefined)).then(() => "same as SQLite", (e: unknown) => (e instanceof Divergence ? e.kind : `failed: ${(e as Error).message}`));
+        expect(["rounded", "other"]).toContain(kind);
+      } finally {
+        imageFaults.roundedImages = false;
+      }
+    }, 120_000);
+  }
 });

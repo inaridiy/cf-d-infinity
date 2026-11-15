@@ -8,7 +8,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { clientOf } from "./libsql";
-import { prng, seedsOr, SimCluster } from "./sim";
+import { prng, REFERENCE_ONLY, seedsOr, SimCluster } from "./sim";
 
 type Arg = null | bigint | number | string | Uint8Array;
 
@@ -151,7 +151,7 @@ describe("value types against SQLite through Hrana", () => {
 //   いた。値の作り直しの段 3 で違いがなくなり、緩めるのをやめた。
 // - 上の生成器が作らない値と文を、2 つ目の生成器 (script2) で流す。2^53 を超える整数と NUL を含む文字列も混ぜる (段 3 から。
 //   段 2 までは test/open/typed-diff-wide.test.ts が流していた)。
-import { runTyped, script2, SCHEMA2 } from "./typed-diff-harness";
+import { oneOf, runTyped, script2, SCHEMA2, type Step as TypedStep } from "./typed-diff-harness";
 
 describe("value types against SQLite through Hrana, keeping INTEGER and REAL apart in the results", () => {
   const defaults = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -175,5 +175,23 @@ describe("value types against SQLite through Hrana, keeping INTEGER and REAL apa
       expect(r.problems.slice(0, 5)).toEqual([]);
     });
   }
+  // 欠陥を戻して、この比べ方が気付くことを確かめる。シャードが型つきの読みの `LIMIT -1 OFFSET 0` の囲いを外すと (Faults の
+  // unfencedRead)、SQLite は包んだ文を外の文へ展開し、要素の式が列を参照するたびに `random()` を評価し直す。型と値が別の評価から来る。
+  // 主キーで 1 行を引く文 (シャードが答える) に、行ごとに値の違う列を置く。基準経路だけの実行では、利用者の文をシャードで実行しないので、
+  // 外す。`random()` の結果は実行のたびに違うので、範囲の検査 (同じ文を 2 度実行して比べる) は切る。
+  const randomReads = (): TypedStep[] => [
+    { sql: "INSERT INTO tv(id, i) VALUES (1, 1), (2, 2), (3, 3)", args: [] },
+    ...Array.from({ length: 30 }, (_v, k): TypedStep => ({
+      sql: "SELECT CASE WHEN random() % 2 THEN 5 ELSE 'x' END AS x, CASE WHEN random() % 2 THEN 2.5 ELSE NULL END AS y FROM tv WHERE id = ?",
+      args: [BigInt(1 + (k % 3))], normalize: oneOf(["i5", "tx", "r2.5", null]),
+    })),
+  ];
+  it.skipIf(REFERENCE_ONLY)("finds a typed read without its fence (unfencedRead), and passes the same reads with it", async () => {
+    for (const shards of [1, 2]) {
+      expect((await runTyped(SCHEMA2, randomReads(), shards, { noSpanCheck: true })).problems).toEqual([]);
+      const r = await runTyped(SCHEMA2, randomReads(), shards, { faults: { unfencedRead: true }, noSpanCheck: true });
+      expect(r.problems.length, `${shards} shards`).toBeGreaterThan(0);
+    }
+  });
 });
 // ==== ここまで: 結果の型を保った比較 ====

@@ -140,6 +140,17 @@ Categories:
   of a piece it does not own), but its flaw is the granularity of the check, slot instead of piece, which the code cannot
   show while every piece is a whole slot; it stays in P. Used in write-guard ("with the guard off (ignoreWriteClaim),
   both new shards take every row ..." and "puts back the old behaviour with ignoreWriteClaim ...").
+- `unfencedRead` (a shard fault, `Faults`): the shard wraps a read for the typed read without the `LIMIT -1 OFFSET 0` fence,
+  so SQLite inlines the wrapped statement and evaluates `random()` once for the type and again for the value (values rework,
+  stage 3, `docs/design-values.md`). No model covers value encoding. Used in typed-diff ("finds a typed read without its fence
+  (unfencedRead), and passes the same reads with it"). The randomized generators do not catch it: none of them sends a
+  shard-answered read with a nondeterministic column, and the span check runs such a statement twice and compares, so the
+  dedicated test turns the span check off. Added 2026-11-15.
+- `roundedImages` (`imageFaults` in `src/shard/rows.ts`, `FAULT=roundedImages`): the INTEGER elements of a row-image tuple
+  are decoded with `Number`, so an integer beyond 2^53 is rounded wherever a row is written back from its image (a committed
+  transaction applied, rows moved by a split, a read at an older time). No model covers value encoding. Used in int64 ("finds the
+  rounding in a transaction across shards (roundedImages) ..." and "... in rows moved by a shard split ..."); with
+  `FAULT=roundedImages`, every int64 scenario test fails and typed-diff fails on seeds 1, 3 and 6 of its first block. Added 2026-11-15.
 
 ## Notes
 

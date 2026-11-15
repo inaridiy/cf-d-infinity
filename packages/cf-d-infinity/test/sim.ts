@@ -366,15 +366,17 @@ const CLIENT_FAULTS = new Set([
 ]);
 /** 範囲の作り方の欠陥のスイッチの名前 (src/client/spans.ts の spanFaults)。test/setup.ts が入れる。 */
 export const SPAN_FAULTS = new Set(["rowSpanDespiteUnique"]);
+/** 行イメージを値に戻すところの欠陥のスイッチの名前 (src/shard/rows.ts の imageFaults)。test/setup.ts が入れる。 */
+export const IMAGE_FAULTS = new Set(["roundedImages"]);
 
 /**
  * 環境変数 FAULT で、欠陥のスイッチを 1 つ、全部のシミュレータに入れる。乱択の検査が、その欠陥を見つけるかを測るためにある
  * (scripts/fault-table.mjs)。試験が自分で入れるスイッチには、上書きせずに足す。
  */
-export function injectedFault(): { name: string; side: "shard" | "client" | "span" } | null {
+export function injectedFault(): { name: string; side: "shard" | "client" | "span" | "image" } | null {
   const name = process.env.FAULT;
   if (!name) return null;
-  return { name, side: CLIENT_FAULTS.has(name) ? "client" : SPAN_FAULTS.has(name) ? "span" : "shard" };
+  return { name, side: CLIENT_FAULTS.has(name) ? "client" : SPAN_FAULTS.has(name) ? "span" : IMAGE_FAULTS.has(name) ? "image" : "shard" };
 }
 
 export interface SimOptions {

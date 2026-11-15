@@ -6,7 +6,7 @@ import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { afterEach, beforeAll, beforeEach, expect } from "vitest";
 import { spanFaults } from "../src/client/spans";
-import { imageChecks } from "../src/shard/rows";
+import { imageChecks, imageFaults } from "../src/shard/rows";
 import { parseObserver } from "../src/sql/cst";
 import { openScratch } from "../src/sql/scratch";
 import { allDriverIntegers, allSpanEscapes, allWriteEscapes, imageCheckOff, injectedFault, tracedNets } from "./sim";
@@ -34,6 +34,7 @@ beforeAll(async () => {
 beforeEach(() => {
   const f = injectedFault();
   if (f?.side === "span") (spanFaults as Record<string, boolean>)[f.name] = true;
+  if (f?.side === "image") (imageFaults as Record<string, boolean>)[f.name] = true;
 });
 
 // RPC_TRACE=<ディレクトリ> を付けて流すと、試験ごとに、その試験が作ったクラスタの RPC の送り元、宛先、種類の列を 1 つのファイルに
