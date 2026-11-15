@@ -1157,6 +1157,13 @@ Worker は、それで T を進める refresh を始める。
 設計 0 は、この設計を入れない実装で、`PIN_ROUTING` なら今の実装 (取引は範囲表を取り直さない)、そうでなければ範囲表だけを取り直す実装である。
 どちらの設計でも、確かめに答えたシャードは時計を to まで進め、c の決まっていない intent を to より上へ push する。
 
+選択肢の定数が 2 つある。
+`FENCE_REFUSES` は、親が fence (`start`) の後、まだ渡していない K2 の読みと確かめも断る形で、今のコードの親である。
+定数を外した形は M19 の親で、渡していない piece に答える。
+この設計を段 2 の直後に入れると、親はまだ前者なので、両方を確かめた。
+`BOUNDED` は、refresh の確かめが (from, to] の変更だけを見る案である (今の `changedSince` は to より後も数える)。
+この案では、移動による `ReadTooOld` の refresh が通らなければ取引は失敗し、ほかの refresh が通らなくても、後の refresh を止めない。
+
 `m23Safe` は次の 5 つである。
 
 - `serializable`: 確定した X の読みは、確定の点 (読むだけなら T、書くなら c の直前) の値と一致する。同じ行を 2 回読んで違う値を見た X は確定しない。
@@ -1166,6 +1173,7 @@ Worker は、それで T を進める refresh を始める。
 - `parentFrozen`: 親の K2 の記録は、pull の後は変わらない。設計 1 で、子が親に尋ねる手を、子が答える手と同じ 1 手にしてある理由である。
 
 `answersSafe` は `serializable` と `readConsistent` で、今の実装が、断るだけで答えを誤らないことを確かめる。
+`readOnlyBelowStart` は、読むだけの X が失敗するのは、refresh の窓 (読んだ時刻, to] に、読んだ行の別の取引の確定があったときだけである、という性質である。移動による refresh の to は、子が答えられるいちばん古い時刻 (到着の m か床) なので、この確定は避けられない。`BOUNDED` の案を比べるのに使う。
 時相の性質 `refreshTerminates` は、始めた refresh がいつか終わること (通るか、競合で終わる) である。
 公平性は、確かめの手 (親と子の答えと断り)、`pull`、`recv`、Y の phase 2 に、弱い公平性を置いた。
 
@@ -1188,7 +1196,11 @@ Worker は、それで T を進める refresh を始める。
 | 設計 2: 子は from から見る | `m23_alt_red_child_from_floor` | `m23_red_child_from_floor` と同じ形 |
 | 設計 1: 子は、到着より前からの窓を、自分で親に尋ねる。Worker を前の持ち主へ回さない (`PINGPONG`) | `m23_live_red_pingpong` | 子が「前の持ち主へ」と断り、親が「渡した」と断る。`boundedRefusals` と `refreshTerminates` が破れる (答えは誤らない) |
 
+上限のない確かめ (今の `changedSince`) では、移動の後、範囲の移動を終えた後の時刻で、別の接続が動いた行を確定すると、読むだけの X は、床までの refresh が通らずに失敗する (`m23_green_ro` で `readOnlyBelowStart` が破れる)。
+`BOUNDED` の案では、どの形でも `m23Safe` は破れず、読むだけの X で `readOnlyBelowStart` が成り立つ。
+
 今の実装は、2 つの形で、移動のほかに何もない経路で X を失敗させる (`placementIndependent` が破れる)。
+2 つとも、親は fence の後に範囲の要求を全部断る (`FENCE_REFUSES`)。
 `m23_impl_pinned` (取引は範囲表を取り直さない) では、X が K2 を読み直す文が `not owner` で失敗する。
 `m23_impl` (範囲表だけ取り直す) では、確かめは読んだシャードへ行き、P は `NotOwner`、子は床で断る。
 どちらも、`answersSafe` は破れない。
@@ -1196,54 +1208,62 @@ Worker は、それで T を進める refresh を始める。
 
 | インスタンス | 性質 | 定数 | 到達状態数 (distinct) | 深さ | 結果 |
 |---|---|---|---|---|---|
-| `m23_green` | `m23Safe` | 設計 1。全表を 2 回読み、K2 を楽観で書く。W 1 回、Y 1 件、OTHER (to は 5 まで)、tick 1 | 5,508,843 | 30 | No violation |
-| `m23_green_ro` | `m23Safe` | 同上で、読むだけ | 4,191,589 | 29 | No violation |
-| `m23_green_pess` | `m23Safe` | 同上で、全表を 1 回読み、K2 を悲観で書く | 2,766,090 | 27 | No violation |
-| `m23_alt_green` | `m23Safe` | 設計 2。`m23_green` と同じ形 | 7,142,365 | 33 | No violation |
-| `m23_impl_pinned` | `answersSafe` | 設計 0、範囲表を取り直さない | 3,523,951 | 25 | No violation |
-| `m23_impl` | `answersSafe` | 設計 0、範囲表を取り直す | 5,555,930 | 27 | No violation |
-| `m23_live` | `refreshTerminates` (時相) | 設計 1。読むだけ、Y 1 件、W なし、tick なし、to は 3 まで | 49,879 | 22 | No violation |
-| `m23_alt_live` | `refreshTerminates` (時相) | 設計 2。同上 | 65,792 | 25 | No violation |
-| `m23_green_wide` | `m23Safe` | `m23_green` で tick 2、to は 6 まで (HEAVY) | (M23_WIDE) | | (M23_WIDE_RESULT) |
-| `m23_red_parent_alone` | `serializable` | 条件を 1 つ外す | 2,297,892 で反例 | 17 | 反例 |
-| `m23_red_child_from_floor` | `serializable` | 同上 | 1,018,541 で反例 | 15 | 反例 |
-| `m23_red_child_from_arrival` | `serializable` | 同上 | 1,174,429 で反例 | 16 | 反例 |
-| `m23_red_no_peer` | `serializable` | 同上 | 729,150 で反例 | 14 | 反例 |
-| `m23_red_prepare_alone` | `serializable` | 同上 | 706,147 で反例 | 14 | 反例 |
-| `m23_red_no_bump` | `serializable` | 同上 | 155,228 で反例 | 12 | 反例 |
-| `m23_red_no_push` | `placementIndependent` | 同上 (読むだけ) | 146,810 で反例 | 12 | 反例 |
-| `m23_impl_pinned` / `m23_impl` | `placementIndependent` | 今の実装 / 範囲表だけ取り直す | 1,418 / 29,804 で反例 | 7 / 10 | 反例 |
-| `m23_live_red_pingpong` | `boundedRefusals` / `refreshTerminates` | 活性の赤 | 4,200 / 52,785 で反例 | 10 / 23 | 反例 |
-| `m23_alt_red_parent_alone` | `serializable` | 設計 2 で条件を 1 つ外す | 1,945,919 で反例 | 17 | 反例 |
-| `m23_alt_red_no_epoch` | `serializable` | 同上 | 2,074,944 で反例 | 17 | 反例 |
-| `m23_alt_red_child_from_floor` | `serializable` | 同上 | 1,010,134 で反例 | 15 | 反例 |
-| `m23_alt_red_unarrived` | `serializable` | 同上 | 4,783,440 で反例 | 19 | 反例 |
-| `m23_alt_red_prepare_alone` | `serializable` | 同上 | 740,092 で反例 | 14 | 反例 |
+| `m23_green` | `m23Safe` | 設計 1。全表を 2 回読み、K2 を楽観で書く。W 1 回、Y 1 件、OTHER (to は 5 まで)、tick 1 | 6,253,563 | 30 | No violation |
+| `m23_green_ro` | `m23Safe` | 同上で、読むだけ | 4,690,083 | 30 | No violation |
+| `m23_green_pess` | `m23Safe` | 同上で、全表を 1 回読み、K2 を悲観で書く | 2,996,564 | 27 | No violation |
+| `m23_green_fenced` | `m23Safe` | `m23_green` で、親は fence の後に全部断る (`FENCE_REFUSES`) | 6,329,435 | 30 | No violation |
+| `m23_green_bounded` | `m23Safe` | `m23_green` で、確かめの上限を to で切る (`BOUNDED`) | 10,499,956 | 30 | No violation |
+| `m23_green_ro_bounded` | `m23Safe` / `readOnlyBelowStart` | `m23_green_ro` で `BOUNDED` | 7,792,045 | 29 | No violation |
+| `m23_green_ro` | `readOnlyBelowStart` | 上限のない確かめ | 239,191 で反例 | 12 | 反例 (W が床より後の c で確定し、読むだけの X が失敗する) |
+| `m23_alt_green` | `m23Safe` | 設計 2。`m23_green` と同じ形 | 8,066,377 | 33 | No violation |
+| `m23_alt_green_ro` / `m23_alt_green_pess` | `m23Safe` | 設計 2。読むだけ / 悲観 | 5,968,248 / 3,534,389 | 32 / 29 | No violation |
+| `m23_impl_pinned` | `answersSafe` | 設計 0、範囲表を取り直さない、`FENCE_REFUSES` | 3,936,872 | 25 | No violation |
+| `m23_impl` | `answersSafe` | 設計 0、範囲表を取り直す、`FENCE_REFUSES` | 6,479,113 | 27 | No violation |
+| `m23_live` | `refreshTerminates` (時相) | 設計 1。読むだけ、Y 1 件、W なし、tick なし、to は 3 まで | 56,791 | 22 | No violation |
+| `m23_live_fenced` | `refreshTerminates` (時相) | 同上で `FENCE_REFUSES` | 57,973 | 22 | No violation |
+| `m23_alt_live` | `refreshTerminates` (時相) | 設計 2。同上 | 74,720 | 25 | No violation |
+| `m23_green_wide` | `m23Safe` | `m23_green` で tick 2、to は 6 まで (HEAVY) | 35,995,564 (7 分ほど) | 32 | No violation |
+| `m23_red_parent_alone` | `serializable` | 条件を 1 つ外す | 2,306,724 で反例 | 17 | 反例 |
+| `m23_red_child_from_floor` | `serializable` | 同上 | 737,304 で反例 | 15 | 反例 |
+| `m23_red_child_from_arrival` | `serializable` | 同上 | 1,213,276 で反例 | 16 | 反例 |
+| `m23_red_no_peer` | `serializable` | 同上 | 836,951 で反例 | 15 | 反例 |
+| `m23_red_prepare_alone` | `serializable` | 同上 | 479,747 で反例 | 14 | 反例 |
+| `m23_red_no_bump` | `serializable` | 同上 | 183,890 で反例 | 12 | 反例 |
+| `m23_red_no_push` | `placementIndependent` | 同上 (読むだけ) | 136,393 で反例 | 12 | 反例 |
+| `m23_impl_pinned` / `m23_impl` | `placementIndependent` | 今の実装 / 範囲表だけ取り直す | 530 / 14,116 で反例 | 6 / 9 | 反例 |
+| `m23_live_red_pingpong` | `boundedRefusals` / `refreshTerminates` | 活性の赤 | 3,774 / 59,931 で反例 | 11 / 23 | 反例 |
+| `m23_alt_red_parent_alone` | `serializable` | 設計 2 で条件を 1 つ外す | 2,012,678 で反例 | 16 | 反例 |
+| `m23_alt_red_no_epoch` | `serializable` | 同上 | 2,277,576 で反例 | 17 | 反例 |
+| `m23_alt_red_child_from_floor` | `serializable` | 同上 | 1,248,225 で反例 | 15 | 反例 |
+| `m23_alt_red_unarrived` | `serializable` | 同上 | 5,341,752 で反例 | 19 | 反例 |
+| `m23_alt_red_prepare_alone` | `serializable` | 同上 | 724,661 で反例 | 14 | 反例 |
 
-状態数は、4 workers、heap 2.5 GB で測った。
-green は 1 本 1 分前後、赤は 15 秒から 1 分である。
+状態数は、4 workers、heap 2.5 GB で、ほかの TLC の検査と同時に流して測った。
+green は 1 本 1 分から 3 分、赤は 15 秒から 1 分である。
 赤の状態数は、TLC が反例を見つけるまでに数えた数である。
+2026-11-15 に、`check.sh` の M23 の節を `HEAVY=1` で流し、60 件 (TLC の検査 42 件と run の試験 18 件) がすべて期待どおりだった。
 
 witness は 7 つ (9 本) で、どれも到達した。
 
 | witness | インスタンス | 内容 | 到達状態数 |
 |---|---|---|---|
-| `witnessRefreshAcross` | `m23_green` | 移動の時刻をまたいで T を進めた refresh が通り、X が確定する | 1,223,689 |
-| `witnessCommitAcross` | `m23_green` | 移動の前に K2 を P で読んだ X が、K2 を書いて、移動の後に子で確定する | 754,670 |
-| `witnessReproduction` | `m23_green`、`m23_alt_green` | 再現の形。移動の前に P で全表を読み、移動の後に refresh で T を進めて読み直し (K2 は子で読む)、動いた行を子で書いて確定する。読んだ値はどれも変わらない | 1,828,230 / 3,105,732 |
-| `witnessConflictBelowFloor` | `m23_green` | 子が到着の後、床の前に確定した W で、X が競合になる (Y なし) | 723,424 |
-| `witnessBelowArrival` | `m23_green`、`m23_green_pess` | T が到着の m より小さいまま、X が子で確定する | 298,810 / 120,747 |
-| `witnessRefusedThenCommitted` | `m23_green` | 親が範囲表の古い X の確かめを断り、X が範囲表を直して確定する | 1,309,116 |
-| `witnessAborted` | `m23_green_ro` | 読むだけの X が、移動の後の読み直しで競合になる (設計の文書の、持ち主の判断 1) | 252,006 |
+| `witnessRefreshAcross` | `m23_green` | 移動の時刻をまたいで T を進めた refresh が通り、X が確定する | 1,161,558 |
+| `witnessCommitAcross` | `m23_green` | 移動の前に K2 を P で読んだ X が、K2 を書いて、移動の後に子で確定する | 518,237 |
+| `witnessReproduction` | `m23_green`、`m23_alt_green` | 再現の形。移動の前に P で全表を読み、移動の後に refresh で T を進めて読み直し (K2 は子で読む)、動いた行を子で書いて確定する。読んだ値はどれも変わらない | 1,817,438 / 3,018,135 |
+| `witnessConflictBelowFloor` | `m23_green` | 子が到着の後、床の前に確定した W で、X が競合になる (Y なし) | 557,072 |
+| `witnessBelowArrival` | `m23_green`、`m23_green_pess` | T が到着の m より小さいまま、X が子で確定する | 150,490 / 85,541 |
+| `witnessRefusedThenCommitted` | `m23_green` | 親が範囲表の古い X の確かめを断り、X が範囲表を直して確定する | 1,434,884 |
+| `witnessAborted` | `m23_green_ro` | 読むだけの X が、移動の後の読み直しで競合になる (設計の文書の、持ち主の判断 1) | 182,151 |
 
-決定的な run は、`m23_green` に 2 本 (再現の 2 つの試験と同じ形)、`m23_green_pess` と `m23_alt_green` に 1 本ずつ、設計 2 の `child_from_floor` と `prepare_alone` を除く各赤に反例の 1 本がある。
+決定的な run は、`m23_green` に 2 本 (再現の 2 つの試験と同じ形)、`m23_green_pess`、`m23_green_fenced`、`m23_green_ro_bounded`、`m23_alt_green` に 1 本ずつ、設計 2 の `child_from_floor` と `prepare_alone` を除く各赤に反例の 1 本がある。
 
 モデルが実装に求めること (設計の文書の「実装がすること」に、手順として書いた)。
 
 - 取引は `schema` だけを確定まで名乗り、範囲表は `NotOwner` のたびに取り直す。読んだ範囲と溜めた書き込みは、今の範囲表で宛先を決め直して、refresh と確定に送る。
 - 親は、渡した区間に触る Worker からの要求を、今と同じく `NotOwner` で断る。
-- 子は、確かめの下限を span と書き込みごとの `since ?? T` で決め、自分の記録を下限から見て、下限が到着の m (行のなかったグループは床) より前なら、親に (下限, m] を尋ねて合わせる。T と床を比べて断ることはしない。グループが届いてから答え、時計を to まで進める。
+- 子は、確かめの下限を span と書き込みごとの `since ?? T` で決め、自分の記録を下限から見て、下限が到着の m (行のなかったグループは床) より前なら、親に (下限, m] を尋ねて合わせる。親は、自分の記録だけで答える (渡したグループの intent は、子が見る)。T と床を比べて断ることはしない。グループが届いてから答え、時計を to まで進める。
 - refresh の確かめは、c の決まっていない intent を to より上へ push し、c の決まった to 以下の intent は適用を待つ。
+- (案) refresh の確かめは (from, to] の変更だけを見る。移動による `ReadTooOld` の refresh が通らなければ、取引は競合で失敗する。
 
 モデルにないもの。
 
@@ -1253,4 +1273,5 @@ witness は 7 つ (9 本) で、どれも到達した。
 - 2 つ以上の取引の確かめが同時に進むこと。X が書くのは K2 だけで、K1 に書く書き手はいない。
 - 行ロックと待ち (M9)。悲観の書き込みは、F の最新を読むことだけを表した。
 - 記録の切り詰め (`logLowWater`)。
-- M1b の、移動のない refresh で intent を push すること。M23 は、移動をまたぐ refresh だけを確かめた。
+- 移動のない refresh で、intent を push すること、上限を to で切ること、通らなかった refresh の後も refresh を続けること (M1b)。M23 は、移動をまたぐ refresh だけを確かめた。
+- 設計 2 で、親が fence の後に全部断る形と、`BOUNDED` の案。

@@ -540,8 +540,18 @@ witness $f m23_green witnessBelowArrival                # T が到着の m よ�
 witness $f m23_green witnessRefusedThenCommitted        # 親が範囲表の古い取引の確かめを断り、取引が範囲表を直して確定する
 witness $f m23_green_pess witnessBelowArrival
 witness $f m23_green_ro witnessAborted                  # 読むだけの取引が、移動の後の読み直しで競合になる (持ち主の判断 1)
+# 段 2 の直後の親 (fence の後は範囲の要求を全部断る。M19 の前)
+green   $f m23_green_fenced m23Safe
+live    $f m23_live_fenced refreshTerminates
+# 確かめの上限を to で切る案 (持ち主の判断 1)
+red     $f m23_green_ro readOnlyBelowStart              # 上限のない確かめでは、床より後の確定でも、読むだけの取引が失敗する
+green   $f m23_green_bounded m23Safe
+green   $f m23_green_ro_bounded m23Safe
+green   $f m23_green_ro_bounded readOnlyBelowStart      # 上限を切れば、読むだけの取引が失敗するのは、窓 (from, 床] に確定があるときだけである
 # 設計 2 (退けた案): Worker が親と子の両方に尋ね、親は要求の epoch で確かめる
 green   $f m23_alt_green m23Safe
+green   $f m23_alt_green_ro m23Safe
+green   $f m23_alt_green_pess m23Safe
 red     $f m23_alt_red_parent_alone serializable        # Worker が、読んだシャード (親) だけに尋ねる
 red     $f m23_alt_red_no_epoch serializable            # 親が、要求の epoch を見ずに答える
 red     $f m23_alt_red_child_from_floor serializable
@@ -552,7 +562,7 @@ witness $f m23_alt_green witnessReproduction
 if [ "${HEAVY:-0}" = "1" ]; then                        # tick 2 回、T の上限 6
   green $f m23_green_wide m23Safe
 fi
-for m in m23_green m23_green_pess m23_red_parent_alone m23_red_child_from_floor m23_red_child_from_arrival m23_red_no_peer \
+for m in m23_green m23_green_pess m23_green_fenced m23_green_ro_bounded m23_red_parent_alone m23_red_child_from_floor m23_red_child_from_arrival m23_red_no_peer \
          m23_red_prepare_alone m23_red_no_bump m23_red_no_push m23_impl_pinned m23_impl m23_live_red_pingpong \
          m23_alt_green m23_alt_red_parent_alone m23_alt_red_no_epoch m23_alt_red_unarrived; do tests $f $m; done
 

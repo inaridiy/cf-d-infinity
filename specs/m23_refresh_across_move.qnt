@@ -43,6 +43,8 @@
 //     小さければ断る。確定の prepare でも、子は T を到着の m と床と比べて断る。PIN_ROUTING は、いまの実装 (取引が、最初の範囲表を
 //     確定まで使い、断られても取り直さない)。
 // どちらの設計でも、確かめに答えたシャードは時計を to まで進め (M1b)、c の決まっていない intent を to より上へ push する。
+// 選択肢が 2 つある。FENCE_REFUSES は、親が fence の後、まだ渡していない K2 も断る形 (いまの実装の親。M19 の前)。
+// BOUNDED は、refresh の確かめが (from, to] の変更だけを見る案 (いまの changedSince は to より後も数える)。
 //
 // invariant
 //   serializable          確定した X の読みは、確定の点 (読むだけなら T、書くなら c の直前) の値と一致する (M1 と同じ形)。
@@ -52,6 +54,8 @@
 //                         読んだ行に別の取引の intent があったときだけである。どちらも、移動がなくても失敗し得る (規則 4 の形)
 //   boundedRefusals       X が移動を理由に断られる回数は、移動の数 (1) 以下である
 //   parentFrozen          親の K2 の記録は、pull の後は変わらない (子が親の記録を尋ねる手を 1 手にしてよい理由)
+//   readOnlyBelowStart    読むだけの X が失敗するのは、refresh の窓 (from, to] に、読んだ行の別の取引の確定があったときだけである
+//                         (BOUNDED の案を比べるのに使う。m23Safe には含めない)
 // temporal
 //   refreshTerminates     始めた refresh は、いつか終わる (通るか、競合で終わる)
 module m23_core {
@@ -70,6 +74,10 @@ module m23_core {
   const CHILD_FROM: int         // 子が自分の記録を確かめる下限。0: 要求の from。1: from と床の大きい方。2: from と到着の m の大きい方
   const BUMP: bool              // 確かめに答えたシャードは、時計を to まで進める
   const PUSH: bool              // 確かめは、c の決まっていない intent を to より上へ push する (false: intent があれば失敗する)
+  // ---- 設計の選択肢 ----
+  const BOUNDED: bool           // refresh の確かめは (from, to] の変更だけを見る (false: to より後も見る。いまの changedSince)。
+                                // 通らなかった refresh は、移動による ReadTooOld のものなら取引を失敗させ、ほかのものなら、後の refresh を止めない
+  const FENCE_REFUSES: bool     // 親は、fence (start) の後、まだ渡していない K2 の読みと確かめも断る (いまの実装の親。M19 の前)
   // ---- 場面 ----
   const SCAN2: bool             // X は全表をもう 1 回読む
   const WRITE: bool             // X は K2 を書く
@@ -111,11 +119,13 @@ module m23_core {
     atP: bool, atC: bool,         // K2 を P で読んだか、C で読んだか (読んだ範囲を記録したシャード)
     rTo: int,                     // refresh の to (0 は refresh の途中でない)
     rRem: Set[(int, int)],        // 確かめが残っている (行, シャード)
+    rFatal: bool,                 // 移動による ReadTooOld で始めた refresh (通らなければ、取引は動いた範囲を読めない)
     wrote: bool, wAt: int, ptsC: int, c: int, applied: bool
   }
   type Ghost = {
     whyChange: bool,              // X が失敗したとき、読んだ行に、読んだ後の別の取引の確定があった
     whyIntent: bool,              // X が失敗したとき、K2 に別の取引の intent があった
+    whyBelow: bool,               // X の refresh が通らなかったとき、読んだ行に、読んだ後で to 以下の時刻の、別の取引の確定があった
     crossed: bool,                // 移動の時刻をまたいで T を進めた refresh が通った
     refusals: int,                // 移動を理由に断られた回数 (3 で止める)
     badRead: bool,                // シャードが、その時刻の真の値と違う値を答えた
@@ -141,7 +151,7 @@ module m23_core {
   pure val idleTxn: Txn = {
     st: IDLE, pc: PC_SCAN1, done: Set(), T: 0, ep: 0, fresh: true,
     lo: KEYS.mapBy(_ => -1), seen: KEYS.mapBy(_ => Set()), atP: false, atC: false,
-    rTo: 0, rRem: Set(), wrote: false, wAt: 0, ptsC: 0, c: 0, applied: false
+    rTo: 0, rRem: Set(), rFatal: false, wrote: false, wAt: 0, ptsC: 0, c: 0, applied: false
   }
 
   action init = all {
@@ -152,7 +162,7 @@ module m23_core {
     wDone' = not(HAS_W),
     ticks' = 0,
     x' = idleTxn,
-    g' = { whyChange: false, whyIntent: false, crossed: false, refusals: 0, badRead: false, frozenBroken: false, wAt: 0, wC: 0 }
+    g' = { whyChange: false, whyIntent: false, whyBelow: false, crossed: false, refusals: 0, badRead: false, frozenBroken: false, wAt: 0, wC: 0 }
   }
   action keepWorld = all { hlc' = hlc, log' = log, mv' = mv, y' = y, wDone' = wDone, ticks' = ticks }
 
@@ -174,6 +184,8 @@ module m23_core {
   def route(k: int): int = if (k == K1 or x.ep == 0) P else C
   // 子が K2 の読みに答える、いちばん小さい T
   def startC: int = max(mv.arrived, mv.floor)
+  // 親が K2 を渡した (Worker からの K2 の読みと確かめを断る)。M19 の親は pull の後から、いまの実装の親は fence の後から断る
+  def handedOver: bool = if (FENCE_REFUSES) mv.epoch == 1 else mv.moved > 0
   // 子が自分の記録を確かめる下限
   def childFrom(lo: int): int = if (CHILD_FROM == 1) max(lo, mv.floor) else if (CHILD_FROM == 2) max(lo, mv.arrived) else lo
   // Y の intent に当たった読み。c が決まって t 以下なら、適用を待つ。c が決まっていなければ、t より上へ push する
@@ -183,7 +195,10 @@ module m23_core {
   // X が失敗するときの理由を、そのときの状態から記録する
   def changeNow: bool = KEYS.exists(k => x.lo.get(k) >= 0 and allWrites(k).exists(v => v.writer != X and v.ver > x.lo.get(k)))
   def intentNow: bool = x.lo.get(K2) >= 0 and yOpen
+  def belowNow: bool = x.rTo > 0 and KEYS.exists(k => x.lo.get(k) >= 0 and
+    allWrites(k).exists(v => v.writer != X and v.ver > x.lo.get(k) and v.ver <= x.rTo))
   def noted: Ghost = g.with("whyChange", g.whyChange or changeNow).with("whyIntent", g.whyIntent or intentNow)
+                      .with("whyBelow", g.whyBelow or belowNow)
   def refused: Ghost = g.with("refusals", min(g.refusals + 1, 3))
 
   pure def nextPc(pc: int): int =
@@ -214,11 +229,11 @@ module m23_core {
     else if (x.done.union(Set(k)) == KEYS) t1.with("done", Set()).with("pc", nextPc(x.pc))
     else t1.with("done", x.done.union(Set(k)))
 
-  // 親か子が、T で答える。親は、まだ渡していない K2 には、fence の後でも答える (M19)。子は、到着の m と床の両方以上の T に答える
+  // 親か子が、T で答える。親は、まだ渡していない K2 には、fence の後でも答える (M19。FENCE_REFUSES なら断る)。子は、到着の m と床の両方以上の T に答える
   action xAnswer(k: int, w: bool, d: int): bool = all {
     inStatement(k, w),
     route(k) == d,
-    if (d == P) (k == K1 or mv.moved == 0) else (mv.arrived > 0 and x.T >= startC),
+    if (d == P) (k == K1 or not(handedOver)) else (mv.arrived > 0 and x.T >= startC),
     not(k == K2 and yBlocks(d, x.T)),
     val v = valueAt(histAt(d, k), x.T)
     all {
@@ -236,7 +251,7 @@ module m23_core {
     (((x.pc == PC_SCAN1 or x.pc == PC_SCAN2) and not(x.done.contains(K2))) or x.pc == PC_WRITE)
   action xNotOwner = all {
     x.ep == 0, k2Next,
-    if (x.pc == PC_WRITE and PESSIMISTIC) mv.epoch == 1 else mv.moved > 0,
+    if (x.pc == PC_WRITE and PESSIMISTIC) mv.epoch == 1 else handedOver,
     x' = if (PIN_ROUTING) x.with("st", ABORTED) else x.with("ep", 1),
     g' = if (PIN_ROUTING) noted else refused,
     keepWorld
@@ -251,22 +266,22 @@ module m23_core {
     else recorded(k)
   def readKeys: Set[int] = KEYS.filter(k => x.lo.get(k) >= 0)
   // まだ何も読んでいなければ、T をそのまま進める (M1b)
-  def refreshPlan(upTo: int): Txn =
+  def refreshPlan(upTo: int, fatal: bool): Txn =
     if (readKeys == Set()) x.with("T", upTo)
-    else x.with("rTo", upTo).with("rRem", readKeys.map(k => dests(k).map(d => (k, d))).flatten())
+    else x.with("rTo", upTo).with("rFatal", fatal).with("rRem", readKeys.map(k => dests(k).map(d => (k, d))).flatten())
 
   // 子が、到着の m か床より小さい T の読みを ReadTooOld で断る。Worker は、T を startC まで進める refresh を始める。
   // 前の refresh が通らなかった取引は、T を進められないので、失敗する (理由は、通らなかったときに記録してある)
   action xTooOld(k: int, w: bool): bool = all {
     inStatement(k, w), k == K2, route(K2) == C, mv.arrived > 0, x.T < startC,
-    x' = if (x.fresh) refreshPlan(startC) else x.with("st", ABORTED),
+    x' = if (x.fresh) refreshPlan(startC, true) else x.with("st", ABORTED),
     keepWorld, g' = g
   }
 
   // ほかのシャードの ReadTooOld で、任意の to への refresh を始める (範囲表の古い Worker も始める)
   action xOther(upTo: int): bool = all {
     OTHER, x.st == ACTIVE, x.rTo == 0, x.fresh, x.pc != PC_COMMIT, upTo > x.T, upTo <= T_MAX,
-    x' = refreshPlan(upTo),
+    x' = refreshPlan(upTo, false),
     keepWorld, g' = g
   }
 
@@ -274,7 +289,11 @@ module m23_core {
   // 確かめで Y の intent に当たった。PUSH なら、c が決まっていなければ to より上へ push し、c が決まって to 以下なら適用を待つ
   // (待った後は記録に入るので、記録で見る)。PUSH でなければ失敗する (M1b と、いまの実装の refresh)。
   def yWaits(d: int, upTo: int): bool = PUSH and yAt(d) and y.c > 0 and y.c <= upTo
-  def ownOk(d: int, k: int, from: int): bool = not(changedAfter(d, k, from)) and (k != K2 or not(yAt(d)) or PUSH)
+  // BOUNDED なら、to より後の変更は見ない (確かめの後で to 以下の時刻の確定が起きないことは、時計を to まで進めることと、
+  // intent の push が守る)。確定の検証 (prepare) は、今と同じく上限を切らない
+  def changedIn(d: int, k: int, from: int): bool =
+    log.get(d).get(k).exists(v => v.ver > from and (not(BOUNDED) or v.ver <= x.rTo) and v.writer != X)
+  def ownOk(d: int, k: int, from: int): bool = not(changedIn(d, k, from)) and (k != K2 or not(yAt(d)) or PUSH)
   def lastOne(k: int, d: int): bool = x.rRem.exclude(Set((k, d))) == Set()
   def confirmed(k: int, d: int): Txn =
     if (not(lastOne(k, d))) x.with("rRem", x.rRem.exclude(Set((k, d))))
@@ -282,7 +301,12 @@ module m23_core {
   // 通った refresh が、K2 を読んだ時刻から移動の時刻をまたいだか (witness 用)
   def crossing(k: int, d: int): bool =
     lastOne(k, d) and x.lo.get(K2) >= 0 and mv.moved > 0 and x.lo.get(K2) < mv.moved and mv.moved <= x.rTo
-  def failed: Txn = x.with("fresh", false).with("rTo", 0).with("rRem", Set())
+  // 通らなかった refresh。BOUNDED でなければ、以後の refresh を止める (M1b。いまの wantsFresh)。BOUNDED なら、移動による
+  // ReadTooOld の refresh は、窓 (from, to] に確定があったので、どう進めても通らず、取引は失敗する。ほかの refresh は、後の refresh を止めない
+  def failed: Txn =
+    if (not(BOUNDED)) x.with("fresh", false).with("rTo", 0).with("rRem", Set())
+    else if (x.rFatal) x.with("st", ABORTED).with("rTo", 0).with("rRem", Set())
+    else x.with("rTo", 0).with("rRem", Set())
 
   // 親が、渡したグループ (pull した K2) の、Worker からの確かめを断るか
   def parentRefuses: bool =
@@ -290,7 +314,7 @@ module m23_core {
 
   action confirmP(k: int): bool = all {
     x.st == ACTIVE, x.rTo > 0, x.rRem.contains((k, P)),
-    if (k == K2 and mv.moved > 0 and parentRefuses) all {
+    if (k == K2 and handedOver and parentRefuses) all {
       // 断る。設計 1 と 2 では、断る応答が範囲表を運び、Worker は宛先を直す。設計 0 では、refresh が通らない
       x' = if (DESIGN == 0) failed
            else if (DESIGN == 1) x.with("ep", 1).with("rRem", x.rRem.exclude(Set((K2, P))).union(Set((K2, C))))
@@ -415,7 +439,7 @@ module m23_core {
     // 設計 2: Worker は、K2 を P で読んでいれば、P を K2 の検証の参加者に入れる (epoch は移動を知っている)
     val p2 = DESIGN == 2 and PARENT_VALIDATES and x.atP
     // いまの実装: 読んだ範囲を、読んだシャードへ送る。P は、渡したグループの範囲を断る
-    val stale = DESIGN == 0 and x.atP and mv.moved > 0
+    val stale = DESIGN == 0 and x.atP and handedOver
     val ok = not(stale) and (lo1 < 0 or not(changedAfter(P, K1, lo1)))
              and (not(p2) or (not(changedAfter(P, K2, lo2)) and not(yAt(P))))
     val c = max(hlc.get(P), x.ptsC) + 1
@@ -544,6 +568,9 @@ module m23_core {
   val serializable = x.st != COMMITTED or KEYS.forall(k => x.lo.get(k) < 0 or x.seen.get(k) == Set(expected(k)))
   val readConsistent = not(g.badRead)
   val placementIndependent = x.st != ABORTED or g.whyChange or (WRITE and g.whyIntent)
+  // 読むだけの X が失敗するのは、refresh の窓 (from, to] に、読んだ行の別の取引の確定があったときだけである。to は、子が答えられる
+  // いちばん古い時刻 (移動による ReadTooOld の refresh) なので、この確定は子も親も答えられない時刻にあり、避けられない
+  val readOnlyBelowStart = WRITE or x.st != ABORTED or g.whyBelow
   val boundedRefusals = g.refusals <= 1
   val parentFrozen = not(g.frozenBroken)
   val m23Safe = serializable and readConsistent and placementIndependent and boundedRefusals and parentFrozen
@@ -585,7 +612,7 @@ module m23_core {
 // 全表を 2 回読み、K2 を楽観で書く (再現の形)。W と Y がある。範囲表の古い Worker の refresh (OTHER) もある
 module m23_green {
   import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   // 再現の 1 つ目: 移動の前に全表を読み、移動の後に読み直して、動いた行を書いて確定する
   run reproductionTest =
@@ -621,14 +648,14 @@ module m23_green {
 // 読むだけの取引 (全表を 2 回読む)。書かない取引は、読んだ行の intent では失敗してはならない (移動がなければ失敗しない)
 module m23_green_ro {
   import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
 }
 
 // 悲観の取引。全表を読み、動いた行を DML で書く。T は最初の読みのまま、到着の m より小さくても、子で確定する
 module m23_green_pess {
   import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = false, WRITE = true, PESSIMISTIC = true, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   run belowArrivalTest =
     init.then(xBegin)
@@ -645,7 +672,7 @@ module m23_green_pess {
 // 赤: 親が、渡したグループの確かめに、自分の記録だけで答える。範囲表の古い Worker は、子に尋ねない
 module m23_red_parent_alone {
   import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = false, PEER = true, PEER_PREPARE = true, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   run counterexampleTest =
     init.then(xBegin)
@@ -664,7 +691,7 @@ module m23_red_parent_alone {
 // 赤: 子が、自分の記録を、床から確かめる。到着の後で床より前に、子が確定した書き込みを見落とす
 module m23_red_child_from_floor {
   import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 1, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 1, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   run counterexampleTest =
     init.then(xBegin)
@@ -684,7 +711,7 @@ module m23_red_child_from_floor {
 // 赤: 子が、自分の記録を、到着の m から確かめる。運ばれた intent が、子で m 以下の c で適用された書き込みを見落とす
 module m23_red_child_from_arrival {
   import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 2, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 2, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   run counterexampleTest =
     init.then(xBegin)
@@ -704,7 +731,7 @@ module m23_red_child_from_arrival {
 // 赤: 子が、到着より前から始まる窓を、親の記録で埋めない (refresh でも prepare でも)
 module m23_red_no_peer {
   import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = false, PEER_PREPARE = false, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   run counterexampleTest =
     init.then(xBegin)
@@ -723,7 +750,7 @@ module m23_red_no_peer {
 // 赤: 確定の prepare で、子が、床より小さい T の検証を、自分の記録だけで通す (refresh も、親の記録の確かめもしない)
 module m23_red_prepare_alone {
   import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = false, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   // 移動の前に、P で読んで K2 を書く (書き込みは Worker に溜まる)。別の接続が K2 を書く。移動の後に確定する
   run counterexampleTest =
@@ -743,7 +770,7 @@ module m23_red_prepare_alone {
 // 赤: 確かめに答えたシャードが、時計を to まで進めない (M1b の m1b_red_ra の、子の側)
 module m23_red_no_bump {
   import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = false, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = false, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   run counterexampleTest =
     init.then(xBegin)
@@ -763,7 +790,7 @@ module m23_red_no_bump {
 // 移動がなければ失敗しない、読むだけの取引が失敗する
 module m23_red_no_push {
   import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = false,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = false, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   run counterexampleTest =
     init.then(xBegin)
@@ -776,10 +803,10 @@ module m23_red_no_push {
         .expect(x.st == ABORTED and not(g.whyChange) and not(placementIndependent))
 }
 
-// いまの実装 (取引は最初の範囲表を確定まで使う)。動いた行に触る文が not owner で失敗する
+// いまの実装 (取引は最初の範囲表を確定まで使う。親は fence の後、範囲の要求を全部断る)。動いた行に触る文が not owner で失敗する
 module m23_impl_pinned {
   import m23_core(DESIGN = 0, PIN_ROUTING = true, OWNER_REFUSES = true, PEER = false, PEER_PREPARE = false, PINGPONG = false,
-                  ASK_BOTH = false, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = false, CHILD_FROM = 1, BUMP = true, PUSH = false,
+                  ASK_BOTH = false, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = false, CHILD_FROM = 1, BUMP = true, PUSH = false, BOUNDED = false, FENCE_REFUSES = true,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   run counterexampleTest =
     init.then(xBegin)
@@ -789,10 +816,10 @@ module m23_impl_pinned {
         .expect(x.st == ABORTED and not(placementIndependent))
 }
 
-// 段 2 (範囲表を取り直す) を入れ、この設計を入れない実装。確かめは読んだシャードへ行き、親は not owner、子は床で断る
+// 範囲表の取り直しだけを入れ、この設計を入れない実装。確かめは読んだシャードへ行き、親は not owner、子は床で断る (親は fence の後に断る)
 module m23_impl {
   import m23_core(DESIGN = 0, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = false, PEER_PREPARE = false, PINGPONG = false,
-                  ASK_BOTH = false, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = false, CHILD_FROM = 1, BUMP = true, PUSH = false,
+                  ASK_BOTH = false, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = false, CHILD_FROM = 1, BUMP = true, PUSH = false, BOUNDED = false, FENCE_REFUSES = true,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   run counterexampleTest =
     init.then(xBegin)
@@ -808,27 +835,76 @@ module m23_impl {
 // 定数を広げた green (HEAVY=1)。時計の tick 2 回、T の上限 6
 module m23_green_wide {
   import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 2, T_MAX = 6).*
+}
+
+// 親が、いまの実装のとおり、fence の後は範囲の要求を全部断る (M19 の親より前)。この設計を、段 2 の直後に入れる場合の親である
+module m23_green_fenced {
+  import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = true,
+                  SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
+  // fence の後、まだ pull していない K2 の読みを、親が断る。子が pull してから答える
+  run fencedTest =
+    init.then(xBegin)
+        .then(xAnswer(K1, false, P)).then(xAnswer(K2, false, P))      // T = 0
+        .then(start)
+        .then(xAnswer(K1, false, P)).then(xNotOwner)                   // pull の前でも断る
+        .expect(x.ep == 1 and mv.moved == 0)
+        .then(pull).then(recv)                                         // 子が pull する。m = 1
+        .then(xTooOld(K2, false)).then(confirmP(K1)).then(confirmC)
+        .expect(x.T == 1 and g.crossed)
+        .then(xAnswer(K2, false, C)).then(xAnswer(K2, true, C))
+        .then(xPrepareC).then(xPrepareP).then(xApply)
+        .expect(x.st == COMMITTED and m23Safe)
+}
+
+// 確かめの上限を to で切る案 (BOUNDED)。書く取引と、読むだけの取引
+module m23_green_bounded {
+  import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = true, FENCE_REFUSES = false,
+                  SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
+}
+module m23_green_ro_bounded {
+  import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = true, FENCE_REFUSES = false,
+                  SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
+  // 移動の後、子が床より後に動いた行を確定しても、読むだけの X は、床まで T を進めて確定する (上限のない確かめでは失敗する)
+  run laterWriteTest =
+    init.then(xBegin)
+        .then(xAnswer(K1, false, P)).then(xAnswer(K2, false, P))
+        .then(start).then(pull).then(recv).then(finish)               // 床 2
+        .then(wWrite(C))                                               // c = 3 > 床
+        .then(xAnswer(K1, false, P)).then(xNotOwner).then(xTooOld(K2, false))
+        .then(confirmP(K1)).then(confirmC)                             // (0, 2] に変更はない
+        .expect(x.T == 2)
+        .then(xAnswer(K2, false, C)).then(xFinishRO)
+        .expect(x.st == COMMITTED and m23Safe and readOnlyBelowStart)
 }
 
 // 活性 (refreshTerminates)。設計 1。読むだけの取引、Y あり、W なし、tick なし、T の上限 3
 module m23_live {
   import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
+                  SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = true, HAS_W = false, HAS_Y = true, TICKS = 0, T_MAX = 3).*
+}
+// 同じ活性を、fence の後に全部断る親で
+module m23_live_fenced {
+  import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = true, PEER_PREPARE = true, PINGPONG = false,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = true,
                   SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = true, HAS_W = false, HAS_Y = true, TICKS = 0, T_MAX = 3).*
 }
 // 同じ活性を設計 2 で
 module m23_alt_live {
   import m23_core(DESIGN = 2, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = false, PEER_PREPARE = false, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = true, HAS_W = false, HAS_Y = true, TICKS = 0, T_MAX = 3).*
 }
 
 // 活性の赤: 子は、親に尋ねる代わりに、到着より前から始まる窓を「前の持ち主へ」と断り、親は「渡した」と断る
 module m23_live_red_pingpong {
   import m23_core(DESIGN = 1, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = false, PEER_PREPARE = true, PINGPONG = true,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = true, HAS_W = false, HAS_Y = true, TICKS = 0, T_MAX = 3).*
   run counterexampleTest =
     init.then(xBegin)
@@ -845,7 +921,7 @@ module m23_live_red_pingpong {
 
 module m23_alt_green {
   import m23_core(DESIGN = 2, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = false, PEER_PREPARE = false, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   run reproductionTest =
     init.then(xBegin)
@@ -860,10 +936,22 @@ module m23_alt_green {
         .expect(x.st == COMMITTED and m23Safe)
 }
 
+// 設計 2 の、読むだけの取引と、悲観の取引
+module m23_alt_green_ro {
+  import m23_core(DESIGN = 2, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = false, PEER_PREPARE = false, PINGPONG = false,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
+                  SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
+}
+module m23_alt_green_pess {
+  import m23_core(DESIGN = 2, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = false, PEER_PREPARE = false, PINGPONG = false,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
+                  SCAN2 = false, WRITE = true, PESSIMISTIC = true, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
+}
+
 // 赤: Worker が、動いた範囲の確かめを、読んだシャード (親) だけへ送る
 module m23_alt_red_parent_alone {
   import m23_core(DESIGN = 2, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = false, PEER_PREPARE = false, PINGPONG = false,
-                  ASK_BOTH = false, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = false, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   run counterexampleTest =
     init.then(xBegin)
@@ -882,7 +970,7 @@ module m23_alt_red_parent_alone {
 // 赤: 親が、要求の epoch を見ずに、渡したグループの確かめに答える。範囲表の古い Worker は、子に尋ねない
 module m23_alt_red_no_epoch {
   import m23_core(DESIGN = 2, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = false, PEER_PREPARE = false, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = false, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = false, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   run counterexampleTest =
     init.then(xBegin)
@@ -901,7 +989,7 @@ module m23_alt_red_no_epoch {
 // 赤: 子が、自分の記録を床から確かめる (設計 1 の m23_red_child_from_floor と同じ条件)
 module m23_alt_red_child_from_floor {
   import m23_core(DESIGN = 2, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = false, PEER_PREPARE = false, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 1, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = true, CHILD_FROM = 1, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
 }
 
@@ -909,7 +997,7 @@ module m23_alt_red_child_from_floor {
 // 届いた後に、親は「intent なし」と答える。どちらも intent を push しない
 module m23_alt_red_unarrived {
   import m23_core(DESIGN = 2, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = false, PEER_PREPARE = false, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = false, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = false, PARENT_VALIDATES = true, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
   run counterexampleTest =
     init.then(xBegin)
@@ -933,6 +1021,6 @@ module m23_alt_red_unarrived {
 // 赤: 確定で、Worker が親を K2 の検証の参加者に入れない。子は、床より小さい T の検証を自分の記録だけで通す
 module m23_alt_red_prepare_alone {
   import m23_core(DESIGN = 2, PIN_ROUTING = false, OWNER_REFUSES = true, PEER = false, PEER_PREPARE = false, PINGPONG = false,
-                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = false, CHILD_FROM = 0, BUMP = true, PUSH = true,
+                  ASK_BOTH = true, EPOCH_CHECK = true, WAIT_ARRIVAL = true, PARENT_VALIDATES = false, CHILD_FROM = 0, BUMP = true, PUSH = true, BOUNDED = false, FENCE_REFUSES = false,
                   SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true, HAS_W = true, HAS_Y = true, TICKS = 1, T_MAX = 5).*
 }

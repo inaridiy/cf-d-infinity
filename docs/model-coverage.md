@@ -35,7 +35,7 @@ Categories:
   section of `specs/check.sh`). Eight get rows, switches and replays when the design is implemented, and the rows of
   M16 move to M22 then; `m22_red_group_refuse` and `m22_live_red_group_wait` restate M20's rule, which was never
   implemented, and become D rows.
-  M23 (`m23_refresh_across_move.qnt`) models a transaction that a split crosses ([design-refresh-across-move.md](./design-refresh-across-move.md)); of its 15 red modules, the seven design-1 reds get rows, switches and replays when the design is implemented (the switches are named there), `m23_impl` and `m23_impl_pinned` are today's code and replay as `test/open/transaction-across-split.test.ts`, and `m23_live_red_pingpong` and the five `m23_alt_red_*` belong to design alternatives and become D rows.
+  M23 (`m23_refresh_across_move.qnt`) models a transaction that a split crosses ([design-refresh-across-move.md](./design-refresh-across-move.md)); of its 15 red modules, the seven design-1 reds get rows, switches and replays when the design is implemented (the switches are named there), `m23_impl` and `m23_impl_pinned` are today's code and replay as `test/open/transaction-across-split.test.ts`, `m23_live_red_pingpong` and the five `m23_alt_red_*` belong to design alternatives and become D rows, and the red check of `m23_green_ro` against `readOnlyBelowStart` (today's unbounded refresh check) gets a row if the bounded check is adopted.
 
 | module | flaw modelled | fault switch | deterministic replay | cat |
 |---|---|---|---|---|
