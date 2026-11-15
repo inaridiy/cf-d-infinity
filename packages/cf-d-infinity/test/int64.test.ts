@@ -1,28 +1,29 @@
-// 未解決 (値の作り直しの段 3 で通る): 64 ビットの整数を、どの経路でも SQLite と同じに扱う。docs/design-values.md の「足す検査」の 1。
+// 64 ビットの整数を、どの経路でも SQLite と同じに扱う。docs/design-values.md の「足す検査」の 1。
 //
-// SQLite の INTEGER は 64 ビットである。いまの D∞ は、2^53 を超える整数の保存を `unsupported:` で断り (計画書の K1、
-// test/wide-integers.test.ts)、Hrana の引数で渡されたものも断り、SQL の中で計算しただけの値は丸めて `float` で返す
-// (docs/sql-language.md の「値」)。作り直しの後は、どれも SQLite と同じ答えになる。段 3 で、この試験を test/ へ移す。
+// SQLite の INTEGER は 64 ビットである。段 2 までの D∞ は、2^53 を超える整数の保存を `unsupported:` で断り (計画書の K1)、Hrana の
+// 引数で渡されたものも断り、SQL の中で計算しただけの値は丸めて `float` で返した。値の作り直しの段 3 で、値の JS の型が格納の型に
+// なり (bigint は INTEGER)、シャードの結果を型つきで読むようになって、どれも SQLite と同じ答えになった。段 0 に test/open/ に置き、
+// 段 3 で test/ へ移した。
 //
 // 場面ごとに、新しいクラスタと新しい基準の SQLite を使う。文を 1 つずつ両方で実行し、最初に食い違ったところで止めて、
 // 食い違い方を分類する。1 つ断られた後は 2 つの状態が分かれるので、その後の食い違いには意味がないからである。
 // シャードは 1、2、4。実行は 3 通り (普通と、基準経路だけの 2 通り。vitest.config.ts の一覧に頼らず、Db の指定で切り替える)。
 // 基準は node:sqlite を BigInt で読み、結果の INTEGER (BigInt) と REAL (数) を区別して比べる。
 //
-// 同じ場面を、±(2^53 - 1) に収まる値でも流す。こちらはいま通る。場面の台本そのものが SQLite と合っていること、つまり
-// 64 ビットの値での失敗が、値の大きさだけから来ていることを示す。
+// 同じ場面を、±(2^53 - 1) に収まる値でも流す。場面の台本そのものが SQLite と合っていることを示す (段 2 までは、64 ビットの値での
+// 失敗が、値の大きさだけから来ていることを示していた)。
 import type { Client } from "@libsql/client";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 // @ts-expect-error 型定義のない JS のモジュール
-import { importBatches, insertLines, parseInsert } from "../../bin/dump.js";
-import { split } from "../../src/autoscaler";
-import { D1Compatible } from "../../src/client/d1";
-import { Db } from "../../src/client/db";
-import type { Reference } from "../../src/sql/plan";
-import { exportPage, importRows, type ExportCursor } from "../../src/transfer";
-import { clientOf } from "../libsql";
-import { SimCluster } from "../sim";
+import { importBatches, insertLines, parseInsert } from "../bin/dump.js";
+import { split } from "../src/autoscaler";
+import { D1Compatible } from "../src/client/d1";
+import { Db } from "../src/client/db";
+import type { Reference } from "../src/sql/plan";
+import { exportPage, importRows, type ExportCursor } from "../src/transfer";
+import { clientOf } from "./libsql";
+import { SimCluster } from "./sim";
 
 type Arg = null | bigint | number | string;
 
@@ -440,10 +441,9 @@ const show = (f: Found) => `${f.scenario} [${f.shards} shards, ${f.mode}] ${f.st
 describe("the scenarios, with integers within ±(2^53 - 1)", () => {
   it("answer as SQLite does on 1, 2 and 4 shards, on the normal path and on both reference paths", async () => {
     const found = await runAll(SAFE);
-    // D1 互換の API は、いまは BigInt の引数を受け取れない (値が小さくても、内部の誤り「Do not know how to serialize a BigInt」で
-    // 失敗する)。段 3 で BigInt を INTEGER として受け取るようになったら、この例外を外す。
-    const d1 = "INSERT with BigInt arguments through the D1-compatible API";
-    expect(found.filter((f) => !(f.kind === "bigint argument" && f.scenario === d1)).map(show)).toEqual([]);
+    // D1 互換の API は、段 2 まで BigInt の引数を受け取れなかった (内部の誤り「Do not know how to serialize a BigInt」)。段 3 で
+    // BigInt を INTEGER として受け取るようになった (src/client/d1.ts の toValue)。
+    expect(found.map(show)).toEqual([]);
   }, 300_000);
 });
 

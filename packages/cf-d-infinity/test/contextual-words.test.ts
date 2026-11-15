@@ -17,7 +17,7 @@ import { describe, expect, it } from "vitest";
 import { Db } from "../src/client/db";
 import { parseStatements } from "../src/sql/cst";
 import { planStatement, type Plan } from "../src/sql/plan";
-import { SimCluster } from "./sim";
+import { asNumbers, SimCluster } from "./sim";
 
 const SCHEMA = [
   // 結合の語を、引用符なしで、列、表、index の名前に使う。
@@ -199,7 +199,7 @@ function sqlite(db: DatabaseSync, sql: string): Out {
 }
 
 const dinf = (db: Db, sql: string): Promise<Out> =>
-  db.query(sql).then((r) => ({ columns: r.columns, values: r.values }), (e: Error) => ({ columns: [], values: [], error: e.message }));
+  db.query(sql).then((r) => ({ columns: r.columns, values: asNumbers(r.values) }), (e: Error) => ({ columns: [], values: [], error: e.message }));
 
 /** 文を順に両方へ流し、違いを返す。ORDER BY のない文の行は、並べ替えて比べる。 */
 async function compare(statements: string[], shards: number): Promise<string[]> {
@@ -249,7 +249,7 @@ describe("words that SQLite reads by their place: results and column names again
     for (const sql of SCHEMA) await db.query(sql);
     const cat = await c.catalog();
     const plan = (sql: string): Promise<Plan> =>
-      planStatement(parseStatements(sql)[0], [], cat, { nextId: async () => 1, sawId: () => undefined, evaluate: async () => null });
+      planStatement(parseStatements(sql)[0], [], cat, { nextId: async () => 1n, sawId: () => undefined, evaluate: async () => null });
     const kinds = async (list: string[]): Promise<string[]> => {
       const out = new Set<string>();
       for (const sql of list) {

@@ -1,13 +1,11 @@
 // 2^53 を超える INTEGER (計画書の K1、2026-11-13 に test/key-conversions.test.ts を作っていて見つけた)。
 //
-// SQLite の INTEGER は 64 ビットだが、D∞ の値 (src/types.ts の Value) は JS の数で、2^53 を超える整数を正確に持てない。
-// DO の SQLite も読み出しで JS の数にする。そのため、シャードに入った 1500000000000000001 と 1500000000000000002 は、Worker では
-// どちらも 1500000000000000000 になる。行を Worker の SQLite に集めると主キーが重なり、SELECT が UNIQUE の違反で失敗する。
-// 取引の書き込みは行イメージを JS の数で運ぶので、確定した値が書いた値と違う。
-// 正しい振る舞いは 2 つのどちらかである。SQLite と同じ答えを返すか、値で決まる `unsupported:` の誤りで、どの経路でもどの
-// 置き場所でも同じように断るか (AGENTS.md の規則 4)。持ち主は断るほうを選んだ (2026-11-13)。断るのは、書き込みのたびに作る
-// 行イメージを捕捉するところと、タプルを値に戻すところである (src/shard/rows.ts の assertExact と、src/value.ts の fromTypedValue。
-// 値の作り直しの段 2)。段 3 で、64 ビットの整数を通すようになる (test/open/int64.test.ts)。
+// SQLite の INTEGER は 64 ビットだが、段 2 までの D∞ の値は JS の数で、2^53 を超える整数を正確に持てなかった。DO の SQLite も
+// 読み出しで JS の数にする。シャードに入った 1500000000000000001 と 1500000000000000002 は、Worker ではどちらも 1500000000000000000
+// になり、行を Worker の SQLite に集めると主キーが重なった。持ち主は、値で決まる `unsupported:` の誤りで、どの経路でもどの置き場所でも
+// 同じように断ると決めた (2026-11-13)。
+// 値の作り直しの段 3 で、値の JS の型が格納の型になり (bigint は INTEGER)、シャードの結果を型つきで読むようになった。断るのをやめ、
+// どの置き場所でも SQLite と同じ答えを返す。64 ビットの整数のほかの経路は、test/int64.test.ts が確かめる。
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { Db } from "../src/client/db";
@@ -32,7 +30,7 @@ async function run(shards: number, statements: string[]) {
 }
 
 describe("integers beyond 2^53", () => {
-  it("give SQLite's answer, or the same unsupported: refusal on every placement", async () => {
+  it("give SQLite's answer on every placement, and no statement is refused", async () => {
     const statements = [
       "INSERT INTO t VALUES (1500000000000000001, 'a'), (1500000000000000002, 'b')",
       "INSERT INTO t VALUES (7, 'c')",
@@ -72,26 +70,27 @@ describe("integers beyond 2^53", () => {
         expect(`${shards} shards, ${s}: ${g}`).toBe(`${shards} shards, ${s}: ${want}`);
       });
     }
-    // 断るかどうかも、シャードの数で変わらない。2026-11-13 の持ち主の決定で、2^53 を超える整数の保存は断る (計画書の K1)。
-    expect(refusedOn[1]).toEqual(expect.arrayContaining([statements[0], statements[2], statements[3], statements[4], statements[5], statements[6], "TXN"]));
-    expect(refusedOn[2]).toEqual(refusedOn[1]);
-    expect(refusedOn[4]).toEqual(refusedOn[1]);
+    // 段 2 までは、2^53 を超える整数を保存する文を断っていた (計画書の K1)。段 3 からは、どの置き場所でも断らない。
+    for (const shards of [1, 2, 4]) expect(refusedOn[shards], `${shards} shards`).toEqual([]);
   });
 
-  it("refuses a column DEFAULT beyond 2^53, which would reach existing rows without a row image (Codex review 2, finding 5)", async () => {
+  it("accepts a column DEFAULT beyond 2^53, which reaches existing rows without a row image, and returns it exactly", async () => {
+    // 段 2 までは、行イメージを作らずに既存の行へ入る既定値を、表定義のときに断っていた (Codex の 2 回目の見直し、指摘 5)。
     for (const shards of [1, 3]) {
       const db = new Db(new SimCluster({ shards }));
       await db.ddl("CREATE TABLE d(id INTEGER PRIMARY KEY, v TEXT)");
       await db.query("INSERT INTO d VALUES (1, 'a')");
-      // 文字列で書いた既定値も、INTEGER の列の型の親和性で整数になる (Codex の 3 回目の確かめ、指摘 5 の残り)。
-      for (const dflt of ["9007199254740993", "(1 << 60)", "-9223372036854775808", "'9007199254740993'", "' 9007199254740993 '"]) {
-        await expect(db.ddl(`ALTER TABLE d ADD COLUMN w INTEGER DEFAULT ${dflt}`)).rejects.toThrow(/^unsupported: an INTEGER beyond/);
-        await expect(db.ddl(`CREATE TABLE e${shards}(id INTEGER PRIMARY KEY, w INTEGER DEFAULT ${dflt})`)).rejects.toThrow(/^unsupported: an INTEGER beyond/);
-      }
-      // TEXT の列の文字列の既定値は文字列のまま入るので、断らない。
-      await db.ddl("ALTER TABLE d ADD COLUMN t TEXT DEFAULT '9007199254740993'");
-      await db.ddl("ALTER TABLE d ADD COLUMN w INTEGER DEFAULT 9007199254740991");
-      expect((await db.query("SELECT id, t, w FROM d")).rows).toEqual([{ id: 1, t: "9007199254740993", w: 9007199254740991 }]);
+      // 文字列で書いた既定値も、INTEGER の列の型の親和性で整数になる。ADD COLUMN の既定値は定数でなければならないので、式の既定値
+      // (`(1 << 60)`) は CREATE TABLE で確かめる。
+      const dflts = ["9007199254740993", "-9223372036854775808", "'9007199254740995'", "' 9007199254740997 '"];
+      for (const [i, dflt] of dflts.entries()) await db.ddl(`ALTER TABLE d ADD COLUMN w${i} INTEGER DEFAULT ${dflt}`);
+      await db.query("INSERT INTO d(id, v) VALUES (2, 'b')");
+      const r = await db.query(`SELECT id, ${dflts.map((_d, i) => `w${i}, typeof(w${i})`).join(", ")} FROM d ORDER BY id`);
+      const want = [9007199254740993n, -(2n ** 63n), 9007199254740995n, 9007199254740997n].flatMap((v) => [v, "integer"]);
+      expect(r.values).toEqual([[1n, ...want], [2n, ...want]]);
+      await db.ddl(`CREATE TABLE e(id INTEGER PRIMARY KEY, w INTEGER DEFAULT (1 << 60))`);
+      await db.query("INSERT INTO e(id) VALUES (1)");
+      expect((await db.query("SELECT w FROM e")).values).toEqual([[1n << 60n]]);
     }
   });
 });

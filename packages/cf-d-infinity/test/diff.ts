@@ -1,7 +1,7 @@
 // 本物の SQLite と同じ文を流して 1 文ずつ比べる。
 import { DatabaseSync } from "node:sqlite";
 import { Db } from "../src/client/db";
-import { SimCluster } from "./sim";
+import { asNumbers, SimCluster } from "./sim";
 
 interface Out {
   columns: string[];
@@ -28,7 +28,8 @@ const real = (db: DatabaseSync, sql: string): Out => {
 const ours = async (db: Db, sql: string): Promise<Out> => {
   try {
     const r = await db.query(sql);
-    return { columns: r.columns, values: r.values, error: false };
+    // 基準は node:sqlite の既定の読み (数) なので、INTEGER も数にして比べる。型は test/typed-diff.test.ts が比べる。
+    return { columns: r.columns, values: asNumbers(r.values), error: false };
   } catch (e) {
     return { columns: [], values: [], error: true, message: (e as Error).message };
   }

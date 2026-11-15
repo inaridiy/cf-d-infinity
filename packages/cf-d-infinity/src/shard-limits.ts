@@ -12,7 +12,7 @@
 //     条件を押し下げずに表を読むので、作りとして上限に収まる。
 import { expressionDepth } from "./sql/depth";
 import type { Value } from "./types";
-import { bindTyped } from "./value";
+import { bindTyped, typedReadSql } from "./value";
 
 /** DO の SQLite の公表されている上限 (Cloudflare の Durable Objects の limits) と、実測した複合 SELECT の項の数。 */
 export const SHARD_LIMITS = {
@@ -96,6 +96,13 @@ export function shardLimitOf(sql: string, params: Value[]): string | null {
 
 /** 文が収まるか。プランナが自分の作る文を確かめるのに使う。 */
 export const withinShardLimits = (sql: string, params: Value[]): boolean => shardLimitOf(sql, params) === null;
+
+/**
+ * 結果を返す読みの文が、シャードが実行する形 (型つきの読みに包んだ文、src/value.ts の typedReadSql) で上限に収まるか。n は結果の
+ * 列の数である。シャードは包んだ後の文を測る (ShardKernel.withinLimits) ので、プランナも同じ形で測る。包む前の文で測ると、
+ * 基準経路の走査がシャードで断られ、基準経路から先がない。
+ */
+export const withinReadLimits = (sql: string, params: Value[], n: number): boolean => withinShardLimits(typedReadSql(sql, n), params);
 
 /**
  * D∞ が作る文 (行イメージを読み書きする文、捕捉の trigger、走査) が上限を超えるなら、その理由を返す。shardLimitOf の上限に、

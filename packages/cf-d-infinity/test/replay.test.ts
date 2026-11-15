@@ -11,7 +11,7 @@ import { handlePipeline, type PipelineReq } from "../src/client/hrana";
 import type { Faults, Value } from "../src/types";
 import { quiescentProblems } from "./invariants";
 import { replay, type ReplayReport, type StatementRecord, type TxnRecord } from "./replay";
-import { prng, seedsOr, SimCluster } from "./sim";
+import { asNumbers, prng, seedsOr, SimCluster } from "./sim";
 
 const DDL = [
   `CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT, code TEXT, v INTEGER NOT NULL DEFAULT 0, n INTEGER NOT NULL DEFAULT 0,
@@ -268,7 +268,7 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
         rec.statements.push(s);
         try {
           const r = await new Db(seen).query(s.sql, s.params);
-          s.values = r.values;
+          s.values = asNumbers(r.values);
           if (s.shape.startsWith("W")) s.changes = r.changes;
           rec.outcome = "committed";
           rec.at = r.ts;
@@ -294,7 +294,7 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
             const from = ++tick;
             try {
               const r = await tx.query(s.sql, s.params);
-              s.values = r.values;
+              s.values = asNumbers(r.values);
               if (s.shape.startsWith("W")) s.changes = r.changes;
             } catch (e) {
               s.error = (e as Error).message;
@@ -418,7 +418,7 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
           const from = ++tick;
           try {
             const r = await db.query(sql, params);
-            st.values = r.values;
+            st.values = asNumbers(r.values);
             if (!/^\s*SELECT/i.test(sql)) st.changes = r.changes;
             if (!seg) {
               target.outcome = "committed";
@@ -504,7 +504,7 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
   const quiescent = await quiescentProblems(c);
   // 失敗した seed を調べるための書き出し。REPLAY_DUMP=<ファイル> で、取引の記録と RPC の記録を JSON で残す。
   if (process.env.REPLAY_DUMP) {
-    const plain = (_k: string, x: unknown) => (x instanceof Set ? [...x] : x instanceof Uint8Array ? [...x] : x);
+    const plain = (_k: string, x: unknown) => (x instanceof Set ? [...x] : x instanceof Uint8Array ? [...x] : typeof x === "bigint" ? `${x}n` : x);
     writeFileSync(process.env.REPLAY_DUMP, JSON.stringify({ seed, history, rpc: c.net.log }, plain));
   }
   const report = replay(ddl, history);

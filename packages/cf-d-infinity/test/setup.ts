@@ -9,7 +9,7 @@ import { spanFaults } from "../src/client/spans";
 import { imageChecks } from "../src/shard/rows";
 import { parseObserver } from "../src/sql/cst";
 import { openScratch } from "../src/sql/scratch";
-import { allSpanEscapes, allWriteEscapes, imageCheckOff, injectedFault, tracedNets } from "./sim";
+import { allDriverIntegers, allSpanEscapes, allWriteEscapes, imageCheckOff, injectedFault, tracedNets } from "./sim";
 
 // PARSER_CORPUS=<ディレクトリ> を付けて流すと、試験が解析に渡した文を、プロセスごとの 1 行 1 文の JSON のファイルに書き出す。
 // パーサの突き合わせ (test/parser-oracle.test.ts) が、これを文の集まりとして読む。同じ文は、プロセスの中で 1 度だけ書く。
@@ -84,4 +84,11 @@ afterEach(() => {
     .map((e) => `${e.shard}: ${e.sql === null ? "(a transaction's writes at commit)" : e.sql.slice(0, 160)} | ${e.row} | ${e.problem.slice(0, 240)}`)
     .filter((s) => !seen.has(s) && seen.add(s));
   expect(distinct.slice(0, 10), "writes outside their declared spans, or rows left on a shard that does not own them").toEqual([]);
+});
+
+// 型つきの読みの検査 (docs/design-values.md の「足す検査」の 5 の 1 つ目、test/sim.ts の allDriverIntegers)。利用者の表に触る文
+// (Backend.query) が、ドライバから INTEGER を数として読んだら、その試験を失敗にする。DO のドライバは、その INTEGER を丸めて返す。
+afterEach(() => {
+  const found = [...new Set(allDriverIntegers.splice(0))];
+  expect(found.slice(0, 5), "statements through query that read an INTEGER as a driver number (a read that is not typed)").toEqual([]);
 });

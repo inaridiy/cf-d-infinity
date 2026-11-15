@@ -86,7 +86,7 @@ describe("the shard's write guard on each path that runs user SQL or takes a tra
     await db.ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
     const cat = await c.catalog();
     const row1: Span = { kind: "pk", table: "t", pk: keyString([1]), sk: keyString([1]) };
-    const req = { sql: "INSERT INTO t VALUES (1, 10), (2, 20)", params: [], spans: [row1], schema: cat.version };
+    const req = { sql: "INSERT INTO t VALUES (1, 10), (2, 20)", params: [], columns: [], spans: [row1], schema: cat.version };
     return { c, cat, req };
   }
 
@@ -153,7 +153,7 @@ describe("the shard's write guard on each path that runs user SQL or takes a tra
     const [mine, gone] = [on("s0"), on("s1")];
     const row: Span = { kind: "pk", table: "t", pk: keyString([mine]), sk: keyString([mine]) };
     await expect(c.shard("s0").execAuto({
-      sql: "INSERT INTO t VALUES (?, 1), (?, 2)", params: [mine, gone], spans: [row], schema: cat.version, write: { sk: null, capture: "insert" },
+      sql: "INSERT INTO t VALUES (?, 1), (?, 2)", params: [BigInt(mine), BigInt(gone)], columns: [], spans: [row], schema: cat.version, write: { sk: null, capture: "insert" },
     })).rejects.toThrow(new RegExp(`^write outside claim: shard s0 does not own t row \\[${gone}\\] \\(not owner: s1\\)`));
     expect(await stored(c)).toEqual([]);
     expect(c.writeEscapes.map((e) => e.row)).toEqual([`t [${gone}]`]);
@@ -170,9 +170,9 @@ describe("the shard's write guard on each path that runs user SQL or takes a tra
     const claim = regionsOf(cat.routing, "s0");
     expect(claim.some((x) => { const t = tokenOf(keyString([theirs]), keyString([theirs])); return t >= x.start && t < x.end; })).toBe(false);
     const wide: Span = { kind: "table", table: "t", claim };
-    const req = { sql: "INSERT INTO t VALUES (?, 1)", schema: cat.version, write: { sk: null } };
-    await c.shard("s0").execAuto({ ...req, params: [mine], spans: [wide] });
-    await expect(c.shard("s0").execAuto({ ...req, params: [theirs], spans: [wide] }))
+    const req = { sql: "INSERT INTO t VALUES (?, 1)", columns: [], schema: cat.version, write: { sk: null } };
+    await c.shard("s0").execAuto({ ...req, params: [BigInt(mine)], spans: [wide] });
+    await expect(c.shard("s0").execAuto({ ...req, params: [BigInt(theirs)], spans: [wide] }))
       .rejects.toThrow(new RegExp(`^write outside claim: the statement wrote t row \\[${theirs}\\]`));
     expect(await stored(c)).toEqual([`${mine}@s0`]);
     expect(c.writeEscapes.map((e) => e.row)).toEqual([`t [${theirs}]`]);

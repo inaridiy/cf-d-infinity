@@ -2,14 +2,16 @@
 // 1 シャードに収まる文はそのシャードの SQLite へ、それ以外は行を集めて Worker の SQLite へ渡す。
 import type { Catalog } from "../meta";
 import { ownerOf } from "../routing";
-import { encode, q, scanList } from "../shard/rows";
+import { encode, imageColumns, q, scanList } from "../shard/rows";
 import type { GlobalIndexDef, TableDef, Value, WritePlan } from "../types";
 import { SqlError, utf8Length } from "../types";
 import { bindParams, constant, ident, render, text, walk, type Node, type Params } from "./cst";
-import { keyString, storedAs } from "../keys";
-import { fromTyped, isReal, typedScalarSql } from "../value";
-import { SHARD_LIMITS, withinShardLimits } from "../shard-limits";
+import { keyString } from "../keys";
+import { returningElemSql } from "../value";
+import { SHARD_LIMITS, withinReadLimits, withinShardLimits } from "../shard-limits";
 import { assertPlainCreateTable, isInternalName } from "./ddl";
+import { returningClause, rewriteReturning } from "./returning";
+import { storedValue } from "./stored";
 
 export type Route =
   | { by: "sk"; sks: string[] }
@@ -24,8 +26,11 @@ export interface Scan {
   sks: string[] | null;
   /** 押し下げた条件。取引の検証は、この条件に関わる変更だけを競合にする。 */
   where?: { alias: string; sql: string; params: Value[] };
-  /** 型を一緒に読む列。INTEGER と REAL を区別して運ぶ (src/value.ts)。表を読む走査では、型のない列である。 */
-  typed?: string[];
+  /**
+   * 走査の結果の列名。シャードは走査を、この数の列の型つきの読みに包んで読む (ExecReq.columns)。表を読む走査では、
+   * PRIMARY KEY のない表の rowid と、表定義の列である (scanList の並び)。
+   */
+  columns: string[];
   /**
    * 押し下げられる条件があったのに、押し下げると DO の SQLite の上限を超えるので、押し下げなかった (scanOf)。
    * 部分集約と Top-N は、条件を全部シャードで評価する前提なので、この走査を使えない。
@@ -33,15 +38,11 @@ export interface Scan {
   unpushed?: true;
 }
 
-/** 走査としてシャードへ送る文。型を一緒に読む列があれば、typeof の列を足して包む (src/shard/rows.ts の typedValues が外す)。 */
-export const scanSql = (s: Pick<Scan, "sql" | "typed">): string =>
-  s.typed ? `SELECT *, ${s.typed.map((c, i) => `typeof(${q(c)}) AS ${q(`__dinf_typeof_${i}`)}`).join(", ")} FROM (${s.sql})` : s.sql;
+/** 表を読む走査の結果の列名 (scanList の並び)。 */
+export const scanColumns = (def: TableDef): string[] => imageColumns(def);
 
-/** 型のない列 (BLOB の親和性)。Worker の SQLite へ入れ直すとき、ほかの列は列の型の親和性が型を戻す。 */
-export const untypedOf = (def: TableDef): string[] | undefined => {
-  const cols = def.columns.filter((c) => (def.affinity[c] ?? "BLOB") === "BLOB");
-  return cols.length ? cols : undefined;
-};
+/** 走査が、シャードが実行する形 (型つきの読み) で DO の SQLite の上限に収まるか。 */
+export const scanFits = (s: Pick<Scan, "sql" | "params" | "columns">): boolean => withinReadLimits(s.sql, s.params, s.columns.length);
 
 export interface WriteTarget {
   route: Route;
@@ -70,22 +71,26 @@ export type Plan =
   /** 読みの基準経路。走査で行を集め、元の文を Worker の SQLite で実行する。 */
   | { kind: "gather"; scans: Scan[]; sql: string; params: Value[] }
   | { kind: "partial"; scan: Scan; columns: string[]; mergeSql: string; mergeParams: Value[] }
-  | { kind: "meta"; sql: string; params: Value[] }
+  /** pragma は、PRAGMA と EXPLAIN の文である。型つきの読みに包めないので、素の列で読む (ScratchDb.pragma)。 */
+  | { kind: "meta"; sql: string; params: Value[]; pragma?: true }
   | {
-      kind: "write"; def: TableDef; targets: WriteTarget[]; lastRowid: number | null;
+      kind: "write"; def: TableDef; targets: WriteTarget[]; lastRowid: bigint | null;
       /** 文が読む全表。サブクエリの表も検証の対象にする。 */
       tables?: TableDef[];
+      /**
+       * 利用者の RETURNING を要素の式に書き換える前の文 (src/sql/returning.ts)。結果の列名は、これを Worker の SQLite でコンパイル
+       * して取る (列名を SQLite 以外が決めない)。RETURNING のない文にはない。
+       */
+      returning?: string;
     }
   /**
    * 書き込みの基準経路。走査で行を集め、元の文を Worker の SQLite で実行し、捕捉した変更をシャードへ振り分ける。
    * 文の結果が衝突し得る行は、実行してから集め足す (Txn.wasmWrite)。INSERT は、文が読む行がないので scans が空になる。
    * lastRowid は、プランナが rowid を採番したときの、最後の値である。
    */
-  | { kind: "wasmWrite"; scans: Scan[]; sql: string; params: Value[]; tables: TableDef[]; lastRowid?: number | null }
+  | { kind: "wasmWrite"; scans: Scan[]; sql: string; params: Value[]; tables: TableDef[]; lastRowid?: bigint | null; returning?: string }
   | {
       kind: "insertSelect"; def: TableDef; select: Plan; head: string; columns: string[] | null; tail: string; tailParams: Value[];
-      /** SELECT の文面と引数。結果の格納の型を読み直すときに、typeof の列を足して包む (Txn.insertSelect)。 */
-      selectSql: string; selectParams: Value[];
     }
   | { kind: "ddl"; sql: string }
   | { kind: "noop" }
@@ -94,11 +99,11 @@ export type Plan =
   | { kind: "tcl"; op: "begin" | "commit" | "rollback" | "savepoint" | "release" | "rollbackTo"; name?: string; immediate?: boolean };
 
 export interface PlanContext {
-  /** rowid を n 個採番し、先頭を返す。 */
-  nextId(table: string, n: number): Promise<number>;
-  /** 利用者が明示した rowid を知らせる。以後の採番はこれより大きくする。 */
-  sawId(table: string, id: number): void;
-  /** 定数でない値を Worker の SQLite で評価し、最初の行を返す。値の型は typedScalarSql と fromTyped で戻す。 */
+  /** rowid を n 個採番し、先頭を返す。採番は 2^53 未満の範囲で続ける (docs/design-values.md の持ち主の判断の 4)。 */
+  nextId(table: string, n: number): Promise<bigint>;
+  /** 利用者が明示した rowid を知らせる。以後の採番はこれより大きくする。2^53 以上の rowid は無視する。 */
+  sawId(table: string, id: bigint): void;
+  /** 定数でない値 (`SELECT 式` の文) を Worker の SQLite で評価し、最初の行を型ごと返す。 */
   evaluate(sql: string, params: Value[]): Promise<Value[] | null>;
   /**
    * 表を読む式の値を、取引の読みとして求める。読んだ範囲は commit で検証される。
@@ -131,7 +136,7 @@ const PURE = new Set(["abs", "lower", "upper", "length", "coalesce", "ifnull", "
 
 /** 表の全行を読む走査。プランナが見落とした表を読み足すのに使う。 */
 export function fullScan(def: TableDef): Scan {
-  return { table: def, sql: `SELECT ${scanList(def)} FROM ${q(def.name)}`, params: [], sks: null, typed: untypedOf(def) };
+  return { table: def, sql: `SELECT ${scanList(def)} FROM ${q(def.name)}`, params: [], sks: null, columns: scanColumns(def) };
 }
 
 /** 利用者の文が名指しした表を探す。内部の表 (グローバル index の表) は、利用者の文からは存在しないものとして扱う。 */
@@ -355,7 +360,7 @@ function pinsOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string[] | n
     if (!vs) return null;
     if (vs.some((v) => v === null)) return null; // NULL との等値は常に偽だが、経路にはしない
     // 列に入るときと同じく、列の型の親和性で揃える。SQLite の等値の比べ方も、定数の側に列の親和性を掛ける。
-    const norm = vs.map((v) => storedAs(v, def.skAffinity[i]!));
+    const norm = vs.map((v) => storedValue(v, def.skAffinity[i]!));
     // SQLite と同じに揃えられない値 (TEXT の列に入る REAL) では絞らない。シャードの SQLite が比べる。
     if (norm.some((v) => v === undefined)) return null;
     keys = keys.flatMap((k) => norm.map((v) => [...k, v as Value]));
@@ -370,7 +375,7 @@ function pkOf(conj: Node[], ref: Ref, s: Scope, values: Value[]): string | null 
     const vs = equalities(conj, ref, col, s, values);
     if (vs?.length !== 1) return null;
     // 行の同一性はシャードと同じ規則で作る (rows.ts の encodeKey)。照合順序のある列は値を揃える。
-    const v = storedAs(vs[0]!, def.affinity[col] ?? "INTEGER");
+    const v = storedValue(vs[0]!, def.affinity[col] ?? "INTEGER");
     if (v === undefined) return null;
     vals.push(v);
   }
@@ -531,7 +536,8 @@ function scanOf(s: Scope | null, ref: Ref | null, def: TableDef, values: Value[]
   const name = ref?.alias ?? def.name;
   const conj = s && ref ? pushable(s, ref, values) : [];
   const from = `SELECT ${scanList(def)} FROM ${q(def.name)} AS ${q(name)}`;
-  if (conj.length === 0) return { table: def, sql: from, params: [], sks: null, typed: untypedOf(def) };
+  const columns = scanColumns(def);
+  if (conj.length === 0) return { table: def, sql: from, params: [], sks: null, columns };
   const parts = conj.map((c) => render(c, values));
   const where = parts.map((p) => `(${p.sql})`).join(" AND ");
   const params = parts.flatMap((p) => p.params);
@@ -541,11 +547,11 @@ function scanOf(s: Scope | null, ref: Ref | null, def: TableDef, values: Value[]
     params,
     sks: pinsOf(conj, ref!, s!, values),
     where: { alias: name, sql: where, params },
-    typed: untypedOf(def),
+    columns,
   };
   // 押し下げた条件で走査が DO の SQLite の上限を超えるなら、条件を押し下げずに表を読む。基準経路の走査は、作りとして上限に
   // 収まらなければならない (src/shard-limits.ts、計画書の不変条件 13)。条件は Worker の SQLite が元の文で評価する。
-  if (!withinShardLimits(scanSql(scan), params)) return { table: def, sql: from, params: [], sks: null, typed: untypedOf(def), unpushed: true };
+  if (!scanFits(scan)) return { table: def, sql: from, params: [], sks: null, columns, unpushed: true };
   return scan;
 }
 
@@ -694,11 +700,11 @@ function partialAggregate(stmt: Node, s: Scope, values: Value[]): Plan | null {
   const groupTail = groups.length ? ` GROUP BY ${groupIdx.map((i) => `"__g${i}"`).join(", ")}` : "";
   const orderR = order ? render(order, values) : null;
   const limitR = limit ? render(limit, values) : null;
-  // 集約の列を足した文も、DO の SQLite の上限に収まらなければ使わない (src/shard-limits.ts)。
-  if (!withinShardLimits(sql, [...shardParams, ...scan.params])) return null;
+  // 集約の列を足した文も、DO の SQLite の上限に収まらなければ使わない (src/shard-limits.ts)。シャードが実行する、型つきの読みの形で測る。
+  if (!withinReadLimits(sql, [...shardParams, ...scan.params], names.length)) return null;
   return {
     kind: "partial",
-    scan: { ...scan, sql, params: [...shardParams, ...scan.params] },
+    scan: { ...scan, sql, params: [...shardParams, ...scan.params], columns: names },
     columns: names,
     mergeSql: `SELECT ${merge.join(", ")} FROM "__p"${groupTail}${orderR ? ` ${orderR.sql}` : ""}${limitR ? ` ${limitR.sql}` : ""}`,
     mergeParams: [...(orderR?.params ?? []), ...(limitR?.params ?? [])],
@@ -726,11 +732,13 @@ function topN(stmt: Node, s: Scope, scan: Scan, values: Value[]): Scan {
     const e = t.expr ?? t; // 方向の指定がない項は、式そのものが入っている
     if (e.type === "identifier" && aliases.has(lower(ident(e)))) unsafe = true;
   }
+  // LIMIT と OFFSET の数は INTEGER (bigint) である。ほかの型の値は、押し下げずに SQLite に任せる。
   const n = constant(limit.count, values);
-  const off = limit.offset ? constant(limit.offset, values) : { value: 0 };
-  if (unsafe || typeof n?.value !== "number" || n.value < 0 || typeof off?.value !== "number") return scan;
+  const off = limit.offset ? constant(limit.offset, values) : { value: 0n };
+  if (unsafe || typeof n?.value !== "bigint" || n.value < 0n || typeof off?.value !== "bigint") return scan;
   const orderSql = terms.map((t) => text(t)).join(", ");
-  return { ...scan, sql: `${scan.sql} ORDER BY ${orderSql} LIMIT ${n.value + Math.max(0, off.value)}` };
+  const top = { ...scan, sql: `${scan.sql} ORDER BY ${orderSql} LIMIT ${n.value + (off.value > 0n ? off.value : 0n)}` };
+  return scanFits(top) ? top : scan;
 }
 
 /** 基準経路の走査。"full" なら条件を押し下げず、表の全行を集める。 */
@@ -781,18 +789,23 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   const keyword = head.insertKw.name === "REPLACE" ? "REPLACE" : head.orAction ? `INSERT OR ${head.orAction.actionKw.name}` : "INSERT";
   const prefix = `${keyword} INTO ${q(def.name)}`;
   const tailClauses = (stmt.clauses as Node[]).filter((c) => c.type === "upsert_clause" || c.type === "returning_clause");
-  const tail = tailClauses.map((c) => render(c, values));
-  const tailSql = tail.map((t) => t.sql).join(" ");
-  const tailParams = tail.flatMap((t) => t.params);
+  let tail = tailClauses.map((c) => render(c, values));
+  let tailSql = tail.map((t) => t.sql).join(" ");
+  let tailParams = tail.flatMap((t) => t.params);
   let cols: string[] | null = head.columns ? head.columns.expr.items.map((c: Node) => ident(c)) : null;
   const body = (stmt.clauses as Node[]).find((c) => ["values_clause", "default_values", "select_stmt", "compound_select_stmt"].includes(c.type));
   if (!body) throw new SqlError("unsupported INSERT");
 
   if (body.type !== "values_clause" && body.type !== "default_values") {
-    return {
-      kind: "insertSelect", def, select: planRead(body, values, cat, ctx.reference), head: prefix, columns: cols, tail: tailSql, tailParams,
-      ...(({ sql, params }) => ({ selectSql: sql, selectParams: params }))(render(body, values)),
-    };
+    // 行ごとの INSERT は、文として計画し直される (Txn.insertSelect)。RETURNING は、そこで書き換える。
+    return { kind: "insertSelect", def, select: planRead(body, values, cat, ctx.reference), head: prefix, columns: cols, tail: tailSql, tailParams };
+  }
+  // 利用者の RETURNING は、項ごとに要素の式に書き換える (src/sql/returning.ts)。結果の列名は、書き換える前の文から取る。
+  const returning = returningOf(stmt, def);
+  if (returning) {
+    tail = tailClauses.map((c) => render(c, values));
+    tailSql = tail.map((t) => t.sql).join(" ");
+    tailParams = tail.flatMap((t) => t.params);
   }
 
   const auto = def.rowidAlias ?? (def.implicitRowid ? "rowid" : null);
@@ -821,16 +834,16 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
     }
     const c = constant(r[idAt], values);
     // INTEGER PRIMARY KEY は、整数の値の REAL (`5.0`) を整数として入れる。
-    const v = c && isReal(c.value) ? { value: c.value.real } : c;
+    const v = c && typeof c.value === "number" && Number.isInteger(c.value) && Math.abs(c.value) < 2 ** 63 ? { value: BigInt(c.value) } : c;
     if (v && v.value === null) {
       missing.push(i);
       return undefined;
     }
     return v?.value;
   });
-  const first = missing.length ? await ctx.nextId(def.name, missing.length) : 0;
-  const assigned = new Map(missing.map((row, i) => [row, first + i]));
-  let last: number | null = null;
+  const first = missing.length ? await ctx.nextId(def.name, missing.length) : 0n;
+  const assigned = new Map(missing.map((row, i) => [row, first + BigInt(i)]));
+  let last: bigint | null = null;
 
   const outCols = auto && idAt < 0 ? [auto, ...names] : names;
   // 衝突を自分で解決する文で、表にシャードをまたぐ UNIQUE がある。衝突する行が別のシャードにあり得るので、挿入先のシャードの
@@ -848,16 +861,13 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
       const rr = render(node, values);
       if (reads[i]![j]) {
         let v: Promise<Value> | undefined;
-        // 読んだ値は引数として束縛し直すので、typeof と一緒に読んで型を戻す (src/value.ts の fromTyped)。
-        const value = () => (v ??= ctx.read!(typedScalarSql(rr.sql), rr.params).then((row) => fromTyped(row?.[1] ?? null, row?.[0], def.name)));
+        // 読んだ値は引数として束縛し直す。読みは型つきなので、読んだ値がそのまま型のある値である。
+        const value = () => (v ??= ctx.read!(`SELECT ${rr.sql}`, rr.params).then((row) => row?.[0] ?? null));
         return { sql: "?", params: [], value, late: value };
       }
       const c = constant(node, values);
       // 計算した値は行の置き場所を決めるのに使う。REAL を整数と取り違えると、TEXT のキーが SQLite と違う (CAST(5 AS REAL) は "5.0")。
-      const evaluated = async () => {
-        const row = await ctx.evaluate(typedScalarSql(rr.sql), rr.params);
-        return fromTyped(row?.[1] ?? null, row?.[0], def.name);
-      };
+      const evaluated = async () => (await ctx.evaluate(`SELECT ${rr.sql}`, rr.params))?.[0] ?? null;
       return { sql: rr.sql, params: rr.params, value: async () => (c ? c.value : evaluated()), fixed: c ?? undefined };
     });
     if (auto && idAt < 0) parts.unshift({ sql: "?", params: [id!], value: async () => id! });
@@ -880,18 +890,18 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
     const skVals: (Value | undefined)[] = [];
     for (const [k, at] of skAt.entries()) {
       const v = at < 0 ? null : await parts[at]!.value();
-      skVals.push(storedAs(v, def.skAffinity[k]!));
+      skVals.push(storedValue(v, def.skAffinity[k]!));
     }
     const pkVals: (Value | undefined)[] = [];
     for (const c of def.pk) {
       const at = outCols.findIndex((n2) => same(n2, c) || (c === "rowid" && ROWID_NAMES.has(lower(n2))));
-      pkVals.push(at < 0 ? null : storedAs(await parts[at]!.value(), def.affinity[c] ?? "INTEGER"));
+      pkVals.push(at < 0 ? null : storedValue(await parts[at]!.value(), def.affinity[c] ?? "INTEGER"));
     }
     // Worker が SQLite と同じに揃えられないキーの値があれば、行の置き場所を決められない。Worker の SQLite に入れさせる (基準経路)。
     if ([...skVals, ...pkVals].some((v) => v === undefined)) viaWorker = true;
     if (auto) {
       const v = id ?? given[i];
-      if (typeof v === "number") {
+      if (typeof v === "bigint") {
         last = v;
         if (id === undefined) ctx.sawId(def.name, v);
       }
@@ -907,7 +917,7 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   if (viaWorker) {
     const isDefault = body.type === "default_values" && outCols.length === 0;
     return {
-      kind: "wasmWrite", scans: [], tables: [def], lastRowid: last,
+      kind: "wasmWrite", scans: [], tables: [def], lastRowid: last, returning,
       sql: `${prefix}${colSql} ${isDefault ? "DEFAULT VALUES" : `VALUES ${built.map((b) => b.sql).join(", ")}`}${tailSql ? ` ${tailSql}` : ""}`,
       params: [...built.flatMap((b) => b.params), ...tailParams],
     };
@@ -948,7 +958,20 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
       });
     }
   }
-  return { kind: "write", def, targets, lastRowid: last };
+  return { kind: "write", def, targets, lastRowid: last, returning };
+}
+
+/**
+ * 利用者の RETURNING を、項ごとに要素の式に書き換える (src/sql/returning.ts、docs/design-values.md の「利用者の RETURNING」)。
+ * 書き換える前の文を返す。結果の列名は、それを Worker の SQLite でコンパイルして取る。RETURNING がなければ undefined。
+ * 書き換えた項は、DO の SQLite でも Worker の SQLite でも同じに読める (src/value.ts の returningElemSql)。
+ */
+function returningOf(stmt: Node, def: TableDef): string | undefined {
+  const clause = returningClause(stmt);
+  if (!clause) return undefined;
+  const original = text(stmt);
+  rewriteReturning(clause, def.columns, returningElemSql);
+  return original;
 }
 
 /**
@@ -972,6 +995,7 @@ function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog, reference?:
   const ref = top.refs[0];
   const def = ref?.def;
   if (!ref || !def) throw new SqlError("cannot modify a view");
+  const returning = returningOf(stmt, def);
   const { sql, params } = render(stmt, values);
   const set = clause(stmt, "set_clause");
   const assigned: string[] = (set?.assignments?.items ?? []).flatMap((a: Node) =>
@@ -986,10 +1010,10 @@ function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog, reference?:
       // DELETE と、UNIQUE の列に触らない UPDATE は、UNIQUE の検査で別の行を読まない。
       const touchesUnique = stmt.type === "update_stmt" && (assigned.length !== (set?.assignments?.items ?? []).length || assigned.some((c) => def.uniques.some((u) => u.some((k) => same(k, c)))));
       const uniqueReads = stmt.type === "delete_stmt" || (!touchesUnique && !def.partialUnique) ? "none" as const : undefined;
-      return { kind: "write", def, tables: defs, lastRowid: null, targets: [{ route: { by: "sk", sks: [key] }, sql, params, write: { sk: key, capture: captureOf(stmt, pk) }, pk, uniqueReads }] };
+      return { kind: "write", def, tables: defs, lastRowid: null, returning, targets: [{ route: { by: "sk", sks: [key] }, sql, params, write: { sk: key, capture: captureOf(stmt, pk) }, pk, uniqueReads }] };
     }
   }
-  return { kind: "wasmWrite", scans: referenceScans(scopes, n, values, reference), sql, params, tables: defs };
+  return { kind: "wasmWrite", scans: referenceScans(scopes, n, values, reference), sql, params, tables: defs, returning };
 }
 
 // ---- 入口 ----
@@ -1018,7 +1042,7 @@ export async function planStatement(stmt: Node, input: Params, cat: Catalog, ctx
       return planUpdateDelete(stmt, values, cat, ctx.reference);
     case "pragma_stmt":
     case "explain_stmt":
-      return { kind: "meta", ...render(stmt, values) };
+      return { kind: "meta", ...render(stmt, values), pragma: true };
     case "reindex_stmt": {
       const target = stmt.name ? ident(stmt.name.type === "member_expr" ? stmt.name.property : stmt.name) : null;
       const known = !target || findTable(cat, target) || Object.keys(cat.indexes).some((i) => same(i, target));

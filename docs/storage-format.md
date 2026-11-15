@@ -1,6 +1,6 @@
 # 保存と通信の形式
 
-状態：Early 版で固める形式の一覧 (2026-11-12)。2026-11-14 に、行の置き場所を token の区間にした ([design-subslots.md](./design-subslots.md))。同じ日に、行イメージをタプルにし、キー文字列の数の書き方を決めた ([design-values.md](./design-values.md) の段 2。保存の形式の版 2、通信の版 4)
+状態：Early 版で固める形式の一覧 (2026-11-12)。2026-11-14 に、行の置き場所を token の区間にした ([design-subslots.md](./design-subslots.md))。同じ日に、行イメージをタプルにし、キー文字列の数の書き方を決めた ([design-values.md](./design-values.md) の段 2。保存の形式の版 2、通信の版 4)。値の JS の型を格納の型にし、シャードの結果を型つきで読むようにした (同じ設計書の段 3。通信の版 5。保存の形式は変わらない)
 
 D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker と Durable Object のあいだを RPC でつなぐ。
 公開した後に新しい版を置くと、古い版が書いたデータを新しい版が開き、古い版と新しい版の Worker と Durable Object がしばらく混ざって動く。
@@ -16,8 +16,8 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 
 | 形式 | 中身 | 区分 |
 |---|---|---|
-| 値の型 | 整数の JS の数は INTEGER、整数でない数は REAL、整数の値の REAL は `{ "real": 数 }` (`src/value.ts`) | 固定 |
-| キー文字列 | 主キーと shard key の値の並びを JSON にしたもの (`src/keys.ts` の `keyString`)。INTEGER は、桁数に関わらず 10 進の数字で書く。REAL は、整数の値で 64 ビットの整数の範囲にあればその整数の数字で、そうでなければ `JSON.stringify` の表記で書く。INTEGER の 5 と REAL の 5.0 は同じ `5`。BLOB は `{"$b":"小文字の 16 進"}`、無限大は `{"$f":"Infinity"}`。値は列の型の親和性で揃えてから作る (`storedAs`)。読み戻すときは `keyValues` が数字の桁を落とさずに読む | 固定 |
+| 値の型 | JS の型が格納の型である (`src/types.ts` の `Value`)。`bigint` は INTEGER (-2^63 から 2^63 - 1)、`number` は REAL (整数の値でも REAL)、文字列は TEXT、`Uint8Array` は BLOB。値を JSON にする場所 (baton、2PC の ID の指紋、範囲の引数) では、INTEGER を `{"$i":"数字"}`、BLOB を `{"$b":"16 進"}`、無限大を `{"$f":"Infinity"}` と書く (`src/shard/rows.ts` の `encode`)。内部の表の値は JS の数で持つ (時刻、版、token、カウンタで、どれも 2^53 に収まる) | 固定 |
+| キー文字列 | 主キーと shard key の値の並びを JSON にしたもの (`src/keys.ts` の `keyString`)。INTEGER は、桁数に関わらず 10 進の数字で書く。REAL は、整数の値で 64 ビットの整数の範囲にあればその整数の数字で、そうでなければ `JSON.stringify` の表記で書く。INTEGER の 5 と REAL の 5.0 は同じ `5`。BLOB は `{"$b":"小文字の 16 進"}`、無限大は `{"$f":"Infinity"}`。値は列の型の親和性で揃えてから作る (`src/sql/stored.ts` の `storedValue`)。読み戻すときは `keyValues` が数字の桁を落とさずに読む | 固定 |
 | 行の置き場所 (token) | `token = region × 2^32 + slot × 2^16 + subslot` の 40 ビットの整数 (`src/routing.ts`)。region はいまは 0 で、行ごとに置く地域を決める拡張のために 8 ビットを空けてある。slot は、shard key のキー文字列の hash (FNV-1a と murmur3 の finalizer、32 ビット) の上位 16 ビット。subslot は、主キーのキー文字列の同じ hash の下位 16 ビット。表の名前は混ぜない。行ごとに保存するものはない。同じ shard key の行は、連続した 65,536 個の token (その slot のブロック) に載る | 固定 |
 | 範囲 | token の半開区間 `[start, end)`。範囲表、読む範囲の claim、範囲の移動の要求、分割の枠が、この形で範囲を運ぶ | 固定 |
 | 位置 (`Pos`) | グループの中の行の位置。`[表の名前, 主キーのキー文字列]` で、表の名前の順、表の中は主キーの順に並ぶ。端は `null`。表の列には、JSON の文字列で書く (端は `null` の 4 文字) | 固定 |
@@ -66,9 +66,9 @@ D∞ は、利用者のデータを Durable Object の SQLite に置き、Worker
 
 | 形式 | 中身 | 区分 |
 |---|---|---|
-| Worker と Durable Object の RPC | 要求と応答の object (`ShardApi`、`src/types.ts`)。要求は版を運ぶ。版 3 から、範囲は token の区間で、読む範囲は `claim` (区間の組) を、範囲の移動は piece (`Piece`、`PieceWant`、`PiecePayload`) を運ぶ。版 4 から、行イメージ (`Change` の `before` と `after`、`PiecePayload` の `rows`、取引が溜める変更) はタプルである | 版で守る (`PROTOCOL_VERSION` = 4。版 3 以前は受け付けない) |
+| Worker と Durable Object の RPC | 要求と応答の object (`ShardApi`、`src/types.ts`)。要求は版を運ぶ。版 3 から、範囲は token の区間で、読む範囲は `claim` (区間の組) を、範囲の移動は piece (`Piece`、`PieceWant`、`PiecePayload`) を運ぶ。版 4 から、行イメージ (`Change` の `before` と `after`、`PiecePayload` の `rows`、取引が溜める変更) はタプルである。版 5 から、値は `bigint` を含む `Value` (structured clone が運ぶ) で、読みの要求は結果の列名 (`ExecReq.columns`) を運ぶ。シャードは読みを型つきの読みに包み (`src/value.ts` の `typedReadSql`)、型のある値を返す。利用者の RETURNING は Worker が要素の式に書き換えて送る | 版で守る (`PROTOCOL_VERSION` = 5。版 4 以前は受け付けない) |
 | Hrana の baton | 開いている取引の書き出し (`Db.dump`) を JSON にして署名したもの | 作り直せる。読めない baton は `BATON_INVALID` で断り、クライアントは取引をやり直す |
 | 読みの session token | `Ts` の数 | 固定 |
-| エクスポート | 1 行に 1 文の `INSERT INTO "表"("列", ...) VALUES (...), ...;`。REAL は小数点か指数を付けて書く。BLOB は `X'...'`、無限大は `9e999` | 固定 (利用者の形式) |
+| エクスポート | 1 行に 1 文の `INSERT INTO "表"("列", ...) VALUES (...), ...;`。REAL は小数点か指数を付けて書く。BLOB は `X'...'`、無限大は `9e999`。2^53 を超える INTEGER も 10 進の数字で書く (段 3 から) | 固定 (利用者の形式) |
 
 利用者に見える入口 (Hrana v2 と v3、D1 互換の API、Service Binding、HTTP の `/sql`、`/batch`、`/ddl`、管理の入口、CLI) の互換は、この文書ではなく、[sql-language.md](./sql-language.md) と README が約束する。

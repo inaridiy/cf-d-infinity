@@ -38,7 +38,7 @@ describe("the span check", () => {
     spanFaults.rowSpanDespiteUnique = true;
     const { c, db } = await unique();
     await expect(db.query("INSERT OR REPLACE INTO p VALUES (1, 2, 'a')")).rejects.toThrow(/^write outside claim: the statement wrote p row \[1,1\]/);
-    expect((await db.query("SELECT tenant_id, id, code FROM p")).values).toEqual([[1, 1, "a"]]);
+    expect((await db.query("SELECT tenant_id, id, code FROM p")).values).toEqual([[1n, 1n, "a"]]);
   });
 
   it("reports an insert whose UNIQUE check read another row", async () => {
@@ -77,7 +77,7 @@ describe("the span check", () => {
     const { version } = await c.catalog();
     // 文は q も読むのに、範囲には p の 1 行しか入れていない。
     await c.shard("s0").exec({
-      sql: "SELECT code, (SELECT count(*) FROM q WHERE tenant_id = 1) AS n FROM p WHERE tenant_id = 1 AND id = 1", params: [],
+      sql: "SELECT code, (SELECT count(*) FROM q WHERE tenant_id = 1) AS n FROM p WHERE tenant_id = 1 AND id = 1", params: [], columns: ["code", "n"],
       spans: [{ kind: "pk", table: "p", pk: "[1,1]", sk: "[1]" }], schema: version,
     });
     expect(c.spanEscapes.length).toBe(1);

@@ -66,7 +66,7 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 | 主キーの列に NULL のある行 | 断る。SQLite は INTEGER でない主キーに NULL をいくつでも入れられるが、行を主キーの値で名指しするので区別できない。`INTEGER PRIMARY KEY` に NULL を渡すと rowid が入るのは SQLite と同じである |
 | 書き込みの文の中の `sqlite_master` と PRAGMA の関数 (`pragma_table_info(...)` など) | 断る。読みの文の中なら、利用者の表定義について答える (シャードの内部の表は見えない) |
 | shard key を含まない、UNIQUE の部分 index と式の index | 断る (`unsupported:`)。シャードをまたぐ UNIQUE の index の表は、列の値だけで項目を作るからである |
-| 名前が `__dinf_` で始まる列と表 | 断る (`unsupported:`)。Worker とシャードが文に足す列の別名に使う。同じ名前の列があると、足した列が利用者の列を上書きする。`$` で始まる列名は、行イメージが列名を持たなくなったので使える (2026-11-14) |
+| 名前が `__dinf_` で始まる表 | 断る。D∞ が文に足す CTE の名前 (型つきの読みの `__dinf_r`) と取り違えないためである。列の名前は予約しない。`$` で始まる列名は、行イメージが列名を持たなくなったので使え、`__dinf_` で始まる列名は、文に列の別名を足さなくなったので使える (2026-11-14) |
 
 ### DO の SQLite の制限
 
@@ -86,9 +86,10 @@ DO の SQLite には、文の長さ (100 KB)、束縛の変数 (100 個)、複�
 
 | 項目 | 差分 |
 |---|---|
-| 2^53 を超える整数 | Hrana で引数として渡すと断る (`unsupported:`)。JavaScript の数値を通るので、受け付けると黙って隣の値になる。SQL の中で計算して 2^53 を超えた値は、結果として返るときに精度が落ちる。Hrana では `float` として返す。±2^53 を超える整数を保存する書き込みは、どの経路でも `unsupported:` で断る。D∞ の値は JS の数で、DO の SQLite も読み出しで JS の数にするので、受け付けると、2^53 より下の桁だけが違う 2 つの主キーが同じ値になり、取引は丸めた値を書く (`test/wide-integers.test.ts`)。64 ビットの ID (Snowflake など) は TEXT で持つ |
-| 引数の型 | 差分はない。Hrana は要求に書いた型のまま束縛する (`integer` は INTEGER、`float` は REAL。sqld と同じ。@libsql/client は JS の数を `float`、BigInt と真偽値を `integer` で送る)。D1 互換の API と Service Binding は、整数の JS の数を INTEGER、ほかの数を REAL として束縛する (D1 と同じ)。DO の SQLite は JS の数を REAL として束縛するので、D∞ が文の中の引数を `(CAST(? AS INTEGER)+0)` に包んで、型を保つ。値は、どの経路で答えても、分割で運んでも、型を変えない |
-| 結果の数の型 | 整数の値の REAL (5.0 など) は、Hrana の `integer` で返す。DO の SQLite は、読み出しで INTEGER と REAL を区別しないからである。sqld は `float` で返す。`typeof()` は SQLite と同じ値を返す。REAL の無限大は、Hrana が JSON で運べないので、クライアントの誤りになる (sqld も同じ) |
+| 64 ビットの整数 | 差分はない (2026-11-14 から。`test/int64.test.ts`)。±2^63 の端まで、保存し、引数で渡し、SQL の中で計算し、結果で返し、分割で運び、エクスポートして取り込める。Hrana は 10 進の文字列 (`integer`) で運ぶ。D1 互換の API、Service Binding、HTTP の `/sql` の結果は D1 と同じく JS の数で返すので、±(2^53 - 1) を超える INTEGER を含む結果は、隣の値に丸めずに誤りにする (Hrana か、`CAST(... AS TEXT)` で読む)。D1 互換の API と Service Binding の引数は、`bigint` で渡せば INTEGER である |
+| 引数の型 | 差分はない。Hrana は要求に書いた型のまま束縛する (`integer` は INTEGER、`float` は REAL。sqld と同じ。@libsql/client は JS の数を `float`、BigInt と真偽値を `integer` で送る)。D1 互換の API、Service Binding、HTTP の `/sql` は、安全な整数の JS の数を INTEGER、ほかの数を REAL、`bigint` を INTEGER として束縛する。DO の SQLite は JS の数を REAL として束縛し、BigInt を束縛できないので、D∞ が文の中の引数を `(CAST(? AS INTEGER)+0)` に包んで、型を保つ (2^53 を超える INTEGER は 10 進の文字列を包む)。値は、どの経路で答えても、分割で運んでも、型を変えない |
+| 結果の数の型 | 差分はない (2026-11-14 から)。整数の値の REAL (5.0 など) は、Hrana の `float` で返る (sqld と同じ)。シャードは結果を型つきで読む (INTEGER と TEXT に印を付けて運ぶ)。REAL の無限大は、Hrana が JSON で運べないので、クライアントの誤りになる (sqld も同じ) |
+| NUL (U+0000) を含む TEXT | 差分はない (2026-11-14 から)。どの経路で答えても、全部を返す。Worker の SQLite のドライバは TEXT を最初の NUL で切るので、D∞ は TEXT を BLOB にして読む |
 | 暗黙の rowid と `INTEGER PRIMARY KEY` の採番 | 一意で増えるが連続しない。削除された番号は再利用しない。接続を跨ぐと順序も保証しない |
 
 ### 制約

@@ -1,5 +1,5 @@
 // 値の型を保った突き合わせと、そのための 2 つ目の生成器 (docs/design-values.md の「足す検査」の 2)。
-// test/typed-diff.test.ts と test/open/typed-diff-wide.test.ts が使う。
+// test/typed-diff.test.ts が使う。
 //
 // test/typed-diff.test.ts の元の比較は、結果の BigInt を数にしてから比べるので、結果の INTEGER と REAL の違いを見ない。
 // ここでは @libsql/client を intMode: "bigint" で使う。INTEGER は BigInt、REAL は JS の数で返るので、型ごと比べられる。
@@ -35,46 +35,14 @@ export const cell = (x: unknown): Cell =>
         : typeof x === "string" ? `t${x}`
           : `b${hex(x instanceof ArrayBuffer ? new Uint8Array(x) : (x as Uint8Array))}`;
 
-// ---- 段 3 まで緩める比較 ----
+// ---- 比較 ----
 //
-// いまの D∞ の結果の型は、次の 2 点で SQLite (と sqld) と違う。どちらも docs/sql-language.md の「値」に書いてある違いで、
-// 値の作り直しの段 3 でなくなる。そのとき、この 2 つの関数と RELAXED_UNTIL_STAGE_3 を消す。
-// ここに当てはまらない食い違いは、いまの欠陥である。緩める条件を広げて通さないこと。
-export const RELAXED_UNTIL_STAGE_3 = true;
+// 結果を型ごと比べる。段 0 から段 2 までは、文書にある 2 点 (整数の値の REAL を Hrana の `integer` で返す、SQL の中で計算した 2^53 を
+// 超える整数を丸めて `float` で返す) を緩めていた。値の作り直しの段 3 で、どちらの違いもなくなったので、緩めるのをやめた。
 
-/** 「結果の数の型」: 整数の値の REAL (5.0) を、Hrana の `integer` で返す。DO の SQLite が読み出しで INTEGER と REAL を区別しないからである。 */
-export function integralRealAsInteger(want: Cell, got: Cell): boolean {
-  if (want === null || got === null || want[0] !== "r" || got[0] !== "i") return false;
-  const x = Number(want.slice(1));
-  return Number.isSafeInteger(x) && got === `i${x}`;
-}
-
-/** 「2^53 を超える整数」: SQL の中で計算して 2^53 を超えた INTEGER は、精度を落として `float` で返す。 */
-export function wideIntegerAsRoundedFloat(want: Cell, got: Cell): boolean {
-  if (want === null || got === null || want[0] !== "i" || got[0] !== "r") return false;
-  const big = BigInt(want.slice(1));
-  return (big > 2n ** 53n - 1n || big < -(2n ** 53n) + 1n) && Number(got.slice(1)) === Number(big);
-}
-
-export interface Relaxed { integralRealAsInteger: number; wideIntegerAsRoundedFloat: number }
-
-/** 2 つの結果が、緩める 2 点を除いて同じか。緩めた回数を数える。 */
-function sameRows(want: Cell[][], got: Cell[][], relaxed: Relaxed): boolean {
-  if (want.length !== got.length) return false;
-  const counted: Relaxed = { integralRealAsInteger: 0, wideIntegerAsRoundedFloat: 0 };
-  for (let i = 0; i < want.length; i++) {
-    if (want[i]!.length !== got[i]!.length) return false;
-    for (let j = 0; j < want[i]!.length; j++) {
-      const [w, g] = [want[i]![j]!, got[i]![j]!];
-      if (w === g) continue;
-      if (RELAXED_UNTIL_STAGE_3 && integralRealAsInteger(w, g)) counted.integralRealAsInteger++;
-      else if (RELAXED_UNTIL_STAGE_3 && wideIntegerAsRoundedFloat(w, g)) counted.wideIntegerAsRoundedFloat++;
-      else return false;
-    }
-  }
-  relaxed.integralRealAsInteger += counted.integralRealAsInteger;
-  relaxed.wideIntegerAsRoundedFloat += counted.wideIntegerAsRoundedFloat;
-  return true;
+/** 2 つの結果が同じか。 */
+function sameRows(want: Cell[][], got: Cell[][]): boolean {
+  return JSON.stringify(want) === JSON.stringify(got);
 }
 
 // ---- 基準の読み方 ----
@@ -146,7 +114,7 @@ export function referenceRows(lite: DatabaseSync, sql: string, args: Arg[]): Cel
   return (read.all(...(args2 as never[])) as unknown as unknown[][]).map((r) => r.map((v) => cell(convert(v))));
 }
 
-export interface TypedRun { problems: string[]; relaxed: Relaxed; statements: number }
+export interface TypedRun { problems: string[]; statements: number }
 
 /**
  * 台本を、D∞ (Hrana 経由) と node:sqlite に流して、結果を型ごと比べる。
@@ -160,7 +128,7 @@ export async function runTyped(schema: string[], steps: Step[], shards: number, 
     lite.exec(s);
     await client.execute(s);
   }
-  const out: TypedRun = { problems: [], relaxed: { integralRealAsInteger: 0, wideIntegerAsRoundedFloat: 0 }, statements: 0 };
+  const out: TypedRun = { problems: [], statements: 0 };
   const shown = (x: unknown) => JSON.stringify(x);
   for (const step of steps) {
     out.statements++;
@@ -182,7 +150,7 @@ export async function runTyped(schema: string[], steps: Step[], shards: number, 
     }
     // Hrana は値を JSON で運ぶので、REAL の無限大を運べない (sqld も同じ)。クライアントの誤りになるのを、正しいとする。
     if (typeof got === "string" && /HRANA_PROTO_ERROR/.test(got) && /"r-?Infinity"/.test(shown(want))) continue;
-    const same = Array.isArray(want) && Array.isArray(got) ? sameRows(want, got, out.relaxed) : want === got;
+    const same = Array.isArray(want) && Array.isArray(got) ? sameRows(want, got) : want === got;
     if (!same) {
       out.problems.push(`${step.sql} ${shown(step.args.map(cell))}\n  sqlite: ${shown(want).slice(0, 300)}\n  ours:   ${shown(got).slice(0, 300)}`);
       if (o.stopAtFirst) break;
@@ -202,9 +170,9 @@ export const SCHEMA2 = [
 ];
 
 export interface Script2Options {
-  /** 2^53 を超える整数を値に混ぜる。いまは保存を断るので (計画書の K1)、段 3 までは test/open/ でだけ使う。 */
+  /** 2^53 を超える整数を値に混ぜる。 */
   wideIntegers?: boolean;
-  /** NUL を含む文字列を値に混ぜる。いまは Worker の SQLite を通ると切れるので (test/open/nul-in-text.test.ts)、test/open/ でだけ使う。 */
+  /** NUL を含む文字列を値に混ぜる。 */
   nul?: boolean;
 }
 

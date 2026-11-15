@@ -8,7 +8,8 @@ import { describe, expect, it } from "vitest";
 import { imageStatements } from "../src/shard/rows";
 import { builtLimitOf } from "../src/shard-limits";
 import { expressionDepth } from "../src/sql/depth";
-import { fullScan, scanSql } from "../src/sql/plan";
+import { fullScan } from "../src/sql/plan";
+import { typedReadSql } from "../src/value";
 import type { TableDef } from "../src/types";
 import { Db } from "../src/client/db";
 import { SimCluster } from "./sim";
@@ -64,7 +65,9 @@ describe("the expression depth estimate", () => {
     // 主キーの列を AND でつなぐ条件は、主キーの列の数だけ深くなっていた。釣り合った木に組むので、深さは列の数の対数で増える。
     for (const [n, pk] of [[1, 1], [3, 2], [33, 1], [64, 10], [99, 1], [99, 99], [100, 100]] as const) {
       const d = def(n, pk);
-      const depths = [scanSql(fullScan(d)), ...imageStatements(d).map((s) => s.sql)].map(expressionDepth);
+      // 全表の走査は、シャードが実行する形 (型つきの読み) で測る。
+      const scan = fullScan(d);
+      const depths = [typedReadSql(scan.sql, scan.columns.length), ...imageStatements(d).map((s) => s.sql)].map(expressionDepth);
       expect(Math.max(...depths), `${n} columns, ${pk} in the key`).toBeLessThanOrEqual(20);
       for (const s of imageStatements(d)) expect(builtLimitOf(s.sql, s.params), `${n} columns, ${pk} in the key: ${s.sql.slice(0, 60)}`).toBeNull();
     }

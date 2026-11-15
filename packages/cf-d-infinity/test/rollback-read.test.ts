@@ -54,7 +54,7 @@ describe("rollback-read reconstructs every past state", () => {
       const { version } = await c.catalog();
       for (const s of snapshots) {
         const past = await shard.exec({
-          T: s.T, sql: dump, params: [], spans: [{ kind: "sk", table: "t", sk: "[1]" }], schema: version,
+          T: s.T, sql: dump, columns: ["id", "code", "n"], params: [], spans: [{ kind: "sk", table: "t", sk: "[1]" }], schema: version,
         });
         expect(new QueryResult(past.columns, past.values).rows).toEqual(s.rows);
       }
@@ -69,6 +69,6 @@ describe("rollback-read reconstructs every past state", () => {
     const T = (await db.query("SELECT count(*) c FROM t WHERE tenant_id = 1")).ts!;
     for (let i = 0; i < 5; i++) await db.query("INSERT INTO t VALUES (1,?)", [i]);
     const { version } = await c.catalog();
-    await expect(c.shard("s0").exec({ T, sql: "SELECT 1", params: [], spans: [], schema: version })).rejects.toThrow(/read too old/);
+    await expect(c.shard("s0").exec({ T, sql: "SELECT 1", columns: ["1"], params: [], spans: [], schema: version })).rejects.toThrow(/read too old/);
   });
 });

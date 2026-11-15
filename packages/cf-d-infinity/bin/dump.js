@@ -3,11 +3,14 @@
 const quote = (id) => `"${id.replaceAll('"', '""')}"`;
 
 /**
- * 値を SQL のリテラルにする。BLOB は { $blob: 16 進 } で受ける。整数の値の REAL は { real: 数 } で受け (src/value.ts)、
- * 小数点を付けて書く。SQLite は小数点か指数のある数のリテラルを REAL として読むので、取り込んでも REAL のままである。
+ * 値を SQL のリテラルにする。値は書き出しの形 (src/transfer.ts の exportValue) で受ける。BLOB は { $blob: 16 進 }、整数の値の REAL は
+ * { real: 数 } で受け、小数点を付けて書く。SQLite は小数点か指数のある数のリテラルを REAL として読むので、取り込んでも REAL のままで
+ * ある。JS の数で正確に表せない INTEGER は { $int: "数字" } で受け、数字のまま書く (段 3 から)。
  */
 export function literal(v) {
   if (v === null || v === undefined) return "NULL";
+  if (typeof v === "bigint") return String(v);
+  if (typeof v === "object" && typeof v.$int === "string" && /^-?[0-9]+$/.test(v.$int)) return v.$int;
   if (typeof v === "object" && typeof v.real === "number") {
     const s = literal(v.real);
     return /^-?[0-9]+$/.test(s) ? `${s}.0` : s;
@@ -95,7 +98,10 @@ export function parseInsert(line) {
           if (!m) return fail();
           const n = m[0] === "9e999" ? Infinity : m[0] === "-9e999" ? -Infinity : Number(m[0]);
           // 小数点か指数のある整数の値は REAL である。印を付けて、取り込むときも REAL として束縛する。
-          row.push(Number.isInteger(n) && /[.eE]/.test(m[0]) ? { real: n } : n);
+          // 小数点も指数もない literal は INTEGER である。JS の数で正確に表せなければ、数字のまま運ぶ。
+          const big = /^-?[0-9]+$/.test(m[0]) && !Number.isSafeInteger(n) ? BigInt(m[0]) : null;
+          if (big !== null && big >= -(2n ** 63n) && big < 2n ** 63n) row.push({ $int: m[0] });
+          else row.push(Number.isInteger(n) && /[.eE]/.test(m[0]) ? { real: n } : n);
           i += m[0].length;
         }
         if (line.startsWith(", ", i)) i += 2;

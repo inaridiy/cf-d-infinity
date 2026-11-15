@@ -396,7 +396,8 @@ describe("the SQL parser", () => {
 
     it("reads 0X1f and 1_000 as numbers, not as identifiers", () => {
       const [hex, separated, real] = one("SELECT 0X1f, 1_000, 5.").clauses[0].columns.items;
-      expect([constant(hex, []), constant(separated, [])]).toEqual([{ value: 31 }, { value: 1000 }]);
+      // 整数の literal は INTEGER (bigint) である。
+      expect([constant(hex, []), constant(separated, [])]).toEqual([{ value: 31n }, { value: 1000n }]);
       expect(real.type).toBe("number_literal");
     });
 

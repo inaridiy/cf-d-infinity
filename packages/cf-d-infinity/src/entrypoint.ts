@@ -2,14 +2,14 @@
 import { RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import type { RemoteResult, RemoteStatement, TransactionMode } from "./binding";
 import type { Db, QueryResult } from "./client/db";
+import { toValue } from "./client/d1";
 import type { Value } from "./types";
 import { clusterStatus, dbFor, exportRows, handle, importRows, schemaSql, slowQueries, type Env, type ExportCursor, type SlowQuery } from "./worker";
 
-const toValue = (v: unknown): Value =>
-  v === undefined || v === null ? null : typeof v === "boolean" ? Number(v) : (v as Value);
 const values = (params: unknown[] = []): Value[] => params.map(toValue);
+/** 結果は D1 と同じ形で返す (INTEGER は JS の数)。bigint で返す口 (intMode) は段 4 で足す。 */
 const pack = (r: QueryResult, db: Db): RemoteResult => ({
-  columns: r.columns, rows: r.rows, values: r.values, changes: r.changes, lastInsertRowid: r.lastInsertRowid, token: db.token,
+  columns: r.columns, rows: r.rows, values: r.d1Values, changes: r.changes, lastInsertRowid: r.lastRowId, token: db.token,
 });
 
 /**
@@ -75,12 +75,10 @@ export class DinfDatabase extends WorkerEntrypoint<Env> {
   /**
    * 表の行を少しずつ返す。論理エクスポートに使う。cursor が null になったら終わりである。
    * 時点はそろえないので、書き込みを止めていなければ、取引の途中の状態が混じり得る。
-   * BLOB は JSON で運べないので、{ $blob: 16 進 } に変える。
+   * 行は JSON で運べる形にする (src/transfer.ts の exportValue)。
    */
   async exportRows(table: string, cursor: ExportCursor | null, limit = 1000) {
-    const page = await exportRows(this.env, table, cursor, limit);
-    const hex = (v: Uint8Array) => Array.from(v, (b) => b.toString(16).padStart(2, "0")).join("");
-    return { ...page, rows: page.rows.map((r) => r.map((v) => (v instanceof Uint8Array ? { $blob: hex(v) } : v))) };
+    return exportRows(this.env, table, cursor, limit);
   }
   /** export が書き出した行を入れる。BLOB は { $blob: 16 進 } で受ける。 */
   async importRows(table: string, columns: string[], rows: unknown[][]): Promise<number> {

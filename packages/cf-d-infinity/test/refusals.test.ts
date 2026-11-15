@@ -31,7 +31,6 @@ const REFUSALS = [
   "sql/ddl.ts: ALTER TABLE ... RENAME COLUMN",
   "sql/ddl.ts: ALTER TABLE ... DROP COLUMN",
   "sql/ddl.ts: a UNIQUE partial or expression index that does not include the shard key",
-  "sql/ddl.ts: column name ${name} is reserved for internal use",
   // 文の形で決まる
   "sql/ddl.ts: CREATE TABLE ... AS SELECT",
   "sql/ddl.ts: CREATE VIRTUAL TABLE",
@@ -41,8 +40,6 @@ const REFUSALS = [
   "client/db.ts: the table ${def.name} is too wide for a shard to scan",
   // 値で決まる
   "shard/rows.ts: NULL in the primary key column",
-  "value.ts: an INTEGER beyond",
-  "client/hrana.ts: the integer ${v.value} cannot be stored exactly",
 ].sort();
 
 describe("the statements this database refuses", () => {

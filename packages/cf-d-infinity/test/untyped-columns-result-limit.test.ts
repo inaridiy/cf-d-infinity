@@ -1,4 +1,6 @@
-// 未解決: 型のない列が多い表は、CREATE TABLE を通るのに、DO では読むことも書くこともできない。
+// 型のない列が多い表を、読み書きできること (段 0 に見つけた欠陥。値の作り直しの段 3 で直り、test/open/ から移した)。
+//
+// 段 2 までは、型のない列が多い表は、CREATE TABLE を通るのに、DO では読むことも書くこともできなかった。
 //
 // DO の SQLite は、結果の列を 100 までに制限している (test/workerd-limits.test.ts)。行イメージを読む文と、行を集める走査
 // (src/shard/rows.ts の imageList と、型のない列の typeof を一緒に読む走査) は、表の列に、型のない列ごとの typeof の列と、
@@ -15,11 +17,12 @@
 // (test/shard-limits.test.ts は、64 列とも型のない表を使っていた)。本物の workerd でも同じ誤りになることを確かめた。
 // 足す列は、作り直しの段 2 と段 3 で、imageList と typeof の列と一緒になくなる。
 // 段 2 (2026-11-14) の後: 行イメージはタプル (1 列) になり、捕捉と行の読みは列を足さなくなった。INSERT、UPDATE、DELETE は通る。
-// 残るのは行を集める走査 (src/sql/plan.ts の scanSql、Scan.typed) で、型のない列ごとの typeof の列を足すので、型のない列が 50 以上の
-// 表では、複数のシャードから行を集める SELECT が「too many columns in result set」で失敗する。走査は段 3 で型つきの読みに替わる。
+// 残ったのは行を集める走査 (段 2 までの src/sql/plan.ts の scanSql、Scan.typed) で、型のない列ごとの typeof の列を足したので、型の
+// ない列が 50 以上の表では、複数のシャードから行を集める SELECT が「too many columns in result set」で失敗した。段 3 で、走査は
+// 型つきの読み (列を足さずに、列ごとに型の印を付ける) に替わった。
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { SimCluster } from "../sim";
+import { Db } from "../src/client/db";
+import { SimCluster } from "./sim";
 
 describe("a table with many columns that have no type", () => {
   for (const untyped of [49, 50, 64, 98]) {

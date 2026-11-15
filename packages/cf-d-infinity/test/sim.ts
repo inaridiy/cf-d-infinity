@@ -7,12 +7,10 @@ import { MetaCore, type SplitMove, type SplitSlot } from "../src/meta";
 import { initialRouting, shardsOf, tokenOf, type Interval, type Routing } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
-import { bindParams, ident, parseStatements, render, type Node } from "../src/sql/cst";
-import { returningClause, rewriteReturning } from "../src/sql/returning";
 import { ShardCore, type SpanEscape, type WriteCheck } from "../src/shard/core";
 import { imageColumns } from "../src/shard/rows";
-import type { Backend, Change, Faults, Row, ShardApi, Span, TableDef, Ts, Value } from "../src/types";
-import { bindTyped, decodeElem, fromTypedValue, restoreColumns, type Tuple } from "../src/value";
+import type { Backend, Change, Faults, Plain, PlainRow, ShardApi, Span, TableDef, Ts, Value } from "../src/types";
+import { bindPlain, bindTyped, decodeElem, restoreColumns, type Tuple } from "../src/value";
 
 /**
  * DO の SQLite の実測の制限 (公式の表にないもの)。node:sqlite は上限を変えられないので、文を見て模す。
@@ -44,6 +42,12 @@ function checkDoLimits(sql: string, params: Value[] = []): void {
     if (bytes > DO_MAX_VALUE_BYTES) throw new Error("string or blob too big: SQLITE_TOOBIG");
   }
 }
+
+/**
+ * 値の型を区別しない比べ方のために、INTEGER (bigint) を JS の数にする。node:sqlite の既定の読み (数) と比べる検査が使う。
+ * 2^53 を超える整数は丸まるので、その値を使う検査 (test/int64.test.ts、test/typed-diff.test.ts) は、これを使わずに型ごと比べる。
+ */
+export const asNumbers = <T>(rows: T[][]): T[][] => rows.map((r) => r.map((v) => (typeof v === "bigint" ? Number(v) : v)) as T[]);
 
 /** seed から決まる乱数 (mulberry32)。 */
 export function prng(seed: number): () => number {
@@ -160,17 +164,19 @@ export class VirtualRuntime implements Runtime {
  * DO の SQLite は、2^53 を超える INTEGER を、精度を落とした JS の数で返す。node:sqlite は既定では例外を投げるので、BigInt で読んで、
  * DO と同じように数にする。
  */
-const lossy = (v: unknown): Value => (typeof v === "bigint" ? Number(v) : (v as Value));
+const lossy = (v: unknown): Plain => (typeof v === "bigint" ? Number(v) : (v as Plain));
 
 /**
  * DO のドライバは、結果の TEXT を NUL (U+0000) を含めて全部返す。node:sqlite のドライバは、最初の NUL で切って返す
  * (docs/design-values.md の「確かめた事実」)。シミュレータがそのまま返すと、NUL を含む TEXT を、シャードの側も基準の側も
  * 同じように切って、食い違いが見えない (test/open/nul-in-text.test.ts が見つけた検査の欠け)。
  *
- * そこで、結果を返す文 (SELECT、VALUES、WITH で始まる文) は、DO のドライバと同じ値になるように包み直して読む。TEXT は BLOB に
- * して運び (CAST(... AS BLOB) は全部のバイトを返す)、UTF-8 として戻す。BLOB は 16 進の文字列で運ぶ。結果の列を 2 回以上参照する
- * ので、`LIMIT -1 OFFSET 0` で、包む前の文を 1 行につき 1 回だけ評価させる。DML の RETURNING は包めないので、そのまま読む
- * (D∞ は RETURNING の項を、TEXT を BLOB で運ぶ要素の式に書き換えて送る)。
+ * そこで、利用者の表に触る文 (Backend.query) のうち、結果を返す文 (SELECT、VALUES、WITH で始まる文) は、DO のドライバと同じ値に
+ * なるように包み直して読む。TEXT は BLOB にして運び (CAST(... AS BLOB) は全部のバイトを返す)、UTF-8 として戻す。BLOB は 16 進の
+ * 文字列で運ぶ。結果の列を 2 回以上参照するので、`LIMIT -1 OFFSET 0` で、包む前の文を 1 行につき 1 回だけ評価させる。
+ * DML の RETURNING は包めないが、D∞ は RETURNING の項を、TEXT を BLOB で運ぶ要素の式に書き換えて送る (src/value.ts の
+ * returningElemSql) ので、そのまま読んでも切れない。内部の表の文 (exec、raw、iterate) は包まない。内部の表の TEXT は、JSON か
+ * キー文字列で、NUL をそのまま持たない (JSON は `\u0000` と書く)。
  */
 const READS_ROWS = /^\s*(?:(?:--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)\s*)*(SELECT|VALUES|WITH)\b/i;
 const wholeTextCache = new Map<string, string>();
@@ -188,49 +194,13 @@ function wholeTextSql(sql: string, n: number): string {
 }
 const utf8Text = new TextDecoder();
 const fromHex = (s: string) => Uint8Array.from(s.match(/../g) ?? [], (h) => parseInt(h, 16));
-/** 包み直して読んだ値を、DO のドライバが返す値にする。TEXT は BLOB で、BLOB は 16 進で届く。INTEGER は DO と同じく JS の数に丸める。 */
-const asDriver = (v: unknown): Value =>
-  v instanceof Uint8Array ? utf8Text.decode(v) : typeof v === "string" ? fromHex(v) : lossy(v);
 
 /**
- * DML の RETURNING は包めないので、項ごとに書き換えて読む (src/sql/returning.ts)。どの格納の型にも印を付け、TEXT は BLOB で運ぶ。
- * 読んだ値は、DO のドライバが返す値にする。書き換えた文は、元の文と、書く表の列ごとに覚える。
+ * query の文が、ドライバから INTEGER を読んだ (docs/design-values.md の「シミュレータ」の 3 つ目)。型つきの読みの形の文は、INTEGER を
+ * 印つきの文字列で返すので、INTEGER がドライバから数として出てくるのは、包み忘れた文だけである。DO のドライバは、その INTEGER を
+ * 丸めた数で返し、D∞ はそれを REAL として読む。範囲の検査と同じく、test/setup.ts が試験ごとに確かめて空にする。
  */
-const returnedElem = (c: string) =>
-  `CASE typeof(${c}) WHEN 'integer' THEN 'i'||${c} WHEN 'text' THEN CAST(${c} AS BLOB) WHEN 'real' THEN 'r'||quote(${c}) WHEN 'blob' THEN 'b'||hex(${c}) END`;
-const returnedAsDriver = (v: unknown): Value => {
-  if (v === null || v === undefined) return null;
-  if (v instanceof Uint8Array) return utf8Text.decode(v);
-  const s = v as string;
-  return s[0] === "i" ? Number(BigInt(s.slice(1))) : s[0] === "r" ? Number(s.slice(1)) : fromHex(s.slice(1));
-};
-const returningCache = new Map<string, { sql: string; order: number[] } | null>();
-/** 文の RETURNING を書き換えた文と、引数の並び (元の引数の番号) を返す。RETURNING のない文は null。 */
-function wholeReturning(db: DatabaseSync, sql: string, paramCount: number): { sql: string; order: number[] } | null {
-  // `*` は表定義の列に開くので、表定義が変われば書き換え直す。
-  const key = `${(db.prepare("PRAGMA schema_version").get() as { schema_version: number }).schema_version}\0${paramCount}\0${sql}`;
-  let hit = returningCache.get(key);
-  if (hit === undefined) {
-    hit = null;
-    const stmt = parseStatements(sql)[0];
-    const clause = returningClause(stmt);
-    if (clause) {
-      // 引数の値の代わりに番号を束縛して、書き換えた後の文の引数が、元のどの引数かを知る。
-      const values = bindParams(stmt, Array.from({ length: paramCount }, (_v, i) => i));
-      const head = (stmt.clauses as Node[]).find((c) => /^(insert|update|delete)_clause$/.test(c.type));
-      let t: Node = head.type === "insert_clause" ? head.table : head.tables.items[0];
-      while (t.type === "alias" || t.expr) t = t.expr;
-      const table = ident(t.type === "member_expr" ? t.property : t);
-      const columns = (db.prepare(`SELECT name FROM pragma_table_info(?)`).all(table) as { name: string }[]).map((r) => r.name);
-      rewriteReturning(clause, columns, returnedElem);
-      const r = render(stmt, values);
-      hit = { sql: r.sql, order: r.params as number[] };
-    }
-    if (returningCache.size >= 4096) returningCache.delete(returningCache.keys().next().value!);
-    returningCache.set(key, hit);
-  }
-  return hit;
-}
+export const allDriverIntegers: string[] = [];
 
 /** node:sqlite の Backend。fence() 後の操作は失敗する (DO 基盤が旧 instance を止めるのと同じ)。 */
 export class SqliteBackend implements Backend {
@@ -244,9 +214,12 @@ export class SqliteBackend implements Backend {
    * node:sqlite も DO の SQLite と同じく、JS の数を REAL として束縛する。束縛の仕方は DO と同じにする (src/value.ts)。
    * DO の上限は、束縛のために書き換えた後の文に掛かる (書き換えで文が長くなる)。
    */
-  private prepare(sql: string, params: Value[]): { columns: string[]; read: ((all: boolean) => Iterable<Value[]>) | null } {
+  private prepare(
+    sql: string, b: { sql: string; params: Plain[]; columns: Map<string, string> | null }, user: boolean,
+  ): { columns: string[]; read: ((all: boolean) => Iterable<Plain[]>) | null } {
     if (this.fenced) throw new Error("fenced instance");
-    const b = bindTyped(sql, params, "real");
+    // DO の SQLite は BigInt を束縛できない。束縛の書き換え (bindTyped) が、いつも数か文字列にする。
+    for (const p of b.params) if (typeof p === "bigint") throw new TypeError("a BigInt reached the driver; the DO SQLite cannot bind it");
     checkDoLimits(b.sql, b.params);
     const st = this.db.prepare(b.sql);
     const p = b.params as never[];
@@ -257,24 +230,22 @@ export class SqliteBackend implements Backend {
       return { columns, read: null };
     }
     let reader = st;
-    let args = p;
-    let convert = lossy;
-    let wrapped = false;
-    if (READS_ROWS.test(b.sql)) {
-      try {
-        reader = this.db.prepare(wholeTextSql(b.sql, columns.length));
-        convert = asDriver;
-        wrapped = true;
-      } catch {
-        // WITH で始まる DML (RETURNING のある書き込み) は包めない。下で、RETURNING を書き換えて読む。
-      }
-    }
-    if (!wrapped) {
-      const r = wholeReturning(this.db, b.sql, b.params.length);
-      if (r) {
-        reader = this.db.prepare(r.sql);
-        args = r.order.map((i) => b.params[i]) as never[];
-        convert = returnedAsDriver;
+    let convert: (v: unknown) => Plain = lossy;
+    if (user) {
+      const integer = (v: bigint): Plain => {
+        allDriverIntegers.push(`${sql.slice(0, 160)} returned the INTEGER ${v} as a driver number`);
+        return Number(v);
+      };
+      convert = (v) => (typeof v === "bigint" ? integer(v) : (v as Plain));
+      if (READS_ROWS.test(b.sql)) {
+        try {
+          reader = this.db.prepare(wholeTextSql(b.sql, columns.length));
+          convert = (v) => (v instanceof Uint8Array ? utf8Text.decode(v) : typeof v === "string" ? fromHex(v) : typeof v === "bigint" ? integer(v) : (v as Plain));
+        } catch (e) {
+          // WITH で始まる DML (RETURNING のある書き込み) は包めない。そのまま読む。ほかの文が包めないのは、包み方の誤りなので投げる
+          // (黙って素の列で読むと、NUL を含む TEXT が切れても誰も気付かない)。
+          if (!(/^\s*WITH\b/i.test(b.sql) && /\b(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(b.sql))) throw e;
+        }
       }
     }
     reader.setReturnArrays(true);
@@ -282,24 +253,28 @@ export class SqliteBackend implements Backend {
     return {
       columns,
       read: (all) => {
-        if (all) return (reader.all(...args) as unknown as unknown[][]).map((r) => r.map(convert));
-        const it = reader.iterate(...args) as unknown as Iterable<unknown[]>;
+        if (all) return (reader.all(...p) as unknown as unknown[][]).map((r) => r.map(convert));
+        const it = reader.iterate(...p) as unknown as Iterable<unknown[]>;
         return (function* () { for (const r of it) yield r.map(convert); })();
       },
     };
   }
-  exec(sql: string, ...params: Value[]): Row[] {
-    const { columns, read } = this.prepare(sql, params);
+  exec(sql: string, ...params: Plain[]): PlainRow[] {
+    const { columns, read } = this.prepare(sql, bindPlain(sql, params, "real"), false);
     if (!read) return [];
     return [...read(true)].map((r) => Object.fromEntries(columns.map((c, i) => [c, r[i] ?? null])));
   }
-  iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
-    const { columns, read } = this.prepare(sql, params);
+  iterate(sql: string, ...params: Plain[]): { columns: string[]; rows: Iterable<Plain[]> } {
+    const { columns, read } = this.prepare(sql, bindPlain(sql, params, "real"), false);
     return { columns, rows: read ? read(false) : [] };
   }
-  raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] } {
-    const { columns, read } = this.prepare(sql, params);
+  raw(sql: string, ...params: Plain[]): { columns: string[]; values: Plain[][] } {
+    const { columns, read } = this.prepare(sql, bindPlain(sql, params, "real"), false);
     return { columns, values: read ? [...read(true)] : [] };
+  }
+  query(sql: string, params: readonly Value[]): { columns: string[]; rows: Iterable<Plain[]> } {
+    const { columns, read } = this.prepare(sql, bindTyped(sql, params, "real"), true);
+    return { columns, rows: read ? read(false) : [] };
   }
   tx<T>(fn: () => T): T {
     const name = `sp${this.depth++}`;
@@ -447,7 +422,7 @@ function keyOfImage(def: TableDef, t: Tuple): { pk: string; sk: string } {
   const cols = imageColumns(def);
   const at = (c: string): Value => {
     const i = cols.indexOf(c);
-    return i >= 0 && i < t.length ? fromTypedValue(decodeElem(t[i] ?? null), def.name) : null;
+    return i >= 0 && i < t.length ? decodeElem(t[i] ?? null) : null;
   };
   return { pk: keyString(def.pk.map(at)), sk: keyString(def.shardKey.map(at)) };
 }
@@ -535,7 +510,7 @@ export class SimCluster implements Cluster {
    */
   fingerprint(): string {
     const h = createHash("sha256");
-    for (const m of this.net.log) h.update(JSON.stringify([m.from, m.to, m.method, m.req], (_k, x) => (x instanceof Uint8Array ? [...x] : x)));
+    for (const m of this.net.log) h.update(JSON.stringify([m.from, m.to, m.method, m.req], (_k, x) => (x instanceof Uint8Array ? [...x] : typeof x === "bigint" ? `${x}n` : x)));
     return `${this.net.log.length} rpcs ${h.digest("hex").slice(0, 16)}`;
   }
 
@@ -557,7 +532,7 @@ export class SimCluster implements Cluster {
         }
         const top = [...count].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${k} x${n}`).join(", ");
         const waiting = [...this.unanswered].sort((a, b) => a.at - b.at).slice(0, 6).map(({ m, at }) =>
-          `${m.from}->${m.to} ${String(m.method)} sent at ${at}: ${JSON.stringify(m.req, (_k, x) => (x instanceof Uint8Array ? "<blob>" : x)).slice(0, 300)}`);
+          `${m.from}->${m.to} ${String(m.method)} sent at ${at}: ${JSON.stringify(m.req, (_k, x) => (x instanceof Uint8Array ? "<blob>" : typeof x === "bigint" ? `${x}n` : x)).slice(0, 300)}`);
         reject(new Error(
           `the run did not finish: ${why} (${this.net.log.length} RPCs, simulated time ${this.time}).\n` +
           `RPCs that never returned (${this.unanswered.size}):\n  ${waiting.join("\n  ") || "none"}\n` +
@@ -789,7 +764,7 @@ export class SimCluster implements Cluster {
 }
 
 /** シャードの変更ログを commit_ts の昇順で全部読む (テスト用)。 */
-export function logRows(b: SqliteBackend): Row[] {
+export function logRows(b: SqliteBackend): PlainRow[] {
   const gens = JSON.parse((b.exec(`SELECT v FROM __meta WHERE k = 'log_gens'`)[0]?.v as string | undefined) ?? "[]") as number[];
   return gens.flatMap((g) => b.exec(`SELECT commit_ts, txn, blob FROM __log_g${g} ORDER BY commit_ts`));
 }

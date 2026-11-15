@@ -2,7 +2,6 @@
 // Worker は状態を持たないので、取引の状態は baton に載せて持ち回る。
 import { decode, encode } from "../shard/rows";
 import { SqlError, type Value } from "../types";
-import { isReal, realOf } from "../value";
 import { checkCount, checkSql, ENTRY_LIMITS } from "../entry";
 import type { Params } from "../sql/cst";
 import type { Db, QueryResult } from "./db";
@@ -57,28 +56,26 @@ function fromH(v: HValue): Value {
   switch (v.type) {
     case "null": return null;
     case "integer": {
-      // 整数は 10 進の文字列で届く。JavaScript の数値は 2^53 を超える整数を正確に表せないので、そのまま数値にすると、
-      // 黙って別の値になる。主キーなら別の行を指す。この先の検査は、変わった後の値しか見ない。ここで断る。
-      const n = Number(v.value);
-      if (!Number.isSafeInteger(n)) {
-        throw new SqlError(`unsupported: the integer ${v.value} cannot be stored exactly; integers are limited to the range from -(2^53 - 1) to 2^53 - 1`);
-      }
-      return n;
+      // 整数は 10 進の文字列で届く。INTEGER (bigint) として正確に受け取る。64 ビットに収まらない値だけを断る。
+      if (!/^-?[0-9]+$/.test(v.value)) throw new SqlError(`not an integer: ${v.value.slice(0, 40)}`);
+      const big = BigInt(v.value);
+      if (big < -(2n ** 63n) || big > 2n ** 63n - 1n) throw new SqlError(`the integer ${v.value} does not fit in 64 bits`);
+      return big;
     }
-    // 整数の値の REAL は、印をつけて REAL のまま運ぶ (src/value.ts)。sqld も float を REAL として束縛する。
-    case "float": return realOf(v.value);
+    // float は REAL である (JS の数)。sqld も float を REAL として束縛する。
+    case "float": return v.value;
     case "text": return v.value;
     case "blob": return fromBase64(v.base64);
   }
 }
 
+/** INTEGER は integer (10 進の文字列)、REAL は float で返す。整数の値の REAL も float で返り、sqld と同じである。 */
 function toH(v: Value): HValue {
   if (v === null || v === undefined) return { type: "null" };
   if (typeof v === "string") return { type: "text", value: v };
   if (v instanceof Uint8Array) return { type: "blob", base64: toBase64(v) };
-  if (isReal(v)) return { type: "float", value: v.real };
-  // 2^53 を超える整数の値は、正確な整数として返せない (JS の数を通るので、もう丸まっている)。float で返す。
-  return Number.isSafeInteger(v) ? { type: "integer", value: String(v) } : { type: "float", value: v };
+  if (typeof v === "bigint") return { type: "integer", value: String(v) };
+  return { type: "float", value: v };
 }
 
 function args(s: Stmt): Params {

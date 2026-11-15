@@ -6,7 +6,10 @@
 import { parse, show } from "sql-parser-cst";
 import type { Affinity, Value } from "../src/types";
 import { SqlError } from "../src/types";
-import { isReal, realOf } from "../src/value";
+// 段 2 までの src/value.ts の、整数の値の REAL の印。値の作り直しの段 3 で src/value.ts から消えたので、ここに写す。
+const realOf = (n: number) => (Number.isInteger(n) ? { real: n } : n);
+const isReal = (v: unknown): v is { real: number } =>
+  typeof v === "object" && v !== null && !(v instanceof Uint8Array) && typeof (v as { real?: unknown }).real === "number";
 
 // 公開 API にない内部の予約語表を直接直す。
 import { sqliteKeywords } from "sql-parser-cst/lib/keywords/sqlite.keywords.js";

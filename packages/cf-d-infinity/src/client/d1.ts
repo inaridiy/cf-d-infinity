@@ -17,12 +17,19 @@ export interface D1LikeResult<T = Row> {
 }
 
 const meta = (r: QueryResult): Meta => ({
-  changes: r.changes, rows_read: r.rows.length, rows_written: r.changes, duration: 0,
-  last_row_id: r.lastInsertRowid ?? 0, changed_db: r.changes > 0, size_after: 0,
+  changes: r.changes, rows_read: r.values.length, rows_written: r.changes, duration: 0,
+  last_row_id: r.lastRowId ?? 0, changed_db: r.changes > 0, size_after: 0,
 });
 
-const toValue = (v: unknown): Value =>
-  v === undefined || v === null ? null : typeof v === "boolean" ? Number(v) : (v as Value);
+/**
+ * 引数の値 (docs/design-values.md の「D1 互換の API、Service Binding、HTTP の JSON」)。bigint は INTEGER である。JS の数は、
+ * 安全な整数なら INTEGER、ほかは REAL である (持ち主の判断の 2。渡された double をそのまま入れる)。真偽値は INTEGER の 1 と 0。
+ */
+export const toValue = (v: unknown): Value =>
+  v === undefined || v === null ? null
+    : typeof v === "boolean" ? (v ? 1n : 0n)
+      : typeof v === "number" && Number.isSafeInteger(v) ? BigInt(v)
+        : (v as Value);
 
 export class Statement {
   constructor(private db: Db, readonly sql: string, readonly params: Value[] = []) {}
@@ -44,7 +51,8 @@ export class Statement {
   }
   async raw<T = Value[]>(opts?: { columnNames?: boolean }): Promise<T[]> {
     const r = await this.db.query(this.sql, this.params);
-    return opts?.columnNames ? [r.columns as T, ...(r.values as T[])] : (r.values as T[]);
+    const values = r.d1Values;
+    return opts?.columnNames ? [r.columns as T, ...(values as T[])] : (values as T[]);
   }
 }
 

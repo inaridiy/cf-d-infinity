@@ -8,8 +8,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { keyString } from "../src/keys";
 import { ownerOf, type Routing } from "../src/routing";
 import { initStoredValue, storedValue } from "../src/sql/stored";
-import type { Affinity } from "../src/types";
-import { decodeElem, decodeTuple, jsonElemSql, parseTuple, returningElemSql, selectElemSql, tupleSql, type TypedValue } from "../src/value";
+import type { Affinity, Value } from "../src/types";
+import { decodeElem, decodeTuple, jsonElemSql, parseTuple, returningElemSql, selectElemSql, tupleSql } from "../src/value";
 import { bitsOf, doubles, EDGE_DOUBLES, INT64, int64s, numericStrings } from "./value-corpus";
 import { CONV_COLUMNS, CONV_DDL, convSql, probe, type Arg, type Cell, type Probe, type Step } from "./workerd-probe";
 
@@ -114,7 +114,7 @@ const LOCAL_MAX_LENGTH = 2_200_000;
 /** 1 つの文の結果。値は文字にする。 */
 type Texts = (string | null)[][] | { error: string };
 /** 型と値を、比べられる文字にする。double はビットで比べる。-0.0 は 0.0 と区別しない。 */
-const shownValue = (v: TypedValue): string =>
+const shownValue = (v: Value): string =>
   v === null ? "NULL"
     : typeof v === "bigint" ? `INTEGER ${v}`
       : typeof v === "number" ? `REAL ${bitsOf(Object.is(v, -0) ? 0 : v)} (${v})`
@@ -126,7 +126,7 @@ const driverValue = (c: Cell): string | number | Uint8Array | null =>
 /** 型の親和性の変換の表 (workerd-probe.ts の CONV_COLUMNS) の、列ごとの親和性。 */
 const CONV_AFFINITY: Affinity[] = ["TEXT", "NUMERIC", "INTEGER", "REAL", "BLOB"];
 /** storedValue の答えが、DO の列に入った値 (workerd-probe.ts の stored の書き方) と同じか。 */
-const sameStored = (got: TypedValue, stored: string): boolean =>
+const sameStored = (got: Value, stored: string): boolean =>
   got === null ? stored === "null:"
     : typeof got === "bigint" ? stored === `integer:${got}`
       : typeof got === "number" ? stored.startsWith("real:") && bitsOf(Number(stored.slice(5))) === bitsOf(Object.is(got, -0) ? 0 : got)
@@ -387,7 +387,7 @@ describe("facts about workerd and the Durable Object SQLite that the value rewor
   it("reads a key string back with keyValues inside workerd, to the digit", async () => {
     // keyValues (src/keys.ts) を、workerd の中で動かす。行の置き場所はキー文字列から決まるので、Worker が読み戻した値が
     // 1 桁でも違えば、別の行を指す。
-    const values: TypedValue[] = [
+    const values: Value[] = [
       ...INT64, ...int64s(300, 11), ...EDGE_DOUBLES, ...doubles(300, 12), 0.5, 1e19, 1e21, Infinity, -Infinity,
       "abc", "a\u0000b", "9223372036854775807", new Uint8Array([0, 255]), null,
     ];
@@ -410,10 +410,10 @@ describe("facts about workerd and the Durable Object SQLite that the value rewor
       `CREATE TRIGGER w_u AFTER UPDATE ON w BEGIN INSERT INTO cap(tbl, old, new) VALUES ('w', ${tuple("old.")}, ${tuple("new.")}); END`,
       `CREATE TRIGGER w_d AFTER DELETE ON w BEGIN INSERT INTO cap(tbl, old) VALUES ('w', ${tuple("old.")}); END`,
     ];
-    const pool: TypedValue[] = [...INT64, ...EDGE_DOUBLES, 0.1 + 0.2, 5, 0.5, "", "abc", "a\u0000b", "é", "i5", new Uint8Array([]), new Uint8Array([0, 255]), null];
+    const pool: Value[] = [...INT64, ...EDGE_DOUBLES, 0.1 + 0.2, 5, 0.5, "", "abc", "a\u0000b", "é", "i5", new Uint8Array([]), new Uint8Array([0, 255]), null];
     const rows = [0, 1, 2].map((r) => cols.map((_c, i) => pool[(i * 3 + r * 7) % pool.length]!));
     // DO は BigInt を束縛できず、数は REAL として束縛する。INTEGER は、10 進の文字列を `(CAST(? AS INTEGER)+0)` で包んで束縛する。
-    const insert = (row: TypedValue[], returning = ""): Step => ({
+    const insert = (row: Value[], returning = ""): Step => ({
       sql: `INSERT INTO w VALUES (${row.map((v) => (typeof v === "bigint" ? "(CAST(? AS INTEGER)+0)" : "?")).join(", ")})${returning}`,
       params: row.map((v): Arg =>
         v === null ? null : typeof v === "bigint" ? String(v) : typeof v === "number" ? { f: Object.is(v, -0) ? "-0" : String(v) }
@@ -437,7 +437,7 @@ describe("facts about workerd and the Durable Object SQLite that the value rewor
     ]);
     expect(r.map((step) => step.error)).toEqual(r.map(() => undefined));
     const [captured, read, typed, , , changed, returned] = r.slice(8);
-    const want = (row: TypedValue[], rowid: number) => [BigInt(rowid), ...row].map(shownValue);
+    const want = (row: Value[], rowid: number) => [BigInt(rowid), ...row].map(shownValue);
     const tupleOf = (c: Cell) => (c[0] === "null" ? null : decodeTuple(parseTuple(String(c[1]))).map(shownValue));
     expect(captured!.rows.map((row) => row.map(tupleOf))).toEqual(rows.map((row, i) => [null, want(row, i + 1)]));
     expect(read!.rows.map((row) => tupleOf(row[0]!))).toEqual(rows.map((row, i) => want(row, i + 1)));

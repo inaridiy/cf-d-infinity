@@ -2,17 +2,18 @@ import type {
   Change, CommitRes, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
 } from "../types";
 import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, utf8Length } from "../types";
-import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, imageAt, imageStatements, joinTerms, pkValues, q, scanList, tupleOfRow, typedValues } from "../shard/rows";
-import type { Tuple } from "../value";
+import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, imageAt, imageStatements, joinTerms, pkValues, q, scanList, tupleOfRow } from "../shard/rows";
+import { decodeReturned, typedReadSql, type Tuple } from "../value";
 import type { Catalog, SplitMove, SplitSlot } from "../meta";
 import { hashKey, ownerOf, regionsOf, shardsOf, type Interval, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import { ident, parseStatements, text, type Node, type Params } from "../sql/cst";
 import { keyString } from "../keys";
-import { fromTyped } from "../value";
 import { sha256Text } from "../sha256";
 import { SHARD_LIMITS, builtLimitOf, isShardLimit, withinShardLimits } from "../shard-limits";
-import { scanSql, untypedOf, SCHEMA_STATEMENTS, findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
+import { scanColumns, scanFits, SCHEMA_STATEMENTS, findTable, fullScan, planStatement, type Plan, type PlanContext, type Reference, type Route, type Scan, type WriteTarget } from "../sql/plan";
+import { sqlJs } from "../sql/scratch";
+import { initStoredValue, storedValueReady } from "../sql/stored";
 import { parseDdl } from "../sql/ddl";
 import { openScratch, ScratchDb, type Compiled } from "../sql/scratch";
 import { groupSpan, rowSpan, scanSpans, statementSpans, tableSpan } from "./spans";
@@ -108,18 +109,43 @@ export function cleanToken(token: unknown): Ts {
   return typeof token === "number" && Number.isSafeInteger(token) && token > 0 ? token : 0;
 }
 
+const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+
+/**
+ * D1 と同じ形の値。INTEGER を JS の数で返す (D1 互換の API、Service Binding、HTTP の `/sql`。docs/design-values.md の「D1 互換の
+ * API、Service Binding、HTTP の JSON」)。JS の数で正確に表せない INTEGER は、黙って隣の値にせずに誤りにする (持ち主の判断の 1。
+ * @libsql/client の intMode "number" と同じ)。誤りにするかどうかは値で決まり、行の置き場所には依らない。
+ * bigint か文字列で返す口 (intMode) は、段 4 で足す。
+ */
+export function d1Value(v: Value): Exclude<Value, bigint> {
+  if (typeof v !== "bigint") return v;
+  if (v > MAX_SAFE || v < -MAX_SAFE) {
+    throw new SqlError(`the result holds the integer ${v}, which a JavaScript number cannot hold exactly; read it through Hrana (@libsql/client with intMode "bigint") or CAST it to TEXT`);
+  }
+  return Number(v);
+}
+
 export class QueryResult {
   constructor(
     readonly columns: string[],
+    /** 型のある値 (bigint は INTEGER、number は REAL)。Hrana と Worker の中の計算が使う。 */
     readonly values: Value[][],
     readonly changes = 0,
-    readonly lastInsertRowid: number | null = null,
+    readonly lastInsertRowid: bigint | null = null,
     /** 読み取りの T、または autocommit の commit 時刻。 */
     readonly ts?: Ts,
   ) {}
-  /** 列名で引ける行。同名の列は後の列が勝つ。 */
+  /** 列名で引ける行。同名の列は後の列が勝つ。値は D1 と同じ形で、INTEGER は JS の数である (d1Value)。 */
   get rows(): Row[] {
-    return this.values.map((v) => Object.fromEntries(this.columns.map((c, i) => [c, v[i] ?? null])));
+    return this.values.map((v) => Object.fromEntries(this.columns.map((c, i) => [c, d1Value(v[i] ?? null)])));
+  }
+  /** values を D1 と同じ形にしたもの (D1 互換の API の raw)。 */
+  get d1Values(): Value[][] {
+    return this.values.map((r) => r.map(d1Value));
+  }
+  /** D1 の meta.last_row_id と HTTP の JSON。JS の数で返す。 */
+  get lastRowId(): number | null {
+    return this.lastInsertRowid === null ? null : Number(this.lastInsertRowid);
   }
 }
 
@@ -203,6 +229,9 @@ const METADATA_IN_WRITE =
 async function runPlanned(
   stmt: Node, source: string, params: Params, cat: Catalog, ctx: PlanContext, run: (p: Plan) => Promise<QueryResult>, seen?: (p: Plan) => void,
 ): Promise<QueryResult> {
+  // プランナは、値が列に入ったときの値を Worker の SQLite に尋ねる (src/sql/stored.ts)。その SQLite は、sql.js と一緒に、isolate に
+  // 1 度だけ開く。開いた後は待たない (待ちを足すと、並行する文の RPC の順序が変わる)。
+  if (!storedValueReady()) await initStoredValue(sqlJs());
   try {
     const p = await planStatement(stmt, params, cat, ctx);
     seen?.(p);
@@ -337,9 +366,9 @@ class ReadScope {
   }
 
   protected async shardRead(p: Extract<Plan, { kind: "shard" }>, t: Target, maxBytes?: number): Promise<ExecRes> {
-    const tables = await this.db.tablesOf(p.sql, this.cat, p.tables, false);
+    const { tables, columns } = await this.db.shapeOf(p.sql, this.cat, p.tables, false);
     return this.call(t.shard, {
-      sql: p.sql, params: p.params, spans: statementSpans({ tables, sks: t.sks, pk: p.pk, write: false }),
+      sql: p.sql, params: p.params, columns, spans: statementSpans({ tables, sks: t.sks, pk: p.pk, write: false }),
       ...(maxBytes === undefined ? {} : { maxBytes, budgeted: true }),
     });
   }
@@ -397,15 +426,11 @@ class ReadScope {
     if (targets.length === 0) return { columns: [], rows: [], bytes: 0 };
     await this.pickT(targets.map((t) => t.shard));
     // 上限はシャードの側で打ち切らせる。全行が届いてから数えると、数える前に Worker のメモリが尽きる。
-    // 集めた行は Worker の SQLite で計算し直すので、型のない列の INTEGER と REAL を区別して運ぶ (src/value.ts)。
-    const sql = scanSql(s);
+    // シャードは走査を型つきの読みで返すので、集めた行は型のある値である。Worker の SQLite に、そのまま入れ直せる。
     const { parts, bytes } = await this.budgeted(targets, budget, (t, maxBytes) =>
-      this.call(t.shard, { sql, params: s.params, spans: scanSpans(s, t.sks), maxRows: this.db.rowBudget, maxBytes, budgeted: true }),
+      this.call(t.shard, { sql: s.sql, params: s.params, columns: s.columns, spans: scanSpans(s, t.sks), maxRows: this.db.rowBudget, maxBytes, budgeted: true }),
     );
-    const columns = parts[0]!.columns;
-    const rows = parts.flatMap((r) => r.values);
-    if (!s.typed) return { columns, rows, bytes };
-    return { ...typedValues({ columns: s.typed, affinity: {} }, columns, rows), bytes };
+    return { columns: s.columns, rows: parts.flatMap((r) => r.values), bytes };
   }
 
   /** 走査を実行して、行を集める。sql が実際に開く表は本物のプランナに尋ね、走査にない表は全行を読み足す。 */
@@ -459,7 +484,8 @@ class ReadScope {
       case "meta": {
         const w = await this.gather([], p.sql);
         try {
-          const r = w.raw(p.sql, ...p.params);
+          // 結果を返す文は、型ごと正確に読む (ScratchDb.select)。PRAGMA と EXPLAIN は包めないので、素の列で読む。
+          const r = p.pragma ? w.pragma(p.sql, p.params) : w.select(p.sql, p.params);
           return new QueryResult(r.columns, r.values, 0, null, this.T);
         } finally {
           w.close();
@@ -476,20 +502,20 @@ class ReadScope {
       case "gather": {
         const w = await this.gather(p.scans, p.sql);
         try {
-          const r = w.raw(p.sql, ...p.params);
+          const r = w.select(p.sql, p.params);
           return new QueryResult(r.columns, r.values, 0, null, this.T);
         } finally {
           w.close();
         }
       }
       case "partial": {
-        // 部分の集約は、型のない __p の表へ入れて計算し直すので、全部の列の型を運ぶ。
-        const { rows } = await this.scan({ ...p.scan, typed: p.columns });
+        // 部分の集約は、型のない __p の表へ入れて計算し直す。走査は型つきで読むので、整数の値の REAL も REAL のまま入る。
+        const { rows } = await this.scan(p.scan);
         const w = await openScratch({ ddl: [] });
         try {
           w.exec(`CREATE TABLE "__p" (${p.columns.map(q).join(", ")})`);
           w.load("__p", p.columns, rows);
-          const r = w.raw(p.mergeSql, ...p.mergeParams);
+          const r = w.select(p.mergeSql, p.mergeParams);
           return new QueryResult(r.columns, r.values, 0, null, this.T);
         } finally {
           w.close();
@@ -551,7 +577,8 @@ export class Txn extends ReadScope {
   protected override record(shard: string, spans: Span[]): void {
     let prior = this.spans.get(shard) ?? [];
     if (this.db.faults.secondDmlNewSpanSince) {
-      const bare = (s: Span) => JSON.stringify({ ...s, since: undefined });
+      // 条件の範囲の引数には bigint が入るので、JSON は encode で作る。
+      const bare = (s: Span) => encode({ ...s, since: undefined });
       const again = new Set(spans.filter((s) => s.since !== undefined).map(bare));
       prior = prior.filter((p) => p.since === undefined || !again.has(bare(p)));
     }
@@ -749,9 +776,9 @@ export class Txn extends ReadScope {
    */
   protected override async shardRead(p: Extract<Plan, { kind: "shard" }>, t: Target): Promise<ExecRes> {
     if (!this.lockReads || !p.pk || p.tables.length !== 1) return super.shardRead(p, t);
-    const tables = await this.db.tablesOf(p.sql, this.cat, p.tables, false);
+    const { tables, columns } = await this.db.shapeOf(p.sql, this.cat, p.tables, false);
     return this.dml(t.shard, {
-      sql: p.sql, params: p.params, spans: statementSpans({ tables, sks: t.sks, pk: p.pk, write: false }),
+      sql: p.sql, params: p.params, columns, spans: statementSpans({ tables, sks: t.sks, pk: p.pk, write: false }),
       lockRows: [{ table: p.tables[0]!.name, pk: p.pk }],
     });
   }
@@ -813,12 +840,14 @@ export class Txn extends ReadScope {
   private async write(p: Extract<Plan, { kind: "write" }>): Promise<QueryResult> {
     const out: { columns: string[]; values: Value[][] } = { columns: [], values: [] };
     let changes = 0;
+    // 利用者の RETURNING の列名。書き換える前の文を、Worker の SQLite でコンパイルして取る。
+    const columns = p.returning ? (await this.db.compiled(p.returning, this.cat)).columns : [];
     const one = async (t: WriteTarget, target: Target) => {
       // index 経由の UPDATE と DELETE は、文を shard key に絞らずに送る。読みと同じく、span も絞らない。
       // 絞ると、ほかの行の確定済みで適用待ちの更新が決着されず、文がその行を古い値から書き換えてしまう。
       const tables = await this.db.tablesOf(t.sql, this.cat, p.tables ?? [p.def], true);
       const spans = statementSpans({ tables, sks: target.sks, pk: t.pk, write: true, uniqueReads: t.uniqueReads });
-      const res = await this.dml(target.shard, { sql: t.sql, params: t.params, spans, write: t.write });
+      const res = await this.dml(target.shard, { sql: t.sql, params: t.params, columns, spans, write: t.write });
       if (res.columns.length) out.columns = res.columns;
       out.values.push(...res.values);
       changes += res.count ?? res.changes.length;
@@ -868,6 +897,8 @@ export class Txn extends ReadScope {
       return d;
     };
     const loaded = await this.collect(p.scans, p.sql);
+    // 利用者の RETURNING の列名。書き換える前の文を、Worker の SQLite でコンパイルして取る。
+    const columns = p.returning ? (await this.db.compiled(p.returning, this.cat)).columns : [];
     // 集めた行の主キー。同じ行を 2 度入れないために持つ。
     const have = new Set<string>();
     for (const l of loaded) for (const key of keysOf(l)) have.add(key);
@@ -886,10 +917,12 @@ export class Txn extends ReadScope {
         for (const d of p.tables) for (const ddl of captureDdl(catalog(d.name))) w.exec(ddl);
         w.exec(`PRAGMA recursive_triggers = ON`);
         w.exec(`INSERT INTO __cap_on VALUES (1)`);
-        const r = w.raw(p.sql, ...p.params);
+        // 利用者の RETURNING は、項ごとに要素の式に書き換えてある (src/sql/returning.ts)。TEXT は BLOB で届くので、NUL で切れない。
+        const returned = [...w.query(p.sql, p.params).rows].map((row) => row.map(decodeReturned));
         // 変更した行の数は、SQLite の数え方そのままである。REPLACE が消した行は数えない。
         const counted = w.raw(`SELECT changes()`).values[0]?.[0] as number;
-        const last = w.raw(`SELECT last_insert_rowid()`).values[0]?.[0] as number;
+        // 利用者が明示した rowid は 2^53 を超え得るので、型ごと読む。
+        const last = w.select(`SELECT last_insert_rowid()`, []).values[0]?.[0] as bigint;
         const changes = capturedChanges(w, catalog);
         const more = await this.conflicting(changes, catalog, have, asked);
         if (more.length > 0) {
@@ -902,11 +935,11 @@ export class Txn extends ReadScope {
           const def = catalog(c.table);
           const idColumn = def.rowidAlias ?? (def.implicitRowid ? "rowid" : null);
           const id = idColumn !== null && c.after ? imageAt(def, c.after, idColumn) : undefined;
-          if (typeof id === "number") this.db.planContext(this.cat).sawId(def.name, id);
+          if (typeof id === "bigint") this.db.planContext(this.cat).sawId(def.name, id);
         }
         // 同じ値の行は全部ここにあり、SQLite が一意性を確かめ終えている。index の項目は、確かめ直さずに書く。
         await this.indexChanges(changes, "trusted");
-        return new QueryResult(r.columns, r.values, counted, p.lastRowid ?? (last || null));
+        return new QueryResult(columns, returned, counted, p.lastRowid ?? (last === 0n ? null : last));
       } finally {
         w.close();
       }
@@ -955,7 +988,7 @@ export class Txn extends ReadScope {
         const sk = keyString([k]);
         // 並べて出さない。取引の最初の読みが 2 つ並ぶと、読む時点が 2 つでき、片方は検証の窓から漏れる。
         const hit = await this.call(ownerOf(this.cat.routing, sk), {
-          sql: `SELECT "pk", "sk" FROM ${q(ix.table)} WHERE "k" = ?`, params: [k],
+          sql: `SELECT "pk", "sk" FROM ${q(ix.table)} WHERE "k" = ?`, params: [k], columns: ["pk", "sk"],
           spans: [rowSpan(ix.table, keyString([k]), sk)],
         });
         for (const [pk, at] of hit.values) {
@@ -973,12 +1006,12 @@ export class Txn extends ReadScope {
         // 問いの数だけ OR でつなぐと、式の木が問いの数だけ深くなる (DO の SQLite の上限は 100)。釣り合った木に組む。
         const where = joinTerms(conds.map((x) => x.sql), "OR");
         const params = conds.flatMap((x) => x.params);
-        return { table: g.def, sql: `SELECT ${scanList(g.def)} FROM ${q(g.def.name)} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, typed: untypedOf(g.def) };
+        return { table: g.def, sql: `SELECT ${scanList(g.def)} FROM ${q(g.def.name)} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, columns: scanColumns(g.def) };
       };
       for (const c of g.conds) {
         const next = [...batch, c];
         const s = scanOf(next);
-        if (batch.length > 0 && !withinShardLimits(scanSql(s), s.params)) {
+        if (batch.length > 0 && !scanFits(s)) {
           batches.push({ def: g.def, sk: g.sk, conds: batch });
           batch = [c];
         } else batch = next;
@@ -988,7 +1021,7 @@ export class Txn extends ReadScope {
     for (const g of batches) {
       const where = joinTerms(g.conds.map((x) => x.sql), "OR");
       const params = g.conds.flatMap((x) => x.params);
-      const scan: Scan = { table: g.def, sql: `SELECT ${scanList(g.def)} FROM ${q(g.def.name)} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, typed: untypedOf(g.def) };
+      const scan: Scan = { table: g.def, sql: `SELECT ${scanList(g.def)} FROM ${q(g.def.name)} WHERE ${where}`, params, sks: [g.sk], where: { alias: g.def.name, sql: where, params }, columns: scanColumns(g.def) };
       const { columns, rows } = await this.scan(scan);
       const found: Loaded = { table: g.def, columns, rows: [] };
       keysOf({ table: g.def, columns, rows }).forEach((key, i) => {
@@ -1002,25 +1035,12 @@ export class Txn extends ReadScope {
   }
 
   private async insertSelect(p: Extract<Plan, { kind: "insertSelect" }>): Promise<QueryResult> {
-    let src = await this.read(p.select);
+    // 読みは型つきなので、読んだ値は型のある値である。INTEGER と REAL を取り違えずに、そのまま引数として束縛し直せる。
+    const src = await this.read(p.select);
     if (src.values.length === 0) return new QueryResult([], []);
-    // 読んだ結果では、整数の値の REAL (5.0) が整数の 5 になる (DO の SQLite は読み出しで区別しない。src/value.ts)。INTEGER と
-    // REAL と NUMERIC の列は、入るときに SQLite が型を揃えるので変わらないが、TEXT の列は "5" と "5.0"、型のない列は格納の型が違う。
-    // そこに入る整数があれば、同じ取引の時点で、typeof を一緒に読み直す (2026-11-13 の Codex の指摘 C6、test/typed-diff.test.ts)。
-    const into = p.columns ?? p.def.columns;
-    const loose = into.map((c) => ["TEXT", "BLOB"].includes(p.def.affinity[c] ?? "BLOB"));
-    if (src.values.some((row) => row.some((v, i) => loose[i] !== false && typeof v === "number" && Number.isInteger(v)))) {
-      const n = src.columns.length;
-      const names = Array.from({ length: n }, (_v, i) => q(`__dinf_c${i}`));
-      const typed = await this.query(
-        `WITH ${q("__dinf_s")}(${names.join(", ")}) AS (${p.selectSql}) SELECT ${names.map((c) => `${c}, typeof(${c})`).join(", ")} FROM ${q("__dinf_s")}`,
-        p.selectParams,
-      );
-      src = new QueryResult(src.columns, typed.values.map((row) => Array.from({ length: n }, (_v, i) => fromTyped(row[2 * i] ?? null, row[2 * i + 1], p.def.name))));
-    }
     const cols = p.columns ? `(${p.columns.map(q).join(", ")}) ` : "";
     let changes = 0;
-    let last: number | null = null;
+    let last: bigint | null = null;
     // DO の bound parameter の上限 (100) に収まる行数ずつ流す。
     const width = Math.max(1, src.columns.length);
     const per = Math.max(1, Math.floor((100 - p.tailParams.length) / width));
@@ -1101,7 +1121,7 @@ export class Txn extends ReadScope {
   async assertUnique(def: TableDef, ix: GlobalIndexDef, k: string, pk: string, resolve = false): Promise<void> {
     const sk = keyString([k]);
     const res = await this.call(ownerOf(this.cat.routing, sk), {
-      sql: `SELECT "pk" FROM ${q(ix.table)} WHERE "k" = ?`, params: [k],
+      sql: `SELECT "pk" FROM ${q(ix.table)} WHERE "k" = ?`, params: [k], columns: ["pk"],
       spans: [rowSpan(ix.table, keyString([k]), sk)],
     });
     if (res.values.some((r) => r[0] !== pk)) {
@@ -1290,7 +1310,19 @@ export class Db {
    * 結果は文の文面と表定義の版ごとに覚えておく。同じ文の 2 回目からは、Worker の SQLite を開かない。
    */
   async tablesOf(sql: string, cat: Catalog, known: TableDef[], write: boolean): Promise<TableDef[]> {
+    return this.checkTables(await this.compiled(sql, cat), known, write);
+  }
+
+  /**
+   * tablesOf と同じ確かめをして、文が読む表と、結果の列名 (シャードへ送る読みの ExecReq.columns) を返す。待つのは compiled の 1 回で、
+   * tablesOf と同じである (待ちの数が変わると、並行する文の RPC の順序が変わる)。
+   */
+  async shapeOf(sql: string, cat: Catalog, known: TableDef[], write: boolean): Promise<{ tables: TableDef[]; columns: string[] }> {
     const seen = await this.compiled(sql, cat);
+    return { tables: this.checkTables(seen, known, write), columns: seen.columns };
+  }
+
+  private checkTables(seen: Compiled, known: TableDef[], write: boolean): TableDef[] {
     // 表定義を読む文は、シャードへ送らない。シャードで実行すると、内部の表 (`__txn` など) について答えてしまう。
     // 読みは、基準経路で実行すれば、利用者の表しかない Worker の SQLite が答える。
     // 書き込みは断る。書き込みの基準経路は、変更を捕捉するための表を Worker の SQLite に作るので、そこでも利用者の表定義だけにはならない。
@@ -1311,14 +1343,17 @@ export class Db {
     return {
       reference: this.reference,
       nextId: (table, n) => this.nextId(table, n),
-      sawId: (table, id) => {
+      sawId: (table, big) => {
+        // 採番は 2^53 未満の範囲で続ける (docs/design-values.md の持ち主の判断の 4)。それより大きい ID は、採番した ID と重ならない。
+        if (big > MAX_SAFE || big < -MAX_SAFE) return;
+        const id = Number(big);
         const b = this.ids.get(table);
         if (!b || id >= b.next) this.pendingSeen.set(table, Math.max(this.pendingSeen.get(table) ?? 0, id));
       },
       evaluate: async (sql, params) => {
         const w = await openScratch(cat);
         try {
-          return w.raw(sql, ...params).values[0] ?? null;
+          return w.select(sql, params).values[0] ?? null;
         } finally {
           w.close();
         }
@@ -1328,8 +1363,8 @@ export class Db {
 
   private pendingSeen = new Map<string, number>();
 
-  /** rowid をブロック単位で採番する。Meta への問い合わせはブロックごとの 1 回で済む。 */
-  private async nextId(table: string, n: number): Promise<number> {
+  /** rowid をブロック単位で採番する。Meta への問い合わせはブロックごとの 1 回で済む。番号は INTEGER (bigint) で返す。 */
+  private async nextId(table: string, n: number): Promise<bigint> {
     const seen = this.pendingSeen.get(table);
     this.pendingSeen.delete(table);
     let b = this.ids.get(table);
@@ -1342,7 +1377,7 @@ export class Db {
     }
     const first = b.next;
     b.next += n;
-    return first;
+    return BigInt(first);
   }
 
   /**
@@ -1359,7 +1394,9 @@ export class Db {
     // 確かめを落とすと、表は CREATE TABLE を通り、後でシャードが trigger を作れないか、1 行も書けない
     // (test/wide-table-expression-depth.test.ts)。
     for (const def of parsed.defs ?? []) {
-      const statements = [{ sql: scanSql(fullScan(def)), params: [] as Value[] }, ...imageStatements(def)];
+      // 全表の走査は、シャードが実行する形 (型つきの読みに包んだ文) で測る。
+      const scan = fullScan(def);
+      const statements = [{ sql: typedReadSql(scan.sql, scan.columns.length), params: [] as Value[] }, ...imageStatements(def)];
       const over = statements.map((s) => builtLimitOf(s.sql, s.params)).find((x) => x !== null);
       if (over) {
         throw new SqlError(`unsupported: the table ${def.name} is too wide for a shard to scan and capture its rows within Durable Object SQLite limits (${over}); use fewer or shorter column names`);
@@ -1374,22 +1411,6 @@ export class Db {
         w.exec(user);
       } catch (e) {
         throw new SqlError((e as Error)?.message ?? String(e));
-      }
-      // 列の DEFAULT は、ADD COLUMN では既存の行へ行イメージを作らずに入る。2^53 を超える整数の DEFAULT は、行イメージの確かめ
-      // (src/shard/rows.ts) を通らないので、ここで値を計算して断る (計画書の K1、2026-11-13 の Codex の 2 回目の見直し、指摘 5)。
-      // 値は、同じ宣言の型の列に SQLite 自身に入れさせてから読む。型の親和性で、文字列の既定値 ('9007199254740993') も整数になる
-      // (Codex の 3 回目の確かめ)。
-      for (const def of parsed.defs ?? []) {
-        for (const col of w.raw(`SELECT name, type, dflt_value FROM pragma_table_info(?) WHERE dflt_value IS NOT NULL`, def.name).values) {
-          w.exec(`CREATE TEMP TABLE "__dinf_default"(v ${(col[1] as string) || ""})`);
-          try {
-            w.exec(`INSERT INTO "__dinf_default" VALUES (${col[2] as string})`);
-            const row = w.raw(`SELECT typeof(v), v FROM "__dinf_default"`).values[0];
-            fromTyped(row?.[1] ?? null, row?.[0], `the DEFAULT of ${def.name}.${col[0] as string}`);
-          } finally {
-            w.exec(`DROP TABLE "__dinf_default"`);
-          }
-        }
       }
     } finally {
       w.close();
@@ -1611,7 +1632,7 @@ export class Db {
     const list = cols.map(q).join(", ");
     for (const shard of shardsOf(cat.routing)) {
       const res = await this.shardOf(shard).exec({
-        sql: `SELECT 1 x FROM ${q(def.name)} GROUP BY ${list} HAVING count(*) > 1 LIMIT 1`,
+        sql: `SELECT 1 x FROM ${q(def.name)} GROUP BY ${list} HAVING count(*) > 1 LIMIT 1`, columns: ["x"],
         params: [], spans: withClaims(cat.routing, shard, [tableSpan(def.name)]), schema: cat.version,
       });
       if (res.error !== undefined) throw new SqlError(res.error);
@@ -1725,7 +1746,8 @@ export class Db {
     def: TableDef, ix: GlobalIndexDef, shard: string, cat: Catalog, entries: Map<string, { pk: string; sk: string }>,
   ): Promise<Ts> {
     // 要るのは、行の同一性 (主キーと shard key) と、index の列だけである。
-    const cols = [...new Set([...def.pk, ...def.shardKey, ...ix.columns])].map(q).join(", ");
+    const names = [...new Set([...def.pk, ...def.shardKey, ...ix.columns])];
+    const cols = names.map(q).join(", ");
     const pkCols = def.pk.map(q).join(", ");
     let after: Value[] | null = null;
     let at: Ts = 0;
@@ -1734,12 +1756,13 @@ export class Db {
     for (;;) {
       const res = await this.shardOf(shard).exec({
         sql: `SELECT ${cols} FROM ${q(def.name)} ${after ? `WHERE (${pkCols}) > (${def.pk.map(() => "?").join(", ")})` : ""} ORDER BY ${pkCols} LIMIT ${BUILD_PAGE}`,
-        params: after ?? [], spans: withClaims(cat.routing, shard, [tableSpan(def.name)]), schema,
+        columns: names, params: after ?? [], spans: withClaims(cat.routing, shard, [tableSpan(def.name)]), schema,
       });
       if (res.error !== undefined) throw new SqlError(res.error);
       // 欠陥のスイッチ scanSkipsEmpty: 行のないシャードは、読まなかったのと同じく、その時計を公開の時刻に入れない。
       if (!(this.faults.scanSkipsEmpty && after === null && res.values.length === 0)) at = Math.max(at, res.T, res.hlc);
-      const rows = new QueryResult(res.columns, res.values).rows;
+      // 行は型のある値のまま使う (D1 と同じ形の rows は、2^53 を超える INTEGER を誤りにする)。
+      const rows = res.values.map((v): Row => Object.fromEntries(names.map((c, i) => [c, v[i] ?? null])));
       for (const row of rows) {
         const vals = ix.columns.map((col) => row[col] ?? null);
         if (vals.some((v) => v === null)) continue; // NULL のある値は、どの行とも衝突しない
@@ -1772,7 +1795,7 @@ export class Db {
         const ks = batch.map((e) => e.k);
         // 値の一覧は 1 つの引数で渡す。1 つずつ渡すと、文に付けられる引数の数の上限 (100) に当たる。
         const found = await tx.call(owner, {
-          sql: `SELECT "k", "pk" FROM ${q(ix.table)} WHERE "k" IN (SELECT value FROM json_each(?))`,
+          sql: `SELECT "k", "pk" FROM ${q(ix.table)} WHERE "k" IN (SELECT value FROM json_each(?))`, columns: ["k", "pk"],
           params: [JSON.stringify(ks)],
           spans: ks.map((k) => rowSpan(ix.table, keyString([k]), keyString([k]))),
         });
@@ -2147,8 +2170,10 @@ export class Db {
     // サブクエリが読む表も span に入れる。入れないと、その表の確定済みで適用待ちの書き込みを待たずに実行してしまう。
     const tables = p.tables ?? [p.def];
     const spans = statementSpans({ tables: await this.tablesOf(t.sql, cat, p.tables ?? [p.def], true), sks: [sk], pk: t.pk, write: true, uniqueReads: t.uniqueReads });
+    // 利用者の RETURNING の列名。書き換える前の文を、Worker の SQLite でコンパイルして取る。
+    const columns = p.returning ? (await this.compiled(p.returning, cat)).columns : [];
     const res = await this.shardOf(ownerOf(cat.routing, sk)).execAuto({
-      sql: t.sql, params: t.params, spans, write: t.write, schema: cat.version, minTs: this.token,
+      sql: t.sql, params: t.params, columns, spans, write: t.write, schema: cat.version, minTs: this.token,
     }).catch(rerouted);
     this.observe(res.hlc);
     return new QueryResult(res.columns, res.values, res.count ?? res.changes.length, p.lastRowid, res.T);

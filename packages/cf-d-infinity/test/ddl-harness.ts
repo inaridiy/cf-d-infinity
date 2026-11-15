@@ -2,7 +2,7 @@
 // スケジュールは実時間のタイマーに依存するので、seed は作業負荷と遅延の列を固定するだけである。
 // 同じ seed でも割り込みの順序は完全には再現しない。失敗した seed は台本の再現テストへ落とす。
 import { writeFileSync } from "node:fs";
-import { SimCluster, logRows, type Rpc } from "./sim";
+import { asNumbers, SimCluster, logRows, type Rpc } from "./sim";
 import { checkHistory, type Read, type TxRecord, type Violation } from "./history";
 import { Db, type Txn } from "../src/client/db";
 import { split } from "../src/autoscaler";
@@ -139,8 +139,9 @@ export async function indexAgreement(c: SimCluster, table = "acct", name = INDEX
     const values = [...new Set(base.map(({ row }) => row[col] ?? null))].filter((x) => x !== null);
     for (const value of values) {
       const want = base.filter(({ row }) => row[col] === value).map(({ row }) => encode(def.pk.map((k) => row[k] ?? null))).sort();
-      const got = (await db.query(`SELECT ${def.pk.map((k) => `"${k}"`).join(", ")} FROM "${table}" WHERE "${col}" = ?`, [value]))
-        .values.map((r) => encode(r)).sort();
+      // 表を直接読んだ行は、内部の入口で読むので、INTEGER も JS の数である。index で引いた結果も数にして比べる。
+      const got = asNumbers((await db.query(`SELECT ${def.pk.map((k) => `"${k}"`).join(", ")} FROM "${table}" WHERE "${col}" = ?`, [value])).values)
+        .map((r) => encode(r)).sort();
       if (encode(want) !== encode(got)) out.wrongRead.push(`${col}=${encode(value)}: index read ${encode(got)}, table has ${encode(want)}`);
     }
   }
@@ -806,7 +807,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
 
   // 失敗した seed を調べるための書き出し。SIM_DUMP=<ファイル> で、取引の記録と RPC の記録を JSON で残す。
   if (process.env.SIM_DUMP) {
-    const plain = (_k: string, x: unknown) => (x instanceof Map ? [...x] : x instanceof Uint8Array ? [...x] : x);
+    const plain = (_k: string, x: unknown) => (x instanceof Map ? [...x] : x instanceof Uint8Array ? [...x] : typeof x === "bigint" ? `${x}n` : x);
     writeFileSync(process.env.SIM_DUMP, JSON.stringify({ seed, history, snapshots, rpc: c.net.log }, plain));
   }
   return {

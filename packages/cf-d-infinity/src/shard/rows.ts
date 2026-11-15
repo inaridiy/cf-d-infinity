@@ -2,15 +2,13 @@
 //
 // 行は、表定義の列の順に並べた要素のタプル (src/value.ts) で運ぶ。PRIMARY KEY のない表は、先頭に rowid を置く。
 // 変更 (Change)、intent、変更ログ、移動のペイロード、取引が溜める変更が、この形で行を運ぶ。タプルは SQL の中で作り (tupleSql)、
-// JS では値に戻すだけである。値に戻すのは、どれも valuesOf か imageAt を通す (2^53 以上の INTEGER を断るのも、そこである)。
-// 書き戻すときは、値を束縛する。SQL の中で要素を値に戻すことはしない。REAL の文字列を SQLite の CAST に読ませると、版ごとの
-// 解釈の違いが入るからである。
-import type { Backend, Change, Row, TableDef, Value } from "../types";
+// JS では値に戻すだけである。値に戻すのは、どれも valuesOf か imageAt を通す。
+// 書き戻すときは、値を束縛する (Backend.query)。SQL の中で要素を値に戻すことはしない。REAL の文字列を SQLite の CAST に読ませると、
+// 版ごとの解釈の違いが入るからである。
+import type { Backend, Change, Plain, Row, TableDef, Value } from "../types";
 import { SqlError } from "../types";
-import { keyParams, keyString } from "../keys";
-import {
-  decodeElem, encodeElem, fromTypedValue, isReal, parseTuple, realOf, tupleSql, typedOf, wideIntegerError, type Elem, type Tuple, type TypedValue,
-} from "../value";
+import { keyString, keyValues } from "../keys";
+import { decodeElem, encodeElem, parseTuple, tupleSql, type Elem, type Tuple } from "../value";
 
 export const q = (id: string) => `"${id.replaceAll('"', '""')}"`;
 
@@ -18,18 +16,22 @@ const hex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")
 const unhex = (s: string) => Uint8Array.from(s.match(/../g) ?? [], (h) => parseInt(h, 16));
 
 /**
- * 値を JSON にする (変更の並び、intent、baton)。BLOB と、JSON で表せない数 (無限大) は印を付ける。整数の値の REAL (src/value.ts) は
- * `{"real": 5}` のまま入る。行イメージはタプル (文字列と null の配列) なので、印には当たらない。
+ * 値を JSON にする (変更の並び、intent、baton、2PC の ID の指紋、範囲の検査)。JSON で表せない値は印を付ける。INTEGER (bigint) は
+ * `{"$i":"数字"}`、BLOB は `{"$b":"16 進"}`、無限大は `{"$f":"Infinity"}` である。行イメージはタプル (文字列と null の配列) なので、
+ * 印には当たらない。JSON の数は、ここではいつも REAL である。
  */
 export const encode = (v: unknown): string =>
   JSON.stringify(v, (_k, x) =>
-    x instanceof Uint8Array ? { $b: hex(x) } : typeof x === "number" && !Number.isFinite(x) ? { $f: String(x) } : x);
+    typeof x === "bigint" ? { $i: String(x) }
+      : x instanceof Uint8Array ? { $b: hex(x) }
+        : typeof x === "number" && !Number.isFinite(x) ? { $f: String(x) } : x);
 
 export const decode = <T>(s: string): T =>
   JSON.parse(s, (_k, x) =>
-    x && typeof x === "object" && typeof x.$b === "string" ? unhex(x.$b)
-      : x && typeof x === "object" && typeof x.$f === "string" ? Number(x.$f)
-        : x) as T;
+    x && typeof x === "object" && typeof x.$i === "string" ? BigInt(x.$i)
+      : x && typeof x === "object" && typeof x.$b === "string" ? unhex(x.$b)
+        : x && typeof x === "object" && typeof x.$f === "string" ? Number(x.$f)
+          : x) as T;
 
 /**
  * 項を op でつなぐ。2 項の演算子で n 個の項をつなぐと、式の木の深さが n になる。DO の SQLite は深さを 100 までに制限しているので
@@ -45,8 +47,8 @@ export function joinTerms(terms: string[], op: "AND" | "OR"): string {
 /** 主キーの列が、束縛した値と等しい条件。prefix は列の修飾である (`"t".`)。 */
 export const keyWhere = (cols: string[], prefix = "") => joinTerms(cols.map((c) => `${prefix}${q(c)} IS ?`), "AND");
 const pkWhere = (def: TableDef) => keyWhere(def.pk);
-/** 主キーのキー文字列を、束縛する値に戻す (src/keys.ts の keyParams)。 */
-export const pkValues = (pkJson: string): Value[] => keyParams(pkJson);
+/** 主キーのキー文字列を、束縛する値に戻す (src/keys.ts の keyValues)。 */
+export const pkValues = (pkJson: string): Value[] => keyValues(pkJson);
 
 /** PRIMARY KEY のない表は rowid も行イメージに含める。行の所在を決める値だからである。 */
 export const selectList = (def: TableDef) => (def.implicitRowid ? "rowid, *" : "*");
@@ -56,42 +58,6 @@ export const selectList = (def: TableDef) => (def.implicitRowid ? "rowid, *" : "
  * 増えた列も返し、シャードによって行の形が違って混ざる (ADD COLUMN の途中。計画書の未解決の問題 11)。
  */
 export const scanList = (def: TableDef) => [...(def.implicitRowid ? ["rowid"] : []), ...def.columns.map(q)].join(", ");
-
-/**
- * 型のない列 (BLOB の親和性)。INTEGER の 5 と REAL の 5.0 を両方持てるが、DO の SQLite は読み出しで区別しない (src/value.ts)。
- * ほかの列は、入れ直すときに列の型の親和性が同じ型に戻す。
- */
-const untypedColumns = (def: Pick<TableDef, "columns" | "affinity">) => def.columns.filter((c) => (def.affinity[c] ?? "BLOB") === "BLOB");
-const typeTag = (i: number) => `__dinf_typeof_${i}`;
-
-/**
- * 型のない列の型を一緒に読む走査の列の並び。scanList に、型のない列ごとの typeof の列を足す (typedValues が外す)。
- * 行を集める走査 (src/sql/plan.ts の scanSql) と同じ形で、値の作り直しの段 3 で、型つきの読みに替わる。
- */
-export const typedScanList = (def: TableDef) =>
-  [scanList(def), ...untypedColumns(def).map((c, i) => `typeof(${q(c)}) AS ${q(typeTag(i))}`)].join(", ");
-
-/** 列名と値の配列で読んだ行から、型を読んだ列を除き、型のない列の整数の値の REAL に印を付ける。 */
-export function typedValues(def: Pick<TableDef, "columns" | "affinity">, columns: string[], rows: Value[][]): { columns: string[]; rows: Value[][] } {
-  const cols = untypedColumns(def);
-  if (cols.length === 0) return { columns, rows };
-  const tagAt = cols.map((_c, i) => columns.indexOf(typeTag(i)));
-  const valAt = cols.map((c) => columns.indexOf(c));
-  if (tagAt.some((i) => i < 0)) return { columns, rows };
-  const keep = columns.map((_c, i) => !tagAt.includes(i));
-  return {
-    columns: columns.filter((_c, i) => keep[i]),
-    rows: rows.map((r) => {
-      const v = [...r];
-      tagAt.forEach((t, k) => {
-        const at = valAt[k]!;
-        const x = v[at];
-        if (at >= 0 && r[t] === "real" && typeof x === "number" && Number.isInteger(x)) v[at] = realOf(x);
-      });
-      return v.filter((_x, i) => keep[i]);
-    }),
-  };
-}
 
 // ---- タプル ----
 
@@ -115,6 +81,14 @@ export const imageSql = (def: Pick<TableDef, "columns" | "implicitRowid">, prefi
 export const imageChecks: { report?: (problem: string) => void } = {};
 
 /**
+ * 試験用の切り替え。欠陥を戻して、検査がそれを見つけることを確かめるのに使う。本番のコードは触らない。
+ * roundedImages: 行イメージのタプルの INTEGER を、bigint ではなく JS の数 (Number) で値に戻す。2^53 を超える INTEGER は、隣の値に
+ * 丸まって書き戻される (確定した取引の適用、移動で運んだ行、過去の時点への巻き戻し)。段 2 まで、DO の SQLite が INTEGER を丸めて
+ * 返していたのと同じ形の欠陥である。
+ */
+export const imageFaults = { roundedImages: false };
+
+/**
  * タプルが表定義のどの列の値かを決める。タプルが短ければ、先頭の列のイメージとして扱う (ADD COLUMN は列を末尾にだけ足すので、
  * 列名つきのイメージを新しい表に入れていたときと同じ結果になる。確定した取引の適用を止めない)。長ければ誤りにする。
  */
@@ -127,13 +101,16 @@ function columnsOf(def: TableDef, t: Tuple, strict = true): string[] {
   return cols.slice(0, t.length);
 }
 
-/** 要素を今の Value に戻す。2^53 以上の INTEGER は、ここで K1 と同じ誤りになる (src/value.ts の fromTypedValue)。 */
-const valueAt = (def: Pick<TableDef, "name">, e: Elem | undefined): Value => fromTypedValue(decodeElem(e ?? null), def.name);
+/** 要素を値に戻す。 */
+function valueAt(e: Elem | undefined): Value {
+  const v = decodeElem(e ?? null);
+  return imageFaults.roundedImages && typeof v === "bigint" ? Number(v) : v;
+}
 
 /** タプルを、表定義の列の順の値に戻す。 */
 export function valuesOf(def: TableDef, t: Tuple): { columns: string[]; values: Value[] } {
   const columns = columnsOf(def, t);
-  return { columns, values: columns.map((_c, i) => valueAt(def, t[i])) };
+  return { columns, values: columns.map((_c, i) => valueAt(t[i])) };
 }
 
 /** タプルの、名前で指した列の値。タプルが短くて値がなければ null。 */
@@ -141,25 +118,28 @@ export function imageAt(def: TableDef, t: Tuple, column: string): Value {
   const i = imageColumns(def).indexOf(column);
   if (i < 0) throw new SqlError(`no such column in a row image of ${def.name}: ${column}`);
   columnsOf(def, t);
-  return i < t.length ? valueAt(def, t[i]) : null;
+  return i < t.length ? valueAt(t[i]) : null;
 }
 
 /**
- * 列名から値への行にする。型のない列の整数の値の REAL だけに印を付ける (段 1 までの行イメージと同じ形。分析へ出す行に使う。段 4 で
- * 作り直す)。変更ログの古い行を、いまの表定義で読むので、長さの違いは食い違いとして報告しない。ADD COLUMN の前の行は短い。
+ * 列名から値への行にする (分析へ出す行。src/analytics.ts)。出す先は JSON なので、段 1 までの行イメージと同じ形にする。INTEGER は
+ * JS の数で、型のない列の整数の値の REAL だけに `{ real }` の印を付ける。JS の数で正確に表せない INTEGER は `{ $int: "数字" }` に
+ * する。分析の出口は段 4 で作り直す (docs/design-values.md の「段」)。
+ * 変更ログの古い行を、いまの表定義で読むので、長さの違いは食い違いとして報告しない。ADD COLUMN の前の行は短い。
  */
-export function rowOf(def: TableDef, t: Tuple): Row {
+export function rowOf(def: TableDef, t: Tuple): Record<string, unknown> {
   const columns = columnsOf(def, t, false);
-  const untyped = new Set(untypedColumns(def));
   return Object.fromEntries(columns.map((c, i) => {
-    const v = valueAt(def, t[i]);
-    return [c, isReal(v) && !untyped.has(c) ? v.real : v];
+    const v = valueAt(t[i]);
+    const untyped = (def.affinity[c] ?? "BLOB") === "BLOB";
+    if (typeof v === "bigint") return [c, Number.isSafeInteger(Number(v)) ? Number(v) : { $int: String(v) }];
+    return [c, typeof v === "number" && untyped && Number.isInteger(v) ? { real: v } : v];
   }));
 }
 
 /** 列名から値への行を、タプルにする。JS で作るのは、index の表の項目 (`__gidx_*`) だけである。 */
 export function tupleOfRow(def: TableDef, row: Row): Tuple {
-  return imageColumns(def).map((c) => encodeElem(typedOf(row[c] ?? null)));
+  return imageColumns(def).map((c) => encodeElem(row[c] ?? null));
 }
 
 /**
@@ -201,18 +181,11 @@ export function assertKeyed(def: TableDef, t: Tuple): void {
   }
 }
 
-/**
- * 捕捉したタプルに、2^53 以上の INTEGER がないことを確かめる (計画書の K1)。今の Value は JS の数なので、その値を正確に運べない。
- * 捕捉はどの書き込みの経路も通るので、ここで断れば、置き場所に依らず同じように断れる。断るのは値で決まる。
- * 値に戻すとき (valueAt) にも同じ誤りにするが、確定した取引を適用するときに初めて断ると、その取引は適用できないまま残る。
- */
-function assertExact(table: string, t: Tuple | null): void {
-  if (!t) return;
-  for (const e of t) if (e !== null && e.length > 16 && e[0] === "i" && !Number.isSafeInteger(Number(e.slice(1)))) throw wideIntegerError(table);
-}
-
 /** タプルの SQL の結果を読む。結果は 1 列の JSON の文字列である。 */
-const tupleIn = (v: Value): Tuple => parseTuple(v as string);
+const tupleIn = (v: Plain | undefined): Tuple => parseTuple(v as string);
+
+/** 利用者の表に触る文の結果を、全部の行で読む。 */
+export const queryAll = (b: Backend, sql: string, params: readonly Value[], label?: string): Plain[][] => [...b.query(sql, params, label).rows];
 
 const selectGroupSql = (def: TableDef) => `SELECT ${imageSql(def)} FROM ${q(def.name)} WHERE ${keyWhere(def.shardKey)}`;
 const selectRowSql = (def: TableDef) => `SELECT ${imageSql(def)} FROM ${q(def.name)} WHERE ${pkWhere(def)}`;
@@ -224,7 +197,7 @@ const insertRowSql = (def: TableDef, columns: string[]) =>
  * 上限に収まることを確かめる (Db.assertReplays)。収まらない表は、行を捕捉できないか、移動で運べない。
  */
 export function imageStatements(def: TableDef): { sql: string; params: Value[] }[] {
-  const zeros = (n: number) => Array.from({ length: n }, () => 0);
+  const zeros = (n: number) => Array.from({ length: n }, () => 0n);
   return [
     ...captureDdl(def).map((sql) => ({ sql, params: [] })),
     { sql: selectRowSql(def), params: zeros(def.pk.length) },
@@ -235,34 +208,34 @@ export function imageStatements(def: TableDef): { sql: string; params: Value[] }
 
 /** shard key が g のグループの行を全部読む。 */
 export function selectGroup(b: Backend, def: TableDef, g: string): Tuple[] {
-  const vals = keyParams(g);
+  const vals = keyValues(g);
   if (vals.length !== def.shardKey.length) return [];
-  return b.raw(selectGroupSql(def), ...vals).values.map((r) => tupleIn(r[0]!));
+  return queryAll(b, selectGroupSql(def), vals).map((r) => tupleIn(r[0]));
 }
 
 export function selectRow(b: Backend, def: TableDef, pk: string): Tuple | null {
-  const r = b.raw(selectRowSql(def), ...pkValues(pk)).values[0];
-  return r ? tupleIn(r[0]!) : null;
+  const r = queryAll(b, selectRowSql(def), pkValues(pk))[0];
+  return r ? tupleIn(r[0]) : null;
 }
 
 /** 行を入れる。束縛する値は列ごとに 1 つで、表を作るときに DO の上限 (100) に収まることを確かめている (imageStatements)。 */
 export function insertRow(b: Backend, def: TableDef, t: Tuple): void {
   const { columns, values } = valuesOf(def, t);
-  b.exec(insertRowSql(def, columns), ...values);
+  queryAll(b, insertRowSql(def, columns), values);
 }
 
 export function deleteRow(b: Backend, def: TableDef, pk: string): void {
-  b.exec(`DELETE FROM ${q(def.name)} WHERE ${pkWhere(def)}`, ...pkValues(pk));
+  queryAll(b, `DELETE FROM ${q(def.name)} WHERE ${pkWhere(def)}`, pkValues(pk));
 }
 
 function updateRow(b: Backend, def: TableDef, pk: string, t: Tuple): void {
   const { columns, values } = valuesOf(def, t);
   const set = columns.map((c, i) => [c, values[i]!] as const).filter(([c]) => !def.pk.includes(c));
   if (set.length === 0) return;
-  b.exec(
+  queryAll(
+    b,
     `UPDATE ${q(def.name)} SET ${set.map(([c]) => `${ref("", c)} = ?`).join(", ")} WHERE ${pkWhere(def)}`,
-    ...set.map(([, v]) => v),
-    ...pkValues(pk),
+    [...set.map(([, v]) => v), ...pkValues(pk)],
   );
 }
 
@@ -297,8 +270,8 @@ export function rowwiseRestore(
 
 /** 2 つの要素が同じ値か。要素を文字で比べない。SQL が作った REAL と JS が作った REAL は、同じ値でも文字が違うことがある。 */
 function sameValue(a: Elem | undefined, b: Elem | undefined): boolean {
-  const x: TypedValue = decodeElem(a ?? null);
-  const y: TypedValue = decodeElem(b ?? null);
+  const x: Value = decodeElem(a ?? null);
+  const y: Value = decodeElem(b ?? null);
   if (x instanceof Uint8Array || y instanceof Uint8Array) {
     return x instanceof Uint8Array && y instanceof Uint8Array && x.length === y.length && x.every((v, i) => v === y[i]);
   }
@@ -384,10 +357,8 @@ export function capturedChanges(b: Backend, catalog: (t: string) => TableDef): C
   for (const r of b.raw(`SELECT tbl, old, new FROM __cap ORDER BY seq`).values) {
     const table = r[0] as string;
     const def = catalog(table);
-    const old = r[1] === null ? null : tupleIn(r[1]!);
-    const fresh = r[2] === null ? null : tupleIn(r[2]!);
-    assertExact(table, old);
-    assertExact(table, fresh);
+    const old = r[1] === null ? null : tupleIn(r[1]);
+    const fresh = r[2] === null ? null : tupleIn(r[2]);
     if (old) {
       const at = `${table}\0${tupleKey(def, old).pk}`;
       const e = net.get(at);
@@ -423,13 +394,10 @@ export function checkAfter(b: Backend, def: TableDef, pk: string, after: Tuple |
   }
 }
 
-/** RETURNING で読んだ行を、捕捉と同じく確かめる (2^53 以上の INTEGER と、主キーの NULL)。 */
-export function returnedRows(def: TableDef, values: Value[][], keyed: boolean): Tuple[] {
-  const rows = values.map((r) => tupleIn(r[0]!));
-  for (const t of rows) {
-    assertExact(def.name, t);
-    if (keyed) assertKeyed(def, t);
-  }
+/** RETURNING で読んだ行を、捕捉と同じく確かめる (主キーの NULL)。 */
+export function returnedRows(def: TableDef, values: Plain[][], keyed: boolean): Tuple[] {
+  const rows = values.map((r) => tupleIn(r[0]));
+  if (keyed) for (const t of rows) assertKeyed(def, t);
   return rows;
 }
 
