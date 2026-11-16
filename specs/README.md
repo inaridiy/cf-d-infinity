@@ -287,6 +287,31 @@ M1 と同じモデルで invariant `atomicVisibility`: 読み取り専用取引�
 - red: `RED_RA` refresh が HLC を進めない (3 取引で反例: R が T を 1 に進めた後、S1 で pts 1 の blind write が c = 1 で入る)、
   `RED_RB` 進めた後も旧 T の検証窓 (保守的、違反なし)、`RED_RC` 失敗後も T を進める (R が x を旧値、y を新値で読む)。
 - claim 3 は `freshReadPicked` (1 文の読み: 1 シャードも複数シャードも) と `freshReadSeq` (取引の 2 文目) に分けた。
+- 2026-11-16 追記: 移動をまたぐ refresh の規則 (M23 の `BOUNDED` と `PUSH`、[docs/design-refresh-across-move.md](../docs/design-refresh-across-move.md) の持ち主の判断 4) を、移動のない read-time refresh にもそろえる案を、定数で入れた。
+  `BOUNDED` は、refresh が (T, to] の変更だけを照合する (今の `changedSince` は to より後も数える)。
+  `PUSH` は、refresh が他の取引の intent で失敗せず、c の決まっていない intent を to より上へ push し、c の決まった (to 以下か確定した) intent は適用を待つ (読みの `settleIntents` と同じ扱い)。
+  どちらも false なら、今の実装とそれまでのインスタンスのままである (ghost の `gh` は、どちらかが true のときだけ動くので、`m1b_green` の状態数は 741,431 のまま変わらない)。
+  通らなかった refresh の扱い (fresh を捨てて T のまま読み続ける) と、anchor が c を決めた後の refresh (`refresh`。(pts, c] で、intent があれば失敗する) は変えていない。
+  名前が `_u` で終わるインスタンスは、それまでのインスタンスと同じ定数に `BOUNDED` と `PUSH` を足したもので、答えはどれも変わらなかった。
+  取引 2 件では、新しい規則が通す refresh の場面が作れない (読んだ span の書き込みか intent と、別の取引の確定による ReadTooOld の両方が要る) ので、テンプレートを 4 つに絞った取引 3 件のインスタンス (`FEW`) を足した。
+  `check.sh` は、新しいインスタンスの `serializable` と `atomicVisibility` を、2 つを合わせた `m1bSafe` で 1 回に確かめ、`m1b_red_ra_u` (約 2 分半) は `HEAVY=1` にした。
+
+  | インスタンス | 性質 | 定数 | 到達状態数 (distinct) | 深さ | 結果 |
+  |---|---|---|---|---|---|
+  | `m1b_green_u` | `serializable` / `atomicVisibility` | `m1b_green` と同じ (2 txn、tick 2) | 738,411 | 21 | No violation (`m1b_green` と同じ) |
+  | `m1b_green_u` | `freshReadPicked` | 同上 | 176,219 で反例 | 11 | 反例 (`m1b_green` と同じ。autocommit の 1 シャード読み) |
+  | `m1b_green_bump_u` | `serializable` / `freshReadPicked` | `m1b_green_bump` と同じ | 718,315 | 21 | No violation (同じ) |
+  | `m1b_green_bump_u` | `freshReadSeq` | 同上 | 103,047 で反例 | 9 | 反例 (同じ。範囲外) |
+  | `m1b_red_ra_u` | `serializable` | `m1b_red_ra` と同じ (3 txn、tick なし) | 6,975,967 で反例 | 14 | 反例 (同じ。約 2 分半) |
+  | `m1b_red_rb_u` | `serializable` | `m1b_red_rb` と同じ | 743,339 | 21 | No violation (同じ) |
+  | `m1b_red_rc_u` | `serializable` | `m1b_red_rc` と同じ | 591,509 で反例 | 13 | 反例 (同じ。W2 の c は窓 (0, to] の中にある) |
+  | `m1b_red_no_wait` | `atomicVisibility` | `PUSH` で、c の決まった intent の適用を待たない (2 txn) | 492,842 で反例 | 12 | 反例 (下) |
+  | `m1b_green3_u` | `serializable` / `atomicVisibility` | 3 txn、`FEW`、tick 1 | 2,269,733 | 21 | No violation |
+  | `m1b_no_push3` | `serializable` / `atomicVisibility` | 同上で、c の決まっていない intent を push せずに通す | 2,270,069 | 21 | No violation (下) |
+
+  witness は 3 つで、どれも到達した。`m1b_green_u` の `witnessReadRefreshAdvanced` (132,051)、`witnessFailedThenFinished` (546,879。refresh が通らなかった読むだけの取引が、古い T のまま読み終えて確定する。fresh を捨てた後の読みが答えられないまま、安全が空に通っているのではない)、`m1b_green3_u` の `witnessNewRulePass` (1,470,001。今の規則なら通らなかった refresh の 1 歩が通り、その取引が確定する) と `witnessFailedThenFinished` (1,424,423) である。決定的な run は、`m1b_green3_u` に 2 本ある。`pushPassTest` は、読んだ x に c の決まっていない U の intent があり、今の規則では refresh が失敗するのを、U を to より上へ push して通す (U の c は to より大きくなる)。`boundedPassTest` は、読んだ x に to より後の確定があるのを、(T, to] だけを見て通す。
+  `m1b_red_no_wait` の反例: R が x@S1 を T = 0 で読む。W (x と y、anchor S2) が x に intent を置き、c = 2 で確定し、y にだけ適用する。R の y の読みが ReadTooOld (to = 2) になり、S1 の refresh が、c の決まった x の intent (c = 2 ≤ to) を待たずに通る。R は x を旧値、y を W の値で読む。
+  `m1b_no_push3` が破れないのは、このモデルが 2 シャードだからである。refresh の後は、読んだシャードの時計も、to を出したシャードの時計も to 以上で、anchor はどちらかなので、後で決まる c は必ず to より大きい。push が要るのは、anchor が 3 つ目のシャードのときで、M23 と M23b の Y (c を anchor が任意に選ぶ) が、その場合を表す。M23b の `m23b_red_skip_push` (確かめが intent を push せずに通す) で、その形が破れることを確かめた。
 
 ### M8 `m8_recent_index.qnt` — __ver 廃止後の first-committer-wins
 
@@ -1246,6 +1271,7 @@ Worker は、それで T を進める refresh を始める。
 green は 1 本 1 分から 3 分、赤は 15 秒から 1 分である。
 赤の状態数は、TLC が反例を見つけるまでに数えた数である。
 2026-11-15 に、`check.sh` の M23 の節を `HEAVY=1` で流し、60 件 (TLC の検査 42 件と run の試験 18 件) がすべて期待どおりだった。その後で足した推奨の組み合わせの 5 件 (`m23_green_rec`、`m23_green_rec_pess` と、その `witnessBelowArrival`、`m23_live_rec` の 2 件) は、1 本ずつ流して期待どおりだった。節の全体は、ほかの TLC の検査と同時に流して、`HEAVY=1` で 45 分ほど、なしで 40 分ほどかかる。
+2026-11-16 に、持ち主が設計 1 と確かめの上限を採ったので、設計 2 の 10 件と、上限のない今の親の 2 件 (`m23_green_fenced`、`m23_live_fenced`) を `HEAVY=1` にした (M23b の節を足して、検査の時間を抑えるため)。`HEAVY` なしの節を、ほかの TLC の検査と同時に流さずに流し、52 件がすべて期待どおりで、21 分かかった。
 
 witness は 7 つ (9 本) で、どれも到達した。
 
@@ -1271,11 +1297,99 @@ witness は 7 つ (9 本) で、どれも到達した。
 
 モデルにないもの。
 
-- 移し直し (P から C、C から D)。設計の文書は、尋ねられたシャードが自分の受け取りの記録をたどって尋ね続ける形にした。確かめていない。
+- 移し直し (P から C、C から D)。2026-11-16 に、M23b (下の節) で確かめた。
 - piece と claim の分け直し (M19)、行を運ばなかったグループ (M5b の `finishRange`。子の窓の始まりは床になる)、応答の喪失と再送。
 - シャードが列を遅れて適用すること (M21)。`start` は Meta と親と子で 1 手である。
 - 2 つ以上の取引の確かめが同時に進むこと。X が書くのは K2 だけで、K1 に書く書き手はいない。
 - 行ロックと待ち (M9)。悲観の書き込みは、F の最新を読むことだけを表した。
 - 記録の切り詰め (`logLowWater`)。
-- 移動のない refresh で、intent を push すること、上限を to で切ること、通らなかった refresh の後も refresh を続けること (M1b)。M23 は、移動をまたぐ refresh だけを確かめた。
+- 移動のない refresh で、intent を push すること、上限を to で切ること、通らなかった refresh の後も refresh を続けること (M1b)。M23 は、移動をまたぐ refresh だけを確かめた。2026-11-16 に、前の 2 つを M1b で確かめた (M1b の節)。3 つ目は、移動のない refresh では今のまま (`wantsFresh` を落とす) とし、変えない。
 - 設計 2 で、親が fence の後に全部断る形と、`BOUNDED` の案。
+
+### M23b `m23b_refresh_two_moves.qnt` — 範囲がもう一度動く間も続く取引 (移し直し。未解決の問題 37 の続き)
+
+2026-11-16 に書いた。
+実装より先に書いたモデルである。
+設計は [docs/design-refresh-across-move.md](../docs/design-refresh-across-move.md) の「移し直し」と「受け取りの記録を残す期間」にある。
+
+M23 は移動 1 回だけを扱った。
+取引が最初の移動の前の読み取り時刻を持ったまま、範囲がもう一度動くと (S0 から S1、S1 から S2)、窓には 3 つのシャードの記録が要る。
+M23b は、M23 の推奨の組み合わせ (設計 1、今のコードの親 `FENCE_REFUSES`、確かめの上限 `BOUNDED`、時計を進める、intent の push) を固定して、尋ねられたシャードが受け取りの記録をたどって尋ね続ける規則を確かめる。
+新しい core にしたのは、M23 の core の状態の形を変えると、M23 の状態数を全部取り直すことになるからである。
+
+舞台は、シャード S0、S1、S2 と行 2 つである。
+行 K1 は S0 に残り、行 K2 のグループが S0 から S1 へ (移動 1)、S1 から S2 へ (移動 2) 移る。
+`BACK` なら、移動 2 の行き先は S0 で、範囲は前の持ち主へ戻る。
+移動の 4 手は M23 と同じで、移動 2 は移動 1 を終えた後でだけ始まる (受け取り中のシャードは fence しない。`fenceStep`)。
+書き手は M23 と同じく、K2 に書く autocommit の書き込み W 1 回と、2PC の取引 Y 1 件で、Y の intent は移動のたびに pull に乗り、phase 2 は移動の記録をたどって、いまの持ち主に届く。
+取引 X の形も M23 と同じで、Worker は `NotOwner` で断られるたびに Meta から範囲表を取り直す。
+
+規則。
+いまの持ち主は、自分の記録を lo から確かめ、自分のいちばん新しい受け取りの記録 (渡した側と到着の m) を見て、lo < m なら渡した側に (lo, m] を尋ねる。
+尋ねられたシャードは、自分の記録を lo から (lo, up] で確かめ (up は尋ねた側の到着の m)、受け取りの記録のうち up より前に受け取ったいちばん新しいものを選んで、lo < その m なら、さらにその渡した側に尋ねる。
+尋ねる手は 1 つずつ別の手 (`askStep`) にした。
+いまの持ち主の答え (自分の記録の確かめ、時計を to まで進めること、intent の push) は、尋ね終わった後の 1 手である。
+
+`m23bSafe` は、M23 の `serializable`、`readConsistent`、`placementIndependent`、`parentFrozen` (渡したシャードは、受け取り直すまで K2 の書き込みを適用しない) に、`boundedRefusals` (断られる回数は移動の数以下) と `boundedAsks` (1 回の確かめが前の持ち主に尋ねる回数は移動の数以下) を合わせたものである。
+時相の性質は、`refreshTerminates` (始めた refresh はいつか終わる) と `asksEnd` (尋ね始めた確かめは、いつか尋ね終わる) である。
+公平性は、確かめの手 (S0 の K1、各シャードの K2)、尋ねる手、2 回の移動の `pull` と `recv`、Y の phase 2 に、弱い公平性を置いた。
+`check.sh` は、2 つを合わせた `chainLive` を確かめる。
+
+書き手 W と Y を両方入れると、状態数が掛け算で増える (W だけで 85 万、Y だけで 577 万、両方では読むだけの形でも 2,867 万)。
+`check.sh` の既定は、書き手を 1 つずつにしたインスタンス (`_w`、`_y`) で確かめ、両方を入れた形 (`m23b_green`、`m23b_green_ro`、`m23b_green_back`) は `HEAVY=1` にした。
+赤は、W で破れるもの (`stop_first`、`forget`、`mid_alone`) は `m23b_green_w` と、Y で破れるもの (`mid_from_arrival`、`skip_push`) は `m23b_green_y` と、外した条件のほかは同じ定数である。
+
+| 条件 (定数) | 外したインスタンス | 反例 |
+|---|---|---|
+| 尋ねられたシャードも尋ね続ける (`FOLLOW`) | `m23b_red_stop_first` | X が S0 で全表を T = 0 で読む。移動 1 の前に、W が S0 で K2 を c = 1 で確定する。2 回の移動の後、S2 は S1 に尋ねるが、S1 は S0 に尋ねない。X は S2 で W の値を読み、確定する |
+| 受け取りの記録を、受け取りを終えた後も残す (`KEEP`) | `m23b_red_forget` | 同じ形。S1 は移動 2 を始める前に移動 1 を終えているので、尋ねられたときには S0 から受け取ったことを忘れている (今のコードのメモリの `this.incoming` だけを引く実装) |
+| 同上、移動 1 回で | `m23b_red_forget_one` | 子が、受け取りを終えた後で、親に尋ねずに答える |
+| 尋ねられたシャードも、自分の記録を lo から見る (`MID_FROM_ARRIVAL` = false) | `m23b_red_mid_from_arrival` | Y が S0 で prepare し、intent が移動 1 の pull に乗る。anchor が c = 1 (m1 = 2 より小さい) を決め、S1 で適用する。S1 は (2, 4] だけを見て、S0 の (0, 2] にも Y はない |
+| 移動 2 で渡した S1 も、Worker からの確かめを断る (`MID_REFUSES`) | `m23b_red_mid_alone` | X は移動 1 と 2 の間に S1 で K2 を読み直す (範囲表は epoch 1)。移動 2 の後、S2 で W が確定する。範囲表の古い X の refresh に、S1 が自分の記録 (と S0) だけで答え、X は S2 で W の値を読む (M23 の `m23_red_parent_alone` を、2 回目の移動で) |
+| いまの持ち主の確かめが、c の決まっていない intent を to より上へ push する (`SKIP_PUSH` = false) | `m23b_red_skip_push` | Y が移動の後に S2 で prepare する (pts 5)。ほかのシャードの ReadTooOld による refresh (to = 5) に、S2 が intent を push せずに答える。Y の anchor が c = 5 を決め、X は T = 5 で Y の値を読む。M23 の `PUSH` = false は「intent があれば失敗する」(安全で、置き場所による失敗) で、こちらは「見ずに通す」(安全でない) である。M1b の 2 シャードでは、この形は破れない (`m1b_no_push3`) |
+| 受け取りの記録を時刻で選ぶ (`BY_TIME`) | `m23b_live_red_cycle` | 範囲が S0 から S1、S1 から S0 へ動く。S0 は S1 に (0, 3] を、S1 は S0 に (0, 1] を尋ね、S0 が窓の上端 1 より後に受け取った記録 (m2 = 3) をたどって、また S1 に尋ねる。`boundedAsks` と `asksEnd`、`refreshTerminates` が破れる (答えは誤らない) |
+
+| インスタンス | 性質 | 定数 | 到達状態数 (distinct) | 結果 |
+|---|---|---|---|---|
+| `m23b_green_w` | `m23bSafe` | 全表を 2 回読み、K2 を楽観で書く (再現の形)。書き手 W、OTHER (to は 5 まで)、tick なし | 848,611 | No violation |
+| `m23b_green_y` | `m23bSafe` | 同上で、書き手 Y | 5,770,037 | No violation |
+| `m23b_green_ro_w` / `m23b_green_ro_y` | `m23bSafe` と `readOnlyBelowStart` (`m23bSafeRO`) | 読むだけ。書き手 W / Y | 590,961 / 4,030,482 | No violation |
+| `m23b_green_pess` | `m23bSafe` | 全表を 1 回読み、K2 を悲観で書く。書き手 W と Y | 11,371,684 | No violation |
+| `m23b_green_back_y` | `m23bSafe` | 範囲が S0 へ戻る。読むだけ、書き手 Y | 3,625,419 | No violation |
+| `m23b_live` | `chainLive` (時相) | 読むだけ、Y、W なし、to は 4 まで | 1,925,233 | No violation |
+| `m23b_green_back` | `m23bSafe` | 範囲が S0 へ戻る。読むだけ、書き手 W と Y (HEAVY) | 23,598,512 | No violation |
+| `m23b_green_ro` | `m23bSafeRO` | 読むだけ、書き手 W と Y (HEAVY) | 28,666,862 | No violation |
+| `m23b_live_back` | `chainLive` (時相) | `m23b_live` で、範囲が S0 へ戻る (HEAVY) | 1,820,452 | No violation |
+| `m23b_green` | `m23bSafe` | 全表を 2 回読み、K2 を楽観で書く。書き手 W と Y、to は 6 まで (HEAVY) | 90,774,382 (18 分。深さ 45) | No violation |
+| `m23b_green_one` | `m23bSafe` | 移動 1 回 (M23 の推奨の組み合わせと同じ規則)。書き手 W と Y、tick 1 (HEAVY) | 17,524,677 | No violation |
+| `m23b_red_stop_first` | `serializable` | 条件を 1 つ外す (`m23b_green_w` の定数) | 260,896 で反例 | 反例 |
+| `m23b_red_forget` | `serializable` | 同上 | 47,383 で反例 | 反例 |
+| `m23b_red_forget_one` | `serializable` | 移動 1 回で、受け取りを終えたら記録を忘れる | 404,461 で反例 | 反例 |
+| `m23b_red_mid_from_arrival` | `serializable` | 条件を 1 つ外す (`m23b_green_y` の定数) | 2,395,489 で反例 | 反例 |
+| `m23b_red_mid_alone` | `serializable` | 条件を 1 つ外す (`m23b_green_w` の定数) | 366,772 で反例 | 反例 |
+| `m23b_red_skip_push` | `serializable` | 条件を 1 つ外す (`m23b_green_y` の定数) | 79,237 で反例 | 反例 |
+| `m23b_live_red_cycle` | `boundedAsks` / `chainLive` (時相、HEAVY) | 範囲が S0 へ戻り、記録を時刻で選ばない | 86,897 / 1,828,701 で反例 | 反例 |
+
+状態数は、4 workers、heap 2.5 GB で、ほかの TLC の検査と同時に流さずに測った。
+赤の状態数は、TLC が反例を見つけるまでに数えた数である。
+2026-11-16 に、`check.sh` の M23b の節を `HEAVY` なしで流し、26 件がすべて期待どおりで、13 分 (762 秒) かかった。その後で足した `m23b_red_skip_push` の 2 件 (TLC の赤と run) は、1 本ずつ流して期待どおりだった。
+
+witness は 5 つで、どれも到達した。
+
+| witness | インスタンス | 内容 | 到達状態数 |
+|---|---|---|---|
+| `witnessReproduction2` | `m23b_green_w` | 再現の形が 2 回の移動をまたぐ。移動 1 の前に S0 で全表を読み、2 回の移動の後に refresh で T を進めて読み直し (K2 は S2 で読む)、動いた行を S2 で書いて確定する。確かめは S1 と S0 に尋ね、読んだ値はどれも変わらない | 572,040 |
+| `witnessOneHop` | `m23b_green_w` | 移動 1 と 2 の間に S1 で読んだ K2 の refresh が、移動 2 をまたいで、S1 だけに尋ねて通り、確定する | 420,320 |
+| `witnessFoundAtS0` | `m23b_green_w` | 移動 1 の前に S0 で確定した W を、S2 から始まる尋ねる列が S0 で見つけ、X が競合になる | 67,471 |
+| `witnessBelowArrival2` | `m23b_green_pess` | T が移動 1 の m より小さいまま、X が S2 で確定する (悲観の取引) | 1,213,644 |
+| `witnessReadAcross2` | `m23b_green_back_y` | 範囲が S0 へ戻った後、2 回の移動をまたいで T を進めた refresh が通り、読むだけの X が確定する | 1,010,820 |
+
+決定的な run は、`m23b_green` に 3 本 (再現の形、S0 での競合、移動の間に読んだ取引)、`m23b_green_pess` と `m23b_green_back` に 1 本ずつ、`m23b_red_forget_one` を除く各赤 (`m23b_live_red_cycle` を含む) に反例の 1 本がある。
+
+モデルにないもの。
+
+- 3 回以上の移動。尋ねる列は、移動の数だけで終わる (選ぶ記録の m は窓の上端より小さい) が、モデルは 2 回までである。
+- 受け取りの記録を消す時期と、変更ログの切り詰め (`logLowWater`)。設計の文書の「受け取りの記録を残す期間」は、モデルの外の議論である。赤 `m23b_red_forget` は、消してはならない側だけを確かめる。
+- 範囲が前の持ち主へ戻る形での、書く取引 (S0 で 1 シャードの確定になる)。`BACK` のインスタンスは読むだけである。
+- M23 の「モデルにないもの」の全部 (piece、行のないグループ、応答の喪失、列の遅れた適用、2 つ以上の取引の確かめ、行ロック)。
+- 移動 2 が移動 1 を終える前に始まること。モデルでは前提として置いた (今のコードの `fenceStep` が断る)。

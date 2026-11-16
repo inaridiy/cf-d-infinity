@@ -182,6 +182,24 @@ witness $f m1b_green witnessReadRefreshAdvanced
 tests   $f m1b_green
 tests   $f m1b_red_ra
 tests   $f m1b_red_rc
+# 2026-11-16: 移動のない read-time refresh を、移動をまたぐ refresh と同じ規則 (上限 to、intent の push と待ち) にそろえた形。答えは上と同じ
+green   $f m1b_green_u m1bSafe                          # serializable と atomicVisibility
+red     $f m1b_green_u freshReadPicked
+witness $f m1b_green_u witnessReadRefreshAdvanced
+witness $f m1b_green_u witnessFailedThenFinished        # 通らなかった refresh の後も、読むだけの取引が古い T のまま確定する
+green   $f m1b_green_bump_u freshReadPicked
+red     $f m1b_green_bump_u freshReadSeq
+green   $f m1b_red_rb_u serializable
+red     $f m1b_red_rc_u serializable
+red     $f m1b_red_no_wait atomicVisibility             # c の決まった intent の適用を待たない
+green   $f m1b_green3_u m1bSafe                         # 取引 3 件、テンプレート 4 つ
+witness $f m1b_green3_u witnessNewRulePass              # いまの規則なら通らなかった refresh が通り、取引が確定する
+witness $f m1b_green3_u witnessFailedThenFinished
+green   $f m1b_no_push3 m1bSafe                         # push しなくても、2 シャードでは破れない (後で決まる c は必ず to より大きい)
+if [ "${HEAVY:-0}" = "1" ]; then
+  red   $f m1b_red_ra_u serializable                    # 取引 3 件 (約 3 分)
+fi
+for m in m1b_green_u m1b_red_ra_u m1b_red_rc_u m1b_red_no_wait m1b_green3_u; do tests $f $m; done
 
 echo "== M8 recent_index (__ver 廃止後の first-committer-wins)"
 f=m8_recent_index.qnt
@@ -540,10 +558,13 @@ witness $f m23_green witnessBelowArrival                # T が到着の m よ�
 witness $f m23_green witnessRefusedThenCommitted        # 親が範囲表の古い取引の確かめを断り、取引が範囲表を直して確定する
 witness $f m23_green_pess witnessBelowArrival
 witness $f m23_green_ro witnessAborted                  # 読むだけの取引が、移動の後の読み直しで競合になる (持ち主の判断 1)
-# 段 2 の直後の親 (fence の後は範囲の要求を全部断る。M19 の前)
-green   $f m23_green_fenced m23Safe
-live    $f m23_live_fenced refreshTerminates
-# 確かめの上限を to で切る案 (持ち主の判断 1)
+# 段 2 の直後の親 (fence の後は範囲の要求を全部断る。M19 の前)。確かめの上限と組み合わせた形 (下の推奨の組み合わせ) を既定にし、
+# 上限のない形は HEAVY にした (2026-11-16、M23b を足して、節の時間を抑えるため)
+if [ "${HEAVY:-0}" = "1" ]; then
+  green $f m23_green_fenced m23Safe
+  live  $f m23_live_fenced refreshTerminates
+fi
+# 確かめの上限を to で切る案 (持ち主の判断 1。2026-11-16 に採った)
 red     $f m23_green_ro readOnlyBelowStart              # 上限のない確かめでは、床より後の確定でも、読むだけの取引が失敗する
 green   $f m23_green_bounded m23Safe
 green   $f m23_green_ro_bounded m23Safe
@@ -554,23 +575,56 @@ green   $f m23_green_rec_pess m23Safe
 witness $f m23_green_rec_pess witnessBelowArrival
 live    $f m23_live_rec refreshTerminates
 green   $f m23_live_rec readOnlyBelowStart
-# 設計 2 (退けた案): Worker が親と子の両方に尋ね、親は要求の epoch で確かめる
-green   $f m23_alt_green m23Safe
-green   $f m23_alt_green_ro m23Safe
-green   $f m23_alt_green_pess m23Safe
-red     $f m23_alt_red_parent_alone serializable        # Worker が、読んだシャード (親) だけに尋ねる
-red     $f m23_alt_red_no_epoch serializable            # 親が、要求の epoch を見ずに答える
-red     $f m23_alt_red_child_from_floor serializable
-red     $f m23_alt_red_unarrived serializable           # 子が、グループが届く前に答える (飛んでいる intent を、親も子も見ない)
-red     $f m23_alt_red_prepare_alone serializable       # 確定で、Worker が親を検証に入れない
-live    $f m23_alt_live refreshTerminates
-witness $f m23_alt_green witnessReproduction
-if [ "${HEAVY:-0}" = "1" ]; then                        # tick 2 回、T の上限 6
-  green $f m23_green_wide m23Safe
+# 設計 2 (退けた案): Worker が親と子の両方に尋ね、親は要求の epoch で確かめる。2026-11-16 に設計 1 を採ったので、HEAVY にした
+if [ "${HEAVY:-0}" = "1" ]; then
+  green   $f m23_alt_green m23Safe
+  green   $f m23_alt_green_ro m23Safe
+  green   $f m23_alt_green_pess m23Safe
+  red     $f m23_alt_red_parent_alone serializable      # Worker が、読んだシャード (親) だけに尋ねる
+  red     $f m23_alt_red_no_epoch serializable          # 親が、要求の epoch を見ずに答える
+  red     $f m23_alt_red_child_from_floor serializable
+  red     $f m23_alt_red_unarrived serializable         # 子が、グループが届く前に答える (飛んでいる intent を、親も子も見ない)
+  red     $f m23_alt_red_prepare_alone serializable     # 確定で、Worker が親を検証に入れない
+  live    $f m23_alt_live refreshTerminates
+  witness $f m23_alt_green witnessReproduction
+  green   $f m23_green_wide m23Safe                     # tick 2 回、T の上限 6
 fi
 for m in m23_green m23_green_pess m23_green_fenced m23_green_ro_bounded m23_red_parent_alone m23_red_child_from_floor m23_red_child_from_arrival m23_red_no_peer \
          m23_red_prepare_alone m23_red_no_bump m23_red_no_push m23_impl_pinned m23_impl m23_live_red_pingpong \
          m23_alt_green m23_alt_red_parent_alone m23_alt_red_no_epoch m23_alt_red_unarrived; do tests $f $m; done
+
+echo "== M23b refresh across two moves (範囲がもう一度動く間も続く取引。受け取りの記録をたどって前の持ち主たちに尋ねる。実装より先に書いたモデル)"
+f=m23b_refresh_two_moves.qnt
+# 書き手 W と Y を両方入れると大きいので、既定では 1 つずつにした (両方の形は HEAVY)
+green   $f m23b_green_w m23bSafe                        # 全表を 2 回読み、動いた行を楽観で書く (再現の形)。書き手は W。範囲表の古い Worker の refresh あり
+green   $f m23b_green_y m23bSafe                        # 同じ形で、書き手は Y (intent が移動のたびに運ばれ、m 以下の c で適用されることがある)
+green   $f m23b_green_ro_w m23bSafeRO                   # 読むだけの取引。m23bSafe と readOnlyBelowStart (失敗するのは、窓 (読んだ時刻, to] に確定があるときだけ)
+green   $f m23b_green_ro_y m23bSafeRO
+green   $f m23b_green_pess m23bSafe                     # 悲観の取引 (W と Y)。T は最初の読みのまま、2 回の移動の後に確定する
+green   $f m23b_green_back_y m23bSafe                   # 範囲が S0 へ戻る (閉路)。読むだけ
+red     $f m23b_red_stop_first serializable             # 尋ねられたシャードが、それ以上尋ねない (最初の前の持ち主で止まる)
+red     $f m23b_red_forget serializable                 # 受け取りを終えたら、受け取りの記録を忘れる
+red     $f m23b_red_forget_one serializable             # 同上、移動 1 回で
+red     $f m23b_red_mid_from_arrival serializable       # 尋ねられたシャードが、自分の記録を自分の到着の m から確かめる
+red     $f m23b_red_mid_alone serializable              # 移動 2 で渡したシャードが、範囲表の古い Worker の確かめに答える
+red     $f m23b_red_skip_push serializable              # いまの持ち主の確かめが、c の決まっていない intent を push せずに通す (anchor が to 以下の c を決める)
+red     $f m23b_live_red_cycle boundedAsks              # 範囲が戻ったとき、記録を時刻で選ばないと、尋ね合いが終わらない
+live    $f m23b_live chainLive                          # 活性: 始めた refresh も、尋ね始めた確かめも、いつか終わる (refreshTerminates と asksEnd)
+witness $f m23b_green_w witnessReproduction2            # 再現の形が、2 回の移動をまたいで、前の持ち主 2 つに尋ねて確定する
+witness $f m23b_green_w witnessOneHop                   # 移動の間に読んだ取引が、前の持ち主 1 つにだけ尋ねて確定する
+witness $f m23b_green_w witnessFoundAtS0                # 移動 1 の前に S0 で確定した書き込みを、尋ねる列が見つける
+witness $f m23b_green_pess witnessBelowArrival2         # T が移動 1 の m より小さいまま、移動 2 の行き先で確定する
+witness $f m23b_green_back_y witnessReadAcross2         # 範囲が戻った後、2 回の移動をまたいで T を進めて確定する
+if [ "${HEAVY:-0}" = "1" ]; then                        # 活性の検査 (1 本 3 分ほど) と、書き手 W と Y の両方
+  live     $f m23b_live_back chainLive                  # 範囲が S0 へ戻る形でも、refresh と尋ねる列が終わる
+  live_red $f m23b_live_red_cycle chainLive             # 記録を時刻で選ばないと終わらない (安全の赤 boundedAsks は既定で確かめる)
+  green $f m23b_green m23bSafe                          # T の上限 6
+  green $f m23b_green_ro m23bSafeRO
+  green $f m23b_green_back m23bSafe
+  green $f m23b_green_one m23bSafe                      # 移動 1 回 (M23 の推奨の組み合わせと同じ規則)
+fi
+for m in m23b_green m23b_green_pess m23b_green_back m23b_red_stop_first m23b_red_forget m23b_red_mid_from_arrival m23b_red_mid_alone \
+         m23b_red_skip_push m23b_live_red_cycle; do tests $f $m; done
 
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt

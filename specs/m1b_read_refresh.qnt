@@ -7,12 +7,26 @@
 //      主張「読みの開始前に確定 (応答済み) の書き込みは必ず見える」を invariant freshRead* で検査する。
 //
 // 2PC 部分は M1 の green (fold / refresh bump / intent 照合 / push は c 未決定時のみ) を固定している。
+//
+// 2026-11-16 追記: 移動をまたぐ refresh の規則 (specs/m23_refresh_across_move.qnt の BOUNDED と PUSH、docs/design-refresh-across-move.md)
+// を、移動のない read-time refresh にもそろえる案を、定数 BOUNDED と PUSH で入れた。どちらも false なら、いまの実装と、それまでの
+// インスタンスのとおりである (ghost の gh は、どちらかが true のときだけ動くので、それまでのインスタンスの状態数は変わらない)。
+//   BOUNDED  read-time refresh は (T, to] の変更だけを照合する (いまの changedSince は to より後も数える)
+//   PUSH     read-time refresh は、他の取引の intent で失敗しない。c の決まっていない intent は to より上へ push し、c の決まった
+//            (to 以下の、または確定した) intent は適用を待つ。読みの settleIntents と同じ扱いである
+// 通らなかった refresh の扱いは変えない (fresh を捨て、T のまま読み続ける)。移動による ReadTooOld の refresh だけを取引の失敗に
+// するのは M23 の規則で、移動のないこのモデルには、その場合がない。anchor の確定のときの refresh (下の refresh) は変えない。
 module m1b_core {
   const RED_RA: bool      // (a) read-time refresh がシャードの HLC を to まで進めない
   const RED_RB: bool      // (b) T を進めた後も、進める前に読んだ span の検証窓を旧 T から取る
   const RED_RC: bool      // (c) refresh が通らなくても T を to に進める
   const PICK_MAX: bool    // (3) 複数シャードの読みの T を対象シャードの HLC の最大にする (false なら最初のシャードの HLC)
   const BUMP_FIRST: bool  // 修正案: 最初の読みで「committed だが c > T の intent」に当たったら T を c に上げる
+  const BOUNDED: bool     // read-time refresh は (T, to] だけを照合する
+  const PUSH: bool        // read-time refresh は intent で失敗せず、push するか適用を待つ
+  const RED_NO_WAIT: bool // PUSH の赤: c の決まった intent の適用を待たずに通す
+  const RED_NO_PUSH: bool // PUSH の変形: c の決まっていない intent を push せずに通す
+  const FEW: bool         // 取引 3 件のインスタンス用に、テンプレートを 4 つ (読み取り専用 2 文、blind x+y、blind x、blind y) に絞る
   const NTXN: int
   const CLOCK_MAX: int
 
@@ -41,6 +55,15 @@ module m1b_core {
     { reads: Set(1, 3), pred: 0, writes: Set(), seq: true },      // 読み取り専用 2 文 (取引の 2 文目)
     { reads: Set(1, 3), pred: 0, writes: Set(1), seq: true }      // x, y を読み x を書く (2 文目で refresh が要る)
   )
+  // FEW のテンプレート。refresh の窓の上限と intent の push は、読んだ span に別の取引の書き込みか intent があり、さらに別の取引の
+  // 確定で ReadTooOld が起きるときにだけ効くので、取引が 3 件要る
+  pure val FEW_TEMPLATES: Set[Tmpl] = Set(
+    { reads: Set(1, 3), pred: 0, writes: Set(), seq: true },      // 読み取り専用 2 文
+    { reads: Set(), pred: 0, writes: Set(1, 3), seq: true },      // blind x, y (クロスシャード)
+    { reads: Set(), pred: 0, writes: Set(1), seq: true },         // blind x
+    { reads: Set(), pred: 0, writes: Set(3), seq: true }          // blind y
+  )
+  pure val TMPLS: Set[Tmpl] = if (FEW) FEW_TEMPLATES else TEMPLATES
 
   type Status = Idle | Reading | Preparing | Refreshing | Committed | Aborted
   type Txn = {
@@ -65,12 +88,16 @@ module m1b_core {
   }
   type Ver = { ver: int, writer: int }
   type Intent = { txn: int, pts: int }
+  // BOUNDED か PUSH のときだけ動く ghost。newPass: いまの規則 ((T, ∞) と intent で失敗) なら通らなかった read-time refresh の
+  // 1 歩が通った取引。failed: read-time refresh が通らなかった取引
+  type Gh = { newPass: Set[int], failed: Set[int] }
 
   var txns: int -> Txn
   var hlc: int -> int
   var hist: int -> Set[Ver]
   var intents: int -> Intent
   var commitSeq: int
+  var gh: Gh
 
   pure def max(a: int, b: int): int = if (a > b) a else b
   pure def maxOf(s: Set[int], d: int): int = s.fold(d, (acc, x) => max(acc, x))
@@ -107,10 +134,16 @@ module m1b_core {
     or (t.tmpl.pred == p and keysOn(p).exists(k => readConflict(tid, k, from, hi)))
   def prepareConflict(tid: int, t: Txn, p: int): bool =
     writeConflict(tid, t, p) or spanConflict(tid, t, p, lo(t, p), BIG)
-  // read-time refresh で q の既読 span を (T, ∞) で照合 (実装の changedSince は上限を切らない)
+  // read-time refresh で照合する q の既読 span のキー
+  pure def refreshKeys(t: Txn, q: int): Set[int] =
+    t.readVals.keys().filter(k => shardOf(k) == q).union(if (t.predDone and t.tmpl.pred == q) keysOn(q) else Set())
+  // q の既読 span を (T, hi] で照合する。intentsFail なら、他の intent があれば失敗する
+  def refreshConflict(tid: int, t: Txn, q: int, hi: int, intentsFail: bool): bool =
+    refreshKeys(t, q).exists(k => hist.get(k).exists(e => e.ver > t.T and e.ver <= hi and e.writer != tid)
+                                  or (intentsFail and otherIntent(k, tid)))
+  // read-time refresh で q の既読 span を照合する。いまの実装は (T, ∞) で、他の intent があれば失敗する (changedSince は上限を切らない)
   def readSpansConflict(tid: int, t: Txn, q: int): bool =
-    t.readVals.keys().filter(k => shardOf(k) == q).exists(k => readConflict(tid, k, t.T, BIG))
-    or (t.predDone and t.tmpl.pred == q and keysOn(q).exists(k => readConflict(tid, k, t.T, BIG)))
+    refreshConflict(tid, t, q, if (BOUNDED) t.rTo else BIG, not(PUSH))
 
   def intentsWithout(tid: int): int -> Intent =
     KEYS.mapBy(k => if (intents.get(k).txn == tid) { txn: NONE, pts: 0 } else intents.get(k))
@@ -146,9 +179,10 @@ module m1b_core {
     hlc' = SHARDS.mapBy(_ => 0),
     hist' = KEYS.mapBy(k => if (BASE.contains(k)) Set({ ver: 0, writer: 0 }) else Set()),
     intents' = KEYS.mapBy(_ => { txn: NONE, pts: 0 }),
-    commitSeq' = 0
+    commitSeq' = 0,
+    gh' = { newPass: Set(), failed: Set() }
   }
-  action keepEnv = all { hlc' = hlc, hist' = hist, intents' = intents, commitSeq' = commitSeq }
+  action keepEnv = all { hlc' = hlc, hist' = hist, intents' = intents, commitSeq' = commitSeq, gh' = gh }
 
   // ---- 開始 ------------------------------------------------------------------
   // T: seq な取引は home の HLC。1 文で複数シャードを読むなら PICK_MAX のとき対象 HLC の最大。fresh は RO だけ選べる
@@ -184,7 +218,7 @@ module m1b_core {
         all {
           hlc' = hlc.set(p, max(hlc.get(p), tt)),
           txns' = withPushes(txns.set(tid, t1), pushTargets(Set(k), tid, tt), tt),
-          hist' = hist, intents' = intents, commitSeq' = commitSeq
+          hist' = hist, intents' = intents, commitSeq' = commitSeq, gh' = gh
         }
       }
     }
@@ -200,7 +234,7 @@ module m1b_core {
       all {
         hlc' = hlc,
         txns' = txns,
-        hist' = hist, intents' = intents, commitSeq' = commitSeq
+        hist' = hist, intents' = intents, commitSeq' = commitSeq, gh' = gh
       }
     }
   }
@@ -219,7 +253,7 @@ module m1b_core {
         all {
           hlc' = hlc.set(p, max(hlc.get(p), tt)),
           txns' = withPushes(txns.set(tid, t1), pushTargets(keysOn(p), tid, tt), tt),
-          hist' = hist, intents' = intents, commitSeq' = commitSeq
+          hist' = hist, intents' = intents, commitSeq' = commitSeq, gh' = gh
         }
       }
     }
@@ -246,24 +280,37 @@ module m1b_core {
       }
     }
   }
-  // 既読シャード q の refresh (T, to]。green は HLC を to に進めてから照合
+  // 既読シャード q の refresh (T, to]。green は HLC を to に進めてから照合。
+  // PUSH なら、c の決まった (to 以下の、または確定した) intent は適用を待ち (RED_NO_WAIT は待たない)、通ったら、c の決まっていない
+  // intent を to より上へ push する (RED_NO_PUSH は push しない)
   action readRefreshStep(tid: int, q: int): bool = all {
     val t = txns.get(tid)
     all {
       t.status == Reading, t.rTo != 0, t.rRem.contains(q),
-      val newH = if (RED_RA) hlc.get(q) else max(hlc.get(q), t.rTo)
-      val ok = not(readSpansConflict(tid, t, q))
-      val rem = t.rRem.exclude(Set(q))
-      val advanced = t.with("T", t.rTo).with("rTo", 0).with("rRem", Set())
-                      .with("spanT", if (RED_RB) t.spanT else Map())
+      val ks = refreshKeys(t, q)
       all {
-        hlc' = hlc.set(q, newH),
-        txns' = txns.set(tid,
+        not(PUSH and not(RED_NO_WAIT) and ks.exists(k => blockedBy(k, tid, t.rTo))),
+        val newH = if (RED_RA) hlc.get(q) else max(hlc.get(q), t.rTo)
+        val ok = not(readSpansConflict(tid, t, q))
+        val okToday = not(refreshConflict(tid, t, q, BIG, true))
+        val rem = t.rRem.exclude(Set(q))
+        val advanced = t.with("T", t.rTo).with("rTo", 0).with("rRem", Set())
+                        .with("spanT", if (RED_RB) t.spanT else Map())
+        val after =
           if (ok and rem != Set()) t.with("rRem", rem)
           else if (ok) advanced
           else if (RED_RC) advanced.with("fresh", false)
-          else t.with("fresh", false).with("rTo", 0).with("rRem", Set())),
-        hist' = hist, intents' = intents, commitSeq' = commitSeq
+          else t.with("fresh", false).with("rTo", 0).with("rRem", Set())
+        val pushes = if (PUSH and ok and not(RED_NO_PUSH)) pushTargets(ks, tid, t.rTo) else Set()
+        all {
+          hlc' = hlc.set(q, newH),
+          txns' = withPushes(txns.set(tid, after), pushes, t.rTo),
+          gh' = if (BOUNDED or PUSH)
+                  gh.with("newPass", if (ok and not(okToday)) gh.newPass.union(Set(tid)) else gh.newPass)
+                    .with("failed", if (ok) gh.failed else gh.failed.union(Set(tid)))
+                else gh,
+          hist' = hist, intents' = intents, commitSeq' = commitSeq
+        }
       }
     }
   }
@@ -296,7 +343,7 @@ module m1b_core {
         hlc' = if (ok) hlc.set(p, newPts) else hlc,
         intents' = if (ok) placeIntents(tid, t, p, newPts) else intentsWithout(tid),
         txns' = if (ok) txns.set(tid, t.with("pts", t.pts.put(p, newPts))) else txns.set(tid, t.with("status", Aborted)),
-        hist' = hist, commitSeq' = commitSeq
+        hist' = hist, commitSeq' = commitSeq, gh' = gh
       }
     }
   }
@@ -321,7 +368,7 @@ module m1b_core {
                                  .with("decSeq", if (done) commitSeq + 1 else 0))
                 else txns.set(tid, t.with("status", Aborted)),
         commitSeq' = if (ok and done) commitSeq + 1 else commitSeq,
-        hist' = hist
+        hist' = hist, gh' = gh
       }
     }
   }
@@ -340,7 +387,7 @@ module m1b_core {
                                  .with("decSeq", if (done) commitSeq + 1 else 0))
                 else txns.set(tid, t.with("status", Aborted)),
         commitSeq' = if (done) commitSeq + 1 else commitSeq,
-        hist' = hist
+        hist' = hist, gh' = gh
       }
     }
   }
@@ -353,17 +400,17 @@ module m1b_core {
         if (t.tmpl.writes.contains(k) and shardOf(k) == p) hist.get(k).union(Set({ ver: t.c, writer: tid })) else hist.get(k)),
       intents' = KEYS.mapBy(k => if (t.tmpl.writes.contains(k) and shardOf(k) == p) { txn: NONE, pts: 0 } else intents.get(k)),
       txns' = txns.set(tid, t.with("applied", t.applied.union(Set(p)))),
-      commitSeq' = commitSeq
+      commitSeq' = commitSeq, gh' = gh
     }
   }
   action tick(s: int): bool = all {
     hlc.get(s) < CLOCK_MAX,
     hlc' = hlc.set(s, hlc.get(s) + 1),
-    txns' = txns, hist' = hist, intents' = intents, commitSeq' = commitSeq
+    txns' = txns, hist' = hist, intents' = intents, commitSeq' = commitSeq, gh' = gh
   }
 
   action step = any {
-    { nondet tid = oneOf(TXNS) nondet tm = oneOf(TEMPLATES) nondet home = oneOf(SHARDS) nondet fr = oneOf(Set(true, false)) begin(tid, tm, home, fr) },
+    { nondet tid = oneOf(TXNS) nondet tm = oneOf(TMPLS) nondet home = oneOf(SHARDS) nondet fr = oneOf(Set(true, false)) begin(tid, tm, home, fr) },
     { nondet tid = oneOf(TXNS) nondet k = oneOf(KEYS) readKey(tid, k) },
     { nondet tid = oneOf(TXNS) readPred(tid) },
     { nondet tid = oneOf(TXNS) nondet p = oneOf(SHARDS) startReadRefresh(tid, p) },
@@ -403,6 +450,9 @@ module m1b_core {
       val ks = w.tmpl.writes.intersect(r.readVals.keys())
       w.status != Committed or isRO(w) or ks == Set() or ks.forall(k => (seenVer(r, k) >= w.c) == (w.c <= r.T))))
 
+  // 2 つを 1 回の検査で確かめる (2026-11-16 に足したインスタンスで使う)
+  val m1bSafe = serializable and atomicVisibility
+
   // ---- claim 3: 読みの開始 (begin) 前に決定 (応答) 済みの書き手は見える ------------------------
   def freshReadFor(seqOnly: bool): bool = TXNS.forall(rid =>
     val r = txns.get(rid)
@@ -424,10 +474,16 @@ module m1b_core {
     val t = txns.get(tid)
     t.status == Committed and isRO(t) and t.fresh and t.T > 0 and t.readVals.keys().size() == 2
       and t.readVals.keys().exists(k => versionAt(k, t.T).ver > 0)))
+  // BOUNDED か PUSH の下で、いまの規則なら通らなかった read-time refresh の 1 歩を通した取引が、確定した
+  val witnessNewRulePass = not(TXNS.exists(tid => gh.newPass.contains(tid) and txns.get(tid).status == Committed))
+  // read-time refresh が通らなかった読むだけの取引が、古い T のまま読み終えて確定した (読みが答えられなくなって、安全が空に通って
+  // いるのではない)
+  val witnessFailedThenFinished = not(TXNS.exists(tid =>
+    gh.failed.contains(tid) and txns.get(tid).status == Committed and isRO(txns.get(tid)) and readsDone(txns.get(tid))))
 }
 
 module m1b_green {
-  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, NTXN = 2, CLOCK_MAX = 2).*
+  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, BOUNDED = false, PUSH = false, RED_NO_WAIT = false, RED_NO_PUSH = false, FEW = false, NTXN = 2, CLOCK_MAX = 2).*
   // read-time refresh で T を進めた読み取り専用取引が、両方の読みを新しい snapshot で揃える
   run readRefreshAdvancesTest =
     init.then(begin(1, { reads: Set(1, 3), pred: 0, writes: Set(), seq: true }, 1, true))
@@ -443,7 +499,7 @@ module m1b_green {
 }
 
 module m1b_red_ra {
-  import m1b_core(RED_RA = true, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, NTXN = 3, CLOCK_MAX = 0).*
+  import m1b_core(RED_RA = true, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, BOUNDED = false, PUSH = false, RED_NO_WAIT = false, RED_NO_PUSH = false, FEW = false, NTXN = 3, CLOCK_MAX = 0).*
   // R: x@S1 を T=0 で読む。W2 が y@S2 に c=1 で commit。R の y 読みで ReadTooOld(to=1) → S1 を refresh するが HLC を進めない。
   // T=1 に進んで y を読み終わる。W3 が x@S1 に blind write: pts = 1 → c = 1 <= T。R は T=1 の snapshot のはずなのに x は旧値。
   run counterexampleTest =
@@ -461,11 +517,11 @@ module m1b_red_ra {
 }
 
 module m1b_red_rb {
-  import m1b_core(RED_RA = false, RED_RB = true, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, NTXN = 2, CLOCK_MAX = 2).*
+  import m1b_core(RED_RA = false, RED_RB = true, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, BOUNDED = false, PUSH = false, RED_NO_WAIT = false, RED_NO_PUSH = false, FEW = false, NTXN = 2, CLOCK_MAX = 2).*
 }
 
 module m1b_red_rc {
-  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = true, PICK_MAX = true, BUMP_FIRST = false, NTXN = 2, CLOCK_MAX = 2).*
+  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = true, PICK_MAX = true, BUMP_FIRST = false, BOUNDED = false, PUSH = false, RED_NO_WAIT = false, RED_NO_PUSH = false, FEW = false, NTXN = 2, CLOCK_MAX = 2).*
   // R: x@S1 を T=0 で読む。W2 が x に c=1 で commit (R の既読 span が変わる)。S2 の時計を進めて W3 相当… 2 取引なので:
   // W2 は x と y に書く (c = 2 以上)。R が y で ReadTooOld → S1 の refresh は x の変更で失敗 → RED_RC は T を進める →
   // R は x を旧値 (T=0 時点)、y を新値で読む → atomicVisibility / serializable 違反。
@@ -485,15 +541,121 @@ module m1b_red_rc {
 
 // claim 3 の修正案: 最初の読みで committed (c > T) の intent に当たったら T を c に上げる
 module m1b_green_bump {
-  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = true, NTXN = 2, CLOCK_MAX = 2).*
+  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = true, BOUNDED = false, PUSH = false, RED_NO_WAIT = false, RED_NO_PUSH = false, FEW = false, NTXN = 2, CLOCK_MAX = 2).*
 }
 
 // claim 3 の反例 (green のまま): cross-shard の書き込みの phase 2 が読むシャードに未到着
 module m1b_claim3 {
-  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, NTXN = 2, CLOCK_MAX = 2).*
+  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, BOUNDED = false, PUSH = false, RED_NO_WAIT = false, RED_NO_PUSH = false, FEW = false, NTXN = 2, CLOCK_MAX = 2).*
   // W1: x@S1, y@S2 に blind write。S2 で pts 1。S1 の時計を 2 に進める。anchor S1: pts = c = 3。応答済み (Committed)。
   // phase 2 は未到着。R (autocommit、1 文で x,y) が開始: T = max(HLC) = 3 >= c なので x,y とも見える … これは成立。
   // 成立しない例は S1 の時計が進んでいない場合: anchor S1 の pts = max(0, 1)+1 = 2 = c。R の T = max(2, 1) = 2 >= c。成立。
   // T = max(HLC) は常に anchor の HLC 以上なので pickT では成立し、seq (2 文目) で破れる。TLC に任せる。
   run reachTest = init.expect(true)
+}
+
+// ---- 2026-11-16: 移動のない read-time refresh を、移動をまたぐ refresh と同じ規則にそろえる (BOUNDED と PUSH) -----------------
+// それまでのインスタンスと同じ定数に、BOUNDED と PUSH を足したもの。どの答えも、それまでのインスタンスと同じになることを確かめる
+module m1b_green_u {
+  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, BOUNDED = true, PUSH = true, RED_NO_WAIT = false, RED_NO_PUSH = false, FEW = false, NTXN = 2, CLOCK_MAX = 2).*
+  run readRefreshAdvancesTest =
+    init.then(begin(1, { reads: Set(1, 3), pred: 0, writes: Set(), seq: true }, 1, true))
+        .then(readKey(1, 1))
+        .then(begin(2, { reads: Set(), pred: 0, writes: Set(3), seq: true }, 2, true))
+        .then(sendCommit(2, 2)).then(anchorPrepare(2)).then(apply(2, 2))
+        .then(startReadRefresh(1, 2))
+        .then(readRefreshStep(1, 1))
+        .expect(txns.get(1).T == 1 and hlc.get(1) == 1)
+        .then(readKey(1, 3)).then(finishRO(1))
+        .expect(txns.get(1).readVals.get(3) == 2 and serializable and atomicVisibility)
+}
+module m1b_green_bump_u {
+  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = true, BOUNDED = true, PUSH = true, RED_NO_WAIT = false, RED_NO_PUSH = false, FEW = false, NTXN = 2, CLOCK_MAX = 2).*
+}
+module m1b_red_ra_u {
+  import m1b_core(RED_RA = true, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, BOUNDED = true, PUSH = true, RED_NO_WAIT = false, RED_NO_PUSH = false, FEW = false, NTXN = 3, CLOCK_MAX = 0).*
+  // m1b_red_ra と同じ反例。上限を to で切っても、時計を to まで進めなければ、to 以下の時刻の確定が後から入る
+  run counterexampleTest =
+    init.then(begin(1, { reads: Set(1, 3), pred: 0, writes: Set(), seq: true }, 1, true))
+        .then(readKey(1, 1))
+        .then(begin(2, { reads: Set(), pred: 0, writes: Set(3), seq: true }, 2, true))
+        .then(sendCommit(2, 2)).then(anchorPrepare(2)).then(apply(2, 2))
+        .then(startReadRefresh(1, 2)).then(readRefreshStep(1, 1))
+        .expect(txns.get(1).T == 1 and hlc.get(1) == 0)
+        .then(readKey(1, 3)).then(finishRO(1))
+        .then(begin(3, { reads: Set(), pred: 0, writes: Set(1), seq: true }, 1, true))
+        .then(sendCommit(3, 1)).then(anchorPrepare(3)).then(apply(3, 1))
+        .expect(txns.get(3).c == 1 and txns.get(1).readVals.get(1) == 0 and not(serializable))
+}
+module m1b_red_rb_u {
+  import m1b_core(RED_RA = false, RED_RB = true, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, BOUNDED = true, PUSH = true, RED_NO_WAIT = false, RED_NO_PUSH = false, FEW = false, NTXN = 2, CLOCK_MAX = 2).*
+}
+module m1b_red_rc_u {
+  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = true, PICK_MAX = true, BUMP_FIRST = false, BOUNDED = true, PUSH = true, RED_NO_WAIT = false, RED_NO_PUSH = false, FEW = false, NTXN = 2, CLOCK_MAX = 2).*
+  // m1b_red_rc と同じ反例。W2 の c = 2 は窓 (0, 2] の中なので、上限を切っても refresh は通らない
+  run counterexampleTest =
+    init.then(begin(1, { reads: Set(1, 3), pred: 0, writes: Set(), seq: true }, 1, true))
+        .then(readKey(1, 1))
+        .then(begin(2, { reads: Set(), pred: 0, writes: Set(1, 3), seq: true }, 1, true))
+        .then(sendCommit(2, 1)).then(prepare(2, 2)).then(anchorPrepare(2))
+        .then(apply(2, 1)).then(apply(2, 2))
+        .then(startReadRefresh(1, 2))
+        .then(readRefreshStep(1, 1))
+        .expect(txns.get(1).T == txns.get(2).c and not(txns.get(1).fresh))
+        .then(readKey(1, 3)).then(finishRO(1))
+        .expect(not(atomicVisibility) and not(serializable))
+}
+// 赤: PUSH で、c の決まった intent の適用を待たずに通す。phase 2 が片方のシャードにだけ届いた取引を、半分だけ読む
+module m1b_red_no_wait {
+  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, BOUNDED = true, PUSH = true, RED_NO_WAIT = true, RED_NO_PUSH = false, FEW = false, NTXN = 2, CLOCK_MAX = 2).*
+  run counterexampleTest =
+    init.then(begin(1, { reads: Set(1, 3), pred: 0, writes: Set(), seq: true }, 1, true))   // R: T = 0
+        .then(readKey(1, 1))                                                                // x を T = 0 で読む
+        .then(begin(2, { reads: Set(), pred: 0, writes: Set(1, 3), seq: true }, 2, true))   // W: x と y、anchor S2
+        .then(sendCommit(2, 2)).then(prepare(2, 1)).then(anchorPrepare(2))                 // x に intent (pts 1)。c = 2 で確定
+        .then(apply(2, 2))                                                                 // y にだけ適用した
+        .then(startReadRefresh(1, 2))                                                      // y の読みで ReadTooOld(to = 2)
+        .then(readRefreshStep(1, 1))                                                       // x の intent (c = 2 <= to) を待たずに通す
+        .expect(txns.get(1).T == 2)
+        .then(readKey(1, 3)).then(finishRO(1))
+        .expect(not(atomicVisibility))
+}
+// 取引 3 件、テンプレート 4 つ (FEW)。新しい規則でだけ通る refresh がある場面
+module m1b_green3_u {
+  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, BOUNDED = true, PUSH = true, RED_NO_WAIT = false, RED_NO_PUSH = false, FEW = true, NTXN = 3, CLOCK_MAX = 1).*
+  // R が読んだ x に、c の決まっていない U の intent がある。いまの規則では R の refresh が失敗する。新しい規則では U を to より上へ
+  // push して通り、U の c は to より大きくなる
+  run pushPassTest =
+    init.then(begin(3, { reads: Set(), pred: 0, writes: Set(3), seq: true }, 2, true))   // V: blind y
+        .then(sendCommit(3, 2)).then(anchorPrepare(3)).then(apply(3, 2))                // y = V (c = 1)
+        .then(begin(1, { reads: Set(1, 3), pred: 0, writes: Set(), seq: true }, 1, true)) // R: T = 0
+        .then(readKey(1, 1))
+        .then(begin(2, { reads: Set(), pred: 0, writes: Set(1, 3), seq: true }, 2, true)) // U: x と y、anchor S2
+        .then(sendCommit(2, 2)).then(prepare(2, 1))                                     // x に U の intent (pts 1)
+        .then(startReadRefresh(1, 2))                                                    // to = 1
+        .then(readRefreshStep(1, 1))
+        .expect(txns.get(1).T == 1 and txns.get(2).pushed == 1)
+        .then(readKey(1, 3)).then(finishRO(1))
+        .then(anchorPrepare(2))
+        .expect(txns.get(2).c == 2 and serializable and atomicVisibility and not(witnessNewRulePass))
+  // R が読んだ x に、to より後の時刻の確定がある。いまの規則 ((T, ∞)) では R の refresh が失敗する。新しい規則では (T, to] だけを見て通る
+  run boundedPassTest =
+    init.then(begin(1, { reads: Set(1, 3), pred: 0, writes: Set(), seq: true }, 1, true)) // R: T = 0
+        .then(readKey(1, 1))
+        .then(tick(1))                                                                   // S1 の時計 1
+        .then(begin(2, { reads: Set(), pred: 0, writes: Set(1), seq: true }, 1, true))   // W: blind x
+        .then(sendCommit(2, 1)).then(anchorPrepare(2)).then(apply(2, 1))                // x = W (c = 2)
+        .then(begin(3, { reads: Set(), pred: 0, writes: Set(3), seq: true }, 2, true))   // V: blind y
+        .then(sendCommit(3, 2)).then(anchorPrepare(3)).then(apply(3, 2))                // y = V (c = 1)
+        .then(startReadRefresh(1, 2))                                                    // to = 1
+        .then(readRefreshStep(1, 1))                                                     // x の変更 (c = 2) は to より後
+        .expect(txns.get(1).T == 1)
+        .then(readKey(1, 3)).then(finishRO(1))
+        .expect(serializable and atomicVisibility and not(witnessNewRulePass))
+}
+// 同じ場面で、c の決まっていない intent を push せずに通す。2 シャードのこのモデルでは破れない: refresh の後は、読んだシャードの時計も、
+// to を出したシャードの時計も to 以上で、anchor はどちらかなので、後で決まる c は必ず to より大きい。push が要るのは、anchor が
+// 3 つ目のシャードのとき (M23 と M23b の Y の c は、anchor が任意に選ぶ) で、M23b の m23b_red_skip_push が破れることを確かめる
+module m1b_no_push3 {
+  import m1b_core(RED_RA = false, RED_RB = false, RED_RC = false, PICK_MAX = true, BUMP_FIRST = false, BOUNDED = true, PUSH = true, RED_NO_WAIT = false, RED_NO_PUSH = true, FEW = true, NTXN = 3, CLOCK_MAX = 1).*
 }
