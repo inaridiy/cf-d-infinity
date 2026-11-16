@@ -23,6 +23,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { REFERENCE_ONLY, seedsOr, SimCluster } from "./sim";
 import { Db } from "../src/client/db";
+import type { Catalog } from "../src/meta";
 import { split } from "../src/autoscaler";
 import { ownerOf, shardsOf } from "../src/routing";
 import { encode } from "../src/shard/rows";
@@ -38,7 +39,7 @@ import {
 type Kind =
   | "history" | "indexReadsMissing" | "indexReadsExtra" | "ackedNotApplied" | "errors" | "errorsDropped" | "stuck" | "schema" | "misplaced"
   | "missing" | "dangling" | "wrongRead" | "leftover" | "uniqueWithDuplicates" | "resurrected" | "lost" | "badExtra" | "splitRefusals"
-  | "staleImage" | "mangled";
+  | "staleImage" | "mangled" | "ddlLost" | "schemaDrift" | "staleWrites";
 
 /** DROP した表を、確定済みの取引の後始末が参照して出る誤り。BUG-5 の症状である。 */
 const DROPPED = /no such table: (main\.)?(side|__gidx_)/;
@@ -67,6 +68,9 @@ function violations(r: Report): Record<Kind, string[]> {
     badExtra: r.badExtra,
     staleImage: r.side.stale,
     mangled: r.side.mangled,
+    ddlLost: r.ddlLost,
+    schemaDrift: r.schemaDrift,
+    staleWrites: r.staleWrites,
   };
 }
 
@@ -103,6 +107,121 @@ const createUnique = async (e: Env) => {
   await e.at(0.6);
   await e.ddl("CREATE UNIQUE INDEX acct_v ON acct(v)");
   await e.checkpoint("after second CREATE UNIQUE INDEX");
+};
+
+// ---- 遷移の途中で止まる進め手、重なる DDL、分割と並ぶ DDL (段 3 と段 4 の後に足した生成器) ----
+//
+// 段 3 から DDL は prepare と commit (か abort) の 2 相で、段 4 から移動は move-start と move-end で進む。上の場面は、DDL を 1 つの接続から
+// 順に出し、進める側を最後まで走らせる。それでは、進める側が遷移の途中で止まる実行も、2 つの DDL が重なる実行も、移動を進める側が止まった
+// 実行も作れず、乱択の検査は、欠陥のスイッチ commitWithoutAcks と overlappingTransitions を見つけず、noSchemaRecheck もほとんど見つけ
+// なかった (docs/design-catalog-epoch.md の「段 3 の結果」)。ここの場面は、次を乱択で混ぜる。乱数は Env.pick の流れから引く。
+//   - 進める側を、DDL の手の列の乱択の番号の前で止める (stopAt)。prepare の前、prepare の後、シャードの prepared の途中、commit の前、
+//     commit の後の適用の前のどこでも止まる。止まった遷移は、期限 (leaseMs) で abort されるか、commit の後なら次の要求が適用させる。
+//   - 2 つの接続から、同じ表と別の表への DDL を、ほぼ同時に出す。
+//   - 1 つの残った行だけが反する CHECK を持つ列を足す (その行のシャードの試しだけが通らない)。
+//   - DROP TABLE の前に古い表定義を読んだ接続を作り、DROP が完了を返した後に、消した表へ書かせる (Env.writeDropped)。
+//   - 行ロックを長く持つ取引と、ロックを待つ autocommit の書き込みの間に、列を足す。
+//   - 分割を進める側を、startMove の後で止める (splitStops)。
+// 足した検査は、完了を返した DDL が効いていること (ddlLost)、catalog とシャードと Meta の SQLite の表が合うこと (schemaDrift)、消した表への
+// 書き込みが成功しないこと (staleWrites) である。
+
+/**
+ * 進める側を止める手の番号。確率 p で止める (既定は半分)。止めるなら 0 から 13 の手の前 (DDL の手は 5 から 15 ほどなので、大きい番号は
+ * 止まらない)。止めないなら null。
+ */
+const stopAt = (e: Env, p = 0.5): number | null => (e.pick() < p ? Math.floor(e.pick() * 14) : null);
+
+/**
+ * 表 acct への DDL の種類。unique は v への UNIQUE の index で、値に重複があれば作れない。uniqueN は n への UNIQUE の index で、n は書き込み
+ * ごとに一意なので、いつも作れる (行のある表なら、書き込みを止めて既存の行から作る build)。作った後のどの書き込みも、項目を保守する。
+ */
+type Change = "column" | "check" | "index" | "unique" | "uniqueN";
+
+/**
+ * acct への DDL を 1 文作る。check は、最初に入れた行 (n が 100 より小さい) のうち、まだ残っている 1 行だけが反する CHECK を持つ列を
+ * 足す。その行のシャードの試しだけが通らないので、文はどこでも効かない (その前に行が書き換わっていれば効く)。作業負荷が後で書く n は
+ * 100 以上なので、足した後の書き込みは CHECK に反しない。残った行がなければ、ふつうの列を足す。
+ */
+async function change(e: Env, kind: Change, tag: string): Promise<string> {
+  if (kind === "check") {
+    const old = (await e.connect().query("SELECT n FROM acct WHERE n < 100")).rows.map((r) => Number(r.n));
+    if (old.length > 0) return `ALTER TABLE acct ADD COLUMN c${tag} INTEGER DEFAULT 0 CHECK (n <> ${old[Math.floor(e.pick() * old.length)]})`;
+  }
+  if (kind === "index") return `CREATE INDEX acct_i${tag} ON acct(v)`;
+  if (kind === "unique") return `CREATE UNIQUE INDEX acct_u${tag} ON acct(v)`;
+  if (kind === "uniqueN") return `CREATE UNIQUE INDEX acct_n${tag} ON acct(n)`;
+  return `ALTER TABLE acct ADD COLUMN x${tag} INTEGER DEFAULT 7`;
+}
+
+/** DDL を、進める側を確率 p で乱択の手で止めて出し、遷移が閉じるのを待つ。文が効いたかは、返る catalog で決まる。 */
+async function changeOnce(e: Env, sql: string, db?: Db, p?: number): Promise<Catalog> {
+  await e.ddl(sql, { db, stopAt: stopAt(e, p) });
+  return e.closed();
+}
+
+/**
+ * DROP TABLE side を、進める側を乱択の手で止めて出す。前に古い表定義の接続を作っておき、DROP が完了を返したら、消した表へ書かせる。
+ * 効いたら、ときどき同じ名前の表を作り直す。side の印 (marks.dropIssued と recreated) は、文が効いたときだけ付ける。
+ */
+async function dropSide(e: Env): Promise<void> {
+  const stale = await e.stale(6);
+  const issued = e.tick();
+  const out = await e.ddl("DROP TABLE side", { stopAt: stopAt(e) });
+  if ((await e.closed()).tables.side) return;
+  e.marks.dropIssued = issued;
+  e.useSide = false;
+  if (out === "ok") await e.writeDropped(stale);
+  if (e.pick() < 0.5) return;
+  if ((await changeOnce(e, SIDE)).tables.side) {
+    e.marks.recreated = e.tick();
+    e.useSide = true;
+  }
+}
+
+/** acct への DDL を count 文、作業負荷の進みに散らして出す。dropAt の番号の文の代わりに、side を消す。 */
+const changes = (o: { kinds: Change[]; count: number; dropAt?: number }) => async (e: Env) => {
+  for (let i = 1; i <= o.count; i++) {
+    await e.at(((i - 1 + e.pick()) / o.count) * 0.9);
+    if (i === o.dropAt) {
+      await dropSide(e);
+      continue;
+    }
+    await changeOnce(e, await change(e, o.kinds[Math.floor(e.pick() * o.kinds.length)]!, String(i)));
+  }
+};
+
+/** Meta が表定義の遷移を開くのを、ほかの遷移か移動が開いているという理由で断った回数を数える (Report.notes の busy)。 */
+function countBusy(e: Env): void {
+  const real = e.c.meta.prepare.bind(e.c.meta);
+  e.c.meta.prepare = async (...a: Parameters<typeof real>) => {
+    try {
+      return await real(...a);
+    } catch (err) {
+      if (/schema busy/.test(String(err))) e.note("busy");
+      throw err;
+    }
+  };
+}
+
+/**
+ * 2 つの接続から、DDL を 5 文ずつ、ほぼ同時に出す。どちらも acct へ出すことが多く、b はときどき side へ出す。進める側は、ときどき止める。
+ * Meta は、遷移を 1 つずつしか開かない (M21 の ONE_OPEN)。遅れた方は schema busy で待つ。文は、出す時点で作る (CHECK の列は、その前に
+ * 行を読むので、出し手の間合いがずれる)。
+ */
+const overlapping = async (e: Env) => {
+  countBusy(e);
+  const actor = async (name: "a" | "b", db: Db) => {
+    for (let i = 1; i <= 5; i++) {
+      await e.at(i / 6);
+      const kinds: Change[] = name === "a" ? ["column", "column", "unique", "check"] : ["column", "column", "index", "unique"];
+      const sql = name === "b" && e.pick() < 0.25
+        ? `ALTER TABLE side ADD COLUMN y${i} INTEGER DEFAULT 0`
+        : await change(e, kinds[Math.floor(e.pick() * kinds.length)]!, `${name}${i}`);
+      await e.c.sleep(e.pick() * 3);
+      await changeOnce(e, sql, db, 0.2);
+    }
+  };
+  await Promise.all([actor("a", e.connect()), actor("b", e.connect())]);
 };
 
 interface Case { s: Scenario; seeds: number[]; known: Kind[] }
@@ -238,6 +357,28 @@ const CASES = {
     },
     seeds: [1, 2, 3, 4, 5, 6], known: [],
   },
+  // 6. 遷移の途中で止まる進め手、重なる DDL、分割と並ぶ DDL (上の「遷移の途中で止まる進め手」)。
+  driverStops: {
+    s: { side: true, slowPhase2: true, values: "dup", leaseMs: 1_000, ops: 50, ddl: changes({ kinds: ["column", "check", "index", "unique"], count: 6, dropAt: 4 }) },
+    seeds: [1, 2], known: [],
+  },
+  overlapping: {
+    s: { side: true, values: "dup", leaseMs: 1_000, ops: 50, ddl: overlapping },
+    seeds: [1, 2], known: [],
+  },
+  // 行ロックを 60 から 260 ms 持つ取引の行へ、autocommit の UPDATE を当てる。ロックを待つ間に、表定義の遷移が prepare から commit まで
+  // 進む。待ちの後で表定義の epoch を確かめ直さないと、作った index を保守しない古い計画の書き込みが通る (BUG-3、M21 の m21_red_no_recheck)。
+  lockWaitsAcrossChanges: {
+    s: { slowLocks: true, ops: 50, tenants: 10, leaseMs: 1_000, ddl: changes({ kinds: ["uniqueN", "uniqueN", "column", "check"], count: 5 }) },
+    seeds: [1, 2], known: [],
+  },
+  splitStops: {
+    s: {
+      splits: true, splitStops: true, replyJitter: true, slowLocks: true, values: "dup", ops: 60, leaseMs: 1_000,
+      ddl: changes({ kinds: ["column", "check", "index", "uniqueN"], count: 4 }),
+    },
+    seeds: [1, 2], known: [],
+  },
 } satisfies Record<string, Case>;
 
 /** 同じ (scenario, seed) の実行は 1 回だけにする。seed ごとのテストと、seed をまたぐテストが共有する。 */
@@ -344,6 +485,29 @@ describe("5. A table recreated with the same columns in another order, racing wi
   };
   each("recreateReordered", "DROP TABLE, then CREATE TABLE with the columns reversed", recreated);
   each("rebuildReordered", "CREATE, INSERT … SELECT, DROP and RENAME, as a migration tool rebuilds a table", recreated);
+});
+
+describe("6. Schema changes whose driver stops mid-transition, that overlap, or that race with stopped splits", () => {
+  each("driverStops", "DDLs whose driver stops at a random step, DROP TABLE with stale writers", (r) => {
+    expect(r.ddlLog.length).toBeGreaterThan(0);
+  });
+  each("overlapping", "two connections issue DDLs on the same and on different tables at the same moments");
+  each("lockWaitsAcrossChanges", "UNIQUE indexes and columns added while autocommit writes wait on row locks");
+  each("splitStops", "DDLs while the split driver stops after startMove", (r) => {
+    expect(r.splits).toBeGreaterThan(0);
+  });
+  // 検査が何も確かめていない実行にならないこと。進める側は、遷移のいろいろな手の前で止まり、2 つの出し手は重なり、DROP の後の古い接続の
+  // 書き込みは試される。
+  it("stops drivers at many steps, makes DDLs collide, and tries writes to a dropped table", async () => {
+    const runs = [...(await all("driverStops")), ...(await all("overlapping")), ...(await all("lockWaitsAcrossChanges")), ...(await all("splitStops"))];
+    // 止まった手の名前 (シャードの名前は除く)。期限を延ばす手 (renew) の前で止まると、続く prepared の手が、止まった手として返る。
+    // commit の後の適用 (syncSchema) の前で止まっても、その失敗は捨てられ、DDL は完了を返す。
+    const stopped = new Set(runs.flatMap((r) => r.ddlLog.flatMap((l) => /driver stopped before (?:s\d+\.)?(\w+)/.exec(l)?.[1] ?? [])));
+    const busy = (await all("overlapping")).reduce((a, r) => a + (r.notes.busy ?? 0), 0);
+    const tried = (await all("driverStops")).reduce((a, r) => a + r.staleTried, 0);
+    expect({ stopped: ["prepare", "prepared", "commit"].filter((x) => !stopped.has(x)), busy: busy > 0, tried: tried > 0 })
+      .toEqual({ stopped: [], busy: true, tried: true });
+  }, 240_000);
 });
 
 // ---- 既知の欠陥の台本 ----
