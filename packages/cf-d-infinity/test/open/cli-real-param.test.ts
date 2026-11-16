@@ -4,6 +4,10 @@
 // (dec)、Service Binding の query に渡す。Service Binding は D1 の規則 (安全な整数の JS の数は INTEGER) で読むので、REAL として
 // 書いた引数が INTEGER になる。正しくは、CLI が REAL と書いた引数は REAL のまま束縛される。JS の数は 5.0 と 5 を見分けられない
 // ので、直すのは CLI と Worker のあいだの運び方である (要素のまま運ぶか、HTTP の /sql に literal の文面で送る)。
+// bin/ だけでは直せない (2026-11-16 に確かめた)。使い捨ての Worker が呼べる DinfDatabase の query、batch、取引の execute は、どれも
+// toValue を通り、REAL の 5.0 になる JS の値はない。HTTP の入口はトークンが要り、importRows は INSERT しかしない。引数を要素で受け取る
+// 入口を src/entrypoint.ts に足し (decodeElem で読み、INTEGER の 64 ビットの範囲を確かめる)、使い捨ての Worker がそれを呼べば、
+// この試験は通る (試作で確かめた)。
 import { execFile } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
