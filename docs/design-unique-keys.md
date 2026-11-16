@@ -35,7 +35,7 @@ SQLite の挙動についての記述は、node:sqlite (SQLite 3.51.3) で小さ
 | 未解決の問題 31 | 表の制約と CREATE INDEX の列の名前と照合順序は、DDL を Worker の SQLite で実行して `PRAGMA index_list` と `PRAGMA index_xinfo` から読む。構文木の読みは、それと突き合わせる検査になる |
 | 段 | 4 段。検査、キーの関数と列の解決、シャードをまたぐ UNIQUE の置き換え、シャードの中の UNIQUE の置き換え。piece の部分は design-subslots.md の段 2 と段 4 の受け入れに入れる |
 
-刷新案 (`.agents/execplans/evidence/2026-11-14-clean-slate-architecture.md` の 5) から、6 点ずれる。
+刷新の提案 (2026-11-14 の、作り直しの 5 つの案。リポジトリには置いていない) の 5 から、6 点ずれる。
 
 1. キーの識別子は、表と index の名前ではなく、カタログが制約に付ける番号にする。名前を使うと、`ALTER TABLE ... RENAME TO` でキーの行を全部書き直すことになり、同じ名前で作り直した表の古いキーと見分けられない。表の制約の index の名前は SQLite が付ける (`sqlite_autoindex_<表>_<番号>`) ので、表の名前に引きずられる。
 2. キーの行は、全部の制約で 1 つの表ではなく、制約ごとの表に置く。M21 の `abort` は、`prepare` が作った表を名前で消す。1 つの表にまとめると、index の作成の取り消しと DROP INDEX が、行の数に比例する削除になる。
