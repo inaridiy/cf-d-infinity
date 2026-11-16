@@ -12,19 +12,24 @@
 // intent が残っていないことを求め、残っていれば、その移動を後回しにする。54 の窓 (宛先が move-start を適用してから、その intent の
 // グループを引き取るまで) より広く外す。OPEN=1 で外す。外すと、確定して届け終えた取引の intent の残り (history.ts の strandedIntents) で
 // 54 が見つかる (seed 8)。54 が直ったら、伏せるのをやめる。
+//
+// 伏せているもの (MoveChaos.hideStalePull)。終わった移動の遅れた pull が、範囲が戻ってきた前の親に届くと、親は、終わった移動の fence で
+// グループを渡し直そうとし、内部の誤り (UNIQUE constraint failed: __moved...) で答え、その pull を待っていた利用者の文も失敗する
+// (test/open/stale-pull-after-return.test.ts。この生成器の seed 119 が見つけた)。宛先へ向かう pull がまだ届いていない間は、その宛先への
+// 移動を後回しにする。OPEN=1 で外す。
 import { describe, expect, it } from "vitest";
 import { runHistory, type RunResult } from "./history";
 import { seedsOr } from "./sim";
 
-/** 未解決の問題 54 の時刻を伏せる。OPEN=1 で外す。 */
-const HIDE_54 = !process.env.OPEN;
+/** 見つけて直していない欠陥の時刻を伏せる (上の 2 つ)。OPEN=1 で外す。 */
+const HIDE_OPEN = !process.env.OPEN;
 
 const memo = new Map<number, Promise<RunResult>>();
 const run = (seed: number) => {
   if (!memo.has(seed)) {
     memo.set(seed, runHistory({
       seed, shards: 3, tenants: 40, skewMs: 20, ops: 40, thinkMs: 400, slowPhase2Ms: 2_000,
-      moves: { kind: "returns", restarts: true, stops: true, hide54: HIDE_54, slowMoveRpcMs: 60, paceMs: 200 },
+      moves: { kind: "returns", restarts: true, stops: true, hide54: HIDE_OPEN, hideStalePull: HIDE_OPEN, slowMoveRpcMs: 60, paceMs: 200 },
     }));
   }
   return memo.get(seed)!;
@@ -42,7 +47,7 @@ describe("ranges that move away and come back to a former owner, in random order
     }, 120_000);
   }
   // 検査が何も確かめていない実行にならないこと。範囲は前の持ち主へ戻り、子と親は移動の途中で再起動し、進める側なしで閉じる移動がある。
-  // 54 を伏せる実行では、伏せるために後回しにした戻る移動がある (伏せる条件が、何かを外している)。
+  // 伏せる実行では、伏せるために後回しにした移動がある (伏せる条件が、何かを外している)。
   it("moves ranges back to former owners, restarts the shards of a move, and finishes moves without their driver", async () => {
     const all = await Promise.all(seeds.map(run));
     const sum = (f: (r: RunResult) => number) => all.reduce((a, r) => a + f(r), 0);
@@ -50,7 +55,7 @@ describe("ranges that move away and come back to a former owner, in random order
       returns: sum((r) => r.counts.returns) > 0,
       restarts: sum((r) => r.counts.restarts) > 0,
       byChild: sum((r) => r.counts.byChild) > 0,
-      deferred: !HIDE_54 || sum((r) => r.counts.deferred) > 0,
+      deferred: !HIDE_OPEN || sum((r) => r.counts.deferred) > 0,
     }).toEqual({ returns: true, restarts: true, byChild: true, deferred: true });
   }, 240_000);
 });

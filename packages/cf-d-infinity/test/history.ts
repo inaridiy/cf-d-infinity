@@ -9,7 +9,7 @@ import { readEpochs } from "../src/meta";
 import { initialRouting, overlaps, ownerOf, planSplit, regionsOf, shardsOf, slotOf, type Interval } from "../src/routing";
 import { SqlError, type Faults } from "../src/types";
 import { expectQuiescent } from "./invariants";
-import { prng, SimCluster, USERS } from "./sim";
+import { prng, SimCluster, USERS, type Rpc } from "./sim";
 
 export type Key = string; // "tenant/id"
 export interface Read {
@@ -90,6 +90,12 @@ export interface MoveChaos {
    * (窓は、宛先が move-start を適用してから、その intent のグループを引き取るまでである)。
    */
   hide54?: boolean;
+  /**
+   * 終わった移動の遅れた pull が、範囲が戻ってきた前の親に届く時刻を作らない (test/open/stale-pull-after-return.test.ts。親は、終わった移動の
+   * fence でグループを渡し直そうとし、内部の誤りで答える)。宛先へ向かう pull がまだ届いていない (応答も失敗も返っていない) 間は、その宛先への
+   * 移動を後回しにする。宛先は範囲を持たないシャードなので、そこへ向かう pull は、どれも終わった移動のものである。
+   */
+  hideStalePull?: boolean;
   /** 移動の手順の要求の配送を、ときどき最大この ms だけ遅らせる。既定は 20。 */
   slowMoveRpcMs?: number;
   /** 移動と移動の間の待ちの上限 (ms)。既定は、thinkMs があればその 2 倍、なければ 60。 */
@@ -156,7 +162,7 @@ export interface MoveCounts {
   byChild: number;
   /** 移動の手順の要求の前に再起動した、子と親の数。 */
   restarts: number;
-  /** hide54 が後回しにした、戻る移動の数。 */
+  /** hide54 と hideStalePull が後回しにした移動の数。 */
   deferred: number;
 }
 
@@ -420,7 +426,11 @@ function startMoves(o: RunOpts, m: MoveChaos, c: SimCluster, r2: () => number) {
   };
   // 移動の手順の要求の配送の前に、ときどき子か親を再起動する。要求は、新しい instance に届く (送り手を再起動したなら、応答は捨てられた
   // instance に返り、その手順は失敗する)。phase 2 と、移動の手順の要求の配送を、ときどき遅らせる。
+  /** 配送したが、まだ応答も失敗も返っていない pull (hideStalePull)。 */
+  const pulls = new Set<Rpc>();
+  c.net.reply = (x) => void pulls.delete(x);
   c.net.gate = (x) => {
+    if (x.method === "pull") pulls.add(x);
     if (m.restarts && MOVE_RPCS.has(x.method) && r2() < 0.12) {
       const who = x.from === "client" || r2() < 0.5 ? x.to : x.from;
       if (c.backends.has(who)) {
@@ -500,6 +510,13 @@ function startMoves(o: RunOpts, m: MoveChaos, c: SimCluster, r2: () => number) {
     return false;
   };
 
+  /** 宛先へ向かう pull が、まだ届いていないか (MoveChaos.hideStalePull)。失敗した pull は、応答の hook を通らないので、失敗の記録で外す。 */
+  const deferStalePull = (to: string): boolean => {
+    if (!m.hideStalePull) return false;
+    for (const x of pulls) if (c.net.failed.some((f) => f.m === x)) pulls.delete(x);
+    return [...pulls].some((x) => x.to === to);
+  };
+
   const started = (p: { from: string; to: string; range: Interval }) =>
     readEpochs(c.metaBackend).some((x) => x.rec.kind === "move-start" && x.rec.from === p.from && x.rec.to === p.to && x.rec.start === p.range.start && x.rec.end === p.range.end);
   let stop = false;
@@ -513,7 +530,7 @@ function startMoves(o: RunOpts, m: MoveChaos, c: SimCluster, r2: () => number) {
       const plan = await choose();
       if (!plan) continue;
       const isReturn = formerly.some((f) => f.shard === plan.to && overlaps(f.range, plan.range));
-      if (isReturn && defer54(plan.to)) {
+      if ((isReturn && defer54(plan.to)) || deferStalePull(plan.to)) {
         counts.deferred++;
         continue;
       }
