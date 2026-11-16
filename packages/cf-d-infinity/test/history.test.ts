@@ -62,16 +62,25 @@ describe("history checker with pessimistic transactions", () => {
 // 段 4 から、子が自分で移動を進める (move-start を適用したときの応答の後の仕事と、5 秒ごとの alarm)。ここでは、移動の手順の要求の前に
 // 子か親を乱択で再起動し、進める側 (Autoscaler の split) を、ときどき startMove の後で止めるか、再起動で失敗した drain をやり直さずに
 // 離れさせる。子は、alarm で続きを進める (シミュレータの alarm は仮想の時計で発火する)。取引の間に待ちを置き、作業負荷を alarm が何度か
-// 発火するまで続ける。確かめるのは、履歴の直列化可能性と、最後の読み (失われた書き込み)、移動の後の確定して届け終えた取引の intent の
-// 残り (history.ts の strandedIntents)、受け取り終える前の move-end (END_AFTER_DRAIN)、移動が閉じた後の行の置き場所、後始末である。
+// 発火するまで続ける。phase 2 と移動の手順の要求の配送を遅らせ、tenant を多くし、移動を詰めて流す (test/move-returns.test.ts と同じ値で、
+// 移動の選び方だけが Autoscaler と同じ半分の分割である)。確かめるのは、履歴の直列化可能性と、最後の読み (失われた書き込み)、移動の後の
+// 確定して届け終えた取引の intent の残り (history.ts の strandedIntents)、受け取り終える前の move-end (END_AFTER_DRAIN)、移動が閉じた後の
+// 行の置き場所、後始末である。
+// 遅らせない値 (4 シャード、tenant 6、移動の間に最大 800 ms) では、欠陥のスイッチ pullWithoutEpoch を seed 1 から 40 で 1 度も見つけず、
+// phase 2 を遅らせるだけで 8、ここの値で 28 になった (tenant を 40 にするだけ、移動を詰めるだけでは 1 のまま。2026-11-16)。
 describe("history checker while the shards of a move restart and its driver stops", () => {
   const memo = new Map<number, ReturnType<typeof runHistory>>();
   const once = (seed: number) => {
-    if (!memo.has(seed)) memo.set(seed, run({ seed, skewMs: 20, ops: 40, thinkMs: 400, moves: { kind: "split", restarts: true, stops: true } }));
+    if (!memo.has(seed)) {
+      memo.set(seed, run({
+        seed, shards: 3, tenants: 40, slowPhase2Ms: 2_000, skewMs: 20, ops: 40, thinkMs: 400,
+        moves: { kind: "split", restarts: true, stops: true, slowMoveRpcMs: 60, paceMs: 200 },
+      }));
+    }
     return memo.get(seed)!;
   };
-  const seeds = seedsOr([61, 62, 63, 64]);
-  for (const seed of seeds) {
+  const defaults = [61, 62, 63, 64];
+  for (const seed of seedsOr(defaults)) {
     it(`stays serializable, and every move finishes (seed ${seed})`, async () => {
       const r = await once(seed);
       expect(r.counts.moves).toBeGreaterThan(0);
@@ -84,8 +93,9 @@ describe("history checker while the shards of a move restart and its driver stop
     }, 120_000);
   }
   // 検査が何も確かめていない実行にならないこと。子と親は移動の途中で再起動し、進める側の drain が完了を返さないまま閉じる移動がある。
+  // 既定の seed で数える (SEEDS で 1 つの seed だけを流しても、この試験は変わらない)。
   it("restarts children and parents mid-move, and some moves finish without their driver", async () => {
-    const all = await Promise.all(seeds.map(once));
+    const all = await Promise.all(defaults.map(once));
     const sum = (f: (r: Awaited<ReturnType<typeof runHistory>>) => number) => all.reduce((a, r) => a + f(r), 0);
     expect({ restarts: sum((r) => r.counts.restarts) > 0, byChild: sum((r) => r.counts.byChild) > 0 }).toEqual({ restarts: true, byChild: true });
   }, 240_000);

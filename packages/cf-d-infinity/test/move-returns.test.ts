@@ -36,8 +36,8 @@ const run = (seed: number) => {
 };
 
 describe("ranges that move away and come back to a former owner, in random orders", () => {
-  const seeds = seedsOr([1, 2, 3, 4, 5, 6, 7, 8]);
-  for (const seed of seeds) {
+  const defaults = [1, 2, 3, 4, 5, 6, 7, 8];
+  for (const seed of seedsOr(defaults)) {
     it(`stays serializable, loses no write, and leaves no delivered intent behind (seed ${seed})`, async () => {
       const r = await run(seed);
       expect(r.counts.moves).toBeGreaterThan(0);
@@ -47,9 +47,9 @@ describe("ranges that move away and come back to a former owner, in random order
     }, 120_000);
   }
   // 検査が何も確かめていない実行にならないこと。範囲は前の持ち主へ戻り、子と親は移動の途中で再起動し、進める側なしで閉じる移動がある。
-  // 伏せる実行では、伏せるために後回しにした移動がある (伏せる条件が、何かを外している)。
+  // 伏せる実行では、伏せるために後回しにした移動がある (伏せる条件が、何かを外している)。既定の seed で数える。
   it("moves ranges back to former owners, restarts the shards of a move, and finishes moves without their driver", async () => {
-    const all = await Promise.all(seeds.map(run));
+    const all = await Promise.all(defaults.map(run));
     const sum = (f: (r: RunResult) => number) => all.reduce((a, r) => a + f(r), 0);
     expect({
       returns: sum((r) => r.counts.returns) > 0,
