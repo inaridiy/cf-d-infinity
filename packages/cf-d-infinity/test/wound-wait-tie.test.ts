@@ -1,4 +1,4 @@
-// 未解決: 同じミリ秒に始まった autocommit の書き込みと取引の行ロックの順序が、ID の綴りで決まる。
+// 直した: 同じミリ秒に始まった autocommit の書き込みと取引の行ロックの順序が、ID の綴りで決まる。
 //
 // 行ロックの待ちは wound-wait である (src/shard/kernel.ts の older)。古い者が、猶予 (200 ms) の後に若い保持者から行を奪う。
 // 古さは開始時刻で比べ、同じ時刻なら ID の文字列で比べる。autocommit の ID は `auto-<時刻>`、取引の ID は `t-<uuid>-<連番>` なので、
@@ -6,9 +6,12 @@
 // autocommit はロックを持たず、行が空くのを待つ側として作ってある (kernel.ts の autoStep の注釈「autocommit は取引より若いものとして
 // 順番を待つ」)。順序が ID の綴りに依るので、入口の ID の接頭辞 (Db の idPrefix) を変えるだけで結果が変わる。
 // 見つけたのは、シャードを核と殻に分けたとき (2026-11-14、計画書の「同じ開始時刻の取引と autocommit」)。
+//
+// 直し方 (2026-11-16): 順序は、開始時刻、同じ時刻なら取引が autocommit より古い、autocommit どうしは発行の時刻、取引どうしは ID の順の
+// 全順序である (kernel.ts の older。autocommit の待ち手には、シャードが LockOwner.auto を付ける)。
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { SimCluster } from "../sim";
+import { Db } from "../src/client/db";
+import { SimCluster } from "./sim";
 
 describe("an autocommit write that starts in the same millisecond as a transaction's row lock", () => {
   for (const idPrefix of ["t", "z", "a"]) {

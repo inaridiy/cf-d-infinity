@@ -198,6 +198,11 @@ export interface LockOwner {
   txn: string;
   /** 開始時刻。古い取引が優先される (wound-wait)。 */
   start: Ts;
+  /**
+   * autocommit の書き込みの待ち手である。シャードが自分で付け、値はその書き込みに発行した時刻である。Worker は付けない。
+   * 同じ開始時刻なら、autocommit はどの取引よりも若い (src/shard/kernel.ts の older)。
+   */
+  auto?: Ts;
 }
 
 export interface ExecRes {

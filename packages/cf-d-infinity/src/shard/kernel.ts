@@ -1409,9 +1409,21 @@ export class ShardKernel {
     this.schemaChanging = false;
   }
 
-  /** 古い取引が優先される。 */
+  /**
+   * 行ロックの待ちの順序 (wound-wait。古い者が先に起き、若い保持者から行を奪う)。全順序である。
+   *   1. 開始時刻の早いほうが古い。
+   *   2. 同じ開始時刻なら、取引が autocommit の書き込みより古い。autocommit はロックを持たず、行が空くのを待つ側にしかいない (autoStep)。
+   *      取引の行を奪うと、取引の COMMIT が検証で競合になる。前は ID の文字列で比べ、`auto-` が `t-` より前なので、同じミリ秒の
+   *      autocommit がいつも取引を奪った (test/wound-wait-tie.test.ts)。
+   *   3. autocommit どうしは、シャードが発行した時刻 (auto) の順である。
+   *   4. 取引どうしは ID で比べる。どちらが先でもよいが、順序は全体で 1 つに決まっていなければならない (specs/m9_protocol.qnt の older は
+   *      取引の番号で比べる)。
+   */
   older(a: LockOwner, b: LockOwner): boolean {
-    return a.start < b.start || (a.start === b.start && a.txn < b.txn);
+    if (a.start !== b.start) return a.start < b.start;
+    if ((a.auto === undefined) !== (b.auto === undefined)) return a.auto === undefined;
+    if (a.auto !== undefined && b.auto !== undefined && a.auto !== b.auto) return a.auto < b.auto;
+    return a.txn < b.txn;
   }
 
 
@@ -2862,7 +2874,7 @@ export class ShardKernel {
       }
       const dry = this.rollback(() => this.run(sec!, req));
       if (!f.me) {
-        f.me = { txn: `auto-${now}`, start: this.deps.clock.now() };
+        f.me = { txn: `auto-${now}`, start: this.deps.clock.now(), auto: now };
         f.deadline = this.deps.clock.now() + LOCK_WAIT_MS;
       }
       const me = f.me;
@@ -2898,7 +2910,7 @@ export class ShardKernel {
   private directStep(f: DirectFrame): Step<ExecRes | null, DirectFrame> {
     const { req, claim } = f;
     if (!f.me) {
-      f.me = { txn: `auto-${f.now}`, start: this.deps.clock.now() };
+      f.me = { txn: `auto-${f.now}`, start: this.deps.clock.now(), auto: f.now };
       f.deadline = this.deps.clock.now() + LOCK_WAIT_MS;
     }
     const me = f.me;
