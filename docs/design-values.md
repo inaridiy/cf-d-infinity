@@ -354,14 +354,14 @@ object `[{"a": 1}]` は、キー文字列を作る `lowerHex` の中で TypeErro
 D1 との違いを、Miniflare 4.20260730.0 のローカルの D1 で確かめた (2026-11-16)。
 `Uint8Array` と `ArrayBuffer` のバイトの BLOB、値でない引数を `bind` が同期で断ること (`D1_TYPE_ERROR`) は同じである。
 D1 は、`Uint16Array` を要素ごとに 1 バイトへ切り (`new Uint16Array([0x4241])` が `X'41'`)、`DataView` を空の BLOB にする。D∞ はバイトを運ぶ (`X'4142'`)。
-D1 は、0 から 255 の数の配列 (`[65, 66]`) を BLOB として受け付ける。D∞ は断る (`Uint8Array` で渡す)。D1 の結果は BLOB を数の配列で返すので、D1 の結果をそのまま引数に戻すコードは、D∞ では断られる (D∞ の結果は `Uint8Array` なので、D∞ の結果を戻すなら通る)。受け付けるかは持ち主が決める。
+D1 は、0 から 255 の数の配列 (`[65, 66]`) を BLOB として受け付ける。D∞ は断る (`Uint8Array` で渡す)。D1 の結果は BLOB を数の配列で返すので、D1 の結果をそのまま引数に戻すコードは、D∞ では断られる (D∞ の結果は `Uint8Array` なので、D∞ の結果を戻すなら通る)。受け付けるかは持ち主が決める。 (同じ日の後の作業で、D1 互換の API だけは D1 と同じく受け付けるようにした。Service Binding と HTTP は断る。`docs/sql-language.md` の「引数の型」)
 `bigint` は、D1 は断り、D∞ は INTEGER として受け付ける。`undefined` は、D1 は断り、D∞ は前から NULL にしている (変えていない)。
 
 断る誤りは `SqlError` で、何番目の引数か (1 から) と、受け付ける型を書く (`parameter 2 is an array; ...`、`parameter 1: the integer 9223372036854775808 does not fit in 64 bits`)。
 文を実行する前に断るので、取引の中でも何も書かない。どちらも引数の型で決まり、行の置き場所には依らない。
 HTTP の印 (小数点か指数のある安全な整数) は、reviver だけが作るクラスである。JSON の本文にも structured clone にも作れないので、利用者は偽れない。
 reviver は配列の要素の数だけを読み替え、本文の `token` などは JS の数のまま残す。
-Hrana の `fromH` は、型の印 (`type`) と値の JS の型が合うかを確かめていない (`float` の文字列が TEXT に、`float` の配列が BLOB になる)。`src/client/hrana.ts` はこの作業では触らなかったので、正しい挙動を期待する再現を `test/open/hrana-value-types.test.ts` に置いた。
+Hrana の `fromH` は、型の印 (`type`) と値の JS の型が合うかを確かめていない (`float` の文字列が TEXT に、`float` の配列が BLOB になる)。`src/client/hrana.ts` はこの作業では触らなかったので、正しい挙動を期待する再現を `test/hrana-value-types.test.ts` に置いた。 (同じ日の後の作業で直した。型の印と合わない引数は `ARGS_INVALID`。`test/hrana-value-types.test.ts`)
 
 検査は、規則を先に書き、前のコードで落ちることを確かめてからコミットした (`test/entry-values.ts`、規則 2)。
 シミュレータでは `test/entry-values.test.ts` が、HTTP の本文の読み方と D1 互換の API を、1 と 2 のシャードで、表を読まない文と主キーで読み書きする文に流す。
