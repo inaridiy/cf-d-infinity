@@ -40,10 +40,11 @@ describe("a schema change that SQLite rejects on the shard", () => {
     await db.ddl(`CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id))`);
     await db.query("INSERT INTO p VALUES (1, 1, 'x')");
     await db.query("INSERT INTO p VALUES (1, 2, 'x')");
-        await expect(db.ddl("CREATE UNIQUE INDEX ux0 ON p(tenant_id, code)")).rejects.toThrow(/duplicate values/);
+    // 文言は、Worker が記録の前に重複を調べたときのもの (Db.checkUnique)。
+    await expect(db.ddl("CREATE UNIQUE INDEX ux0 ON p(tenant_id, code)")).rejects.toThrow(/^UNIQUE constraint failed: p has duplicate values$/);
     const ddl = await outcome(db.ddl("CREATE UNIQUE INDEX IF NOT EXISTS ux ON p(tenant_id, code)"));
     const read = await outcome(new Db(c, { retries: 2 }).query("SELECT id FROM p WHERE tenant_id = 1 ORDER BY id").then((r) => r.rows));
-    expect(ddl).toHaveProperty("err");
+    expect(ddl).toEqual({ err: "UNIQUE constraint failed: p has duplicate values" });
     expect(read).toEqual({ ok: [{ id: 1 }, { id: 2 }] });
   });
 
@@ -72,7 +73,7 @@ describe("a schema change that SQLite rejects on the shard", () => {
 
   it("a partial UNIQUE index that one shard's rows violate: is withdrawn everywhere and reported", async () => {
     const { c, db, bad, good } = await twoShards();
-    await expect(db.ddl("CREATE UNIQUE INDEX ux ON p(tenant_id, code) WHERE gone IS NOT NULL")).rejects.toThrow(/UNIQUE constraint failed/);
+    await expect(db.ddl("CREATE UNIQUE INDEX ux ON p(tenant_id, code) WHERE gone IS NOT NULL")).rejects.toThrow(/^UNIQUE constraint failed: p\.tenant_id, p\.code$/);
     const cat = await settled(c);
     expect(cat.indexes.ux).toBeUndefined();
     expect(cat.ddl.join("\n")).not.toMatch(/ux/);
@@ -92,7 +93,7 @@ describe("a schema change that SQLite rejects on the shard", () => {
 
   it("ADD COLUMN with a CHECK that one shard's rows violate: is withdrawn everywhere and reported", async () => {
     const { c, db, bad, good } = await twoShards();
-    await expect(db.ddl("ALTER TABLE p ADD COLUMN extra INTEGER CHECK (gone IS NULL)")).rejects.toThrow(/CHECK constraint failed/);
+    await expect(db.ddl("ALTER TABLE p ADD COLUMN extra INTEGER CHECK (gone IS NULL)")).rejects.toThrow(/^CHECK constraint failed$/);
     const cat = await settled(c);
     expect(cat.tables.p!.columns).not.toContain("extra");
     const other = new Db(c, { retries: 2 });
