@@ -86,6 +86,14 @@ const TABLES: Record<string, { cols: string[]; pk: string[]; order: string }> = 
 
 /** 書き手の文を待つ仮想の時間 (ms)。上の「待ちの扱い」。 */
 export const PATIENCE_MS = 1500;
+/**
+ * 悲観的な取引 (SQL の BEGIN、baton) で、シャードが文を実行する書き込みの形 (主キーか shard key の値の 1 つに絞る文)。シャードは
+ * 行ロックを取り、最新の時刻 F の状態で実行する。ほかの書き込み (範囲、条件、INSERT … SELECT) は、Worker の SQLite で、取引の
+ * 読む時点 T の行に対して実行する。基準経路だけの実行 (REFERENCE) では、どの書き込みも後者である。
+ */
+const AT_LATEST = new Set(["point update", "not null violation", "insert", "upsert", "point delete", "pinned group update", "pinned delete", "insert b", "replace b"]);
+/** モデルが取引の文ごとに残す、読む時点と書き込みの候補 (世界) の数の上限 (下の checkTrace の keepWorlds)。 */
+const WORLDS = 64;
 /** 台本の手順の間に進める仮想の時間 (ms)。HLC の順序を台本の順序に揃える (下の runPlacement)。 */
 const GAP_MS = 5;
 
@@ -690,6 +698,18 @@ export function checkTrace(s: Script, t: Trace, m: Model): Verdict {
     return same(r.out, e.out) && overlayKey(r.delta) === overlayKey(e.delta);
   };
   const fail = (i: number, what: string) => problems.push(`step ${i}: ${what}`);
+  // 候補の世界は、文ごとに増える (書き込みの文は、答え (変えた行の数) が同じでも、読んだ時点ごとに書いた値が違う)。数を WORLDS 個に
+  // 抑える。前は台本の順の先頭 64 個を残し、前の時点で読んだ世界を優先していた。取引が読む時点を進めてから書き、そのまま確定すると、
+  // 本当の世界が落ち、確定の時点で文が同じ答えにならないと誤って報告した (seed 296、2026-11-16。範囲の書き込みが行ロックを取るように
+  // なって、こう確定する取引が増えた)。半分は今までどおり順の先頭から、残りの半分は、いまの最新の状態でも同じ答えになる文が多い
+  // 世界から選ぶ。確定する取引の本当の世界は、確定の時点で全部の文が同じ答えになるので、後の半分に残る。
+  const keepWorlds = (next: World[]): World[] => {
+    if (next.length <= WORLDS) return next;
+    const head = next.slice(0, WORLDS / 2);
+    const rest = next.slice(WORLDS / 2).map((w, j) => ({ w, j, n: w.hist.filter((e) => holdsAt(e, latest())).length }));
+    rest.sort((x, y) => y.n - x.n || x.j - y.j);
+    return [...head, ...rest.slice(0, WORLDS - head.length).map((x) => x.w)];
+  };
   for (const i of t.order) {
     if (problems.length > 0) break;
     const step = s.steps[i]!;
@@ -756,14 +776,19 @@ export function checkTrace(s: Script, t: Trace, m: Model): Verdict {
       }
       choices.set(i, distinct.size);
       // 読む時点の候補が 2 つ以上残った。どの時点で読んだかで COMMIT の検証が変わるので、確定の成否は文書の約束の外になる。
-      // 悲観的な取引の書き込みは、文の時点の行に対して実行する (docs/sql-language.md の「取引」の表) ので数えない。
-      if ((!step.write || s.mode === "object") && new Set(next.map((w) => w.hist.at(-1)!.at)).size > 1) unforced = true;
+      // 悲観的な取引の書き込みのうち、シャードが文を実行するもの (AT_LATEST) は、最新の状態の行に対して実行するので数えない。
+      // 範囲や条件で書く文は、Worker の SQLite で、取引の読む時点 T のスナップショットの行に対して実行する (docs/sql-language.md の
+      // 「取引」)。読みと同じく数える。前は悲観的な取引の書き込みを全部数えなかった。確定の phase 2 が届いていないシャードは変更を
+      // 知らせないので T が進まず、4 シャードでだけ範囲の書き込みが古い行から計算され、確定が競合になった (seed 296、2026-11-16。
+      // 範囲の書き込みが行ロックを取るようになり、別の接続の書き込みで先に競合しなくなって、見えるようになった)。
+      const atLatest = step.write && s.mode !== "object" && !REFERENCE_ONLY && AT_LATEST.has(step.shape ?? "");
+      if (!atLatest && new Set(next.map((w) => w.hist.at(-1)!.at)).size > 1) unforced = true;
       first = false;
       if (next.length === 0) {
         fail(i, `tx ${step.sql} ${JSON.stringify(step.params)}: no state between the snapshot and now gives ${show(got)} (serial SQLite gives ${[...distinct].map((x) => x.slice(0, 80)).join(" or ")})`);
         break;
       }
-      worlds = next.slice(0, 64);
+      worlds = keepWorlds(next);
       continue;
     }
     // COMMIT と ROLLBACK
@@ -847,7 +872,11 @@ export async function checkSeed(seed: number, o: { mask: boolean }, s: Script = 
     };
     for (const step of s.steps) {
       const runs = traces.filter((t) => (t.truncatedAt === undefined || step.i < t.truncatedAt) && (t.splitAt === undefined || step.i < t.splitAt) && t.results[step.i]);
-      const groups = step.i > end ? groupBy(runs, ended) : [runs];
+      // 取引の終わりより後に効いた手順は、確定の成否が同じ置き場所の間でだけ比べる。待たされた書き手の文と、その後に後回しにした
+      // 書き手の文は、台本では取引の終わりより前でも、終わりの後に効く (runPlacement の release)。台本の番号で分けると、確定の成否が
+      // 置き場所で違ってよい台本で、後回しにした文の答えを、成否の違う置き場所の間で比べてしまう (seed 296、2026-11-16)。
+      const afterEnd = (t: Trace) => step.i > end || t.order.indexOf(step.i) > t.order.indexOf(end);
+      const groups = runs.some(afterEnd) ? groupBy(runs, ended) : [runs];
       for (const comparable of groups) {
         if (comparable.length < 2) continue;
         const keys = comparable.map((t) => keyOf(t.results[step.i]!.outcome));
