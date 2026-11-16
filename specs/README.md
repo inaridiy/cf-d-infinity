@@ -1394,3 +1394,108 @@ witness は 5 つで、どれも到達した。
 - 範囲が前の持ち主へ戻る形での、書く取引 (S0 で 1 シャードの確定になる)。`BACK` のインスタンスは読むだけである。
 - M23 の「モデルにないもの」の全部 (piece、行のないグループ、応答の喪失、列の遅れた適用、2 つ以上の取引の確かめ、行ロック)。
 - 移動 2 が移動 1 を終える前に始まること。モデルでは前提として置いた (今のコードの `fenceStep` が断る)。
+
+### M23c `m23c_old_reads_across_move.qnt` — 移動の前の読み取り時刻の読みに、前の持ち主の記録で答える (古い読み。未解決の問題 37 の続き)
+
+2026-11-16 に書いた。
+実装より先に書いたモデルである。
+設計は [docs/design-refresh-across-move.md](../docs/design-refresh-across-move.md) の「古い読み」にある。
+
+M23 と M23b の規則では、子は、到着の m か床より小さい T の読みを `ReadTooOld` で断り、Worker が refresh で T を進める。
+窓 (T, m か床] に、読んだ行の別の接続の確定があると、読むだけの取引も競合で失敗する (案 A' の残る失敗)。
+持ち主の基準 (2026-11-16。ORM から使って SQLite と同じに振る舞う。分割だけが起こす失敗は許さない) では、これは許されない。
+M23c は、その読みに T のまま答える規則を確かめる。
+新しい core にしたのは、M23b と同じく、M23b の状態の形を変えると、M23b の状態数を全部取り直すことになるからである。
+
+舞台、書き手、取引 X、確かめ (refresh と確定の検証) は M23b と同じで、確かめは M23b の緑の条件に固定した (尋ね続ける、受け取りの記録を時刻で選ぶ、尋ねられた側も lo から見る、移動 2 で渡した S1 も断る、intent を push する)。
+足したものは 3 つである。
+
+- 古い読み。持ち主は、閾値 (グループの到着の m。運ばれなかったグループは範囲の床) より小さい T の K2 の読みを、受け取りの記録の渡した側に、窓の上端 up = 受け持ち始めた時刻で尋ねる。尋ねられた側は、自分の受け取りの記録を時刻で選んで、同じ規則で前へたどる。答えは、列の終わりのシャードの行 (土台) と、各シャードの記録の T 以下の版を合わせた中で、いちばん新しい版である。intent は持ち主だけが扱う。尋ねる列は 1 手で答える (前の持ち主の記録は pull の後で変わらない。各シャードは `logLowWater` との比べと記録の読みを同じ同期区間で行う、を前提として置いた)。
+- 保持。各シャードの `logLowWater` (`low`) を、時計 - `R` まで、`GCS` 回まで上げる手 (`gc`) と、渡した行を消す手 (`dropRows`) を足した。`RETAIN` なら、渡した行は `logLowWater` が手放した時刻以上になってから消す。受け取りの記録も、受け取った側の `logLowWater` が受け持ち始めた時刻以上になると消したものとして扱う。読みも確かめも、T か窓の下限が、答えに要るシャードの `logLowWater` より小さければ「古すぎる」で断る。
+- 空にされたグループ (`EMPTY`)。W の書き込みは K2 の行を消す。fence の後に K2 に行も intent もなければ pull されず、子は `finish` で範囲の床から受け持つ (M5b の `finishRange`)。
+
+土台の版は時刻を持たない (時刻 -1)。子は、受け取った行より前へは時間をさかのぼれず、受け取った行をそのまま答えるからである。そのため、K2 の最初の行 (版 0) は、S0 の記録ではなく土台に置いた。
+
+`m23cSafe` は、M23b の `serializable`、`readConsistent`、`boundedRefusals`、`boundedAsks`、`parentFrozen` に、`boundedHops` (1 回の読みが前の持ち主に尋ねる回数は移動の数以下) を足し、`placementIndependent` に「古すぎる」で断られたときを足したものである。
+`roNeverFails` は、読むだけの X が失敗するのは「古すぎる」で断られたときだけである、という性質で、読むだけのインスタンスは `m23cSafeRO` (`m23cSafe` と `roNeverFails`) を確かめる。
+`logLowWater` は時計 - `R` より上がらないので、「古すぎる」は、T が、答えに要るシャードの時計で保持の幅より古いときだけに起きる (実装では `LOG_RETAIN_MS`、今は 10 分)。
+時相の性質は 2 つある。
+`txnEnds` は、X がいつか確定するか失敗すること (読みが intent や到着を待ち続けない) で、`chainLive` は、M23b と同じく、始めた refresh と尋ねる列がいつか終わることである。
+公平性は、X の手の全体、2 回の移動の `pull`、`recv`、`finish`、Y の phase 2 に、弱い公平性を置いた。
+`check.sh` の既定は、`txnEnds` を OTHER なしの 2 つのインスタンスで確かめる。`chainLive` (OTHER あり) は HEAVY にした。古い読みは refresh も尋ねる列 (確かめの) も使わないので、この性質は M23b の `m23b_live` と同じ規則を確かめる。
+
+赤は、規則の条件を 1 つずつ外す。
+`m23c_red_prev_above` だけは、閾値を範囲の床にした形 (`m23c_green_split_floor`、緑) から、重ねることを外す。
+閾値を到着の m にするか範囲の床にするかは、重ねることがあれば答えを変えない。
+前の持ち主が到着の m 以上の T に答えて子の書き込みを落とすのは、重ねないときだけである。
+`m23c_red_no_retain` の前の持ち主は、行を消した後に「行なし」と答える (今の rollback-read は、今の行から T より後の確定を戻すので、そうなる)。行を消したことに気づいて断る形にしても、T は `logLowWater` より新しいので、読むだけの取引が置き場所のために失敗する (`roNeverFails` が破れるはずである)。モデルで確かめたのは前者だけである。
+
+| 条件 (定数) | 外したインスタンス | 反例 |
+|---|---|---|
+| 古い読み (`OLD_READS`)。外すと M23b の規則 | `m23c_base_ro` | 案 A' の形。X が S0 で全表を T = 0 で読む。W が K2 を c = 1 で S0 に確定する。移動 1 (m1 = 2、床 3) の後、S1 が T = 0 を断り、refresh の確かめが S0 の (0, 2] に W を見つけて、読むだけの X が失敗する (`roNeverFails`) |
+| 持ち主は、閾値より小さい T を前の持ち主に尋ねる (`FWD`) | `m23c_red_child_below` | 同じ形で、S1 が T = 0 に、受け取った行 (W の値) で答える |
+| 尋ねた側は、自分の記録の T 以下の版を重ねる (`MERGE`) | `m23c_red_no_merge` | Y が S0 で prepare し (pts 1)、X が T = 1 で読み始める。Y の intent が pull に乗り、anchor が c = 1 (m1 = 2 より小さい) を決め、S1 で適用する。S1 は S0 の答え (最初の行) をそのまま返す。「受け取る前に、子の書き込みはない」は成り立たない |
+| 同上、閾値を範囲の床にした形で | `m23c_red_prev_above` | 移動 1 (m1 = 1) を受け取った後、W が S1 で c = 2 で確定する。X は refresh で T = 2 にし、床 3 の後で K2 を読む。T は到着の m 以上だが床より小さいので、S1 は S0 に尋ね、S0 の答え (最初の行) をそのまま返す |
+| 渡した行を、`logLowWater` が手放した時刻を越えるまで残す (`RETAIN`) | `m23c_red_no_retain` | X が T = 0 で読む。移動 1 を終えると、S0 が渡した行を消す (今の `ack`)。S1 に尋ねられた S0 は、T = 0 の行を答えられず、「行なし」と答える |
+| 渡したシャードは、Worker の要求を断り、持ち主の尋ねにだけ答える (`PREV_ANSWERS` = false、epoch の確かめ) | `m23c_red_no_epoch` | `m23c_red_no_merge` と同じ intent の形で、範囲表の古い X (epoch 0) の読みに、S0 が、T = 1 < m1 = 2 なので、残した行で答える。S1 で適用された Y を見ない |
+| 持ち主が尋ねる。Worker が前の持ち主へ直接送らない (`WORKER_ROUTES` = false) | `m23c_red_worker_routes` | Y の intent (c は未定) が pull で S1 に移る。X の T = 1 の読みを、Worker が S0 へ送り、S0 が答える。誰も Y を push せず、anchor が c = 1 (T 以下) を決め、Y は S1 で適用される。X が読み直すと、S0 はまた最初の行を答えるが、T = 1 の値は Y である |
+| 運ばれなかったグループの窓の始まりを、範囲の床として記録に残す (`EMPTY_FLOOR`) | `m23c_red_empty_no_floor` | X が T = 0 で読む。W が K2 の行を消す (c = 1)。移動 1 は行を運ばず、S1 が床 2 から受け持つ。S1 は到着の記録がないので尋ねず、T = 0 に「行なし」と答える (今のコードの `noRangeFloor`、M5b の `m5b_red_emptied` と同じ欠陥) |
+
+| インスタンス | 性質 | 定数 | 到達状態数 (distinct) | 結果 |
+|---|---|---|---|---|
+| `m23c_green_ro_w` | `m23cSafeRO` | 読むだけ (全表を 2 回読む)。書き手 W、移動 2 回、OTHER (to は 5 まで) | 1,201,275 | No violation |
+| `m23c_green_ro_y` | `m23cSafeRO` | 同上で、書き手 Y | 7,833,657 | No violation |
+| `m23c_green_w` | `m23cSafe` | 全表を 2 回読み、K2 を楽観で書く。書き手 W | 1,761,688 | No violation |
+| `m23c_green_back_y` | `m23cSafeRO` | 範囲が S0 へ戻る。読むだけ、書き手 Y | 6,839,355 | No violation |
+| `m23c_green_split_floor` | `m23cSafeRO` | 閾値を範囲の床にする。読むだけ、書き手 W | 1,306,232 | No violation |
+| `m23c_green_retain` | `m23cSafeRO` | 変更ログを 2 回まで切り詰める (保持の幅 1)。移動 1 回、読むだけ、書き手 W | 7,457,625 | No violation |
+| `m23c_green_empty` | `m23cSafeRO` | W が K2 の行を消す。空のグループは運ばれない。読むだけ、移動 2 回 | 771,188 | No violation |
+| `m23c_live_end` | `txnEnds` (時相) | 読むだけ、書き手 W と Y、OTHER なし | 88,802 | No violation |
+| `m23c_live_end_w` | `txnEnds` (時相) | 書く取引 (楽観)、書き手 W と Y、OTHER なし | 179,431 | No violation |
+| `m23c_green_y` | `m23cSafe` | 書く取引 (楽観)、書き手 Y (HEAVY) | 11,502,165 | No violation |
+| `m23c_green_split_floor_y` | `m23cSafeRO` | 閾値を範囲の床にする。読むだけ、書き手 Y (HEAVY) | 8,420,809 | No violation |
+| `m23c_green_pess` | `m23cSafe` | 全表を 1 回読み、K2 を悲観で書く。書き手 W と Y (HEAVY) | 24,056,593 (5 分) | No violation |
+| `m23c_green_retain_w` | `m23cSafe` | `m23c_green_retain` で、書く取引 (HEAVY) | 10,255,846 | No violation |
+| `m23c_green_retain2` | `m23cSafeRO` | 変更ログを 1 回切り詰める。移動 2 回、読むだけ、書き手 W (HEAVY) | 26,682,901 (5 分) | No violation |
+| `m23c_live` | `chainLive` (時相) | 読むだけ、書き手 Y、OTHER あり (to は 4 まで) (HEAVY) | 3,442,150 (9 分) | No violation |
+| `m23c_base_ro` | `roNeverFails` | M23b の規則のまま。読むだけ、書き手 W | 19,450 で反例 | 反例 |
+| `m23c_red_child_below` | `readConsistent` | 条件を 1 つ外す (`m23c_green_ro_w` の定数) | 4,637 で反例 | 反例 |
+| `m23c_red_no_merge` | `readConsistent` | 同上 (`m23c_green_ro_y` の定数) | 6,017 で反例 | 反例 |
+| `m23c_red_prev_above` | `readConsistent` | `m23c_green_split_floor` から重ねることを外す | 6,576 で反例 | 反例 |
+| `m23c_red_no_retain` | `readConsistent` | 条件を 1 つ外す (`m23c_green_ro_w` の定数) | 2,674 で反例 | 反例 |
+| `m23c_red_no_epoch` | `readConsistent` | 同上 (`m23c_green_ro_y` の定数) | 1,191 で反例 | 反例 |
+| `m23c_red_worker_routes` | `readConsistent` | 同上 (`m23c_green_ro_y` の定数) | 4,038 で反例 | 反例 |
+| `m23c_red_empty_no_floor` | `readConsistent` | 同上 (`m23c_green_empty` の定数) | 2,222 で反例 | 反例 |
+
+状態数は、4 workers、heap 2.5 GB で、ほかの TLC の検査と同時に流さずに測った。
+赤の状態数は、TLC が反例を見つけるまでに数えた数で、流すたびに少し変わる。
+2026-11-16 に、`check.sh` の M23c の節を `HEAVY` なしで流し、36 件 (TLC の検査 23 件と run の試験 13 件) がすべて期待どおりで、13 分 (763 秒) かかった。HEAVY の 6 件は 1 本ずつ流して期待どおりだった (`m23c_live` が 9 分、`m23c_green_pess` と `m23c_green_retain2` が 5 分ずつ)。
+`txnEnds` を OTHER ありで確かめると、ほかのシャードの `ReadTooOld` による refresh が、通らないまま何度でも始まる経路で破れる (25,693 状態で反例。モデルの OTHER は回数を数えないが、実装は 1 つの文につき 4 回までである)。これは検査の側の誤りなので、OTHER なしのインスタンスで確かめた。
+移動 2 回で変更ログを 2 回切り詰める形は、4 分で 2,045 万状態を数えても終わらなかったので、移動 1 回の形を既定にし、移動 2 回は切り詰め 1 回の形 (`m23c_green_retain2`) を HEAVY にした。
+
+witness は 6 つで、どれも到達した。
+
+| witness | インスタンス | 内容 | 到達状態数 |
+|---|---|---|---|
+| `witnessAPrime` | `m23c_green_ro_w` | 案 A' の形。読むだけの X が T で読み、W が動く行を (T, m1] の時刻で S0 に確定する。X は T を進めずに、移動の後に動いた行を前の持ち主に尋ねて読み、確定する | 17,620 |
+| `witnessForward2` | `m23c_green_ro_w` | 2 回の移動をまたいで、前の持ち主 2 つ (S1 と S0) に尋ねた読みがあり、X が確定する | 79,090 |
+| `witnessOverlay` | `m23c_green_ro_y` | 尋ねて答えた読みの答えが、持ち主の重ねた版 (pull に乗った Y を、受け取る前の c で適用したもの) で、X が確定する | 105,181 |
+| `witnessTooOld` | `m23c_green_retain` | 前の持ち主の `logLowWater` より古い読みが「古すぎる」で断られ、X が失敗する | 5,305 |
+| `witnessWriteAcross2` | `m23c_green_w` | 書く X が、T を進めずに、2 回の移動の後に動いた行を読み直し、移動 2 の行き先で書いて確定する | 663,395 |
+| `witnessEmptyRead` | `m23c_green_empty` | 空にされたグループを、子が前の持ち主に尋ねて、削除の前の T の行を答え、X が確定する | 11,037 |
+
+決定的な run は、`m23c_green_ro_w` に 2 本 (案 A' の形と、2 回の移動をまたぐ読み)、`m23c_green_ro_y`、`m23c_green_w`、`m23c_green_retain`、`m23c_green_empty` に 1 本ずつ、`m23c_base_ro` と各赤に反例の 1 本がある。
+
+わかったこと。
+
+- 案 A' の残る失敗は、移動の前の読み取り時刻の読みに T のまま答えれば、なくせる。読むだけの取引は、`logLowWater` より古いときのほかは失敗しない。
+- 「受け取る前に、子の書き込みはない」は、確定の時刻では成り立たない。前の持ち主の答えだけを使う形 (重ねない、Worker が前の持ち主へ直接送る、渡したシャードが範囲表の古い Worker に答える) は、どれも、pull に乗った intent を受け取る前の c で適用した版を落として破れる。
+- 閾値 (到着の m か範囲の床か) は、重ねることがあれば答えを変えない。閾値を到着の m にすると、子は、行を運んだグループの [到着の m, 床) の T に、自分の状態で答えてよい (M23 の設計の文書の判断 1 で、確かめていないとした点)。行を運ばなかったグループには、範囲の床が閾値として要る。
+
+モデルにないもの。
+
+- 尋ねる列をシャードごとの別の手にすること。前の持ち主の記録は pull の後で変わらないので 1 手にした。各シャードが `logLowWater` との比べと記録の読みを同じ同期区間で行う、を前提として置いた。
+- 全表の span (複数のグループ)。閾値を範囲の床にした形が、その答え方にあたる。
+- 渡した行を残す場所。範囲が戻ったとき (BACK)、残した行と受け取った行を別に持つものとして扱った。
+- 移動 2 回で変更ログを 2 回以上切り詰めること (状態数のため)。
+- M23b の「モデルにないもの」の全部。

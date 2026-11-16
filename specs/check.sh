@@ -626,6 +626,42 @@ fi
 for m in m23b_green m23b_green_pess m23b_green_back m23b_red_stop_first m23b_red_forget m23b_red_mid_from_arrival m23b_red_mid_alone \
          m23b_red_skip_push m23b_live_red_cycle; do tests $f $m; done
 
+echo "== M23c old reads across moves (移動の前の読み取り時刻の読みに、前の持ち主の記録で答える。実装より先に書いたモデル)"
+f=m23c_old_reads_across_move.qnt
+green   $f m23c_green_ro_w m23cSafeRO                   # 読むだけの取引。書き手 W、2 回の移動。読むだけの取引は「古すぎる」のほかでは失敗しない
+green   $f m23c_green_ro_y m23cSafeRO                   # 同上、書き手 Y (pull に乗った intent が、受け取る前の c で子で適用される)
+green   $f m23c_green_w m23cSafe                        # 書く取引 (楽観)。書き手 W
+green   $f m23c_green_back_y m23cSafeRO                 # 範囲が S0 へ戻る。読むだけ、書き手 Y
+green   $f m23c_green_split_floor m23cSafeRO            # 閾値を範囲の床にしても、持ち主が自分の版を重ねれば安全 (全表の span の形)
+green   $f m23c_green_retain m23cSafeRO                 # 変更ログを切り詰める (移動 1 回)。渡した行は logLowWater が手放した時刻を越えるまで残す
+green   $f m23c_green_empty m23cSafeRO                  # 空にされたグループは運ばれず、子は範囲の床より前の T を前の持ち主に尋ねる
+red     $f m23c_base_ro roNeverFails                    # M23b の規則のまま: 案 A' の形で、読むだけの取引が移動のために失敗する
+red     $f m23c_red_child_below readConsistent          # 持ち主が、到着より前の T に、受け取った行で答える
+red     $f m23c_red_no_merge readConsistent             # 持ち主が、自分の版を重ねない (受け取る前の c で適用した intent を落とす)
+red     $f m23c_red_prev_above readConsistent           # 閾値を床にして重ねない: 前の持ち主が到着の m 以上の T に答え、子の書き込みを落とす
+red     $f m23c_red_no_retain readConsistent            # 渡した行を、移動を終えたら消す (今の ack)
+red     $f m23c_red_no_epoch readConsistent             # 渡したシャードが、範囲表の古い Worker の読みに、残した行で答える
+red     $f m23c_red_worker_routes readConsistent        # Worker が古い読みを前の持ち主へ直接送る (持ち主は重ねず、intent も push しない)
+red     $f m23c_red_empty_no_floor readConsistent       # 運ばれなかったグループの窓の始まり (範囲の床) を記録しない
+live    $f m23c_live_end txnEnds                        # 活性: 取引はいつか終わる (読みが intent や到着を待ち続けない)。OTHER なし
+live    $f m23c_live_end_w txnEnds                      # 同上、書く取引
+witness $f m23c_green_ro_w witnessAPrime                # 案 A' の形の読むだけの取引が、T を進めずに確定する
+witness $f m23c_green_ro_w witnessForward2              # 2 回の移動をまたいで、前の持ち主 2 つに尋ねた読みで確定する
+witness $f m23c_green_ro_y witnessOverlay               # 持ち主の重ねた版 (受け取る前の c で適用した intent) が答えになる
+witness $f m23c_green_retain witnessTooOld              # 前の持ち主の logLowWater より古い読みが「古すぎる」で断られる
+witness $f m23c_green_w witnessWriteAcross2             # 書く取引が、T を進めずに 2 回の移動をまたいで確定する
+witness $f m23c_green_empty witnessEmptyRead            # 空にされたグループの、削除の前の行を、前の持ち主に尋ねて読む
+if [ "${HEAVY:-0}" = "1" ]; then
+  green $f m23c_green_y m23cSafe                        # 書く取引、書き手 Y
+  green $f m23c_green_pess m23cSafe                     # 悲観の取引、書き手 W と Y
+  green $f m23c_green_split_floor_y m23cSafeRO
+  green $f m23c_green_retain_w m23cSafe                 # 書く取引で、変更ログを切り詰める
+  green $f m23c_green_retain2 m23cSafeRO                # 移動 2 回で、変更ログを 1 回切り詰める
+  live  $f m23c_live chainLive                         # OTHER ありで、refresh と尋ねる列が終わる (古い読みはどちらも使わない。M23b の m23b_live と同じ規則)
+fi
+for m in m23c_green_ro_w m23c_green_ro_y m23c_green_w m23c_green_retain m23c_green_empty m23c_base_ro m23c_red_child_below \
+         m23c_red_no_merge m23c_red_prev_above m23c_red_no_retain m23c_red_no_epoch m23c_red_worker_routes m23c_red_empty_no_floor; do tests $f $m; done
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect

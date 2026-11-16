@@ -47,7 +47,8 @@
 //   boundedHops           1 回の読みが前の持ち主に尋ねる回数は、移動の数以下である
 //   parentFrozen          K2 を渡したシャードは、受け取り直すまで K2 の書き込みを適用しない
 // temporal
-//   txnEnds               X は、いつか確定するか失敗する (読みが待ち続けない)。refresh と尋ねる列も、いつか終わる
+//   txnEnds               X は、いつか確定するか失敗する (読みが待ち続けない)。OTHER なしで確かめる
+//   chainLive             始めた refresh も、尋ね始めた確かめも、いつか終わる (M23b と同じ)
 module m23c_core {
   // ---- 古い読みの規則の条件。赤は 1 つずつ外す ----
   const OLD_READS: bool         // 古い T の読みに、持ち主が前の持ち主の記録で答える (false: M23b のまま。子は ReadTooOld で断る)
@@ -737,9 +738,12 @@ module m23c_core {
     weakFair(pull(2), vars), weakFair(recv(2), vars), weakFair(finish(2), vars),
     weakFair(yPhase2, vars)
   }
-  temporal txnEnds = fairness implies (eventually(x.st == COMMITTED or x.st == ABORTED)
-                                       and always(x.rTo > 0 implies eventually(x.rTo == 0))
-                                       and always(x.chain == C_ASK implies eventually(x.chain != C_ASK)))
+  // X は、いつか確定するか失敗する。OTHER の refresh は、モデルでは何度でも始まり (実装では 1 つの文につき 4 回まで。Txn.call の attempt)、
+  // 通らない refresh を繰り返す経路が残るので、この性質は OTHER なしのインスタンスで確かめる
+  temporal txnEnds = fairness implies eventually(x.st == COMMITTED or x.st == ABORTED)
+  // 始めた refresh も、尋ね始めた確かめも、いつか終わる (M23b と同じ)
+  temporal chainLive = fairness implies (always(x.rTo > 0 implies eventually(x.rTo == 0))
+                                         and always(x.chain == C_ASK implies eventually(x.chain != C_ASK)))
 }
 
 // ---- 規則 (緑) ---------------------------------------------------------------------------------------------------------
@@ -902,12 +906,26 @@ module m23c_green_empty {
         .expect(x.st == COMMITTED and m23cSafeRO and not(witnessEmptyRead))
 }
 
-// 活性。読むだけ、書き手 Y、T の上限 4
+// 活性。m23c_live (読むだけ、書き手 Y、T の上限 4) は refresh と尋ねる列が終わること (chainLive)、m23c_live_end と m23c_live_end_w
+// (書き手 W と Y) は、OTHER なしで、取引が終わること (txnEnds。読みが intent や到着を待ち続けない) を確かめる
 module m23c_live {
   import m23c_core(OLD_READS = true, FWD = true, MERGE = true, SPLIT_FLOOR = false, EMPTY_FLOOR = true, PREV_ANSWERS = false,
                    WORKER_ROUTES = false, RETAIN = true,
                    MOVES_N = 2, BACK = false, EMPTY = false, SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = true,
                    HAS_W = false, HAS_Y = true, TICKS = 0, T_MAX = 4, GCS = 0, R = 1).*
+}
+module m23c_live_end {
+  import m23c_core(OLD_READS = true, FWD = true, MERGE = true, SPLIT_FLOOR = false, EMPTY_FLOOR = true, PREV_ANSWERS = false,
+                   WORKER_ROUTES = false, RETAIN = true,
+                   MOVES_N = 2, BACK = false, EMPTY = false, SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = false,
+                   HAS_W = true, HAS_Y = true, TICKS = 0, T_MAX = 5, GCS = 0, R = 1).*
+}
+// 同じく、書く取引 (楽観)。確定の検証で前の持ち主に尋ねる列と、2PC の確定も終わる
+module m23c_live_end_w {
+  import m23c_core(OLD_READS = true, FWD = true, MERGE = true, SPLIT_FLOOR = false, EMPTY_FLOOR = true, PREV_ANSWERS = false,
+                   WORKER_ROUTES = false, RETAIN = true,
+                   MOVES_N = 2, BACK = false, EMPTY = false, SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = false,
+                   HAS_W = true, HAS_Y = true, TICKS = 0, T_MAX = 5, GCS = 0, R = 1).*
 }
 
 // ---- 赤: 条件を 1 つずつ外す ------------------------------------------------------------------------------------------
