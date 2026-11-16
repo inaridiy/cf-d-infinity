@@ -164,24 +164,13 @@ const enc = (v) => v === null || v === undefined ? null
   : typeof v === "number" ? (Number.isNaN(v) ? null : "r" + real(v))
   : typeof v === "string" ? "t" + v
   : "b" + hex(v instanceof ArrayBuffer ? new Uint8Array(v) : v);
-const dec = (e) => {
-  if (e === null) return null;
-  const rest = String(e).slice(1);
-  switch (String(e)[0]) {
-    case "i": return BigInt(rest);
-    case "r": return Number(rest);
-    case "t": return rest;
-    case "b": return Uint8Array.from(rest.match(/../g) || [], (h) => parseInt(h, 16));
-  }
-  throw new Error("not an element: " + JSON.stringify(e));
-};
 export default {
   async fetch(request, env) {
     const { op, args } = await request.json();
     if (!OPS.has(op)) return Response.json({ error: "unknown operation " + op });
     try {
       if (op === "query") {
-        const r = await env.DINF_DB.query(args[0], args[1].map(dec), 0, "bigint");
+        const r = await env.DINF_DB.queryElements(args[0], args[1], 0, "bigint");
         return Response.json({ ok: { columns: r.columns, values: r.values.map((row) => row.map(enc)), changes: r.changes, lastInsertRowid: enc(r.lastInsertRowid) } });
       }
       return Response.json({ ok: await env.DINF_DB[op](...args) });
