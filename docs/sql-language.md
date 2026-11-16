@@ -93,6 +93,7 @@ DO の SQLite には、文の長さ (100 KB)、束縛の変数 (100 個)、複�
 | NUL (U+0000) を含む TEXT | 差分はない (2026-11-14 から)。どの経路で答えても、全部を返す。Worker の SQLite のドライバは TEXT を最初の NUL で切るので、D∞ は TEXT を BLOB にして読む |
 | HTTP の `/sql` と `/batch` の JSON の BLOB と無限大 | 値を JSON の値のまま書くので、BLOB はバイトの番号を鍵にした object (`{"0":0,"1":255}`)、REAL の ±無限大は `null` になる。`hex()` か `quote()` で読むか、Hrana を使う。D1 互換の API と Service Binding は、structured clone で BLOB を `Uint8Array` のまま返す |
 | 暗黙の rowid と `INTEGER PRIMARY KEY` の採番 | 一意で増えるが連続しない。削除された番号は再利用しない。接続を跨ぐと順序も保証しない |
+| 文の結果の `lastInsertRowid` (D1 の `meta.last_row_id`) | 文が最後に入れた行の rowid で、行を入れなかった文は `null` (D1 の `meta` は 0) である。SQLite の `last_insert_rowid()` と同じく、`REPLACE` が消してから入れた行は入れたことになり、UPSERT の `DO UPDATE` で更新した行と、`OR IGNORE` や `DO NOTHING` が入れなかった行は、ならない。文をどの経路で実行しても同じ値になる (2026-11-16 から。`test/last-insert-rowid.test.ts`、差分の検査が比べる)。違いは 2 つある。SQLite の接続の値は文をまたいで残るが、D∞ は文ごとに返し、`UPDATE` と `DELETE` は `null` である。rowid が行のキーでない表 (`INTEGER PRIMARY KEY` でない主キーの表) の行は、rowid を返さない。D∞ の行は、シャードをまたいで意味のある、そういう rowid を持たないからである |
 
 ### 制約
 
@@ -119,6 +120,12 @@ DO の SQLite には、文の長さ (100 KB)、束縛の変数 (100 個)、複�
 読んでから書く取引は `BEGIN IMMEDIATE` を使うのがよい。
 
 ロックは行ごとで、待ちは SQLite の busy_timeout に相当する 5 秒が上限である。
+書き込みのロックは、文の経路によらず、文が書いた行のすべてに取る。
+主キーで 1 行に絞る文はシャードが文を実行するときに、範囲や条件で書く文 (行を集めて Worker の SQLite で実行する文) は、文を実行した後に書いた行ごとに取る。
+後者の文は、取引の読み取り時刻のスナップショットで行を読んで計算するので、読み取り時刻とロックの間に別の接続が同じ行を確定していれば、`COMMIT` が `SQLITE_BUSY` になる。
+`BEGIN IMMEDIATE` でも同じである (最新を読むのは主キーの読みだけである)。
+行ロックの待ちは wound-wait で、古いものが先に行を取る。
+古さは、取引なら最初にロックを取った時刻、autocommit の書き込みならシャードが受けた時刻で比べ、同じミリ秒なら取引を古いものとする (autocommit はロックを持たず、取引の行を奪わずに待つ)。
 autocommit の文は内部でリトライし、`batch` も文が全部分かっているので内部でやり直す (DDL を含む `batch` は、次の「取引の中の DDL」を参照)。
 `BEGIN` で始めた対話的な取引のリトライはアプリの責任である。
 

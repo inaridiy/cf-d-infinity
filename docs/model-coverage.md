@@ -131,6 +131,16 @@ Categories:
 | m21_red_owner_unchecked | the shard does not look ownership up in its own snapshot | ignoreFence (widened in stage 2: it now also turns off the snapshot check, next to the `__fenced` refusal) | epoch-requests ("refuses a row that its snapshot gives to another shard ..." and "put back with ignoreFence ..."; added 2026-11-15); migration ("a parent that ignores the fence accepts a write the child never sees") for the parent's side | A |
 | m21_red_strict_epoch | the shard requires the request's epoch to equal its own, so a split refuses unmoved rows of transactions planned before it (not a safety flaw) | none | transaction-on-unmoved-rows-across-split (four tests, through the Worker); epoch-requests ("serves an unmoved row to a request planned before a split that the shard has applied" and "... a newer epoch ... without fetching the log"; added 2026-11-15) | A |
 
+Two changes of the Worker's transaction layer (2026-11-16) use M9 as it is, with no new module. A pessimistic
+transaction now also locks the rows that a statement run in the Worker's SQLite wrote (`Txn.lockWritten`, open problem 36):
+the lock is M9's locking read (`tmpl.imm`, `lockKeys` includes the read keys, `since` = F), sent for the written rows
+after the statement read its rows at T. The write keeps no `since`, so it is validated from T, which is stricter than M9's
+window from F (M9's template C, a predicate read at T followed by a locked write, is the closest shape). M9 checks safety
+without trusting locks (`RED_SKIP_LOST`), so adding a lock adds only waiting. The wound-wait order now breaks a tie of
+start times by kind (a transaction is older than an autocommit write) before the id (`older` in
+`src/shard/kernel.ts`). M9's `older` compares T and then the transaction number; any fixed total order satisfies it.
+Replays: ranged-write-in-begin-takes-no-lock and wound-wait-tie.
+
 ## Switches that match no red module
 
 - `rowSpanDespiteUnique`: narrows a write's span to one row despite an in-shard UNIQUE. Used in span-check:28, :38 and :45, review-regressions:57, health:76. Since 2026-11-14 the shard's write guard also refuses the REPLACE this switch narrows (span-check:38); span-check:28 turns the guard off to show the read check alone.

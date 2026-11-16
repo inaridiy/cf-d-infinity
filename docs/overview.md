@@ -114,10 +114,14 @@ Recovery is *presumed abort*: nothing is logged at the anchor during prepare. A 
 old intent asks the anchor, and an anchor that has neither a record nor an in-flight entry writes an abort tombstone.
 
 **Row locks.** Optimistic validation alone makes transactions that fight over the same rows fail at `COMMIT`
-repeatedly, so writes take row locks when the statement runs, as in TiDB's pessimistic mode. `BEGIN IMMEDIATE` also
-locks the rows it reads by primary key. Locks live only in the shard's memory and may vanish at any time (restart,
-TTL, migration) without harm, because commit-time validation still checks every row from the moment it was read.
-Waiting uses wound-wait; prepared transactions cannot be wounded and never wait, which keeps the wait graph acyclic.
+repeatedly, so writes take row locks when the statement runs, as in TiDB's pessimistic mode. Every row a statement
+writes passes through one function in the Worker (`Txn.wrote`), whichever path ran the statement: a statement sent to
+one shard takes its locks there as it runs, and a statement run in the Worker's SQLite takes them afterwards with a
+locking read of the rows it wrote. `BEGIN IMMEDIATE` also locks the rows it reads by primary key. Locks live only in
+the shard's memory and may vanish at any time (restart, TTL, migration) without harm, because commit-time validation
+still checks every row from the moment it was read. Waiting uses wound-wait over one total order (start time; at the
+same millisecond a transaction is older than an autocommit write, which holds no locks); prepared transactions
+cannot be wounded and never wait, which keeps the wait graph acyclic.
 
 ## Queries across shards
 
