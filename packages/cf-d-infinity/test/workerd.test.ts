@@ -348,6 +348,21 @@ describe("DDL through the HTTP /ddl endpoint", () => {
     expect((await sql("SELECT id FROM people WHERE email = ?", ["y@example.test"])).rows).toEqual([{ id: 2 }]);
     expect((await sql("INSERT INTO people(id, email) VALUES (3, 'x@example.test')")).status).toBe(400);
   });
+
+  // 行で失敗し得る DDL は、各シャードが、書き込みを止めた表で文を試して巻き戻してから確定する (docs/design-catalog-epoch.md の段 3)。
+  // 本物の DO の SQLite で、取引の中の DDL が巻き戻ることと、確定のときに同じ文がもう一度通ることを確かめる。
+  it("tries a change that can fail on rows on the fenced table, rolls the trial back, and runs it again at the commit", async () => {
+    await post("/ddl", { sql: "CREATE TABLE trial(id INTEGER PRIMARY KEY, email TEXT)" });
+    await sql("INSERT INTO trial(id, email) VALUES (1, 'a@example.test'), (2, 'b@example.test')");
+    expect((await post("/ddl", { sql: "ALTER TABLE trial ADD COLUMN n INTEGER DEFAULT 1 CHECK (n > 0)" })).status).toBe(200);
+    expect((await post("/ddl", { sql: "CREATE UNIQUE INDEX trial_id_email ON trial(id, email)" })).status).toBe(200);
+    expect((await sql("SELECT id, n FROM trial ORDER BY id")).rows).toEqual([{ id: 1, n: 1 }, { id: 2, n: 1 }]);
+    expect((await sql("INSERT INTO trial(id, email, n) VALUES (3, 'c@example.test', 0)")).status).toBe(400);
+    // 試しに通らない DDL は abort され、表は元のままである。
+    const bad = await post("/ddl", { sql: "ALTER TABLE trial ADD COLUMN m INTEGER CHECK (m IS NOT NULL)" });
+    expect(bad.status).toBe(400);
+    expect((await sql("INSERT INTO trial(id, email) VALUES (4, 'd@example.test')")).status).toBe(200);
+  });
 });
 
 // 書き込み禁止の期限の延長を、本物の DO で通す。期限 (meta.ts の LEASE_MS、5 秒) より長くかかる index の作成は、
