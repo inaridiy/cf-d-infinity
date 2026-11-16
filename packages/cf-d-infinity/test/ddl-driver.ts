@@ -12,13 +12,16 @@ import { SimCluster } from "./sim";
 
 export const outcome = (p: Promise<unknown>) => p.then(() => "ok", (e: Error) => e.message);
 
-/** 進める側の Cluster。呼び出しを順に記録し、stopAt 番目の手 (catalog を除いた呼び出しの番号、0 から) で止まる。 */
-export function driver(c: SimCluster, stopAt: number | null): { cluster: Cluster; calls: string[] } {
+/**
+ * 進める側の Cluster。呼び出しを順に記録し、stopAt 番目の手 (free に挙げた読むだけの呼び出しを除いた番号、0 から) で止まる。
+ * 既定で手に数えないのは catalog だけである。分割を進める側 (test/split-slot.test.ts) は、移動の一覧を読む呼び出しも除く。
+ */
+export function driver(c: SimCluster, stopAt: number | null, free: readonly string[] = ["catalog"]): { cluster: Cluster; calls: string[] } {
   const calls: string[] = [];
   let stopped = false;
   const step = (name: string): boolean => {
     if (stopped) return false;
-    if (name === "catalog") return true;
+    if (free.includes(name)) return true;
     if (stopAt !== null && calls.length === stopAt) {
       stopped = true;
       return false;
