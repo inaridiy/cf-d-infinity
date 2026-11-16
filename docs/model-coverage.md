@@ -11,8 +11,8 @@ counterexample.
 
 Categories:
 - A: the implementation has the guard, and a deterministic replay exists (83 rows; every row with a guard).
-  Of these, 62 also have a fault switch, and the replay checks that the switch produces the violation. 16 have no switch,
-  and 5 have a switch whose replay runs only the fixed code; for those 21 the replay checks the fixed code on the
+  Of these, 63 also have a fault switch, and the replay checks that the switch produces the violation. 15 have no switch,
+  and 5 have a switch whose replay runs only the fixed code; for those 20 the replay checks the fixed code on the
   model's ordering, not that removing the guard breaks it. (Recounted from this table on 2026-11-16, after catalog epoch stage 3 replaced the rows of M12 and M14 by 22 rows of M21. Before it, on 2026-11-15: 78 rows, 53, 19 and 6.)
 - D: a design alternative the implementation never had or no longer has, or a variant another mechanism already covers; no switch needed (14 rows, M16 and M17 included; `m15_red_no_based_on` became D in stage 3).
 - P: models for a mechanism that is designed but not in the code yet, so there is no guard to switch off. M18
@@ -96,7 +96,7 @@ Categories:
 | m11_red_no_reject | shard accepts stale-version requests | none (check in `schemaStep`, src/shard/kernel.ts) | migration:234 (fixed, guard-only) | A |
 | m11_red_early_public | index public before backfill finishes | publishBeforeBackfill (added 2026-11-12; publishes before any entry is written, as in the model's trace) | unique-index-build ("a UNIQUE index that spans shards is published after the existing rows are indexed (m11_red_early_public)"; added 2026-11-12) | A |
 | m11_red_no_write_only | writes skip a write-only index | none | none | D |
-| m11_red_no_sync | DDL returns before all shards applied it | none (stub at ddl-concurrent:687, seed sweep) | migration:247 (fixed) | A |
+| m11_red_no_sync | DDL returns before all shards applied it | commitWithoutAcks (since catalog epoch stage 3; the M21 restatement is `m21_red_drop_missing_ack`) | m21-two-phase ("a DROP TABLE returns only after every shard applied its prepare (m21_red_drop_missing_ack)"); ddl-concurrent ("lost-write check: detects a DDL that returns before every shard applied it"); migration:247 (fixed) | A |
 | m13_red_main | DDL takes effect before buffered writes, plus repin | noImplicitCommit (+repinOnRestore) | migration-tools:122 (fixed) | A |
 | m13_red_pin_only | DDL does not commit first; own new table unwritable | noImplicitCommit | migration-tools:161 (fixed) | A |
 | m13_red_repin | transaction takes new version without replanning | repinOnRestore | txn-across-schema-change:53 | A |
