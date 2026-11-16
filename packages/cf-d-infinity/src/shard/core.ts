@@ -5,13 +5,12 @@
 //   - 複数の要求が同じ仕事を待つための合流 (表定義の適用、グループの引き取り)。
 //   - 行を待つタイマー (waitForRow)。
 // 待ちの数と順序は、核の 1 歩が返す Effect で決まる。殻は、待ちを足しも省きもしない。型は step.ts にある。
-import type { Backend, ExecReq, ExecRes, CommitReq, CommitRes, LockOwner, Piece, PiecePayload, PieceWant, PrepareReq, PrepareRes, ShardApi, Span, Ts, TxnStatus } from "../types";
+import type { Backend, ExecReq, ExecRes, CommitReq, CommitRes, GroupCursor, LockOwner, Piece, PiecePayload, PieceWant, PrepareReq, PrepareRes, ShardApi, Span, Ts, TxnStatus } from "../types";
 import { ConflictError } from "../types";
 import type { Interval } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import type { Effect, Fork, Outcome, PeerCall, Program } from "./step";
 import type { Logged } from "../catalog";
-import type { SplitMove } from "../meta";
 import { ShardKernel, WOUND_DELAY_MS, type KernelDeps, type Sig, type Waiter } from "./kernel";
 
 export {
@@ -25,10 +24,8 @@ export interface ShardDeps extends KernelDeps {
   meta: {
     /** Meta の epoch の列の、epoch が after より後の記録 (meta.ts の epochsSince)。シャードは、これを自分の写し __epoch に足す。 */
     epochsSince(after: number): Promise<Logged[]>;
-    /** 分割の枠を示して、子が受け取り始める。分割の表定義の epoch が返る (meta.ts の startSplit)。 */
-    startSplit(id: string, move: SplitMove): Promise<{ schema: number }>;
-    /** 分割の枠が生きていて、子が受け取り始めていることを確かめる (meta.ts の checkSplit)。 */
-    checkSplit(id: string, move: SplitMove): Promise<void>;
+    /** 移動を閉じる (meta.ts の endMove)。子が、受け取り終えた後で呼ぶ。閉じた記録の epoch が返る。 */
+    endMove(epoch: number): Promise<{ epoch: number }>;
   };
   /** 実時間、待ち、乱数の出どころ。指定しなければ実物を使う。シミュレータは seed から決まる実装を渡す。 */
   runtime?: Runtime;
@@ -45,6 +42,8 @@ export class ShardCore implements ShardApi {
   private schemaChange: Promise<void> | null = null;
   /** 引き取っている最中のグループ。同じグループを待つ要求は、同じ引き取りを待つ。 */
   private pulling = new Map<string, Promise<void>>();
+  /** 子として進めている最中の移動 (move-start の epoch ごと)。応答の後の仕事、alarm、進める側の drain が、同じ移動に合流する。 */
+  private moving = new Map<number, Promise<{ groups: number; rows: number; bytes: number }>>();
 
   constructor(private deps: ShardDeps) {
     this.id = deps.id;
@@ -124,6 +123,8 @@ export class ShardCore implements ShardApi {
         return this.schemaChange!.catch(() => undefined);
       case "pull":
         return this.pullGroups(e.groups);
+      case "move":
+        return this.drive(e.epoch);
       case "ask":
         return this.ask(e.anchor, e.txn, e.pushTo);
       case "flight":
@@ -185,6 +186,16 @@ export class ShardCore implements ShardApi {
       waits.push(job);
     }
     return Promise.all(waits).then(() => undefined);
+  }
+
+  /** 子として、移動を終えるまで進める。進めている最中なら、それに合流する。 */
+  private drive(epoch: number): Promise<{ groups: number; rows: number; bytes: number }> {
+    let job = this.moving.get(epoch);
+    if (!job) {
+      job = this.start("move", { epoch }).finally(() => this.moving.delete(epoch));
+      this.moving.set(epoch, job);
+    }
+    return job;
   }
 
   /**
@@ -264,19 +275,20 @@ export class ShardCore implements ShardApi {
   status(req: { txn: string }): Promise<TxnStatus> {
     return this.start("status", { req });
   }
-  beginIncoming(req: Interval & { from: string; slot: string }): Promise<{ schema: number }> {
-    return this.start("beginIncoming", { req });
-  }
-  fence(req: Interval & { to: string; schema?: number; slot: string }): Promise<void> {
-    return this.start("fence", { req });
-  }
-  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number }): Promise<PiecePayload[]> {
+  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch?: number }): Promise<PiecePayload[]> {
     return this.start("pull", { req });
   }
-  drain(req: Interval): Promise<{ groups: number; rows: number; bytes: number }> {
-    return this.start("drain", { req });
+  listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch?: number }): Promise<{ groups: string[]; cursor: GroupCursor | null }> {
+    return this.start("groups", { req });
   }
-  syncSchema(req: { schema: number }): Promise<{ moving: boolean }> {
+  finishMove(req: Interval & { epoch?: number }): Promise<{ m: Ts }> {
+    return this.start("finishMove", { req });
+  }
+  /** 子として、移動を終えるまで進める (ShardApi.drain)。移動を進めている最中なら、それに合流する。 */
+  drain(req: Interval & { epoch: number }): Promise<{ groups: number; rows: number; bytes: number }> {
+    return this.drive(req.epoch);
+  }
+  syncSchema(req: { schema: number; epoch?: number }): Promise<{ moving: boolean }> {
     return this.start("syncSchema", { req });
   }
   /** alarm の本体。未完了の仕事が残っていれば true を返す。呼び出し側 (DO の alarm) は true なら次の alarm を予約する。 */
@@ -292,14 +304,8 @@ export class ShardCore implements ShardApi {
   async moves(req: Parameters<ShardKernel["moves"]>[0]): Promise<ReturnType<ShardKernel["moves"]>> {
     return this.k.moves(req);
   }
-  async listGroups(req: Parameters<ShardKernel["listGroups"]>[0]): Promise<ReturnType<ShardKernel["listGroups"]>> {
-    return this.k.listGroups(req);
-  }
   async ack(req: Parameters<ShardKernel["ack"]>[0]): Promise<ReturnType<ShardKernel["ack"]>> {
     return this.k.ack(req);
-  }
-  async finishMove(req: Parameters<ShardKernel["finishMove"]>[0]): Promise<ReturnType<ShardKernel["finishMove"]>> {
-    return this.k.finishMove(req);
   }
   async finishIncoming(req: Parameters<ShardKernel["finishIncoming"]>[0]): Promise<ReturnType<ShardKernel["finishIncoming"]>> {
     return this.k.finishIncoming(req);

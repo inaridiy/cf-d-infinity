@@ -4,7 +4,8 @@ import type {
 import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, isWriteOutsideClaim, utf8Length } from "../types";
 import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, imageAt, imageStatements, joinTerms, pkValues, q, scanList, tupleOfRow } from "../shard/rows";
 import { decodeReturned, typedReadSql, type Tuple } from "../value";
-import type { Catalog, Prepared, SplitMove, SplitSlot } from "../meta";
+import type { Catalog, Prepared } from "../meta";
+import type { Move, OpenMove } from "../catalog";
 import { hashKey, ownerOf, regionsOf, shardsOf, type Interval, type Routing } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
 import { ident, parseStatements, text, type Node, type Params } from "../sql/cst";
@@ -33,14 +34,14 @@ export interface Cluster {
   abort(epoch: number, reason: string): Promise<{ reason: string }>;
   /** 開いている遷移の期限を延ばす。epoch は prepare の epoch。期限の長さを返す。 */
   renew(epoch: number): Promise<{ leaseMs: number }>;
-  /** 分割のために、保守の操作の枠を取る (meta.ts の beginSplit)。basedOn は、全シャードへ適用させた表定義の epoch。 */
-  beginSplit(move: SplitMove, basedOn: number): Promise<SplitSlot>;
-  /** 分割が終わり、枠を返す。 */
-  endSplit(id: string): Promise<void>;
-  /** 進行中の分割の枠。 */
-  splits(): Promise<SplitSlot[]>;
+  /**
+   * 範囲の移動を開く (meta.ts の startMove。move-start を記録する)。同じ移動がもう開いていれば、その epoch を返す。表定義の遷移が
+   * 開いていれば `schema busy`、重なる移動が開いていれば `split busy` で断られる。
+   */
+  startMove(move: Move): Promise<{ epoch: number; routing: Routing }>;
+  /** 開いている移動 (move-start の後、move-end の前)。 */
+  moves(): Promise<OpenMove[]>;
   allocate(table: string, n: number, min?: number): Promise<number>;
-  switchRange(move: Interval & { to: string; from?: string }): Promise<Routing>;
   /** 実時間、待ち、乱数、識別子の出どころ。なければ実物を使う。シミュレータのクラスタは、seed から決まる実装を持つ。 */
   runtime?: Runtime;
   /** このクラスタへつなぐ Db の、基準経路だけで実行する指定の既定。試験が使う。 */
@@ -83,8 +84,6 @@ export interface ClientFaults {
   scanSkipsEmpty?: boolean;
   /** 取引が読んだ表を DROP する前の確認を、どのシャードでも、読んだ時刻ではなく確定の時刻から行う (モデル m14_red_commit_ts、M21 の m21_guard_red_commit_ts)。 */
   guardFromCommitTs?: boolean;
-  /** 分割の枠を、全シャードに最新の版を適用させずに取る (モデル m15_red_no_based_on。autoscaler.ts の reserveSplit が読む)。 */
-  splitWithoutSync?: boolean;
   /** 読みだけの取引は、ロックを取って最新を読んだ範囲があっても、COMMIT で検証せずにロックを手放して終える (モデル m9_red_ro_skip)。 */
   lockedReadsSkipValidation?: boolean;
   /** 同じ行への 2 回目の DML で、書き込みの since を 2 回目の F にする (モデル m9_red_second_f。守りの 1 つ目、Txn.buffer の min)。 */
@@ -1836,34 +1835,23 @@ export class Db {
 
   /**
    * 範囲表の全シャードに prepared を尋ね、ok と答えたシャードを返す。どれかが ok でなければ、その理由で失敗する (trial なら SQLite の誤りの文)。
-   * 範囲の移動の途中のシャードは、移動が終わるまで表定義の記録を適用しないので、待って尋ね直す。分割の枠がある間は prepare が
-   * 記録されないので、起きるのは、枠より前に始まった移動の名残だけである。
+   * 移動の途中のシャードは表定義の記録を適用しないが、Meta は移動が開いている間に prepare を記録しない (M21 の DDL_WAITS_MOVE。段 4 から
+   * 列で決まる)。移動が閉じるのは、子が受け取り終え、親が渡し終えた後なので、prepare の後に移動の途中のシャードはない。段 3 までの、
+   * 移動の途中のシャードを待って尋ね直す手は消した。そのシャードの誤りは、そのまま DDL の失敗になる。
    */
   private async preparedAll(epoch: number, shards: string[], early: boolean): Promise<string[]> {
-    const deadline = this.rt.now() + (this.opts.splitWaitMs ?? SPLIT_WAIT_MS);
     // 欠陥のスイッチ commitWithoutAcks: 最後のシャードの答えを待たない。
-    let pending = this.faults.commitWithoutAcks ? shards.slice(0, -1) : shards;
+    const pending = this.faults.commitWithoutAcks ? shards.slice(0, -1) : shards;
+    // 全部の答えを待ってから、シャードの順で最初の失敗を返す。
+    const answers = await Promise.allSettled(pending.map((id) => this.shardOf(id).prepared(early ? { epoch, early: true } : { epoch })));
     const acks: string[] = [];
-    for (;;) {
-      const answers = await Promise.allSettled(pending.map((id) => this.shardOf(id).prepared(early ? { epoch, early: true } : { epoch })));
-      const again: string[] = [];
-      for (const [i, a] of answers.entries()) {
-        const id = pending[i]!;
-        if (a.status === "rejected") {
-          const m = (a.reason as Error)?.message ?? "";
-          if (/waiting for a shard split/.test(m) && this.rt.now() <= deadline) {
-            again.push(id);
-            continue;
-          }
-          throw a.reason;
-        }
-        if (!a.value.ok) throw new SqlError(a.value.reason ?? `shard ${id} did not prepare the schema change`);
-        acks.push(id);
-      }
-      if (again.length === 0) return acks;
-      await sleep(this.rt, 20);
-      pending = again;
+    for (const [i, a] of answers.entries()) {
+      const id = pending[i]!;
+      if (a.status === "rejected") throw a.reason;
+      if (!a.value.ok) throw new SqlError(a.value.reason ?? `shard ${id} did not prepare the schema change`);
+      acks.push(id);
     }
+    return acks;
   }
 
   /**

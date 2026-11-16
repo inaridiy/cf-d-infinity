@@ -7,6 +7,8 @@
 // 利用者の表に触らず、abort の適用は禁止を解くだけなので、適用は行に依らず通る。枠を取る前の適用は断られない。
 //
 // 見つけたのは、specs/m15_maintenance_slot.qnt の m15_red_no_based_on の反例を写したときである (test/split-slot.test.ts、2026-11-12)。
+// 段 4 で分割の枠と、枠を取る前の全シャードへの適用はなくなった。移動を開く (move-start を記録する) のは、表定義の遷移が開いていない
+// ときだけで (M21 の MOVE_WAITS_DDL)、ここでは abort の後なので、split() は 1 回で通る。
 import { describe, expect, it } from "vitest";
 import { split } from "../src/autoscaler";
 import { Db } from "../src/client/db";

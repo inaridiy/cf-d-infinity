@@ -11,10 +11,10 @@
 //     (`this.arrived.has`)。行が消える。
 // 送り出した側の記録 (`__moved`) も同じで、同じグループを 2 度渡すと、2 度目を列挙しない (ack 済みの印が残る)。
 import { describe, expect, it } from "vitest";
-import { split } from "../../src/autoscaler";
-import { Db } from "../../src/client/db";
-import { REGION_TOKENS } from "../../src/routing";
-import { SimCluster } from "../sim";
+import { split } from "../src/autoscaler";
+import { Db } from "../src/client/db";
+import { REGION_TOKENS } from "../src/routing";
+import { SimCluster } from "./sim";
 
 const outcome = (p: Promise<unknown>) => p.then(() => "ok", (e: Error) => e.message);
 const whole = { start: 0, end: REGION_TOKENS };

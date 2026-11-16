@@ -5,12 +5,12 @@
 // (catalog、分割の枠) の答えも、表定義の版の数と取り消しの印がなくなり、表定義の epoch が prepare と abort でも進むので、比べられない。
 // 古い Meta の写しは消した。表定義の遷移の条件は、M21 と突き合わせる test/catalog-m21.test.ts と、下の試験が確かめる。
 import { describe, expect, it } from "vitest";
-import { split, splitsToResume } from "../src/autoscaler";
+import { movesToResume, split } from "../src/autoscaler";
 import { fold, refusal, type Logged } from "../src/catalog";
-import { Db, type Cluster } from "../src/client/db";
+import { Db } from "../src/client/db";
 import { MetaCore, readEpochs } from "../src/meta";
 import { planSplit, REGION_TOKENS } from "../src/routing";
-import type { ShardApi } from "../src/types";
+import { driver } from "./ddl-driver";
 import { SimCluster, SqliteBackend, VirtualRuntime } from "./sim";
 
 /** 答えを比べられる文字列にする。誤りは、型の名前と文。 */
@@ -31,20 +31,18 @@ async function ddl(meta: MetaCore, sql: string, shards = ["s0", "s1"]) {
 }
 
 describe("the epoch log", () => {
-  it("stores one record per epoch: the first range table at 0, then prepare and commit, switches and returned split slots", async () => {
+  it("stores one record per epoch: the first range table at 0, then prepare and commit, the start and the end of a move", async () => {
     const b = new SqliteBackend();
     const meta = new MetaCore(b, ["s0", "s1"], { runtime: new VirtualRuntime(1) });
     await ddl(meta, "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT)");
     const range = planSplit((await meta.catalog()).routing, "s0")!;
-    const slot = await meta.beginSplit({ parent: "s0", child: "s2", ...range }, 2);
-    await meta.startSplit(slot.id, { parent: "s0", child: "s2", ...range });
-    await meta.switchRange({ ...range, to: "s2", from: "s0" });
-    // 同じ切り替えをもう一度呼んでも、記録は増えない。
-    await meta.switchRange({ ...range, to: "s2", from: "s0" });
-    // 分割の枠がある間は、表定義の遷移を開かない。
+    const { epoch } = await meta.startMove({ from: "s0", to: "s2", ...range });
+    // 同じ移動をもう一度開いても、記録は増えない。
+    expect(await meta.startMove({ from: "s0", to: "s2", ...range })).toMatchObject({ epoch });
+    // 移動が開いている間は、表定義の遷移を開かない (M21 の DDL_WAITS_MOVE)。
     expect(await outcome(() => meta.prepare("CREATE INDEX ta ON t(a)"))).toMatch(/^throws SchemaBusy: schema busy: a shard split of s0/);
-    await meta.endSplit(slot.id);
-    await meta.endSplit(slot.id);
+    await meta.endMove(epoch);
+    await meta.endMove(epoch);
     await ddl(meta, "CREATE INDEX ta ON t(a)", ["s0", "s1", "s2"]);
     expect(readEpochs(b).map((x) => [x.epoch, x.rec.kind, "of" in x.rec ? x.rec.of : null])).toEqual([
       [0, "genesis", null], [1, "prepare", null], [2, "commit", 1], [3, "move-start", null], [4, "move-end", 3], [5, "prepare", null], [6, "commit", 5],
@@ -138,6 +136,32 @@ describe("the epoch log", () => {
     expect(() => fold([{ epoch: 1, rec: genesis.rec }])).toThrow(/broken/);
   });
 
+  it("does not open a move while a schema transition is open, nor a transition while a move is open (both directions of M21's exclusion)", async () => {
+    const b = new SqliteBackend();
+    const meta = new MetaCore(b, ["s0", "s1"], { runtime: new VirtualRuntime(1) });
+    await ddl(meta, "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT)");
+    const range = planSplit((await meta.catalog()).routing, "s0")!;
+    const p = await meta.prepare("ALTER TABLE t ADD COLUMN b INTEGER CHECK (b > 0)");
+    // 表定義の遷移が開いている間は、移動を開かない (MOVE_WAITS_DDL)。
+    expect(await outcome(() => meta.startMove({ from: "s0", to: "s2", ...range }))).toBe("throws SchemaBusy: schema busy: ALTER TABLE t ADD COLUMN b INTEGER CHECK (b > 0) is in progress");
+    await meta.abort(p.epoch!, "test");
+    const { epoch } = await meta.startMove({ from: "s0", to: "s2", ...range });
+    // 移動が開いている間は、表定義の遷移を開かない (DDL_WAITS_MOVE)。閉じれば開ける。
+    expect(await outcome(() => meta.prepare("CREATE INDEX ta ON t(a)"))).toBe("throws SchemaBusy: schema busy: a shard split of s0 is in progress");
+    await meta.endMove(epoch);
+    expect((await meta.prepare("CREATE INDEX ta ON t(a)")).epoch).toBe(epoch + 2);
+    // 欠陥のスイッチは、それぞれの向きの確かめだけを外す。
+    const loose = new MetaCore(new SqliteBackend(), ["s0", "s1"], { runtime: new VirtualRuntime(1), faults: { ddlDuringMove: true, moveDuringDdl: true } });
+    await ddl(loose, "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT)");
+    const q = await loose.prepare("ALTER TABLE t ADD COLUMN b INTEGER CHECK (b > 0)");
+    const m = await loose.startMove({ from: "s0", to: "s2", ...range });
+    expect(m.epoch).toBe(q.epoch! + 1);
+    // 移動どうしの条件は残る。
+    expect(await outcome(() => loose.startMove({ from: "s0", to: "s3", start: 0, end: range.start }))).toMatch(/^throws SplitBusy: split busy: a move of/);
+    await loose.abort(q.epoch!, "test");
+    expect((await loose.prepare("CREATE INDEX ta ON t(a)")).epoch).toBe(m.epoch + 2);
+  });
+
   it("refuses a move that overlaps an open move or names its shards, and a child that already owns a range", () => {
     // M21 は移動を 1 つしか持たないので、移動どうしの条件は、ここで確かめる (設計書の「同時に開ける遷移」)。
     const q = REGION_TOKENS / 4;
@@ -181,43 +205,34 @@ describe("the epoch log", () => {
   });
 });
 
-// 分割を進める側は、どの段の前でも止まり得る (test/split-slot.test.ts)。止まった分割を再開して終えたとき、列には、その移動の
-// move-start と move-end が 1 つずつあり、開いている移動は残らない。
+// 分割を進める側は、どの手の前でも止まり得る (test/split-slot.test.ts)。止まった分割を再開して終えたとき、列には、その移動の
+// move-start と move-end が 1 つずつあり、開いている移動は残らない。手は、止めずに流したときの呼び出しの列から取る。
 describe("the moves a split records", () => {
-  const STEPS = ["beginIncoming", "fence", "switchRange", "drain", "finishMove", "finishIncoming", "endSplit"] as const;
-  /** 段 step の前で止まる、分割を進める側。 */
-  function stopsBefore(c: SimCluster, step: string): Cluster {
-    const stopped = () => Promise.reject(new Error(`driver stopped before ${step}`));
-    return new Proxy(c as unknown as Cluster, {
-      get(target, prop, receiver) {
-        if (prop === step) return stopped;
-        if (prop === "shard") {
-          return (id: string) => new Proxy({} as ShardApi, {
-            get: (_t, method: keyof ShardApi) => (method === step ? stopped : (req: never) => (c.shard(id)[method] as (r: never) => Promise<unknown>)(req)),
-          });
-        }
-        const v = Reflect.get(target, prop, receiver);
-        return typeof v === "function" ? v.bind(target) : v;
-      },
-    });
+  const FREE = ["catalog", "moves"];
+  async function seeded() {
+    const c = new SimCluster({ shards: 1 });
+    await new Db(c).ddl("CREATE TABLE items(id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
+    await new Db(c).query(`INSERT INTO items(id, n) VALUES ${Array.from({ length: 40 }, (_, i) => `(${i + 1}, ${i + 1})`).join(", ")}`);
+    return { c, range: planSplit((await c.catalog()).routing, "s0")! };
   }
 
-  for (const step of STEPS) {
-    it(`a split stopped before ${step} and resumed records one move-start and one move-end`, async () => {
-      const c = new SimCluster({ shards: 1 });
-      await new Db(c).ddl("CREATE TABLE items(id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
-      await new Db(c).query(`INSERT INTO items(id, n) VALUES ${Array.from({ length: 40 }, (_, i) => `(${i + 1}, ${i + 1})`).join(", ")}`);
-      const range = planSplit((await c.catalog()).routing, "s0")!;
-      expect(await outcome(() => split(stopsBefore(c, step), "s0", "s1", { range }))).toMatch(/driver stopped/);
-      const jobs = splitsToResume(await c.splits(), () => false);
-      // 子が受け取り始める前に止まった分割は、枠が期限で消えるので、最初からやり直す。
-      if (jobs.length === 0) await c.sleep(6_000);
+  it("a split stopped before any of its steps and resumed records one move-start and one move-end", async () => {
+    const dry = await seeded();
+    const free = driver(dry.c, null, FREE);
+    expect(await outcome(() => split(free.cluster, "s0", "s1", { range: dry.range }))).toMatch(/^ok/);
+    expect(free.calls).toEqual(["startMove", "s1.drain"]);
+    for (let i = 0; i < free.calls.length; i++) {
+      const { c, range } = await seeded();
+      expect(await outcome(() => split(driver(c, i, FREE).cluster, "s0", "s1", { range }))).toMatch(/driver stopped/);
+      // 子が知る前に止まった移動は、Meta に開いたまま残る。Autoscaler は、開いている移動を再開する。
+      const jobs = movesToResume(await c.moves(), () => false);
+      expect(jobs).toEqual(i === 0 ? [] : [{ parent: "s0", child: "s1", range }]);
       for (const j of jobs.length ? jobs : [{ parent: "s0", child: "s1", range }]) expect(await outcome(() => split(c, j.parent, j.child, { range: j.range }))).toMatch(/^ok/);
       const log = readEpochs(c.metaBackend);
       const moves = log.filter((x) => x.rec.kind === "move-start" || x.rec.kind === "move-end").map((x) => x.rec);
       expect(moves).toEqual([{ kind: "move-start", from: "s0", to: "s1", ...range }, { kind: "move-end", of: log.find((x) => x.rec.kind === "move-start")!.epoch }]);
       expect(fold(log).moves).toEqual([]);
-      expect(await c.splits()).toEqual([]);
-    });
-  }
+      expect(await c.moves()).toEqual([]);
+    }
+  });
 });

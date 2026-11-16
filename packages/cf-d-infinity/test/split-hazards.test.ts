@@ -42,12 +42,18 @@ describe("a split that is interrupted or repeated", () => {
 
   it("refuses to split a shard that is still receiving its range, and works once that finished", async () => {
     const c = await seeded();
+    const range = planSplit((await c.catalog()).routing, "s0")!;
     c.net.drop = (m) => m.method === "drain" && m.from === "client" && m.to === "s1";
-    await split(c, "s0", "s1").catch(() => undefined);
+    await split(c, "s0", "s1", { range }).catch(() => undefined);
     c.net.drop = () => false;
     expect(await outcome(split(c, "s1", "s2"))).toMatch(/still receiving a range/);
-    expect(await census(c)).toEqual({ byKey: ROWS, wide: expect.stringMatching(/migrating/) });
-    expect(await outcome(split(c, "s0", "s1"))).toBe("ok");
+    // 段 4 から、子は、移動を知った後は自分で終える (docs/design-catalog-epoch.md の決めたこと 4)。進める側の drain は届かなかったが、
+    // 行の読みが子に届くと、子は move-start を適用して受け取り始め、そのまま移動を終える。
+    expect((await census(c)).byKey).toBe(ROWS);
+    await c.settle();
+    expect(await census(c)).toEqual(whole);
+    // 同じ分割をもう一度呼んでも、終わった分割として通る。
+    expect(await outcome(split(c, "s0", "s1", { range }))).toBe("ok");
     expect(await outcome(split(c, "s1", "s2"))).toBe("ok");
     await drain(c);
     expect(await census(c)).toEqual(whole);
@@ -57,16 +63,22 @@ describe("a split that is interrupted or repeated", () => {
   it("refuses a second split of a range that is already being handed to another shard", async () => {
     const c = await seeded();
     const range = planSplit((await c.catalog()).routing, "s0")!;
-    // 1 つ目の増設は、子の受け入れと親の fence の後、範囲表の切り替えで失敗した。
-    const metaDown = withOverrides(c, { switchRange: async () => { throw new Error("meta unreachable"); } });
-    expect(await outcome(split(metaDown, "s0", "s1", { range }))).toMatch(/meta unreachable/);
+    // 1 つ目の増設は、移動を開いた (move-start を記録した) 後、子への drain が届かずに失敗した。
+    const unreachable = async () => {
+      throw new Error("child unreachable");
+    };
+    const childDown = withOverrides(c, {
+      shard: (id: string) => (id === "s1" ? new Proxy(c.shard(id), { get: (t, m) => (m === "drain" ? unreachable : Reflect.get(t, m)) }) : c.shard(id)),
+    });
+    expect(await outcome(split(childDown, "s0", "s1", { range }))).toMatch(/child unreachable/);
     expect(await outcome(split(c, "s0", "s2"))).toMatch(/already handing slots .* to s1/);
-    // シャードに直接頼んでも通らない。
-    // 枠を示さない fence も、枠のある別の子への fence も通らない。
-    await expect(c.shard("s0").fence({ ...range, to: "s2", slot: "none" })).rejects.toThrow(/split slot/);
+    // Meta に直接頼んでも通らない。親が開いている移動の端である。範囲表はもう s1 を指すので、ほかの親からの移動も断る。
+    await expect(c.startMove({ ...range, to: "s2", from: "s0" })).rejects.toThrow(/owned by s1, not by s0/);
+    await expect(c.startMove({ start: 0, end: range.start, to: "s2", from: "s0" })).rejects.toThrow(/split busy: a move of .* from s0 to s1 is in progress/);
+    await expect(c.startMove({ ...range, to: "s2", from: "s9" })).rejects.toThrow(/owned by s1, not by s9/);
+    // 親は、move-start を適用するまで fence していないので、渡すべきでない子への pull は断る。
     await expect(c.shard("s0").pull({ ...range, want: [{ g: "[1]", from: null }], to: "s2", maxBytes: 1000 })).rejects.toThrow();
-    await expect(c.switchRange({ ...range, to: "s2", from: "s9" })).rejects.toThrow(/owned by s0, not by s9/);
-    // 1 つ目の増設をやり直すまで、その範囲は読めない (親は fence 済みで、範囲表はまだ親を指している)。行は失われていない。
+    // 1 つ目の増設をやり直すと終わる。行は失われていない。
     expect(await outcome(split(c, "s0", "s1", { range }))).toBe("ok");
     await drain(c);
     expect(await census(c)).toEqual(whole);

@@ -294,30 +294,30 @@ export interface ShardApi {
   flush(req: { upTo?: Ts }): Promise<FlushRes>;
   // 範囲の移動の要求は、範囲を token の区間 (Interval) で運ぶ。
   // いまのシャードは、両端が slot の境目にある区間の移動だけを受ける (ShardCore の wholeSlotsOnly)。
-  /** 子が受け入れの準備をする。親の fence より先に呼ぶ。 */
-  /** 範囲を受け取る準備をする。子の表定義の epoch を返す。親は、fence の前にその epoch まで追いつく。 */
-  /** 子が範囲を受け取り始める。slot は Meta が分割に渡した枠で、子は Meta に枠を示し、Meta が返す表定義で受け取り始める。 */
-  beginIncoming(req: Interval & { from: string; slot: string }): Promise<{ schema: number }>;
-  /** 親がスロットの受理を止める。以後は NotOwner を返す。 */
-  /** 親が範囲を送り出し始める。slot は分割の枠で、子が受け取り始めていなければ断る。 */
-  fence(req: Interval & { to: string; schema?: number; slot: string }): Promise<void>;
-  /** 終わっていない範囲の移動。増設をやり直すとき、同じ範囲を続けるのに使う。 */
+  // 移動は Meta の列の move-start で始まる (docs/design-catalog-epoch.md の段 4)。親は move-start を適用すると、その区間の書き込みを
+  // 断り (fence)、子は適用すると受け取り始め、自分で移動を進める。子から親への要求 (listGroups、pull、finishMove) は move-start の
+  // epoch を運び、親は、その epoch まで列を適用してから答える (M21 の PULL_AT_EPOCH)。
+  /** 終わっていない範囲の移動。 */
   moves(req: Record<string, never>): Promise<{ outgoing: (Interval & { to: string })[]; incoming: (Interval & { from: string })[] }>;
   /** 範囲にあるグループを列挙する。列挙するのはグループで、piece ではない。 */
-  listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null }): Promise<{ groups: string[]; cursor: GroupCursor | null }>;
+  listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch?: number }): Promise<{ groups: string[]; cursor: GroupCursor | null }>;
   /**
    * 区間 [start, end) の fence から、piece を子へ渡す。want は、グループごとに、子が欲しい piece を位置で指す。
    * いまは、どの piece もグループの全体なので、子は `{ g, from: null }` だけを送る。
    */
-  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number }): Promise<PiecePayload[]>;
+  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch?: number }): Promise<PiecePayload[]>;
   ack(req: { pieces: Piece[] }): Promise<void>;
-  /** 子が背景で全グループを引き取る。 */
-  drain(req: Interval): Promise<{ groups: number; rows: number; bytes: number }>;
+  /**
+   * 子が移動を終えるまで進める (docs/design-catalog-epoch.md の決めたこと 4)。epoch は移動の move-start の epoch で、子はそこまで列を
+   * 適用し (受け取り始め)、全グループを引き取り (drain)、親の finishMove で時計を受け取り、受け取り終えた印を付け、Meta に move-end を
+   * 記録させる。子が自分で (move-start を適用した後の仕事と alarm で) 進めている最中なら、それに合流する。運んだ数を返す。
+   */
+  drain(req: Interval & { epoch: number }): Promise<{ groups: number; rows: number; bytes: number }>;
   /**
    * 範囲を渡し終えた印を付ける。返す m は、このシャードがその範囲について発行した、どの時刻よりも大きい。
    * 受け取る側の finishIncoming に渡す。
    */
-  finishMove(req: Interval): Promise<{ m: Ts }>;
+  finishMove(req: Interval & { epoch?: number }): Promise<{ m: Ts }>;
   /** 範囲を受け取り終えた印を付ける。時計を m まで進めてから、届かなかったグループ (渡す側に行がなかった) を受け持ち始める。 */
   finishIncoming(req: Interval & { m: Ts }): Promise<void>;
   metrics(req: Record<string, never>): Promise<ShardMetrics>;
@@ -329,9 +329,9 @@ export interface ShardApi {
   unlock(req: { txn: string }): Promise<void>;
   /**
    * 表定義の epoch schema まで、Meta の列を適用する。DDL を確定した側は、書き込みの禁止を早く解くために、全シャードへ適用させてから
-   * 完了を返す (正しさには要らない。次の要求が適用させる)。
+   * 完了を返す (正しさには要らない。次の要求が適用させる)。epoch があれば、範囲の記録もその epoch まで適用する。
    */
-  syncSchema(req: { schema: number }): Promise<{ moving: boolean }>;
+  syncSchema(req: { schema: number; epoch?: number }): Promise<{ moving: boolean }>;
   /** 現在の HLC を返す。複数シャードの読み取りの T を決めるのに使う。 */
   now(req: Record<string, never>): Promise<Ts>;
 }
@@ -357,6 +357,11 @@ export interface Piece {
   /** この piece を切り出した fence の、token の区間。受け取る側では、受け取った範囲の区間である。 */
   range: Interval;
   after: Pos;
+  /**
+   * この piece を運ぶ移動の move-start の epoch。同じグループが、範囲が前の持ち主へ戻るたびに、何度も同じシャードを出入りするので、
+   * 送り出しと到着の記録は、移動ごとに分ける (docs/design-refresh-across-move.md の「受け取りの記録を残す期間」)。
+   */
+  epoch: number;
 }
 
 /** 子が欲しい piece。from は、子がそのグループで揃えた位置の続き (null は先頭から)。at は、要求が名指しした行の位置である。 */
@@ -475,10 +480,17 @@ export interface Faults {
   commitWithoutAcks?: boolean;
   /** Meta が、表定義の遷移が開いている間に、次の prepare を記録する (M21 の m21_red_two_open)。 */
   overlappingTransitions?: boolean;
-  /** Meta が、期限切れで消えた分割の枠を示す子の受け取りの始まりを断らない (モデル m15_red_late_start の 1 つ目の守り)。 */
-  startWithoutSlot?: boolean;
-  /** Meta が、親の fence の前に、分割の枠が生きていることを確かめない (モデル m15_red_late_start の 2 つ目の守り)。 */
-  fenceWithoutSlot?: boolean;
+  /** Meta が、移動が開いている間に、表定義の遷移を開く (prepare を記録する。M21 の m21_red_ddl_during_move)。 */
+  ddlDuringMove?: boolean;
+  /** Meta が、表定義の遷移が開いている間に、移動を開く (move-start を記録する。M21 の m21_red_move_during_ddl)。 */
+  moveDuringDdl?: boolean;
+  /** 子が、受け取り終える前に、Meta に move-end を記録させる (M21 の m21_red_end_early)。 */
+  endBeforeDrained?: boolean;
+  /**
+   * 親が、子からの移動の要求 (listGroups、pull、finishMove) が運ぶ move-start の epoch まで列を適用せずに答え、fence の前に頼まれた行を
+   * 渡す (M21 の m21_red_pull_unfenced。モデルでは、要求が epoch を運ばない形)。親は、渡した後も、古い範囲表の書き込みを受ける。
+   */
+  pullWithoutEpoch?: boolean;
   /** autocommit の書き込みが、他の取引の intent との UNIQUE を照合しない (2026-11 のレビューで見つかった欠陥)。 */
   autoIgnoresUniqueIntents?: boolean;
   /**
@@ -623,8 +635,12 @@ export class ReadTooOld extends Error {
 // 版 8 (2026-11-16): 表定義の変更を 2 相にした (docs/design-catalog-epoch.md の段 3)。シャードは Meta の列の prepare、commit、abort を
 // 適用し、新しい入口 prepared で prepare を適用したかと試した結果を答える。分割の枠の版 (startSplit の答え) は、表定義の epoch だけになった。
 // 版 7 のシャードは prepare の記録を適用できず、版 7 の Worker は Meta の古い入口 (applyDdl) を呼ぶので、版 7 の要求は受け付けない。
-export const PROTOCOL_VERSION = 8;
-export const MIN_PROTOCOL_VERSION = 8;
+// 版 9 (2026-11-16): 範囲の移動を Meta の列の move-start と move-end で進める (docs/design-catalog-epoch.md の段 4)。beginIncoming と
+// fence の入口がなくなり、子が自分で移動を進める (drain は move-start の epoch を受け、移動を終えるまで進める)。子から親への
+// listGroups、pull、finishMove は move-start の epoch を運ぶ。Piece は移動の epoch を運ぶ。版 8 のシャードは move-start から
+// 受け取りを始めず、版 8 の Autoscaler は分割の枠を取るので、版 8 の要求は受け付けない。
+export const PROTOCOL_VERSION = 9;
+export const MIN_PROTOCOL_VERSION = 9;
 
 export class VersionSkew extends Error {
   readonly retryable = true;
@@ -730,8 +746,14 @@ export function utf8Length(s: string): number {
  * 1 つの版を運ぶ commit (DdlEntry) から、prepare、commit (of)、abort の 3 種類になった。Meta の __meta の build_lease は lease
  * (開いている遷移の期限) に、splits の枠の version は schema (表定義の epoch) になった。版 4 からの移行は書かない。版 4 のデータを
  * 開くと、新しいコードは版 4 の commit の記録を畳めないので、移行がないと言って起動を拒否する。
+ *
+ * 版 6 (2026-11-16): 範囲の移動を Meta の列の move-start と move-end で進める (docs/design-catalog-epoch.md の段 4)。シャードの移動の
+ * 記録 (__fenced、__incoming、__moved、__moved_txn、__arrived) に、その移動の move-start の epoch の列を足し、送り出しと到着の
+ * 記録を移動ごとにした (__moved と __moved_txn と __arrived の主キーに epoch が入る)。範囲が前の持ち主へ戻ると、同じシャードが同じ
+ * 区間と同じグループを何度も受け取り、渡すからである。Meta の __meta の splits (分割の枠) はなくなった。版 5 からの移行は書かない。
+ * 版 5 のシャードを開くと、記録の表の形が違うので、移行がないと言って起動を拒否する。
  */
-export const STORAGE_FORMAT = 5;
+export const STORAGE_FORMAT = 6;
 
 /** 版 n の保存データを版 n + 1 にする移行。鍵は n である。最初の公開の前の形式は持たない (公開前は後方互換を持たない)。 */
 const STORAGE_MIGRATIONS: Record<number, (b: Backend) => void> = {};

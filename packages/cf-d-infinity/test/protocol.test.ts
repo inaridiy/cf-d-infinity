@@ -49,10 +49,14 @@ function moveSample(): string {
   const range = { start: 32768 * SUBSLOTS, end: 65536 * SUBSLOTS } satisfies Interval;
   const part = { start: 7 * SUBSLOTS + 32768, end: 8 * SUBSLOTS } satisfies Interval;
   const span = { kind: "table", table: "t", claim: [range, part] } satisfies Span;
-  const piece = { g, range, after: null } satisfies Piece;
+  // piece は、運ぶ移動の move-start の epoch を持つ (版 9 から。docs/design-catalog-epoch.md の段 4)。
+  const piece = { g, range, after: null, epoch: 11 } satisfies Piece;
   const want = [{ g, from: null }, { g, at }] satisfies PieceWant[];
-  const payload = { g, range: part, after: null, upTo: at, m: 1024, rows: [{ table: "t", row: ["i1", null, "tx"] }], intents: [], schema: 3 } satisfies PiecePayload;
-  return JSON.stringify([span, range, part, piece, want, payload]);
+  const payload = { g, range: part, after: null, epoch: 11, upTo: at, m: 1024, rows: [{ table: "t", row: ["i1", null, "tx"] }], intents: [], schema: 3 } satisfies PiecePayload;
+  // 子から親への移動の要求は move-start の epoch を運び、進める側の drain も、その epoch を名指しする (版 9 から)。
+  const pull = { ...range, want, to: "s1", maxBytes: 1_000_000, epoch: 11 } satisfies Parameters<ShardApi["pull"]>[0];
+  const drain = { ...range, epoch: 11 } satisfies Parameters<ShardApi["drain"]>[0];
+  return JSON.stringify([span, range, part, piece, want, payload, pull, drain]);
 }
 
 /** 版ごとの、見本の指紋。古い版の値は、その版のときの見本のもので、いまの見本からは作れない。 */
@@ -64,6 +68,7 @@ const WIRE: Record<number, string> = {
   6: "3ef766de45822d5c",
   7: "ada064f16f3fde8e",
   8: "edeccd61efb19a77",
+  9: "4e20b5834a72831a",
 };
 
 describe("protocol version", () => {

@@ -267,7 +267,7 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
           return c.shard(shard);
         },
         runtime: c.runtime, reference: c.reference, catalog: () => c.catalog(), prepare: (q, o, b) => c.prepare(q, o, b),
-        commit: (e, a, at) => c.commit(e, a, at), abort: (e, r) => c.abort(e, r), renew: (e) => c.renew(e), beginSplit: (m, b) => c.beginSplit(m, b), endSplit: (id) => c.endSplit(id), splits: () => c.splits(), allocate: (t, n, m) => c.allocate(t, n, m), switchRange: (m) => c.switchRange(m),
+        commit: (e, a, at) => c.commit(e, a, at), abort: (e, r) => c.abort(e, r), renew: (e) => c.renew(e), startMove: (m) => c.startMove(m), moves: () => c.moves(), allocate: (t, n, m) => c.allocate(t, n, m),
       };
       if (rnd() < 0.4) {
         // 取引の外の 1 文。

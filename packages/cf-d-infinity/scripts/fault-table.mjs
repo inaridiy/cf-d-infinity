@@ -44,11 +44,13 @@ const SHARD = [
   "phase2BeforeSync", "dropNoLowWater", "gcUndone", "flushPastIntents", "unchangedIgnoresIntents", "commitIgnoresDigest", "prepareKeepsFirst",
   "lockedReadAtT", "dmlAtT", "dmlSkipsClock", "woundPrepared", "prepareWaits",
   // Meta が読むスイッチ (同じ Faults にある)。commitWithoutAcks は Worker の側にもあり、test/sim.ts の injectedFault が両方に入れる。
-  "commitAfterAbort", "commitWithoutAcks", "overlappingTransitions", "startWithoutSlot", "fenceWithoutSlot",
+  "commitAfterAbort", "commitWithoutAcks", "overlappingTransitions", "ddlDuringMove", "moveDuringDdl",
+  // 子が移動を進める手順のスイッチ (段 4)。
+  "endBeforeDrained", "pullWithoutEpoch",
 ];
 const OTHER = [
   "rowSpanDespiteUnique", "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
-  "publishBeforeBackfill", "checkBeforePrepare", "scanSkipsEmpty", "guardFromCommitTs", "splitWithoutSync",
+  "publishBeforeBackfill", "checkBeforePrepare", "scanSkipsEmpty", "guardFromCommitTs",
   "lockedReadsSkipValidation", "secondDmlNewSince", "secondDmlNewSpanSince",
 ];
 const FAULTS = ["none", ...(only ?? [...SHARD, ...OTHER])];

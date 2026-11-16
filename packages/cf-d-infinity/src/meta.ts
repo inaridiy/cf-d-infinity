@@ -2,8 +2,8 @@ import { SqlError, checkStorageFormat, type Backend, type Faults, type TableDef,
 import { parseDdl, type DdlMode, type IndexInfo, type ParsedDdl } from "./sql/ddl";
 import { systemRuntime, type Runtime } from "./runtime";
 import { CAPTURE_TABLES } from "./shard/rows";
-import { checkInterval, contains, initialRouting, overlaps, rangeText, sameInterval, type Interval, type Routing } from "./routing";
-import { describeOpen, fold, refusal, splitId, type EpochRecord, type Logged, type OpenDdl, type Snapshot } from "./catalog";
+import { checkInterval, initialRouting, rangeText, sameInterval, slotAligned, type Interval, type Routing } from "./routing";
+import { describeOpen, fold, refusal, type EpochRecord, type Logged, type Move, type OpenDdl, type OpenMove, type Snapshot } from "./catalog";
 
 /**
  * 表定義の遷移の期限 (docs/design-catalog-epoch.md の「期限」)。prepare から commit か abort までの間、fence の表への書き込みが止まる。
@@ -91,25 +91,15 @@ export class SchemaBusy extends Error {
   }
 }
 
-/**
- * 分割が持つ、保守の操作の枠 (specs/m15_maintenance_slot.qnt。段 4 で、移動の記録 move-start と move-end に置き換わる)。
- * 分割どうしは枠を共有でき、表定義の遷移とは排他である。
- * 枠を取った直後は期限がある。分割を進める側が、子が受け取り始める前に止まっても、枠が残らないようにするためである。
- * 子が受け取り始めると (startSplit)、期限を外す。分割は取り消せないので、進める側 (Autoscaler) が再開して終える。
- */
-export interface SplitSlot extends Interval {
-  id: string;
-  parent: string;
-  child: string;
-  /** 分割の表定義の epoch。子はこの epoch で受け取り始め、親はこの epoch まで追いついてから fence する。 */
-  schema: number;
-  started: boolean;
-  until: number;
+/** 移動を開けない。重なる移動か、親か子の移動が開いている。終わるのを待ってやり直す。 */
+export class SplitBusy extends Error {
+  readonly retryable = true;
+  constructor(detail: string) {
+    super(`split busy: ${detail}`);
+  }
 }
-/** 分割の同一性。親、子、移す区間 (token) で決まる。 */
-export type SplitMove = Pick<SplitSlot, "parent" | "child" | "start" | "end">;
-const sameSplit = (a: SplitMove, b: SplitMove): boolean => a.parent === b.parent && a.child === b.child && sameInterval(a, b);
-/** 区間の形を確かめる。おかしな区間を、範囲表や枠に書かない。 */
+
+/** 区間の形を確かめる。おかしな区間を、範囲表に書かない。 */
 function assertInterval(x: Interval): void {
   try {
     checkInterval(x);
@@ -117,6 +107,9 @@ function assertInterval(x: Interval): void {
     throw new SqlError((e as Error).message);
   }
 }
+
+/** 表定義の遷移を開いてよいかを尋ねるための、中身のない prepare の記録。 */
+const PROBE: EpochRecord = { kind: "prepare", mode: "plain", ddl: { sql: [], defs: [], drops: [], user: null }, fence: [] };
 
 /** 開いている表定義の遷移の期限。 */
 interface Lease {
@@ -130,9 +123,12 @@ const ROLLBACK = Symbol("rollback");
 
 /**
  * 表定義、DDL 履歴、範囲表、rowid の採番を持つ。hot path には載せない。
- * 表定義の遷移と範囲表の切り替えは、epoch の列 (__epoch、src/catalog.ts) に記録し、答えは列を畳んで作る。
+ * 表定義の遷移と範囲の移動は、epoch の列 (__epoch、src/catalog.ts) に記録し、答えは列を畳んで作る。記録を足せるかは、列を畳んだ
+ * スナップショットから決める (catalog.ts の refusal)。
  * 表定義の変更は 2 相である (段 3。docs/design-catalog-epoch.md の「表定義の遷移」)。prepare が表への書き込みを止め、進める側が
  * 全シャードの ok を集めた後で commit が確定する。失敗か期限切れなら abort が禁止を解く。取り消しの文 (逆操作) はない。
+ * 範囲の移動は move-start で始まり、子が受け取り終えた後の move-end で閉じる (段 4)。取り消しはない。表定義の遷移と移動は、同時に
+ * 開かない (両方向)。
  */
 export class MetaCore {
   private rt: Runtime;
@@ -217,24 +213,6 @@ export class MetaCore {
     return this.snapshot().routing;
   }
 
-  /** 範囲表を切り替える。これが増設の線形化点である。移すのは token の区間で、区間の境目は、どの token にも置ける。 */
-  async switchRange(move: Interval & { to: string; from?: string }): Promise<Routing> {
-    assertInterval(move);
-    const current = this.routing();
-    const done = current.ranges.some((x) => x.shard === move.to && contains(x, move));
-    if (done) return current; // 増設の手順はやり直せるので、切り替えも冪等にする。
-    // 範囲の持ち主が、呼び出し側の思っている親でなければ断る。別の増設が先に切り替えていると、その子が持つ行を
-    // 範囲表が指さなくなる。
-    const owners = [...new Set(current.ranges.filter((x) => overlaps(x, move)).map((x) => x.shard))];
-    if (move.from !== undefined && !(owners.length === 1 && owners[0] === move.from)) {
-      throw new SqlError(`${rangeText(move)} are owned by ${owners.join(", ")}, not by ${move.from}`);
-    }
-    // 渡す側を省いた切り替え (試験が直に呼ぶ) は、区間の持ち主が 1 つなら、それを渡す側として記録する。
-    const from = move.from ?? (owners.length === 1 ? owners[0] : undefined);
-    this.record({ kind: "move-start", ...(from === undefined ? {} : { from }), to: move.to, start: move.start, end: move.end });
-    return this.snapshot().routing;
-  }
-
   /**
    * Hrana の baton に署名する鍵。DINF_BATON_SECRET が設定されていないときに使う。最初に呼ばれたときに乱数で作って保存し、
    * 以後は同じ値を返す。データ用のトークンから計算できる鍵だと、トークンを持つ人が取引の状態を書き換えた baton を作れる。
@@ -248,92 +226,77 @@ export class MetaCore {
     return this.b.exec(`SELECT v FROM __meta WHERE k = 'baton_secret'`)[0]!.v as string;
   }
 
-  private splitSlots(): SplitSlot[] {
-    const r = this.b.exec(`SELECT v FROM __meta WHERE k = 'splits'`)[0];
-    return r ? (JSON.parse(r.v as string) as SplitSlot[]) : [];
-  }
-  private setSplitSlots(list: SplitSlot[]): void {
-    this.b.exec(`INSERT INTO __meta(k, v) VALUES ('splits', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, JSON.stringify(list));
-  }
-
   /**
-   * 表定義の遷移を開いてよいか。だめなら、待ってやり直せる誤りを投げる。
-   * 表定義の遷移は 1 つずつ開く (M21 の ONE_OPEN。refusal の one-open)。分割の枠がある間は開かない (DDL_WAITS_MOVE。段 4 までは枠が守る)。
+   * 表定義の遷移を開いてよいか。だめなら、待ってやり直せる誤りを投げる (refusal の 2 つ)。
+   *   one-open        表定義の遷移は 1 つずつ開く (M21 の ONE_OPEN)。
+   *   ddl-waits-move  移動が開いている間は開かない (DDL_WAITS_MOVE)。移動の途中の親と子は表定義の記録を適用しないので、
+   *                   その epoch で計画した要求を、移動が終わるまで断ることになる (m21_red_ddl_during_move)。
    */
   private assertFreeForDdl(s: Snapshot): void {
-    const r = refusal(s, { kind: "prepare", mode: "plain", ddl: { sql: [], defs: [], drops: [], user: null }, fence: [] });
+    const r = refusal(s, PROBE);
     if (r?.rule === "one-open" && !this.faults.overlappingTransitions) throw new SchemaBusy(describeOpen(r.open));
-    const splits = this.splitSlots();
-    if (splits.length > 0) throw new SchemaBusy(`a shard split of ${splits.map((x) => x.parent).join(", ")}`);
+    // 欠陥のスイッチで one-open を外しても、移動の確かめは残す (遷移を除いたスナップショットで尋ね直す)。
+    const m = refusal({ ...s, open: null }, PROBE);
+    if (m?.rule === "ddl-waits-move" && !this.faults.ddlDuringMove) {
+      throw new SchemaBusy(`a shard split of ${[...new Set(m.moves.map((x) => x.from))].join(", ")}`);
+    }
   }
 
   /**
-   * 分割のために、保守の操作の枠を取る。basedOn は、呼び出し側が全シャードへ適用させた表定義の epoch で、最新と違えば断る。
-   * 表定義の遷移が開いている間は取らない (M21 の MOVE_WAITS_DDL)。同じ範囲の分割の枠がもうあれば、それを返す (分割の再開)。
+   * 範囲の移動を開く (move-start を記録する。docs/design-catalog-epoch.md の「移動の遷移」、段 4)。この記録が、範囲表の切り替えであり、
+   * 親の fence であり (親は、この記録を適用すると、その区間の書き込みを断る)、子の受け取りの始まりである (子は、適用すると受け取り始め、
+   * 自分で移動を進める)。シャードの確かめは待たない。子も親も、記録そのものから始められるからである。
+   * 同じ移動 (親、子、区間) がもう開いていれば、記録を足さずに、その epoch を返す (分割の再開)。
+   * 記録を足せないのは、refusal の 4 つの条件である。
+   *   move-waits-ddl  表定義の遷移が開いている (M21 の MOVE_WAITS_DDL)。SchemaBusy で、待ってやり直せる。遷移の終わり (commit か
+   *                   abort) が、移動の途中の親と子に届くと、適用できないからである (m21_red_move_during_ddl)。
+   *   owner           区間の全体を、親が持っていない。
+   *   moves-overlap   開いている移動と、区間か、親か子が重なる。SplitBusy で、待ってやり直せる。
+   *   child-owns      子が、もう範囲を持っている。
+   * 区間の両端は slot の境目でなければならない (シャードの移動の手順が、まだグループの全体を運ぶことを前提にしている)。
    */
-  async beginSplit(move: SplitMove, basedOn: number): Promise<SplitSlot> {
-    this.expire();
-    const list = this.splitSlots();
-    const same = list.find((x) => sameSplit(x, move));
-    if (same) return same;
-    const s = this.current();
-    if (basedOn !== s.schema) throw new SchemaMoved(s.schema);
-    if (s.open) throw new SchemaBusy(describeOpen(s.open));
+  async startMove(move: Move): Promise<{ epoch: number; routing: Routing }> {
     assertInterval(move);
-    const slot: SplitSlot = {
-      id: splitId(move),
-      parent: move.parent, child: move.child, start: move.start, end: move.end, schema: s.schema, started: false, until: this.rt.now() + this.leaseMs,
-    };
-    this.setSplitSlots([...list, slot]);
-    return slot;
+    if (!slotAligned(move)) throw new SqlError(`moving a part of a slot is not supported yet: ${rangeText(move)}`);
+    this.expire();
+    const s = this.current();
+    const same = s.moves.find((m) => m.from === move.from && m.to === move.to && sameInterval(m, move));
+    if (same) return { epoch: same.epoch, routing: s.routing };
+    const rec: EpochRecord = { kind: "move-start", from: move.from, to: move.to, start: move.start, end: move.end };
+    const busy = refusal(s, rec);
+    if (busy?.rule === "move-waits-ddl" && !this.faults.moveDuringDdl) throw new SchemaBusy(describeOpen(busy.open));
+    // 欠陥のスイッチで move-waits-ddl を外しても、ほかの条件は確かめる (遷移を除いたスナップショットで尋ね直す)。
+    const r = busy?.rule === "move-waits-ddl" ? refusal({ ...s, open: null }, rec) : busy;
+    if (r?.rule === "owner") throw new SqlError(`${rangeText(move)} are owned by ${r.owners.join(", ") || "nobody"}, not by ${move.from}`);
+    if (r?.rule === "moves-overlap") {
+      const m = r.moves[0]!;
+      throw new SplitBusy(`a move of ${rangeText(m)} from ${m.from} to ${m.to} is in progress`);
+    }
+    if (r?.rule === "child-owns") throw new SqlError(`split: ${move.to} already owns other ranges`);
+    if (r) throw new SqlError(`cannot start the move: ${r.rule}`);
+    const epoch = this.record(rec);
+    return { epoch, routing: this.snapshot().routing };
   }
 
   /**
-   * 子が受け取り始める。枠が生きていれば、期限を外して分割の表定義の epoch を返す。枠がなければ (期限切れ) 断る。
-   * 子は、その epoch まで列を適用してから受け取り始める。
+   * 移動を閉じる (move-end を記録する)。epoch は、その移動の move-start の epoch である。子が受け取り終えた後で (finishIncoming の後)、
+   * 子が呼ぶ (M21 の END_AFTER_DRAIN。列からは決まらないので、Meta は確かめない)。もう閉じていれば、記録を足さずに、閉じた記録の epoch を
+   * 返す (子は alarm で呼び直す)。
    */
-  async startSplit(id: string, move: SplitMove): Promise<{ schema: number }> {
+  async endMove(epoch: number): Promise<{ epoch: number }> {
     this.expire();
-    const list = this.splitSlots();
-    const slot = list.find((x) => x.id === id);
-    // 欠陥のスイッチ: 枠が期限で消えていても断らず、いまの表定義で受け取り始めさせる。枠のないまま分割が進み、DDL が記録される。
-    if (!slot && this.faults.startWithoutSlot) return { schema: this.current().schema };
-    if (!slot || !sameSplit(slot, move)) {
-      throw new SqlError(`split ${id}: no such split slot (it expired before the child started, or it is for another range)`);
-    }
-    if (!slot.started) this.setSplitSlots(list.map((x) => (x.id === id ? { ...x, started: true } : x)));
-    return { schema: slot.schema };
+    const s = this.current();
+    if (refusal(s, { kind: "move-end", of: epoch }) === null) return { epoch: this.record({ kind: "move-end", of: epoch }) };
+    const log = readEpochs(this.b);
+    const ended = log.find((x) => x.rec.kind === "move-end" && x.rec.of === epoch);
+    if (ended) return { epoch: ended.epoch };
+    throw new SqlError(`epoch ${epoch} is not a move`);
   }
 
-  /** 親が fence する前に、枠が生きていて、子が受け取り始めていることを確かめる。 */
-  async checkSplit(id: string, move: SplitMove): Promise<void> {
-    if (this.faults.fenceWithoutSlot) return;
-    const slot = this.splitSlots().find((x) => x.id === id);
-    if (!slot?.started || !sameSplit(slot, move)) {
-      throw new SqlError(`split ${id}: the split slot is not held, or the child has not started receiving`);
-    }
-  }
-
-  /**
-   * 分割が終わった。枠を返し、その分割の移動 (範囲表の切り替えの move-start) が開いていれば、move-end を記録する。
-   * 移動は、枠の名前 (親、子、区間) で引く。枠が期限で消えていても (欠陥のスイッチ startWithoutSlot)、移動は閉じる。
-   */
-  async endSplit(id: string): Promise<void> {
-    const list = this.splitSlots();
-    const slot = list.find((x) => x.id === id);
-    const move = this.snapshot().moves.find((m) =>
-      (m.from !== undefined && splitId({ parent: m.from, child: m.to, start: m.start, end: m.end }) === id) ||
-      (slot !== undefined && m.to === slot.child && sameInterval(m, slot) && (m.from === undefined || m.from === slot.parent)));
-    this.b.tx(() => {
-      this.setSplitSlots(list.filter((x) => x.id !== id));
-      if (move) this.record({ kind: "move-end", of: move.epoch });
-    });
-  }
-
-  /** 進行中の分割の枠。Autoscaler が、止まった分割を再開するのに使う。 */
-  async splits(): Promise<SplitSlot[]> {
+  /** 開いている移動 (move-start の後、move-end の前)。Autoscaler が、止まった分割を再開するのに使う。 */
+  async moves(): Promise<OpenMove[]> {
     this.expire();
-    return this.splitSlots();
+    return this.current().moves;
   }
 
   /**
@@ -355,12 +318,9 @@ export class MetaCore {
   /**
    * 期限を過ぎた表定義の遷移を abort する。外から呼ばれるたびに、最初に確かめる。
    * 書き込みを断られた Worker も、列を取りに来るシャードも、Meta に尋ねる。だから、タイマーがなくても、待っている者がいれば abort される。
-   * 子が受け取り始める前に期限を過ぎた分割の枠も、ここで捨てる。
+   * 移動には期限がない (move-start の後は、子が自分で進める)。
    */
   private expire(): void {
-    const slots = this.splitSlots();
-    const live = slots.filter((x) => x.started || this.rt.now() <= x.until);
-    if (live.length !== slots.length) this.setSplitSlots(live);
     const now = this.rt.now();
     for (const o of this.snapshot().opens) {
       const lease = this.lease(o.epoch);
@@ -426,7 +386,7 @@ export class MetaCore {
 
   /**
    * 表定義の遷移を開く (prepare を記録する)。basedOn は、呼び出し側が文を解釈した表定義の epoch で、最新と違えば SchemaMoved で断る
-   * (取り消しがないので、意味は「文を解釈した表定義が最新である」ことだけである)。遷移が開いているか分割の枠があれば SchemaBusy。
+   * (取り消しがないので、意味は「文を解釈した表定義が最新である」ことだけである)。遷移か移動が開いていれば SchemaBusy。
    * guard は、取引が読んだ表の DROP で、その取引が読んだ表である (mode guard。読んだ範囲は、進める側が commit の前に確かめる)。
    * 何もしない DDL (IF NOT EXISTS で表がある、など) は、何も記録せずに epoch: null を返す。
    */
@@ -461,7 +421,7 @@ export class MetaCore {
    * 表定義の遷移を確定する (commit を記録する)。epoch は prepare の epoch、acks は prepared に ok と答えたシャード、at は index を
    * 公開する commit が運ぶ時刻である。確かめるのは 3 つ (設計書の「Meta の入口」)。
    *   1. その遷移が開いている。期限切れか失敗で abort された後の commit は通らない (M21 の ONE_EXIT)。先に expire を通す。
-   *   2. acks が、範囲表の全シャードを含む (ALL_ACKS)。遷移が開いている間は分割が始まらないので、シャードの集合は prepare から変わらない。
+   *   2. acks が、範囲表の全シャードを含む (ALL_ACKS)。遷移が開いている間は移動が始まらないので、シャードの集合は prepare から変わらない。
    * 文は、Meta の SQLite でも実行して残す。
    */
   async commit(epoch: number, acks: string[], at?: Ts): Promise<Catalog> {

@@ -205,14 +205,16 @@ Five rules keep a schema change from tearing a transaction that is under way:
   prepare, has every shard check that nothing changed in what the transaction read since it read it, and only then
   commits. If something changed, the drop is aborted as a conflict and no row is lost. Model M21 (it replaced M14).
 - A shard born from a split catches up to its parent's schema before it accepts the parent's rows.
-- A shard that is handing over or receiving a range applies no schema change until the move is finished, and the
-  parent catches up to the child's version before it fences the range. Rows and intents in transit then always have
-  the shape of the table that receives them. Splits and schema changes take turns through a maintenance slot at
-  Meta: a split takes it only while no schema transition is open, uses the schema epoch Meta returns with it, and
-  holds it until the child has received the range; Meta opens no schema transition meanwhile, so no request planned
-  at the current schema is refused by a moving shard. Splits share the slot with each other. A split that stops before
-  the child starts receiving releases the slot after 5 seconds; one that has started cannot be undone, so the
-  autoscaler resumes it. Model M15 (stage 4 of the catalog epoch design replaces the slot with move records).
+- A shard that is handing over or receiving a range applies no schema change until the move is finished. A move is
+  two records in Meta's epoch log. The move-start record is at once the range-table switch, the parent's fence (the
+  parent applies it before it hands any row over, so the rows it hands over have the shape of the child's table) and
+  the start of the child's receive; the child applies the log in order, so it starts receiving at the parent's schema
+  epoch. The child then drives the move itself (right away, and again from its alarm after a restart): it pulls every
+  group, takes the parent's clock, and only after it has received everything has Meta record the move-end. Meta records
+  no move-start while a schema transition is open and opens no schema transition while a move is open, so no request
+  planned at the current schema is refused by a moving shard. Moves may run side by side when their ranges and shards
+  are disjoint. A move cannot be undone; one whose child has not learnt of it yet is resumed by the autoscaler.
+  Model M21 (it replaced M15).
 
 The first four came out of randomized tests and a model (M11) that found six ways the first implementation got it
 wrong; the fifth came out of a second design review and is covered by simulator tests but not yet by a model. The

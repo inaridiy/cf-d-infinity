@@ -88,8 +88,10 @@ describe("the shard's write guard on a multi-row INSERT planned before two split
     const c = new SimCluster({ shards: 1 });
     const { a, b } = await staleInsertScene(c);
     const [s1, s2] = await resend(c, a, b);
-    // 段 2 から、シャードは所有を自分のスナップショットで引くので、宣言の確かめより先に、持ち主でない行として断る。
-    expect(s1).toBe(`write outside claim: shard s1 does not own t row [${b}] (not owner: s2); nothing was written; the request was built wrongly, please report this`);
+    // 段 2 から、シャードは所有を自分のスナップショットで引くので、宣言の確かめより先に、持ち主でない行として断る。s1 のスナップショットは、
+    // 2 つ目の移動 (s0 から s2) を知らない。要求が宣言した行は s1 のものなので、s1 は範囲の記録を適用しないからである (段 4 から、s1 が
+    // 自分の移動の後に写しを進めるのは、自分の move-end までである)。だから、b の持ち主を s0 と答える。
+    expect(s1).toBe(`write outside claim: shard s1 does not own t row [${b}] (not owner: s0); nothing was written; the request was built wrongly, please report this`);
     expect(s2).toBe(`write outside claim: shard s2 does not own t row [${a}] (not owner: s1); nothing was written; the request was built wrongly, please report this`);
     expect(isWriteOutsideClaim(new Error(s1))).toBe(true);
     await c.settle();

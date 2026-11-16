@@ -391,8 +391,9 @@ describe("a UNIQUE index build that outlives one lease", () => {
   });
 });
 
-// 分割の枠 (M15) を、本物の DO で通す。枠を取り、子の受け入れが Meta の startSplit を、親の fence が checkSplit を呼び、
-// 終わりに枠を返す。返っていなければ、後の表定義の変更が待たされる。
+// 範囲の移動 (catalog epoch の段 4) を、本物の DO で通す。Autoscaler が Meta に move-start を記録させ、子が、親から行を引き取り、
+// 親の時計を受け取った後で、Meta に move-end を記録させる (子の DO から Meta の DO への endMove)。記録されていなければ、移動が
+// 開いたまま残り、後の表定義の変更が待たされる。
 describe("a split through /admin/split", () => {
   const admin = (path: string, body: object = {}) => post(path, body, ADMIN) as unknown as Promise<Record<string, unknown> & { status: number }>;
 
@@ -405,9 +406,9 @@ describe("a split through /admin/split", () => {
     const child = `shard-${Math.max(...before.shards.map((s) => Number(s.slice("shard-".length)))) + 1}`;
     const r = await admin("/admin/split", { parent, child });
     expect([r.status, r.error]).toEqual([200, undefined]);
-    const after = (await admin("/admin/status")) as unknown as { shards: string[]; splits: unknown[] };
+    const after = (await admin("/admin/status")) as unknown as { shards: string[]; moves: unknown[] };
     expect(after.shards).toContain(child);
-    expect(after.splits).toEqual([]);
+    expect(after.moves).toEqual([]);
     // 子へ移った行も含めて、全部の行が読め、書ける。
     expect((await sql("SELECT count(*) c, sum(v) s FROM sp")).rows).toEqual([{ c: 40, s: 8200 }]);
     expect((await sql("UPDATE sp SET v = v + 1")).error).toBeUndefined();

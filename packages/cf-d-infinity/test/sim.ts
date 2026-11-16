@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Db, type ClientFaults, type Cluster } from "../src/client/db";
 import { keyString } from "../src/keys";
-import { fold, type EpochRecord } from "../src/catalog";
-import { MetaCore, type Catalog, type SplitMove, type SplitSlot } from "../src/meta";
+import { fold, type EpochRecord, type Move } from "../src/catalog";
+import { MetaCore, type Catalog } from "../src/meta";
 import { initialRouting, shardsOf, tokenOf, type Interval, type Routing } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
@@ -389,7 +389,7 @@ export class SimNet {
 /** Worker の側の欠陥のスイッチの名前 (src/client/db.ts の ClientFaults)。 */
 const CLIENT_FAULTS = new Set([
   "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
-  "publishBeforeBackfill", "checkBeforePrepare", "scanSkipsEmpty", "guardFromCommitTs", "splitWithoutSync",
+  "publishBeforeBackfill", "checkBeforePrepare", "scanSkipsEmpty", "guardFromCommitTs",
   "lockedReadsSkipValidation", "secondDmlNewSince", "secondDmlNewSpanSince",
 ]);
 /**
@@ -638,7 +638,7 @@ export class SimCluster implements Cluster {
       peer: (to) => this.stub(id, to),
       meta: {
         epochsSince: (after) => this.meta.epochsSince(after),
-        startSplit: (id, move) => this.meta.startSplit(id, move), checkSplit: (id, move) => this.meta.checkSplit(id, move),
+        endMove: (epoch) => this.meta.endMove(epoch),
       },
       background: (p) => {
         this.background.add(p);
@@ -665,9 +665,11 @@ export class SimCluster implements Cluster {
    * claimed) とは別に、ここで確かめ直す。守りを欠陥のスイッチ (ignoreWriteClaim) で外しても、同じに確かめる。変更の行ごとに:
    *   1. 変更が名乗る行 (pk と sk) が、行イメージから読んだ行と同じである。
    *   2. 文の実行なら、文が宣言した範囲のどれかが、その行を覆う。
-   *   3. 変更後の行が残るなら、そのシャードが、その行の token を持っている。持ち主は、Meta の範囲表と、シャードが保存した範囲の
-   *      移動の記録 (__fenced と __incoming) から決める。シャードのメモリと、シャードの所有の規則は使わない。手放した token は
-   *      持たない。受け取った token と、範囲表がそのシャードに割り当てる token は持つ。
+   *   3. 変更後の行が残るなら、そのシャードが、その行の token を持っている。持ち主は、シャードが保存した記録 (Meta の epoch の列の写し
+   *      __epoch と、渡したグループの記録 __moved と __arrived) から決める。シャードのメモリと、シャードの所有の規則は使わない。
+   *      写しを畳んだ範囲表がそのシャードに割り当てる token を持ち、渡して受け取り直していないグループの行は持たない (段 4 から、
+   *      範囲表の切り替えと親の fence と子の受け取りの始まりは、同じ move-start の記録である。親は、その記録を写すまで、移る範囲の行を
+   *      持ち、書き込みを受けてよい。その行は、記録を写した後に子へ運ばれる)。
    * 確かめるだけで、処理は変えない (RPC の列も変わらない)。見つけたものは test/setup.ts が試験ごとに確かめる。
    */
   private checkWrites(e: WriteCheck): void {
@@ -695,20 +697,24 @@ export class SimCluster implements Cluster {
     if (e.spans && !e.spans.some((s) => declaresRow(s, c.table, key, token))) {
       return `the statement wrote a row outside its declared spans ${JSON.stringify(e.spans).slice(0, 200)}`;
     }
-    if (c.after && !this.ownsToken(e.shard, token)) {
+    if (c.after && !this.ownsToken(e.shard, token, key.sk)) {
       return `the row would stay on ${e.shard}, which does not own token ${token} (the range table gives it to ${this.routingOwner(token)})`;
     }
     return null;
   }
 
-  /** シャードが token を持っているか。Meta の範囲表と、シャードが保存した範囲の移動の記録から決める (checkWrites の 3)。 */
-  private ownsToken(shard: string, token: number): boolean {
+  /**
+   * シャードが、shard key sk の行の token を持っているか。シャードが保存した記録から決める (checkWrites の 3)。
+   * 写した epoch の列を畳んだ範囲表で、その token がシャードのものであり、そのグループを渡して受け取り直していないこと。
+   */
+  private ownsToken(shard: string, token: number, sk: string): boolean {
     const db = this.backends.get(shard)!.db;
-    const inside = (table: string) =>
-      (db.prepare(`SELECT lo, hi FROM ${table}`).all() as { lo: number; hi: number }[]).some((r) => token >= r.lo && token < r.hi);
-    if (inside("__fenced")) return false;
-    if (inside("__incoming")) return true;
-    return this.routingOwner(token) === shard;
+    const rows = db.prepare(`SELECT epoch, rec FROM __epoch ORDER BY epoch`).all() as { epoch: number; rec: string }[];
+    const routing = rows.length > 0 ? fold(rows.map((r) => ({ epoch: r.epoch, rec: JSON.parse(r.rec) as EpochRecord }))).routing : initialRouting(this.shardIds);
+    if (routing.ranges.find((x) => token >= x.start && token < x.end)?.shard !== shard) return false;
+    const last = (table: string) => (db.prepare(`SELECT max(epoch) AS e FROM ${table} WHERE g = ?`).get(sk) as { e: number | null }).e;
+    const out = last("__moved");
+    return out === null || (last("__arrived") ?? -1) > out;
   }
 
   /**
@@ -800,26 +806,21 @@ export class SimCluster implements Cluster {
   renew(epoch: number) {
     return this.meta.renew(epoch);
   }
-  switchRange(move: Interval & { to: string; from?: string }) {
-    return this.meta.switchRange(move);
+  startMove(move: Move) {
+    return this.meta.startMove(move);
   }
-  beginSplit(move: SplitMove, basedOn: number) {
-    return this.meta.beginSplit(move, basedOn);
-  }
-  endSplit(id: string) {
-    return this.meta.endSplit(id);
-  }
-  splits() {
-    return this.meta.splits();
+  moves() {
+    return this.meta.moves();
   }
   /**
-   * 試験が分割の段を自分で進めるための、分割の枠。Autoscaler の split と同じく、全シャードに最新の表定義を適用させてから取る。
-   * 返る id を、beginIncoming と fence に渡す。
+   * 試験が範囲の移動を自分で進めるための入口。Meta に move-start を記録させ、tell に挙げたシャードに、その epoch まで列を適用させる
+   * (親なら fence が付き、子なら受け取り始めて、自分で移動を進め始める)。誰にも知らせなければ、記録だけが残る (進める側が止まった形)。
    */
-  async reserveSplit(parent: string, child: string, range: Interval): Promise<SplitSlot> {
-    const cat = await this.catalog();
-    for (const id of shardsOf(cat.routing)) await this.shard(id).syncSchema({ schema: cat.schema });
-    return this.meta.beginSplit({ parent, child, ...range }, cat.schema);
+  async moveAt(parent: string, child: string, range: Interval, tell: string[] = []): Promise<{ epoch: number }> {
+    const { epoch } = await this.meta.startMove({ from: parent, to: child, ...range });
+    const { schema } = await this.catalog();
+    for (const id of tell) await this.shard(id).syncSchema({ schema, epoch });
+    return { epoch };
   }
   /**
    * 試験が、表定義の変更を 1 手ずつ進めるための入口。DDL の prepare を記録し、全シャードの prepared の ok を集めて commit する

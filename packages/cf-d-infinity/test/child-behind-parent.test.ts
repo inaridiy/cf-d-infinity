@@ -1,4 +1,7 @@
 // Review of f2224ce, fix 6. Passes since 2026-11-11: a split holds the maintenance slot at Meta, which records no schema change while it does, and the split uses the version Meta gives with the slot (invariant 4, specs/m15_maintenance_slot.qnt).
+// Since catalog epoch stage 4 (2026-11-16) the slot is gone: the move-start record in Meta's epoch log is the range-table switch, the
+// parent's fence and the start of the child's receive, and Meta records no schema transition while a move is open (M21's
+// DDL_WAITS_MOVE). The child applies the log in order, so it starts receiving at the parent's schema epoch.
 //
 // A child that was told to expect a range at schema version N, whose parent applied version N+1 before it fenced, is
 // behind its parent. It may catch up only when a group arrives (applySchema(catchUp)). But a request for a row of the
@@ -24,21 +27,23 @@ describe("split whose child is one schema version behind its parent", () => {
     const range = planSplit(cat.routing, "s0")!;
     const moved = ids.find((id) => slotOf(JSON.stringify([id])) >= range.start && slotOf(JSON.stringify([id])) < range.end)!;
 
-    // split(): step 1. The driver takes the maintenance slot from Meta, and the child prepares to receive the range
-    // at the slot's version (specs/m15_maintenance_slot.qnt).
-    const slot = await c.reserveSplit("s0", "s1", range);
-    const { schema } = await c.shard("s1").beginIncoming({ ...range, from: "s0", slot: slot.id });
-    // A schema change arrives now. While the split holds the slot, Meta does not record it; it waits for the split.
+    // The child's own copy of the rows starts when it applies the move-start. Hold it at its first step (listing the parent's
+    // groups), so that the copy has not started when the reads below arrive.
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    c.net.gate = (m) => (m.from === "s1" && m.method === "listGroups" ? held : undefined);
+    // split(): the driver opens the move at Meta and tells the child, then stops (request cut off, Worker limit).
+    await c.moveAt("s0", "s1", range, ["s1"]);
+    // A schema change arrives now. While the move is open, Meta does not record it; it waits for the move.
     const ddl = outcome(new Db(c).ddl("CREATE TABLE other(id INTEGER PRIMARY KEY)"));
-    // split(): steps 2 and 3. The driver stops here (request cut off, Worker limit); the copy has not started.
-    await c.shard("s0").fence({ ...range, to: "s1", schema, slot: slot.id });
-    await c.switchRange({ ...range, to: "s1", from: "s0" });
     const health = await Promise.all(["s0", "s1"].map((id) => c.cores.get(id)!.health({}).then((h) => ({ id, schema: h.schema, incoming: h.incoming, outgoing: h.outgoing }))));
     const read = await outcome(new Db(c, { retries: 5 }).query("SELECT n FROM items WHERE id = ?", [moved]).then((r) => r.rows));
     const write = await outcome(new Db(c, { retries: 5 }).query("UPDATE items SET n = 0 WHERE id = ?", [moved]));
     console.log(JSON.stringify({ health, read, write }));
 
     // Running the split again finishes it, and the schema change goes through after it.
+    c.net.gate = () => undefined;
+    release();
     const resumed = await outcome(split(c, "s0", "s1"));
     expect(await ddl).toHaveProperty("ok");
     const after = await outcome(new Db(c, { retries: 5 }).query("SELECT n FROM items WHERE id = ?", [moved]).then((r) => r.rows));

@@ -3,8 +3,9 @@ import { Db, type Cluster, type StatementStat } from "./client/db";
 import { exportPage, importRows, type ExportCursor, type ExportPage } from "./transfer";
 
 export { importRows, type ExportCursor };
-import { collectMetrics, decide, DEFAULTS, healthProblems, needsFollowUp, nextShardNumber, split, splitsToResume, type AutoscalerState, type Thresholds } from "./autoscaler";
-import { MetaCore, type Catalog, type SplitMove } from "./meta";
+import { collectMetrics, decide, DEFAULTS, healthProblems, movesToResume, needsFollowUp, nextShardNumber, split, type AutoscalerState, type Thresholds } from "./autoscaler";
+import type { Move } from "./catalog";
+import { MetaCore, type Catalog } from "./meta";
 import { planSplit, shardsOf, type Interval } from "./routing";
 import { ShardCore } from "./shard/core";
 import { batonSealer, handlePipeline, serveHranaSocket, type BatonSeal, type PipelineReq } from "./client/hrana";
@@ -133,8 +134,7 @@ export class DinfShard extends DurableObject<Env> {
       peer: (id) => shardStub(env, id),
       meta: {
         epochsSince: (after) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).epochsSince(after) as never,
-        startSplit: (id, move) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).startSplit(id, move),
-        checkSplit: (id, move) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).checkSplit(id, move),
+        endMove: (epoch) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).endMove(epoch),
       },
       background: (p) => ctx.waitUntil(p),
       // 予約済みの alarm は後ろへずらさない。負荷が続くと毎回ずれて、いつまでも発火しなくなる。
@@ -242,23 +242,14 @@ export class DinfMeta extends DurableObject<Env> {
   renew(epoch: number) {
     return this.core.renew(epoch);
   }
-  switchRange(move: Interval & { to: string; from?: string }) {
-    return this.core.switchRange(move);
+  startMove(move: Move) {
+    return this.core.startMove(move);
   }
-  beginSplit(move: SplitMove, basedOn: number) {
-    return this.core.beginSplit(move, basedOn);
+  endMove(epoch: number) {
+    return this.core.endMove(epoch);
   }
-  startSplit(id: string, move: SplitMove) {
-    return this.core.startSplit(id, move);
-  }
-  checkSplit(id: string, move: SplitMove) {
-    return this.core.checkSplit(id, move);
-  }
-  endSplit(id: string) {
-    return this.core.endSplit(id);
-  }
-  splits() {
-    return this.core.splits();
+  moves() {
+    return this.core.moves();
   }
   batonSecret() {
     return this.core.batonSecret();
@@ -379,9 +370,9 @@ export class DinfAutoscaler extends DurableObject<Env> {
     this.event("tick", metrics.map((m) => ({ id: m.id, w: m.writes, r: m.reads, ms: m.elapsedMs, size: m.size, mig: m.migrating, probe: m.probeMs })));
     // 途中で失敗した増設は同じ範囲で再開する。各段は冪等である。
     for (const job of c.pending) this.runSplit(cluster, job);
-    // Meta に残っている分割の枠も再開する。別の進め方 (手で始めた分割など) が途中で止まると、枠が残り、
-    // 表定義の変更がいつまでも記録できなくなる。子が受け取り始めた分割は取り消せないので、終わらせる。
-    for (const job of splitsToResume(await cluster.splits(), (child) => c.pending.some((j) => j.child === child))) this.runSplit(cluster, job);
+    // Meta に開いたまま残っている移動も再開する。別の進め方 (手で始めた分割など) が途中で止まり、子が move-start をまだ知らないと、
+    // 移動が開いたまま残り、表定義の変更がいつまでも記録できなくなる。移動は取り消せないので、子に終わらせる。
+    for (const job of movesToResume(await cluster.moves(), (child) => c.pending.some((j) => j.child === child))) this.runSplit(cluster, job);
     const { routing } = await cluster.catalog();
     // 持続回数と cooldown は永続化する。メモリだけだと、再起動のたびに cooldown が消えて続けて割る。
     const saved = this.ctx.storage.sql.exec(`SELECT v FROM conf WHERE k = 'state'`).toArray()[0];
@@ -426,7 +417,7 @@ export class DinfAutoscaler extends DurableObject<Env> {
         this.save(c);
         this.event("split-done", r);
       },
-      // 表定義の変更が枠を持っている間は、分割を待たせる。次の判断のときに、もう一度始める。
+      // 表定義の遷移か、重なる移動が開いている間は、分割を待たせる。次の判断のときに、もう一度始める。
       (e) => this.event(/split busy:/.test(String(e)) ? "split-waiting" : "split-failed", { child: job.child, error: String(e) }),
     ).finally(() => this.running.delete(job.child)));
   }
@@ -450,10 +441,8 @@ export function clusterOf(env: Env, count?: number, prefix = "shard"): Cluster {
     commit: (epoch, acks, at) => meta.commit(epoch, acks, at) as never,
     abort: (epoch, reason) => meta.abort(epoch, reason),
     renew: (epoch) => meta.renew(epoch),
-    switchRange: (move) => meta.switchRange(move) as never,
-    beginSplit: (move, basedOn) => meta.beginSplit(move, basedOn) as never,
-    endSplit: (id) => meta.endSplit(id),
-    splits: () => meta.splits() as never,
+    startMove: (move) => meta.startMove(move) as never,
+    moves: () => meta.moves() as never,
     allocate: (table, n, min) => meta.allocate(table, n, min),
   };
 }
@@ -579,7 +568,7 @@ export async function clusterStatus(env: Env, name = "shard", shards?: number) {
     // schema は表定義の epoch で、シャードの health の schema と同じ数である (段 2)。
     routing: cat.routing, shards: ids, schema: cat.schema, health, problems: healthProblems(health),
     // 進行中の分割。終わるまで、表定義の変更は待つ。長く残っているなら、分割が進めなくなっている。
-    splits: await cluster.splits(),
+    moves: await cluster.moves(),
     scaler: await env.DINF_AUTOSCALER.getByName(name).status(),
   };
 }

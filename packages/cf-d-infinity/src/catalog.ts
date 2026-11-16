@@ -9,8 +9,8 @@
 //   prepare     表定義の遷移を開く (段 3)。fence の表への書き込みを止める。ddl は、まだ表定義に入らない。
 //   commit      遷移を確定する。of は終える prepare の epoch で、その prepare の ddl を表定義に入れる。
 //   abort       遷移を取り消す。禁止を解き、prepare が作った内部の表 (staging) を消すだけで、利用者の表に触る文を持たない。
-//   move-start  範囲表の切り替え (MetaCore.switchRange)。
-//   move-end    分割の枠を返すこと (MetaCore.endSplit)。
+//   move-start  範囲の移動を開く (MetaCore.startMove。段 4)。範囲表の切り替えであり、親の fence であり、子の受け取りの始まりである。
+//   move-end    移動を閉じる (MetaCore.endMove)。子が受け取り終えた後で、子が記録させる。
 // 表定義の epoch (Snapshot.schema) は、prepare、commit、abort のどれでも進む (設計書の決めたこと 6)。
 import { applyMove, overlaps, shardsOf, type Interval, type Routing } from "./routing";
 import type { DdlMode, IndexInfo, ParsedDdl } from "./sql/ddl";
@@ -18,9 +18,9 @@ import type { TableDef, Ts } from "./types";
 
 export type { DdlMode } from "./sql/ddl";
 
-/** 範囲の移動。from は渡す側で、段 1 の switchRange は from を省けるので、区間の持ち主が 1 つに決まらなければ持たない。 */
+/** 範囲の移動。from は渡す側 (親)、to は受け取る側 (子) である。 */
 export interface Move extends Interval {
-  from?: string;
+  from: string;
   to: string;
 }
 
@@ -162,9 +162,7 @@ export function fold(log: readonly Logged[], upTo = Number.POSITIVE_INFINITY): S
       }
       case "move-start": {
         s.routing = applyMove(s.routing, rec);
-        const m: OpenMove = { epoch, to: rec.to, start: rec.start, end: rec.end };
-        if (rec.from !== undefined) m.from = rec.from;
-        s.moves = [...s.moves, m];
+        s.moves = [...s.moves, { epoch, from: rec.from, to: rec.to, start: rec.start, end: rec.end }];
         break;
       }
       case "move-end":
@@ -187,10 +185,6 @@ export function describeOpen(o: Pick<OpenDdl, "mode" | "fence" | "ddl">): string
   if (o.mode === "guard") return `the lock on ${o.fence.join(", ")} before DROP TABLE`;
   return o.ddl.user ?? "a schema change";
 }
-
-/** 分割の枠の名前 (MetaCore.beginSplit が付ける)。endSplit が、どの移動を閉じるかを、これで引く (段 4 で枠がなくなるまで)。 */
-export const splitId = (m: { parent: string; child: string; start: number; end: number }): string =>
-  `split:${m.parent}:${m.child}:${m.start}:${m.end}`;
 
 /** 記録を足せない理由。M21 の Meta の手の条件のどれに当たるかを rule に書く。 */
 export type Refusal =
@@ -219,11 +213,9 @@ export type Refusal =
  * スナップショット s (列の最後まで畳んだもの) の後に、記録 rec を足せるか。足せなければ理由を返す。
  * 条件は設計書の「同時に開ける遷移」と「Meta の入口」で、M21 の Meta の手 (prepareOp、commitOp、expire、startSplit、endSplit) の
  * 条件と同じものである。acks は、commit を記録する前に、進める側が集めた ok のシャードである。
- * 段 3 の Meta は、表定義の遷移の条件 (one-open、one-exit、all-acks) を、ここで決める。表定義の遷移と移動の排他 (ddl-waits-move、
- * move-waits-ddl) と移動の条件は、段 4 まで、分割の枠と今の確かめ (switchRange) が守る。枠は範囲表の切り替えより前に取られ、
- * 記録を残さずに期限で消えるので、列だけからは決められないからである。
- * 移動の中身の条件 (子が受け取り終えた後でだけ move-end を記録する、M21 の END_AFTER_DRAIN) は、列からは決まらない。段 4 で、
- * 受け取り終えた子が自分で move-end を記録させることで守る。
+ * Meta は、記録を足すたびに、ここで決める (段 3 から表定義の遷移の条件、段 4 から表定義の遷移と移動の排他と、移動の条件)。
+ * 移動の中身の条件 (子が受け取り終えた後でだけ move-end を記録する、M21 の END_AFTER_DRAIN) は、列からは決まらない。受け取り終えた
+ * 子が自分で move-end を記録させることで守る (kernel.ts の moveStep)。
  */
 export function refusal(s: Snapshot, rec: EpochRecord, acks: readonly string[] = []): Refusal | null {
   switch (rec.kind) {
@@ -246,7 +238,7 @@ export function refusal(s: Snapshot, rec: EpochRecord, acks: readonly string[] =
       const owners = [...new Set(s.routing.ranges.filter((x) => overlaps(x, rec)).map((x) => x.shard))];
       if (!(owners.length === 1 && owners[0] === rec.from)) return { rule: "owner", owners };
       const ends = [rec.from, rec.to];
-      const clash = s.moves.filter((m) => overlaps(m, rec) || ends.includes(m.to) || (m.from !== undefined && ends.includes(m.from)));
+      const clash = s.moves.filter((m) => overlaps(m, rec) || ends.includes(m.to) || ends.includes(m.from));
       if (clash.length > 0) return { rule: "moves-overlap", moves: clash };
       if (s.routing.ranges.some((x) => x.shard === rec.to)) return { rule: "child-owns" };
       return null;

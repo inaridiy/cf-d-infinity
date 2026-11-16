@@ -5,8 +5,8 @@
 // スナップショットでは自分のものでないときに、Meta の列を適用してから確かめ直す (M21 の gate)。子は、範囲の移動の記録を
 // 適用するまで、自分が宛先だと知らない。この試験は、段 2 より前のコードで通り、段 2 の後も通り続けなければならない。
 //
-// 1. 分割を進める側が、範囲表を切り替えた直後に止まる。子は受け取りを始めただけで、行は 1 つも届いていない。最新の範囲表を
-//    持つ Worker が、動いた行を読み書きする。
+// 1. 分割を進める側が、移動を開いた (範囲表を切り替えた) 直後に止まる。子は move-start を適用しておらず、行は 1 つも届いていない。
+//    最新の範囲表を持つ Worker が、動いた行を読み書きする。
 // 2. 分割が終わった後、Meta に表定義の変更を記録するが、どのシャードにも適用させない。最新の表定義と範囲表を持つ Worker が、
 //    動いた行に、足した列で書く。
 import { describe, expect, it } from "vitest";
@@ -35,11 +35,9 @@ describe("a child shard that is behind the newest catalog", () => {
       const t = tokenOf(key(id), key(id));
       return t >= range.start && t < range.end;
     })!;
-    // split() の最初の 3 段だけを進めて止まる (分割を進める側の要求が切れた)。行はまだ親にある。
-    const slot = await c.reserveSplit("s0", "s1", range);
-    const { schema } = await c.shard("s1").beginIncoming({ ...range, from: "s0", slot: slot.id });
-    await c.shard("s0").fence({ ...range, to: "s1", schema, slot: slot.id });
-    await c.switchRange({ ...range, to: "s1", from: "s0" });
+    // 分割を進める側が、移動を開いた (move-start を記録した) 直後に止まる (要求が切れた)。親だけが記録を適用して fence し、子は
+    // 何も知らない。行はまだ親にある。
+    await c.moveAt("s0", "s1", range, ["s0"]);
     expect(ownerOf((await c.catalog()).routing, key(moved))).toBe("s1");
 
     const db = new Db(c, { retries: 0 });
