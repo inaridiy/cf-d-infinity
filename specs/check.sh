@@ -794,6 +794,30 @@ fi
 for m in m23c_green_ro_w m23c_green_ro_y m23c_green_w m23c_green_retain m23c_green_empty m23c_base_ro m23c_red_child_below \
          m23c_red_no_merge m23c_red_prev_above m23c_red_no_retain m23c_red_no_epoch m23c_red_worker_routes m23c_red_empty_no_floor; do tests $f $m; done
 
+echo "== M25 txn lock lease (行ロックの寿命を取引のものにする。どの文も、取引の全部のロックを延ばす。実装より先に書いたモデル)"
+f=m25_txn_lock_lease.qnt
+green   $f m25_green leaseSafe                          # 決めた設計 (R = 1)。4 つの置き場所を、同じ利用者の手で並べて動かす
+green   $f m25_green_exact leaseSafe                    # 文ごとに延ばす形 (R = 0)
+green   $f m25_per_shard_same leaseSafe                 # 今の形でも、行が 1 つのシャードにあれば、どの文もロックを延ばす (下の赤と合わせて、置き場所で決まる)
+red     $f m25_red_per_shard outcomeSame                # 今の形: 文を受けたシャードだけが延ばす。y で働く間に、別のシャードの x のロックが切れる
+red     $f m25_red_per_shard stmtKeeps
+red     $f m25_red_local_lease outcomeSame              # 文を受けたシャードが、受けるたびに自分で now + L に延ばす
+red     $f m25_red_no_epoch idleLoses                   # シャードが lease の版を見ない: 延長の再配達で、取り消した取引のロックが延び続ける
+red     $f m25_red_regrant lockProtects                 # 延長が、切れたロックを取り直す
+red     $f m25_red_trust_lease serializable             # COMMIT が lease を信じて検証を省く: 再起動でロックが消えた後の書き込みを失う
+witness $f m25_green witnessBusyKeeps                   # 行が 2 つのシャード。y で働き続ける取引の x のロックは切れず、W が SQLITE_BUSY、取引が確定する
+witness $f m25_green witnessIdleLoses                   # 放っておかれた取引の x のロックが切れて W が書き、COMMIT が競合になる (どの置き場所でも)
+witness $f m25_green witnessRenew                       # 文が触らないシャードへ延長が届き、取引が確定する
+witness $f m25_green witnessLeftover                    # unlock の届かなかったロックは、lease の期限で切れ、待っていた W が書く
+witness $f m25_green witnessRestartCaught               # 再起動で消えたロックの後の W の書き込みを、COMMIT の検証が見つける
+witness $f m25_green_exact witnessBusyKeeps
+green   $f m25_red_per_shard witnessBusyKeeps           # 同じ witness は、今の形では届かない
+live    $f m25_green leaseLive                          # 活性: ロックはいつか全部切れたままになり、待つ W は終わり、時刻は上限まで進む
+live    $f m25_green_exact leaseLive
+live_red $f m25_red_no_epoch locksReleased              # 版を見ないと、再配達で延び続けるロックが、時刻の上限を越えて残る
+for m in m25_green m25_green_exact m25_per_shard_same m25_red_per_shard m25_red_local_lease m25_red_no_epoch m25_red_regrant \
+         m25_red_trust_lease; do tests $f $m; done
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect
