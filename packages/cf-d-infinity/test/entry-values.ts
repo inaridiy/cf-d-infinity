@@ -5,7 +5,7 @@
 //   - HTTP の /sql と /batch: JSON の数の literal は文面で決める。数字だけなら INTEGER (64 ビットまで正確)、小数点か指数があれば REAL。
 //     64 ビットに収まらない数字だけの literal は、SQLite の literal と同じく REAL である。
 //   - D1 互換の API と Service Binding: JS の数は、安全な整数なら INTEGER、ほかは REAL。bigint は INTEGER で、64 ビットの外は断る。
-//     BLOB は Uint8Array、ArrayBuffer、型つき配列のバイトである (D1 と同じ)。
+//     BLOB は Uint8Array、ArrayBuffer、型つき配列のバイトである (D1 は型つき配列を要素ごとに 1 バイトへ切る。src/client/d1.ts)。
 //   - どの入口も、値でないもの (配列、object など) を、文を実行する前に利用者の誤りとして断る。内部の TypeError にしない。
 import type { Value } from "../src/types";
 

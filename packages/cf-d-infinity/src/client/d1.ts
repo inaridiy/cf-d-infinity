@@ -45,9 +45,11 @@ export const kindOf = (v: unknown): string => (Array.isArray(v) ? "an array" : t
  *   - undefined と null は NULL。真偽値は INTEGER の 1 と 0。文字列は TEXT。
  *   - JS の数は、安全な整数なら INTEGER、ほかは REAL (持ち主の判断の 2。渡された double をそのまま入れる)。
  *   - bigint は INTEGER。64 ビットに収まらなければ断る。
- *   - Uint8Array、ArrayBuffer、型つき配列と DataView は、そのバイトの BLOB (D1 と同じ)。型つき配列は Uint8Array にして、要素では
- *     なくバイトを運ぶ (前は、workerd で Uint16Array が要素ごとに 1 バイトへ切られ、キー文字列は要素から作られた)。
- *   - ほか (配列、object、symbol、関数) は、利用者の誤り (SqlError) として断る。
+ *   - Uint8Array と ArrayBuffer は、そのバイトの BLOB (D1 と同じ)。型つき配列と DataView も、Uint8Array にして、要素ではなく
+ *     バイトを運ぶ。D1 (Miniflare 4.20260730 のローカルの D1 で確かめた) は Uint16Array を要素ごとに 1 バイトへ切り、DataView を
+ *     空の BLOB にする。前の D∞ も、workerd で Uint16Array を要素ごとに切り、キー文字列を要素から作った。
+ *   - ほか (配列、object、symbol、関数) は、利用者の誤り (SqlError) として断る。D1 は、0 から 255 の数の配列を BLOB として受け付ける
+ *     が、ここでは断る (Uint8Array で渡す)。前の D∞ は、どんな配列も符号の中で Uint8Array として読んだ。
  * i は引数の位置 (0 から)。誤りの文面には、SQLite と同じく 1 から数えた番号で書く。
  */
 export function toValue(v: unknown, i = 0): Value {

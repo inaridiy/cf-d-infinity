@@ -48,8 +48,9 @@ const utf8 = new TextEncoder();
  * そういう名前の列のある表は、どの走査も上限を超えることになり、基準経路でも読めなかった (2026-11-13 の Codex の 2 回目の見直し、
  * 指摘 8)。test/sim.ts の DO の模倣も、これで数える。
  * 前は手書きの走査と `\b` の正規表現で数えた。`$` や ASCII の外の文字に続く識別子の一部 (`UNION$`、`éUNION`) と引数の名前
- * (`$union`) を数え (多め)、番号つきの引数の直後の語 (`?1UNION`) を数えなかった (少なめ)。利用者の文の引数は、シャードへ送る前に
- * `?` に書き換わる (src/sql/cst.ts の bindParams) ので、少なめになる形は届かなかった (2026-11-16、test/lexical-scans.test.ts)。
+ * (`$union`) を数え (多め)、番号つきの引数の直後の語 (`?1UNION`) を数えなかった (少なめ)。多めの数え方で、シミュレータの DO の
+ * 模倣は、`UNION$a` のような名前の列が 5 つ以上ある表の CREATE TABLE を断った。利用者の文の引数は、シャードへ送る前に `?` に
+ * 書き換わる (src/sql/cst.ts の bindParams) ので、少なめになる形は届かなかった (2026-11-16、test/lexical-scans.test.ts)。
  */
 export function compoundTerms(sql: string): number {
   let terms = 1;

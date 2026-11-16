@@ -349,7 +349,13 @@ object `[{"a": 1}]` は、キー文字列を作る `lowerHex` の中で TypeErro
 | 入口 | 規則 |
 |---|---|
 | HTTP の `/sql` と `/batch` (`src/entry.ts` の `numberLiterals` と `jsonParams`) | 数の literal は文面で決める。数字だけなら INTEGER (64 ビットに収まれば正確に読む。収まらなければ、SQLite の literal と同じく REAL)。小数点か指数があれば REAL。`true` と `false` は INTEGER の 1 と 0。JSON の配列と object は断る (JSON には BLOB を書く形がない)。`params` が配列でなければ 400 で断る。元の文面を読めない実行環境では、D1 互換の API と同じ規則で読む |
-| D1 互換の API と Service Binding (`src/client/d1.ts` の `toValue`、`src/entrypoint.ts`) | 変えていない数の規則 (安全な整数は INTEGER、ほかは REAL。`5.0` と `5` は JS の数として同じなので、どちらも INTEGER)。`bigint` は INTEGER で、64 ビットの外は断る。`Uint8Array`、`ArrayBuffer`、型つき配列と `DataView` は、そのバイトの BLOB (D1 と同じ)。配列、object、symbol、関数は断る。D1 互換の API は、D1 と同じく `bind` が同期で断る |
+| D1 互換の API と Service Binding (`src/client/d1.ts` の `toValue`、`src/entrypoint.ts`) | 変えていない数の規則 (安全な整数は INTEGER、ほかは REAL。`5.0` と `5` は JS の数として同じなので、どちらも INTEGER)。`bigint` は INTEGER で、64 ビットの外は断る。`Uint8Array`、`ArrayBuffer`、型つき配列と `DataView` は、そのバイトの BLOB。配列、object、symbol、関数は断る。D1 互換の API は、D1 と同じく `bind` が同期で断る |
+
+D1 との違いを、Miniflare 4.20260730.0 のローカルの D1 で確かめた (2026-11-16)。
+`Uint8Array` と `ArrayBuffer` のバイトの BLOB、値でない引数を `bind` が同期で断ること (`D1_TYPE_ERROR`) は同じである。
+D1 は、`Uint16Array` を要素ごとに 1 バイトへ切り (`new Uint16Array([0x4241])` が `X'41'`)、`DataView` を空の BLOB にする。D∞ はバイトを運ぶ (`X'4142'`)。
+D1 は、0 から 255 の数の配列 (`[65, 66]`) を BLOB として受け付ける。D∞ は断る (`Uint8Array` で渡す)。D1 の結果は BLOB を数の配列で返すので、D1 の結果をそのまま引数に戻すコードは、D∞ では断られる (D∞ の結果は `Uint8Array` なので、D∞ の結果を戻すなら通る)。受け付けるかは持ち主が決める。
+`bigint` は、D1 は断り、D∞ は INTEGER として受け付ける。`undefined` は、D1 は断り、D∞ は前から NULL にしている (変えていない)。
 
 断る誤りは `SqlError` で、何番目の引数か (1 から) と、受け付ける型を書く (`parameter 2 is an array; ...`、`parameter 1: the integer 9223372036854775808 does not fit in 64 bits`)。
 文を実行する前に断るので、取引の中でも何も書かない。どちらも引数の型で決まり、行の置き場所には依らない。

@@ -365,6 +365,22 @@ describe("what the old scans' misreadings did to a statement", () => {
     }
   });
 
+  it("C1: a table whose column names join UNION, EXCEPT or INTERSECT to `$` can be created, written and read on every placement", async () => {
+    // 前の compoundTerms は、`UNION$a` のような名前を複合 SELECT の項として数えた。シミュレータの DO の模倣 (test/sim.ts) も同じ
+    // 関数で数えるので、この 6 列の表の CREATE TABLE を「too many terms in compound SELECT」で断った (前のコードで確かめた。2026-11-16)。
+    // 本物の DO の SQLite は、そこに複合 SELECT を数えない。本番では、その名前を引用せずに書いた文が、シャードで上限を超えたと
+    // 見なされて基準経路へ回っただけのはずである (workerd では確かめていない)。
+    const cols = ["UNION$a", "UNION$b", "EXCEPT$c", "UNION$d", "UNION$e", "INTERSECT$f"];
+    for (const shards of [1, 2]) {
+      const db = new Db(new SimCluster({ shards }));
+      await db.ddl(`CREATE TABLE c(id INTEGER PRIMARY KEY, ${cols.map((c) => `${c} INTEGER`).join(", ")})`);
+      await db.query(`INSERT INTO c(id, ${cols.join(", ")}) VALUES (1, 1, 2, 3, 4, 5, 6), (2, 1, 2, 3, 4, 5, 6)`, []);
+      await db.query(`UPDATE c SET ${cols[0]} = ${cols.slice(1).join(" + ")} WHERE id = 1`, []);
+      expect((await db.query(`SELECT ${cols.join(", ")} FROM c WHERE id = 1`, [])).values, `${shards} shards`).toEqual([[20n, 2n, 3n, 4n, 5n, 6n]]);
+      expect((await db.query(`SELECT ${cols[0]} FROM c ORDER BY id`, [])).values, `${shards} shards`).toEqual([[20n], [1n]]);
+    }
+  });
+
   it("P1 and C2 did not reach a user statement: the planner renames every parameter to `?` before binding", async () => {
     // 前の placeholders は `THEN:b` を見落とし、前の compoundTerms は `?1UNION` を数えなかった。どちらも、その形の文面が束縛か
     // シャードに届いたときだけ効く。利用者の文は、計画の前に引数を `?` に書き換える (src/sql/cst.ts の bindParams) ので、`THEN?` と
