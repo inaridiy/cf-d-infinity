@@ -552,10 +552,22 @@ witness $f m24_boundary_green witnessUnrelatedNoRetry   # 関係のない DDL �
 witness $f m24_boundary_green witnessRetriedAndDone
 witness $f m24_boundary_green witnessOtherDdlThenDone
 green   $f m24_boundary_red_global witnessUnrelatedNoRetry  # 同じ witness は、すべての DDL の版と比べると届かない
+if [ "${HEAVY:-0}" = "1" ]; then                        # 取引 2 件 (M21 の場面と同じ数)
+  green $f m24_green_unrelated2 m24Safe
+  green $f m24_green_build2 m24Safe
+  green $f m24_green_check2 m24Safe
+  green $f m24_green_drop2 m24Safe
+fi
+for m in m24_green_unrelated m24_green_build m24_green_check m24_green_drop m24_green_split \
+         m24_red_global m24_red_global_commit_only m24_red_prepare_advances m24_red_read_deps m24_red_apply_all m24_red_apply_touched \
+         m24_red_index m24_red_write_epoch m24_red_view \
+         m24_floor_green m24_floor_red_global m24_floor_red_restore_all m24_floor_red_no_floor \
+         m24_lock_green m24_lock_red_no_wait m24_lock_red_no_wound m24_boundary_green m24_boundary_red_global; do tests $f $m; done
 # 決めたこと 6 の確かめ直し: M21 の場面を、epoch を commit だけで進める形で (index の作成と CHECK は、M21 の m21_alt_commit_only_*)
+f=m24b_m21_commit_only.qnt
 green   $f m24_m21_green_split_txns epochSafeCommitOnly
 green   $f m24_m21_green_split epochSafeCommitOnly
-if [ "${HEAVY:-0}" = "1" ]; then                        # M21 の大きな場面と、M21 の赤 (noServeBelowAck を除く) を、commit だけで進める形で。取引 2 件の M24
+if [ "${HEAVY:-0}" = "1" ]; then                        # M21 の大きな場面と、M21 の赤 (noServeBelowAck を除く) を、commit だけで進める形で
   green $f m24_m21_green_drop epochSafeCommitOnly
   green $f m24_m21_green_ddl2 epochSafeCommitOnly
   green $f m24_m21_green_split_build epochSafeCommitOnly
@@ -594,16 +606,7 @@ if [ "${HEAVY:-0}" = "1" ]; then                        # M21 の大きな場面
   red   $f m24_m21_red_owner_unchecked moveKeepsWrites
   red   $f m24_m21_red_owner_unchecked readConsistent
   red   $f m24_m21_red_strict_epoch pinnedSurvives
-  green $f m24_green_unrelated2 m24Safe
-  green $f m24_green_build2 m24Safe
-  green $f m24_green_check2 m24Safe
-  green $f m24_green_drop2 m24Safe
 fi
-for m in m24_green_unrelated m24_green_build m24_green_check m24_green_drop m24_green_split \
-         m24_red_global m24_red_global_commit_only m24_red_prepare_advances m24_red_read_deps m24_red_apply_all m24_red_apply_touched \
-         m24_red_index m24_red_write_epoch m24_red_view \
-         m24_floor_green m24_floor_red_global m24_floor_red_restore_all m24_floor_red_no_floor \
-         m24_lock_green m24_lock_red_no_wait m24_lock_red_no_wound m24_boundary_green m24_boundary_red_global; do tests $f $m; done
 
 echo "== M22 unique keys (主キー以外の UNIQUE をキーの行にまとめる。グループが piece ごとに動く間も、UNIQUE の値を書く文が通る。実装より先に書いたモデル)"
 f=m22_unique_keys.qnt

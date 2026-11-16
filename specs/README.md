@@ -1532,7 +1532,7 @@ M21 の設計の条件は、設計どおりに固定した (外した形は M21 
 - `m24_lock_*`: 行ロックと DDL の待ち。表 X の行 2 つ (P と Q)、悲観の取引 1 件 (P に書き、Q に書き、確定する)、X の DDL 1 回。ロックは、利用者の待ちで切れるか (`idleExpire`)、書き込み禁止で待っている間に切れる (`blockedExpire`)。
 - `m24_boundary_*`: M13 の本体に、ほかの接続の DDL が区切りの表に触るかを足したもの。
 
-決めたこと 6 (epoch を commit だけで進める) は、M21 の本体を、M21 のインスタンスと同じ定数で `SCHEMA_ON_PREPARE = false` にして確かめ直した (`m24_m21_*`)。
+決めたこと 6 (epoch を commit だけで進める) は、M21 の本体を、M21 のインスタンスと同じ定数で `SCHEMA_ON_PREPARE = false` にして確かめ直した (`m24b_m21_commit_only.qnt` の `m24_m21_*`。M21 を読み込むので、M24 の検査のたびに読まないよう、ファイルを分けた)。
 M21 のファイルは変えていない (`test/catalog-m21.test.ts` が、その sha256 を確かめている)。
 
 不変条件は、M21 のもの (`noServeBelowAck` と `pinned` を除く。`m21Safe`) と、新しい 3 つである。

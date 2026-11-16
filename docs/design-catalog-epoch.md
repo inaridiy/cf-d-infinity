@@ -1030,15 +1030,16 @@ SQLite (WAL) では、ほかの接続の DDL は、別の表の取引を失敗�
 | view の epoch が進む記録 | `CREATE VIEW` と `DROP VIEW` の commit |
 | epoch を進める記録の種類 | commit だけ (決めたこと 6 を改める。下の「決めたこと 6 を改める」)。prepare と abort は、どの epoch も進めない。prepare が作る内部の表 (`__gidx_<index>`) だけは、prepare の epoch で生まれる |
 | 計画が頼るもの | 文が開く表 (view を通るなら、その元の表。`Db.tablesOf` が Worker の SQLite のコンパイルで確かめる表)、文が名指す view、文が書く表 |
-| 要求が運ぶもの | 頼るものごとに、名前と epoch と、書き込みとして頼るか。書く表は書き込みの epoch、ほかは読みの epoch である |
+| 要求が運ぶもの | 頼るものごとに、名前と epoch と、書き込みとして頼るか。書く表と、文が `INDEXED BY` で index を名指す表 (パーサが受け付ける。`indexed_table`) は書き込みの epoch、ほかは読みの epoch である。index を名指す読みは、`DROP INDEX` の後に古い計画のまま届くと、シャードの SQLite が `no such index` で断るからである |
 | シャードが比べるもの | 運ばれたものだけを、自分のスナップショットと比べる。要求のほうが新しければ、列をその epoch まで適用してから比べ直す。古ければ `stale schema` で断る。等しければ通す |
 | 取引のスナップショット | 最初に読むか書くかしたときの表定義の全体を、確定まで使う (今と同じ。M13)。初めて触る表も、その表定義で計画する |
 
 読みの epoch と書き込みの epoch を分けたのは、index の DDL の後も、読むだけの取引が続けられるようにするためである (下の「触った表の DDL と SQLite」)。
 読みの経路は、index と UNIQUE の情報を使わない。
 計画 (`src/sql/plan.ts`) が `uniques` と `globalIndexes` を見るのは INSERT と UPDATE で、範囲 (`src/client/spans.ts` の `statementSpans`) が `uniques` で範囲を広げるのは書き込みだけである。
+`src/client/db.ts` で `uniques` と `globalIndexes` を見る所も、書き込みが衝突し得る行を集める所と、グローバル index を保守する所 (`indexChanges`) である。
 グローバル index は読みの経路に使わない (`docs/sql-language.md`)。
-シャード内の index は、シャードの SQLite が自分で使い、答えを変えない。
+シャード内の index は、シャードの SQLite が自分で使い、答えを変えない。変わり得るのは、`ORDER BY` のない読みの行の順だけで、SQL はそれを決めていない。
 読みの epoch が index の作成で進むのは、古い時刻の読み戻しが、新しい UNIQUE や式で失敗し得る index (上の表) だけである。
 
 要求が運ぶものの数は、その要求の範囲と書き込みが名指す表と、文が名指す view の数である。
@@ -1088,7 +1089,7 @@ SQLite とまだ違うのは、次の 4 つだけである。
 
 1. 読むだけの取引が、触った表か初めて触る表を、ほかの接続の DDL (列を足す、名前を変える、表を消す、シャード内の UNIQUE index か、式か WHERE のある index を作る) の確定の後で読むと、その文が `SQLITE_BUSY` になる。SQLite は古いスナップショットで答える。
 2. 行ロックは、そのシャードで文を実行しないまま 5 秒経つと切れる (TTL。Worker が落ちたときのため)。その後は DDL が待たずに進み、取引のその表への次の文か `COMMIT` が `SQLITE_BUSY` になる。SQLite の書き込みのロックは、`COMMIT` まで切れない。
-3. `Db.begin()` の取引 (楽観) は、`COMMIT` まで行ロックを持たないので、DDL を待たせない。`COMMIT` が `SQLITE_BUSY` になる。`transaction(fn)` も同じだが、自分でやり直す。SQL の `BEGIN`、Hrana の取引と baton、D1 互換の batch は悲観なので、当たらない。
+3. 楽観の取引は、`COMMIT` まで行ロックを持たないので、DDL を待たせない。`COMMIT` が `SQLITE_BUSY` になる。楽観なのは、Worker の中から使う `Db.begin()` と `Db.transaction(fn)`、それを使う D1 互換の `batch` (`Db.batch`) である。`transaction(fn)` と `batch` は、自分でやり直すので、利用者には見えない。悲観なのは、SQL の `BEGIN` (`Db.control` が `pessimistic` にする)、それを使う Hrana の取引と baton、Service Binding の `begin()` (`BEGIN IMMEDIATE` か `BEGIN` を送る。`src/entrypoint.ts`) で、これらには当たらない。
 4. 書いた取引が、別のシャードで X の書き込み禁止に当たったときは、DDL を取り消させる (上の「Worker」の、遷移を取り消させる手)。DDL は `SQLITE_BUSY` で失敗する。SQLite では、取引が書き込みのロックを持つ間、DDL はそもそも始まらない。結果 (DDL が `SQLITE_BUSY` で失敗し、取引は続く) は同じだが、DDL の側は、待たずに失敗することがある。
 
 (a) の待ちを入れないと、書いた取引の `COMMIT` が、DDL の後で古い計画として断られる (`m24_lock_red_no_wait`)。
@@ -1117,7 +1118,7 @@ M13 の規則 (DDL の前に取引を確定する、取引は版を名乗り続�
 M24 は M21 の本体を写し、表定義のものを 4 つ (表 A、A の上の view V、別の表 B、まだない表 N) にして、DDL を 2 つ (`CREATE TABLE N`、B の行で失敗し得る DDL) 足したものである。
 M21 の設計の条件は、設計どおりに固定した。新しい条件を定数にし、赤はそれを 1 つずつ外す。
 床、行ロック、取引の中の DDL は、小さなモデル (`m24_floor_*`、`m24_lock_*`、`m24_boundary_*`) で確かめた。
-決めたこと 6 は、M21 の本体を、M21 のインスタンスと同じ定数で、epoch を commit だけで進める形にして確かめ直した (`m24_m21_*`。M21 のファイルは、`test/catalog-m21.test.ts` が sha256 を確かめているので変えない)。
+決めたこと 6 は、M21 の本体を、M21 のインスタンスと同じ定数で、epoch を commit だけで進める形にして確かめ直した (`specs/m24b_m21_commit_only.qnt` の `m24_m21_*`。M21 を読み込むので、M24 の検査のたびに読まないよう、ファイルを分けた。M21 のファイルは、`test/catalog-m21.test.ts` が sha256 を確かめているので変えない)。
 
 | 条件 | 外したときの赤 | 破れる不変条件 |
 |---|---|---|
@@ -1151,6 +1152,9 @@ witness は、取引が、計画の後の関係のない `CREATE TABLE` の comm
 - 2PC の取引 (anchor から参加者への prepare)。M24 の取引は 1 シャードである。参加者への prepare も、その参加者の書き込みと範囲が頼るものを運ぶ。
 - 取引が 2 つ以上の表に書く形。M24 の取引は A の 1 行を書く。B は読むだけである。
 - 活性。記録の適用が、ほかの表の intent のために飢えないこと (上の「シャード」の最後の段落) は、時相の性質としては確かめていない。
+- 表ごとの intent の決着。モデルの取引は A にしか書かないので、B と N の記録は決着させる intent を持たない。決着を全部の表にした形との違いは、モデルには現れない。
+- `INDEXED BY` で index を名指す読み。モデルの読みは index を名指さない。上の「規則」では、書き込みの epoch で頼るとした。
+- 書き込み禁止の待ちの上限 (30 秒)。本体の書き込みは、禁止が解けるまで待ち続ける。実装では、30 秒を超える遷移 (行の多い表の index の作成) の間に待った書き込みは `SQLITE_BUSY` になる。今と同じで、この設計は変えない。
 
 ### 実装の一覧
 
@@ -1182,10 +1186,11 @@ witness は、取引が、計画の後の関係のない `CREATE TABLE` の comm
 
 > 取引が最初に読むか書くかした後で、別の接続が表定義を変えても、取引は最初の表定義のまま続く。
 > 後から作られた表は見えない (`no such table`)。SQLite で、読み始めた取引から、後で作られた表が見えないのと同じである。
-> 別の接続の DDL が取引を失敗させるのは、その DDL が、取引の文が頼る表 (読む表、書く表、view の元の表) を変えて確定したときだけである。
-> 別の表の DDL、新しい表を作る DDL、失敗した DDL は、取引に影響しない。
-> 頼る表を変えた DDL が確定した後では、その表を読む文と書く文が `SQLITE_BUSY` で断られる。取引をやり直す。
-> ただし、index を作るか消すだけの DDL (一意でない列の `CREATE INDEX`、shard key を含まない列への `CREATE UNIQUE INDEX`、`DROP INDEX`) の後も、その表を読む文は通る。書く文は断られる。
+> 別の接続の DDL が取引を古くするのは、その DDL が、取引の文が頼る表 (読む表、書く表、view の元の表) を変えて確定したときだけである。
+> 別の表の DDL、新しい表を作る DDL、失敗した DDL は、取引を古くしない。
+> DDL が書き込みを止めている間 (下の「DDL」)、その表への書き込みは待つ。DDL が失敗すれば、待った書き込みはそのまま通る。
+> 頼る表を変えた DDL が確定した後では、その表を読む文と書く文、その表を読んだか書いた取引の `COMMIT` が、`SQLITE_BUSY` で断られる。取引をやり直す。
+> ただし、index を作るか消すだけの DDL (一意でない列の `CREATE INDEX`、shard key を含まない列への `CREATE UNIQUE INDEX`、`DROP INDEX`) の後は、その表を読む文と、その表を読んだだけの取引の `COMMIT` は通る。書く文 (と `INDEXED BY` でその表の index を名指す文) と、書いた取引の `COMMIT` は断られる。
 > 取引が表の行を書いて行ロックを持っている間は、その表の DDL のほうが待つ (最大 5 秒。待ち切れなければ、DDL が `SQLITE_BUSY` で失敗する)。
 > 取引が別のシャードで、DDL の書き込みの禁止に当たったときも、DDL のほうが `SQLITE_BUSY` で失敗する。
 > SQLite で、書いた取引が書き込みのロックを持つ間、ほかの接続の DDL が待つのと同じである。
@@ -1194,7 +1199,7 @@ witness は、取引が、計画の後の関係のない `CREATE TABLE` の comm
 >
 > - 読むだけの取引は、SQLite では、ほかの接続の DDL の後も、古い表定義と古い行のまま読み続けられる。この DB では、列を足す、名前を変える、表を消す、シャード内の UNIQUE index か、式か WHERE のある index を作る DDL が確定した後で、その表を読む文が `SQLITE_BUSY` になる。その取引で初めて読む表でも同じである。
 > - 行ロックは、そのシャードで文を実行しないまま 5 秒経つと切れる。その後は DDL が待たずに進み、取引のその表への次の文か `COMMIT` が `SQLITE_BUSY` になる。
-> - `Db.begin()` と `transaction(fn)` の取引は、`COMMIT` まで行ロックを持たないので、DDL を待たせない。`COMMIT` が `SQLITE_BUSY` になる (`transaction(fn)` は自分でやり直す)。
+> - Worker の中から使う `Db` の `begin()` と `transaction(fn)` の取引は、`COMMIT` まで行ロックを持たないので、DDL を待たせない。`COMMIT` が `SQLITE_BUSY` になる (`transaction(fn)` と、それを使う D1 互換の `batch` は、自分でやり直す)。
 
 > DDL が取引を古くするのは、確定したときだけで、古くなるのは、その DDL が変えた表に頼る取引だけである (`docs/design-catalog-epoch.md` の「表ごとの epoch」)。
 > 失敗した DDL と、ほかの表の DDL は、取引を古くしない。
