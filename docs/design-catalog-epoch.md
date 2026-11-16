@@ -1288,6 +1288,19 @@ Meta は、記録を足す前に、列を畳んだスナップショットで `r
 | `__moved`、`__moved_txn` | 主キー `(g, lo, after)`。同じグループを 2 度渡すと、2 度目を列挙せず (ack 済みの印が残る)、前の m で渡した | 主キー `(g, epoch, after)`。メモリの印は「渡して、まだ受け取り直していない」グループだけで、範囲が戻ると外す。決着の転送は、いまも渡したままの移動の記録だけをたどる (前の移動の記録をたどると、戻した先と戻ってきた先が互いに転送し合う) |
 | `Piece`、`PiecePayload` | グループ、区間、位置 | 移動の epoch も運ぶ。前の移動の遅れた ack は、受け取り直した後の行を消さない |
 
+### 消したもの
+
+| 場所 | 消したもの |
+|---|---|
+| `src/meta.ts` | 分割の枠 (`SplitSlot`、`SplitMove`、`beginSplit`、`startSplit`、`checkSplit`、`endSplit`、`splits`、`__meta` の `splits`、枠の期限)、`switchRange` |
+| `src/catalog.ts` | `splitId`。`Move.from` は省けなくなった |
+| `src/autoscaler.ts` | `reserveSplit` (枠を取る前の全シャードへの `syncSchema`)、`split` の `beginIncoming`、`fence`、`switchRange`、`finishMove`、`finishIncoming`、`endSplit` の手、`splitsToResume` (`movesToResume` に替えた) |
+| `src/shard/kernel.ts`、`core.ts`、`step.ts` | `beginIncomingStep`、`fenceStep` と、その RPC。所有の確かめの `fencedIn` (`__fenced` の終わった行による拒否)。`finishIncoming` の 2 つ目の UPDATE。Meta への `startSplit`、`checkSplit` |
+| `src/client/db.ts` | `Cluster` の `beginSplit`、`endSplit`、`splits`、`switchRange`。`Db.preparedAll` の、移動の途中のシャードを待って尋ね直す手 |
+| `src/worker.ts` | Meta の DO の枠の入口と `switchRange`。`/admin/status` の `splits` は `moves` になった |
+| 欠陥のスイッチ | `startWithoutSlot`、`fenceWithoutSlot` (Meta)、`splitWithoutSync` (Worker) |
+| 試験 | `test/split-slot.test.ts` の、M15 の `m15_red_no_based_on` と `m15_red_late_start` の再生 (枠と一緒に、形がなくなった) |
+
 ### 設計の本文からずれたところ
 
 - 進める側の手は、設計の「今と同じ順に呼んでよい」より少ない。`split` は `startMove` と子の `drain` だけを呼び、`drain` が、子の手順 (引き取り、親の `finishMove`、`finishIncoming`、`endMove`) に合流する。進める側が `finishIncoming` と `endMove` を自分で呼ぶと、子が受け取り終えたかを進める側が知らずに呼ぶことになる。
@@ -1375,6 +1388,10 @@ M24 (`specs/m24_*`) は、commit だけで進める決め方で、前の 2 つ (
 - 子が移動を進める手順は、応答の後の仕事 (DO では `ctx.waitUntil`) で始まり、続きは alarm (5 秒ごと) が進める。alarm の handler の上限 (15 分) を越える移動は、alarm が `drain` を続きから進める (到着の記録のあるグループは飛ばす)。本物の DO では確かめていない (`test/workerd.test.ts` は、Autoscaler の `drain` が子の手順に合流する形で、移動の全部を通す)。
 - 2 つ以上の移動が同時に開くこと (区間とシャードが重ならないとき) は、Meta の条件 (`moves-overlap`) と `test/catalog.test.ts` の場面だけで確かめた。乱択の検査 (`history`、`elle-sim`、`ddl-concurrent`) の分割は、1 つずつ進む。
 - 範囲が前の持ち主へ戻る形は、`test/range-returns.test.ts` の決まった並び (1 シャードの全部の範囲を 3 回動かす) だけで確かめた。Autoscaler は、範囲を持たないシャードしか子にしないので (`child-owns`)、ふつうの分割では起きない。
+
+### 見つけて直していないもの
+
+- 範囲が前の持ち主へ戻る途中に届いた phase 2 を、前の持ち主が、intent を適用も転送もせずに受け取ったと答える (`test/open/phase2-during-return.test.ts`)。2 シャードの取引 (z は s0、s1 が anchor) が確定を返し、s0 への phase 2 が届く前に、z の intent が範囲と一緒に s2 へ行き、範囲が s0 へ戻る移動の途中 (s0 は move-start を適用して受け取り始め、z をまだ引き取っていない) で phase 2 が届く。s0 には z の intent がなく、渡した印は move-start の適用で外れているので、何もせずに答え、anchor は届け終えた印を付ける。z の intent は、後で範囲と一緒に s0 に届き、決着しないまま残る。読み手が来れば anchor に尋ねて決着させるが、anchor が届け終えた取引の記録を消した後 (`TXN_RETAIN_MS`) は、presumed abort で捨てられる (M10 の `m10_red_gc_undone` と同じ形の失い方)。不変条件の候補: 参加者は、intent を適用したか、いまの持ち主へ転送した後でだけ、phase 2 を受け取ったと答える。持ち主は、送り出した側の記録 (`moved`、`moveStarted`、`forwards`)。送り出した側の記録で 4 つ目の手直しになるので、規則 1 により直していない。案は 2 つある。渡した印を、範囲を受け取り直したときではなく、そのグループが届いたときか、受け取り終えたとき (`finishIncoming`) に外す (届くまでは、phase 2 を、渡した先へ転送する。渡した先は、まだ渡していなければ自分で適用し、渡していれば転送し返し、受け取る側は未着の piece を引き取ってから適用する)。または、範囲が前の持ち主へ戻る移動を、M23b を書き手に広げて確かめるまで、Meta が断る (Autoscaler の分割は、もともと範囲を持たないシャードしか子にしないので、ふつうは起きない)。
 
 ### 段 4 の後に要るもの
 
