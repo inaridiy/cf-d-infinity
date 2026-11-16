@@ -9,7 +9,7 @@ import { split, splitsToResume } from "../src/autoscaler";
 import { Db, type ClientFaults, type Cluster } from "../src/client/db";
 import { ownerOf, planSplit, slotOf } from "../src/routing";
 import type { Faults, ShardApi } from "../src/types";
-import { SimCluster } from "./sim";
+import { delivers, SimCluster } from "./sim";
 
 const outcome = (p: Promise<unknown>) => p.then(() => "ok", (e: Error) => e.message);
 
@@ -82,12 +82,15 @@ describe("a split whose driver stops", () => {
   }
 });
 
-// specs/m15_maintenance_slot.qnt の m15_red_no_based_on。分割は、全シャードが最新の版を適用した後でだけ枠を取る (BASED_ON)。
-// 適用に失敗するシャードは、取り消しの版を記録する。取り消しは枠を確かめないので、枠を取った後に失敗すると、分割の途中に版が進み、
-// 移動の途中の親と子は、その版を断り続ける。モデルの反例と同じ順で流す: 分割に関わらないシャード s1 で失敗する版が記録される (record)。
-// 分割を進める側が、s1 がまだ適用しないうちに枠を取る (reserve)。子が受け取り始め (beginIncoming)、親が fence する。s1 が版を適用し、
-// 失敗して取り消しを記録する (applyT)。取り消しの版で計画した要求が、親と子に届く (request)。
-describe("a split takes its slot only after every shard applied the latest version (m15_red_no_based_on)", () => {
+// specs/m15_maintenance_slot.qnt の m15_red_no_based_on。段 3 より前は、分割は、全シャードが最新の版を適用した後でだけ枠を取った
+// (BASED_ON)。適用に失敗するシャードが、枠を取った後に取り消しの版を記録すると、分割の途中に版が進み、移動の途中の親と子は、その版を
+// 断り続けたからである。段 3 で取り消しがなくなり、行で失敗する DDL は、prepare の確かめで見つかって abort になる。遷移が開いている間
+// (prepare から commit か abort まで) は枠を取らず (M21 の MOVE_WAITS_DDL)、枠がある間は遷移を開かない (DDL_WAITS_MOVE) ので、
+// 分割の途中に表定義の記録が入る形がない。後継の赤 (m21_red_move_during_ddl) の再生は段 4 で足す。
+// ここでは、モデルの反例の始まりと同じ順で流す: 分割に関わらないシャード s1 で失敗する DDL の prepare が記録され、進める側がそこで止まる
+// (s1 はまだ prepare を適用していない)。分割を進める側が枠を取ろうとする。欠陥のスイッチ splitWithoutSync (枠の前に全シャードへ適用
+// させない) を入れても入れなくても、分割は遷移が終わるのを待ち、期限で abort された後に始まって終わる。
+describe("a split does not start while a schema change is open, so no schema record lands mid-split (m15_red_no_based_on)", () => {
   const scenario = async (clientFaults?: ClientFaults) => {
     const c = new SimCluster({ shards: 2, clientFaults });
     const db = new Db(c);
@@ -99,61 +102,38 @@ describe("a split takes its slot only after every shard applied the latest versi
     const inRange = (t: number) => slotOf(JSON.stringify([t])) >= range.start && slotOf(JSON.stringify([t])) < range.end;
     const [moved, stays, bad] = [on("s0").find(inRange)!, on("s0").find((t) => !inRange(t))!, on("s1")[0]!];
     await db.query("INSERT INTO p VALUES (?, 1, 'x', NULL), (?, 1, 'y', NULL)", [moved, stays]);
-    // s1 にだけ、次の DDL に反する行を置く。空の表では通るので、Meta は記録する。
+    // s1 にだけ、次の DDL に反する行を置く。空の表では通るので、Meta は prepare を記録する。
     await db.query("INSERT INTO p VALUES (?, 1, 'z', 1), (?, 2, 'z', 1)", [bad, bad]);
-    const before = (await c.catalog()).version;
-    // DDL を記録した側は、全シャードに適用させる前に止まった (記録の直後)。
-    const failing = (await c.applyDdl("CREATE UNIQUE INDEX ux ON p(tenant_id, code) WHERE gone IS NOT NULL", before)).schema;
-    // 分割は、親が fence して範囲表を切り替えた後、子が範囲を運び終えるところで止める。
-    let release!: () => void;
-    const held = new Promise<void>((r) => (release = r));
-    let reached!: () => void;
-    const hit = new Promise<void>((r) => (reached = r));
-    c.net.gate = (m) => {
-      if (m.method !== "drain") return undefined;
-      reached();
-      return held;
-    };
-    const midwayOf = (p: Promise<string>) => Promise.race([hit.then(() => true), p.then(() => false)]);
-    let splitting = outcome(split(c, "s0", "s2", { range }));
-    let midway = await midwayOf(splitting);
-    // 直したコードでは、枠を取る前の適用で s1 が失敗して版を取り消し、1 回目の split() は枠を取らずに失敗する。Autoscaler は、保留の
-    // 分割を次の判断でやり直す (worker.ts の runSplit)。ここでも、止めを掛けたまま 1 度だけやり直す。1 回目で終わらないことは、
-    // test/open/split-reserve-revoked.test.ts が再現する。
-    if (!midway) {
-      splitting = outcome(split(c, "s0", "s2", { range }));
-      midway = await midwayOf(splitting);
+    // DDL を進める側は、prepare を記録した直後に止まった (どのシャードにも prepared を尋ねていない)。
+    const p = await c.prepare("CREATE UNIQUE INDEX ux ON p(tenant_id, code) WHERE gone IS NOT NULL", {}, (await c.catalog()).schema);
+    // 遷移が開いている間は、枠を取らない。Autoscaler は、保留の分割を次の判断でやり直す (worker.ts の runSplit)。
+    const busy = await outcome(split(c, "s0", "s2", { range }));
+    // 期限が過ぎるまで、何度かやり直す。
+    let split2 = busy;
+    for (let i = 0; i < 10 && split2 !== "ok"; i++) {
+      await c.sleep(1_000);
+      split2 = await outcome(split(c, "s0", "s2", { range }));
     }
-    // 分割の版。取り消しより後の版なら、取り消しは枠より前に入った。
-    const slot = (await c.splits())[0];
-    // s1 が最新の版を適用し、失敗して取り消しを記録する (直したコードでは、もう済んでいる)。
-    await outcome(c.shard("s1").syncSchema({ schema: failing }));
     const cat = await c.catalog();
-    // 取り消しの版で計画した読み。親に残る行と、子へ移る行。
     const read = (t: number) => outcome(new Db(c, { retries: 2 }).query("SELECT code FROM p WHERE tenant_id = ? AND id = 1", [t]));
-    const reads = { parent: await read(stays), child: await read(moved) };
-    c.net.gate = () => undefined;
-    release();
-    return { midway, slotAfterRevocation: slot !== undefined && slot.version > before + 1, revoked: cat.revoked?.version === before + 1, reads, split: await splitting };
+    return { busy, split: split2, aborted: cat.aborted?.of === p.epoch, reads: { parent: await read(stays), child: await read(moved) } };
   };
 
-  it("applies the failing version on every shard before the slot, so the revocation lands before the split", async () => {
-    expect(await scenario()).toEqual({ midway: true, slotAfterRevocation: true, revoked: true, reads: { parent: "ok", child: "ok" }, split: "ok" });
+  it("waits for the transition to end (here: its lease lapses), and then splits; the rows stay readable", async () => {
+    expect(await scenario()).toEqual({ busy: expect.stringMatching(/^split busy: schema busy:/), split: "ok", aborted: true, reads: { parent: "ok", child: "ok" } });
   });
 
-  it("put back: a slot taken before every shard applied the version lets the revocation land mid-split, and the parent and the child refuse it", async () => {
-    expect(await scenario({ splitWithoutSync: true })).toEqual({
-      midway: true, slotAfterRevocation: false, revoked: true,
-      reads: { parent: expect.stringMatching(/waiting for a shard split on s0/), child: expect.stringMatching(/waiting for a shard split on s2/) },
-      split: "ok",
-    });
+  it("with splitWithoutSync (the slot taken without the sync before it), the same: the switch reproduces nothing since stage 3", async () => {
+    expect(await scenario({ splitWithoutSync: true })).toEqual({ busy: expect.stringMatching(/^split busy: schema busy:/), split: "ok", aborted: true, reads: { parent: "ok", child: "ok" } });
   });
 });
 
 // specs/m15_maintenance_slot.qnt の m15_red_late_start。子が受け取り始める前の枠は、期限で消える。期限切れの後に届いた子の受け取りの
-// 始まりは断る (EXPIRY_GUARD)。断らないと、枠のないまま分割が進み、その間に DDL が記録され、移動の途中の親と子は、その版を断り続ける。
+// 始まりは断る (EXPIRY_GUARD)。断らないと、枠のないまま分割が進み、その間に DDL が記録され、移動の途中の親と子は、その記録を断り続ける。
 // モデルの反例と同じ順で流す: 分割を進める側が枠を取り (reserve)、そこで止まる。枠が期限で消える (expire)。遅れて、子の受け取りの
-// 始まりが届く (beginIncoming)。DDL が記録される (record)。親が新しい版を適用する前に、fence が届く。新しい版で計画した要求が親に届く。
+// 始まりが届く (beginIncoming)。DDL の prepare が記録される (record)。親がそれを適用する前に、fence が届く。新しい表定義で計画した要求が
+// 親に届く。段 3 から、DDL は prepare の後で全シャードの prepared を待つので、移動の途中の親が prepare を適用できず、DDL は待ち切れずに
+// abort になる。
 // 実装では、親の fence の前にも、枠が生きていることを確かめる (Meta の checkSplit)。モデルには、この 2 つ目の守りがない。
 describe("a child that starts receiving after the split slot lapsed (m15_red_late_start)", () => {
   const scenario = async (faults: Faults = {}) => {
@@ -168,15 +148,15 @@ describe("a child that starts receiving after the split slot lapsed (m15_red_lat
     const lapsed = (await c.splits()).length === 0;
     const begun = await c.shard("s1").beginIncoming({ ...range, from: "s0", slot: slot.id }).then((r) => r, (e: Error) => e);
     const started = begun instanceof Error ? begun.message : "ok";
-    // DDL を記録した後、その版が親へ届くのを止める。その間に、分割を進める側の fence が親に届く。
-    // 段 2 から syncSchema は表定義の epoch を運ぶ。範囲表は切り替えていないので、次の記録の epoch は、いまの epoch に 1 を足したもの。
+    // DDL の prepare を記録した後、それが親へ届くのを止める (段 3 から、進める側は prepared で届ける)。その間に、分割を進める側の
+    // fence が親に届く。範囲表は切り替えていないので、次の記録の epoch は、いまの epoch に 1 を足したもの。
     const next = (await c.catalog()).epoch + 1;
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     let reached!: () => void;
     const hit = new Promise<void>((r) => (reached = r));
     c.net.gate = (m) => {
-      if (m.method !== "syncSchema" || m.to !== "s0" || (m.req as { schema: number }).schema !== next) return undefined;
+      if (m.to !== "s0" || !delivers(m, next)) return undefined;
       reached();
       return held;
     };
@@ -187,7 +167,7 @@ describe("a child that starts receiving after the split slot lapsed (m15_red_lat
     c.net.gate = () => undefined;
     release();
     const recorded = await ddl;
-    // 新しい版で計画した、親に残る行の読み。
+    // 新しい表定義で計画した、親に残る行の読み。
     const read = await outcome(new Db(c, { retries: 2 }).query("SELECT n FROM items WHERE id = ?", [stays]));
     return { lapsed, started, fenced, recorded, read };
   };
@@ -202,10 +182,10 @@ describe("a child that starts receiving after the split slot lapsed (m15_red_lat
     });
   });
 
-  it("put back both guards: the split runs without a slot, and the parent refuses the version recorded meanwhile", async () => {
+  it("put back both guards: the split runs without a slot, and the parent refuses the schema records written meanwhile", async () => {
     expect(await scenario({ startWithoutSlot: true, fenceWithoutSlot: true })).toEqual({
       lapsed: true, started: "ok", fenced: "ok",
-      recorded: expect.stringMatching(/a shard split is in progress/), read: expect.stringMatching(/waiting for a shard split on s0/),
+      recorded: expect.stringMatching(/waiting for a shard split on s0/), read: expect.stringMatching(/waiting for a shard split on s0/),
     });
   });
 });

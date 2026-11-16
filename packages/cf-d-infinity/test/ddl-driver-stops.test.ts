@@ -1,7 +1,10 @@
 // 表定義の変更を進める側 (DDL を出した Worker の 1 回の呼び出し) が、どの手の前で止まっても、文は効いたか効かなかったかのどちらかで、
 // クラスタは使えるままである (docs/design-catalog-epoch.md の段 3 の「落ちてから通る検査」。止め方は test/ddl-driver.ts)。
-// 場面は、行のある表へのシャードをまたぐ UNIQUE の index と、取引が読んだ表の DROP である。行で失敗する DDL の場面は、
-// test/open/ddl-driver-stops-failing-ddl.test.ts にある (段 3 より前のコードでは落ちる)。
+// 場面は、行で失敗する DDL (片方のシャードの行が CHECK に反する ADD COLUMN)、行のある表へのシャードをまたぐ UNIQUE の index、
+// 取引が読んだ表の DROP である。
+// 行で失敗する DDL の場面は、段 3 より前のコードで落ちた (2026-11-16。test/open/ にあった)。Meta が版を記録した後、シャードへ適用させる
+// 前に進める側が止まると、取り消しは、どれかの要求がそのシャードに版を適用させるまで起きず、その間、ほかの接続は列を足した表定義で
+// 計画した (4 つの値の INSERT が「5 columns but 4 values」で失敗した)。段 3 から、DDL は commit まで表定義に入らない。
 import { describe, expect, it } from "vitest";
 import { Db } from "../src/client/db";
 import { indexAgreement } from "./ddl-harness";
@@ -9,6 +12,26 @@ import { outcome, settled, stopsEverywhere, twoShards, type Scenario } from "./d
 import { SimCluster } from "./sim";
 
 const SCENARIOS: Scenario[] = [
+  {
+    name: "an ADD COLUMN whose CHECK the rows of one shard violate",
+    async setup() {
+      const { c, db, bad, good } = await twoShards();
+      await db.query("INSERT INTO p VALUES (?, 1, 'x', 1), (?, 2, 'y', NULL)", [bad, good]);
+      return {
+        c,
+        run: (d) => d.ddl("ALTER TABLE p ADD COLUMN extra INTEGER CHECK (gone IS NULL)"),
+        // s0 の行が CHECK に反するので、文はどこでも効かない。列を足す前の形のまま、どちらのシャードへも書ける。
+        async check(c) {
+          const other = new Db(c);
+          const wrote = await outcome(other.query("INSERT INTO p VALUES (?, 3, 'z', 1), (?, 3, 'z', 1)", [bad, good]));
+          const read = await outcome(other.query("SELECT extra FROM p"));
+          const cat = await c.catalog();
+          return { wrote, extra: cat.tables.p!.columns.includes("extra"), read: /no such column/.test(read) ? "no such column" : read };
+        },
+      };
+    },
+    expected: () => ({ wrote: "ok", extra: false, read: "no such column" }),
+  },
   {
     name: "a UNIQUE index across shards built from existing rows",
     async setup() {

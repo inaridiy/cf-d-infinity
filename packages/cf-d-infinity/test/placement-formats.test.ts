@@ -81,21 +81,21 @@ describe("Meta", () => {
 
   it("identifies a split by the token range it moves", async () => {
     const c = new SimCluster({ shards: 1 });
-    const { version, schema } = await c.catalog();
+    const { schema } = await c.catalog();
     const range = { start: REGION_TOKENS / 2, end: REGION_TOKENS };
-    const slot = await c.beginSplit({ parent: "s0", child: "s1", ...range }, version);
-    expect(slot).toEqual({ id: `split:s0:s1:${range.start}:${range.end}`, parent: "s0", child: "s1", ...range, version, started: false, until: slot.until });
-    expect(Object.keys(slot)).toEqual(["id", "parent", "child", "start", "end", "version", "started", "until"]);
-    expect(await c.beginSplit({ parent: "s0", child: "s1", ...range }, version)).toEqual(slot);
+    const slot = await c.beginSplit({ parent: "s0", child: "s1", ...range }, schema);
+    expect(slot).toEqual({ id: `split:s0:s1:${range.start}:${range.end}`, parent: "s0", child: "s1", ...range, schema, started: false, until: slot.until });
+    expect(Object.keys(slot)).toEqual(["id", "parent", "child", "start", "end", "schema", "started", "until"]);
+    expect(await c.beginSplit({ parent: "s0", child: "s1", ...range }, schema)).toEqual(slot);
     // 範囲が 1 token でも違えば、別の分割である。枠は、名指しされた範囲のものでなければ使えない。
     const cut = { start: 7 * SUBSLOTS, end: 7 * SUBSLOTS + 100 };
-    const part = await c.beginSplit({ parent: "s0", child: "s2", ...cut }, version);
+    const part = await c.beginSplit({ parent: "s0", child: "s2", ...cut }, schema);
     expect(part.id).toBe(`split:s0:s2:${cut.start}:${cut.end}`);
     expect(await outcome(c.meta.startSplit(part.id, { parent: "s0", child: "s2", start: cut.start, end: cut.end + 1 }))).toMatch(/no such split slot/);
-    expect(await c.meta.startSplit(part.id, { parent: "s0", child: "s2", ...cut })).toEqual({ version, schema });
+    expect(await c.meta.startSplit(part.id, { parent: "s0", child: "s2", ...cut })).toEqual({ schema });
     expect(await outcome(c.meta.checkSplit(part.id, { parent: "s0", child: "s2", start: cut.start, end: cut.end + 1 }))).toMatch(/split slot is not held/);
     expect(await outcome(c.meta.checkSplit(part.id, { parent: "s0", child: "s2", ...cut }))).toBe("ok");
-    expect(await outcome(c.beginSplit({ parent: "s0", child: "s3", start: 5, end: 5 }, version))).toMatch(/invalid token range/);
+    expect(await outcome(c.beginSplit({ parent: "s0", child: "s3", start: 5, end: 5 }, schema))).toMatch(/invalid token range/);
   });
 });
 

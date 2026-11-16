@@ -62,13 +62,13 @@ describe("statements that loop over rows, within one Worker invocation", () => {
     const c = await seeded(1200);
     const first = capped(c, 30);
     expect(await outcome(new Db(first.cluster).query("CREATE UNIQUE INDEX people_email ON people(email)"))).toMatch(/too many rows to index within one request/);
-    // 取り消しの要求も出せなかった。期限が来るまで、表は書き込み禁止のままである。
-    expect((await c.catalog()).tables.people!.building?.name).toBe("people_email");
-    // 書き込みは待つ。期限が来れば Meta が取り消し、待っていた書き込みが通る。
+    // abort の要求も出せなかった。期限が来るまで、表は書き込み禁止のままである。
+    expect((await c.catalog()).open).toMatchObject({ mode: "build", index: "people_email", fence: ["people"] });
+    // 書き込みは待つ。期限が来れば Meta が abort し、待っていた書き込みが通る。
     await new Db(c).query("INSERT INTO people(id, email, city) VALUES (5000, 'u1@example.com', 'c1')");
     const cat = await c.catalog();
-    expect({ building: cat.tables.people!.building, built: cat.tables.people!.globalIndexes, listed: cat.indexes.people_email })
-      .toEqual({ building: undefined, built: [], listed: undefined });
+    expect({ open: cat.open, built: cat.tables.people!.globalIndexes, listed: cat.indexes.people_email })
+      .toEqual({ open: undefined, built: [], listed: undefined });
     // 取り消しを適用したシャードには、index の表が残らない。同じ email の行が 2 つ入った。
     await touchAll(c);
     expect((await indexAgreement(c, "people", "people_email")).leftover).toEqual([]);

@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { keyString } from "../src/keys";
 import { SUBSLOTS, type Interval } from "../src/routing";
 import { encode } from "../src/shard/rows";
-import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type ExecReq, type ExecRes, type Piece, type PiecePayload, type PieceWant, type Span } from "../src/types";
+import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type ExecReq, type ExecRes, type Piece, type PiecePayload, type PieceWant, type ShardApi, type Span } from "../src/types";
 import { encodeTuple } from "../src/value";
 
 /**
@@ -24,6 +24,8 @@ function wireSample(): string {
   } satisfies Partial<ExecReq>;
   // 書き込みの応答は、文が入れた行を、入れた順に運ぶ (版 7 から。lastInsertRowid はこれだけから決める)。
   const written = { changes: [change], inserted: [{ table: "t", pk: keyString([1n]) }], count: 1 } satisfies Partial<ExecRes>;
+  // 表定義の遷移の prepare を適用したかを尋ねる要求と、その答え (版 8 から。docs/design-catalog-epoch.md の段 3)。
+  const prepared: [Parameters<ShardApi["prepared"]>[0], Awaited<ReturnType<ShardApi["prepared"]>>] = [{ epoch: 9 }, { ok: false, reason: "CHECK constraint failed" }];
   return [
     JSON.stringify(values, (_k, x) => (x instanceof Uint8Array ? { u8: [...x] } : typeof x === "bigint" ? { int: String(x) } : typeof x === "number" && !Number.isFinite(x) ? String(x) : x)),
     encode(change),
@@ -31,6 +33,7 @@ function wireSample(): string {
     encode(read),
     moveSample(),
     encode(written),
+    encode(prepared),
   ].join("\n");
 }
 
@@ -60,6 +63,7 @@ const WIRE: Record<number, string> = {
   5: "9f3b7b3e9eaa9b09",
   6: "3ef766de45822d5c",
   7: "ada064f16f3fde8e",
+  8: "edeccd61efb19a77",
 };
 
 describe("protocol version", () => {

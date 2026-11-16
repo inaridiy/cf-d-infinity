@@ -205,28 +205,26 @@ export class SplitBusy extends Error {
 }
 
 /**
- * 分割の枠を取る。先に、全シャードに最新の版を適用させる。適用に失敗したシャードは、その版の取り消しを記録するので、
- * 版が進む。進んでいれば、もう一度適用させてから取る。こうして取った枠の間は、取り消しも入らない (m15_red_no_based_on)。
- * 表定義の変更 (index の作成など) が枠を持っていれば、SplitBusy を投げる。同じ範囲の枠がもうあれば、それを返す (再開)。
+ * 分割の枠を取る。先に、全シャードに最新の表定義の epoch まで列を適用させ、その epoch を basedOn として渡す。
+ * 表定義の遷移が開いていれば (prepare から commit か abort まで)、Meta は SchemaBusy で断り、ここは SplitBusy を投げる。
+ * 表定義が進んでいれば (SchemaMoved)、その epoch まで適用させてから取り直す。同じ範囲の枠がもうあれば、それを返す (再開)。
+ * 段 3 から、表定義の記録は後から取り消されない。適用に失敗するシャードは prepare の確かめで見つかり、abort の後に分割が始まる。
+ * 全シャードに適用させるのは、枠を取る表定義 (子が受け取り始め、親が fence の前に追いつく epoch) を、全シャードが知っているためである。
  */
 async function reserveSplit(cluster: Cluster, move: SplitMove) {
   const rt = cluster.runtime ?? systemRuntime;
   const cat = await cluster.catalog();
-  // 最新の版は Meta が知っている。手元の表定義が古ければ、Meta が断るときに教える版まで、全シャードを進める。
-  // シャードは表定義の epoch で比べるので (段 2)、適用させるときは、その版の表定義の epoch を渡す。Meta の枠は版で取る。
-  let version = cat.version;
   let schema = cat.schema;
   for (let attempt = 0; ; attempt++) {
-    // 欠陥のスイッチ splitWithoutSync: 適用させずに取る。適用に失敗するシャードが、分割の途中で取り消しの版を記録する。
+    // 欠陥のスイッチ splitWithoutSync: 適用させずに取る。
     if (!cluster.clientFaults?.splitWithoutSync) await Promise.all(shardsOf(cat.routing).map((id) => cluster.shard(id).syncSchema({ schema })));
     try {
-      return await cluster.beginSplit(move, version);
+      return await cluster.beginSplit(move, schema);
     } catch (e) {
       const m = (e as Error)?.message ?? "";
-      if (e instanceof SchemaMoved || /schema moved to version/.test(m)) {
+      if (e instanceof SchemaMoved || /schema moved to epoch/.test(m)) {
         if (attempt >= 10) throw e;
-        version = e instanceof SchemaMoved ? e.version : Number(/schema moved to version (\d+)/.exec(m)![1]);
-        schema = e instanceof SchemaMoved ? e.schema : Number(/\(schema epoch (\d+)\)/.exec(m)![1]);
+        schema = e instanceof SchemaMoved ? e.schema : Number(/schema moved to epoch (\d+)/.exec(m)![1]);
         await sleep(rt, 10);
         continue;
       }

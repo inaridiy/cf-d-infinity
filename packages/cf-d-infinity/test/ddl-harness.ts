@@ -4,7 +4,7 @@
 import { writeFileSync } from "node:fs";
 import { asNumbers, SimCluster, logRows, type Rpc } from "./sim";
 import { checkHistory, type Read, type TxRecord, type Violation } from "./history";
-import { Db, type Txn } from "../src/client/db";
+import { Db, type ClientFaults, type Txn } from "../src/client/db";
 import { split } from "../src/autoscaler";
 import { ownerOf, planSplit, shardsOf } from "../src/routing";
 import { fold, type EpochRecord } from "../src/catalog";
@@ -112,7 +112,7 @@ export async function indexAgreement(c: SimCluster, table = "acct", name = INDEX
   const cat = await c.catalog();
   const ix = cat.tables[table]?.globalIndexes.find((g) => g.name === name);
   const gidx = `__gidx_${name}`;
-  const building = cat.tables[table]?.building?.name === name;
+  const building = cat.open?.mode === "build" && cat.open.index === name;
   const out: IndexReport = { state: ix ? "public" : building ? "building" : null, unique: ix !== undefined, missing: [], dangling: [], wrongRead: [], leftover: [] };
   // 作っている最中の index の表は、まだ埋まっていなくてよい。
   if (building) return out;
@@ -346,6 +346,8 @@ export interface Scenario {
   /** ロックを長く持つ取引を混ぜる。autocommit の書き込みがロック待ちの間に DDL をまたぐ。 */
   slowLocks?: boolean;
   faults?: Faults;
+  /** Worker の側の欠陥のスイッチ (src/client/db.ts の ClientFaults)。 */
+  clientFaults?: ClientFaults;
   /** 欠陥の注入。検査が失敗し得ることを確かめるためだけに使う。 */
   inject?(c: SimCluster): void;
 }
@@ -405,7 +407,7 @@ export async function runScenario(seed: number, s: Scenario): Promise<Report> {
   const rnd = prng(seed);
   const sched = prng(seed ^ 0x5bd1e995);
   // backoff と sync の乱数、txn id の乱数部分は、クラスタの実行環境が同じ seed から作る。
-  const c = new SimCluster({ shards: s.shards ?? 3, faults: s.faults, seed });
+  const c = new SimCluster({ shards: s.shards ?? 3, faults: s.faults, clientFaults: s.clientFaults, seed });
   // 終わらない実行は、実時間の制限を待たずに、原因の分かる失敗にする。普通の実行は、仮想の時刻で 1 秒ほど、出来事は数万個で終わる。
   const report = await Promise.race([runSeeded(c, seed, s, rnd, sched), c.stalled(STALL_MS, STALL_STEPS)]);
   if (process.env.SIM_STATS) console.info(`seed ${seed}: ${c.runtime.now() - 1_000_000} ms simulated, ${c.net.log.length} RPCs`);

@@ -60,10 +60,12 @@ describe("a child shard that is behind the newest catalog", () => {
     await split(c, "s0", "s1", { range });
     const { routing } = await c.catalog();
     const moved = Array.from({ length: ROWS }, (_v, i) => i + 1).find((id) => ownerOf(routing, key(id)) === "s1")!;
-    // Meta にだけ記録する。どのシャードにも適用させない (DDL を出した Worker が、全シャードへ適用させる前に止まった)。
-    const before = [await health(c, "s0"), await health(c, "s1")];
+    // DDL を出した Worker が、commit を記録した後、どのシャードにも commit を適用させる前に止まった。段 3 から、commit は、全シャードが
+    // prepare を適用した後でだけ記録されるので、どのシャードも prepare の epoch にいて、commit の epoch を知らない。
     await c.applyDdl("ALTER TABLE t ADD COLUMN note TEXT");
-    expect([await health(c, "s0"), await health(c, "s1")]).toEqual(before);
+    const before = [await health(c, "s0"), await health(c, "s1")];
+    expect(before[0]).toBe(before[1]);
+    expect(before[1]).toBeLessThan((await c.catalog()).schema);
 
     const db = new Db(c, { retries: 0 });
     await db.query("UPDATE t SET note = 'x' WHERE id = ?", [moved]);

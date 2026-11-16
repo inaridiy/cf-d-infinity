@@ -350,7 +350,7 @@ describe("DDL through the HTTP /ddl endpoint", () => {
   });
 });
 
-// 書き込み禁止の期限の延長を、本物の DO で通す。期限 (meta.ts の INDEX_LEASE_MS、5 秒) より長くかかる index の作成は、
+// 書き込み禁止の期限の延長を、本物の DO で通す。期限 (meta.ts の LEASE_MS、5 秒) より長くかかる index の作成は、
 // 延長が周期で続かなければ、Meta に取り消されて失敗する。長くかからせるために、作る前に、その表に書いた取引を開いたままにする。
 describe("a UNIQUE index build that outlives one lease", () => {
   it("keeps its write lock past the lease by renewing it, and ends with the index and the rows agreeing", async () => {

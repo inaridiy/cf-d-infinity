@@ -54,19 +54,12 @@ export interface TableDef {
    * この項目のない古い表定義では、省いた列の値は分からないものとして扱う。
    */
   defaults?: string[];
-  /** 出来上がった index だけが入る。作っている最中の index は building にあり、計画からは見えない。 */
+  /**
+   * 出来上がった index だけが入る。既存の行から作っている最中の index は、その遷移の prepare の ddl にあり、commit までは表定義に
+   * 入らないので、計画からは見えない。作っている間の書き込みの禁止は、表定義の印ではなく、スナップショットの開いている遷移
+   * (src/catalog.ts の Snapshot.open の fence) である。
+   */
   globalIndexes: GlobalIndexDef[];
-  /**
-   * 既存の行から作っている最中の、シャードをまたぐ UNIQUE の index。これがある間、シャードはこの表への書き込みを断る。
-   * 行が止まっているので、既存の行の項目を埋める作業は、並行する書き込みを考えなくてよい (specs/m12_unique_index_build.qnt)。
-   * 公開されると globalIndexes へ移り、取り消されると消える。
-   */
-  building?: GlobalIndexDef;
-  /**
-   * 表定義の変更が、この表への書き込みを止めている理由。取引が読んだ表を DROP する前に掛ける (specs/m14_rebuild_guard.qnt)。
-   * 掛けた版の次の版が、その DROP か、取り消しである。
-   */
-  locked?: string;
 }
 
 export type Affinity = "INTEGER" | "REAL" | "NUMERIC" | "TEXT" | "BLOB";
@@ -280,10 +273,19 @@ export interface ShardApi {
   prepare(req: PrepareReq): Promise<PrepareRes>;
   refresh(req: { txn: string; spans: Span[]; from: Ts; to: Ts }): Promise<{ ok: boolean; reason?: string }>;
   /**
-   * 表を消す前の確認。schema の表定義の epoch (表の書き込み禁止) を適用した後で、spans に from より後の変更も intent もないかを答える。
-   * from は、取引がその範囲を読んだ時刻である。読みの要求が時刻を運ぶので、このシャードは from を見ている。
+   * 表を消す前の確認 (mode guard の遷移)。schema の表定義の epoch (その遷移の prepare。表の書き込み禁止) を適用した後で、spans に
+   * from より後の変更も intent もないかを答える。from は、取引がその範囲を読んだ時刻である。読みの要求が時刻を運ぶので、
+   * このシャードは from を見ている。
    */
   unchanged(req: { spans: Span[]; from: Ts; schema: number }): Promise<{ ok: boolean; reason?: string }>;
+  /**
+   * 表定義の遷移の prepare を適用したかを答える (docs/design-catalog-epoch.md の「Worker」)。epoch は prepare の epoch で、シャードは
+   * そこまで Meta の列を適用し (fence の表の intent を決着させ、以後その表への書き込みを断る)、mode が trial なら、書き込みを止めた表に
+   * 文を試して巻き戻し、SQLite が通したかを返す。その遷移が自分のスナップショットでもう開いていなければ (先に abort が記録された)、
+   * ok: false を返す。進める側は、範囲表の全シャードの ok を集めてから、Meta に commit を記録させる。
+   * early は欠陥のスイッチ checkBeforePrepare (Worker の側) だけが付ける。列を適用せずに、いまの表で試す (M21 の m21_red_trial_early)。
+   */
+  prepared(req: { epoch: number; early?: true }): Promise<{ ok: boolean; reason?: string }>;
   /** pieces は移動先への転送で使う。未到着ならその piece を先に引き取る。 */
   finalize(req: { txn: string; c: Ts; pieces?: Piece[] }): Promise<void>;
   abort(req: { txn: string; pieces?: Piece[] }): Promise<void>;
@@ -325,7 +327,10 @@ export interface ShardApi {
   exportRows(req: { table: string; after: Value[] | null; limit: number; skip?: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }>;
   /** 取引の rollback でロックを手放す。届かなくても TTL で消える。 */
   unlock(req: { txn: string }): Promise<void>;
-  /** 表定義の epoch schema まで、Meta の列を適用する。DDL は、全シャードへ適用させてから完了を返す。 */
+  /**
+   * 表定義の epoch schema まで、Meta の列を適用する。DDL を確定した側は、書き込みの禁止を早く解くために、全シャードへ適用させてから
+   * 完了を返す (正しさには要らない。次の要求が適用させる)。
+   */
   syncSchema(req: { schema: number }): Promise<{ moving: boolean }>;
   /** 現在の HLC を返す。複数シャードの読み取りの T を決めるのに使う。 */
   now(req: Record<string, never>): Promise<Ts>;
@@ -334,10 +339,6 @@ export interface ShardApi {
 export interface FlushRes {
   flushTs: Ts;
   entries: { commitTs: Ts; txn: string; changes: Change[] }[];
-}
-
-export interface MetaApi {
-  ddlSince(version: number): Promise<{ version: number; ddl: string[] }>;
 }
 
 /**
@@ -460,17 +461,32 @@ export interface Backend {
 
 /** 検証済みの欠陥を再導入するスイッチ。反例の再現テスト専用で、既定はすべて false。シャードと Meta (meta.ts) が読む。 */
 export interface Faults {
-  /** Meta が、書き込み禁止の版が期限切れで取り消された後でも、DROP を記録する (モデル m14_red_untied)。 */
-  dropAfterExpiry?: boolean;
+  /**
+   * Meta の commit が、遷移が開いているかを確かめない (M21 の m21_red_two_exits と m21_red_drop_untied。段 3 まではあった
+   * dropAfterExpiry の意味を広げた)。期限切れか取り消しで abort された遷移の遅れた commit も、同じ prepare を開き直して確定する。
+   * abort から開き直すまでの間に書かれた行は、index の項目を持たないか (index の作成)、DROP で消える (取引が読んだ表の DROP)。
+   */
+  commitAfterAbort?: boolean;
+  /**
+   * Meta の commit が、ok を答えたシャードの集合が範囲表の全シャードを覆うことを確かめない (M21 の m21_red_early_commit、
+   * m21_red_trial_missing_ack、m21_red_drop_missing_ack)。Worker の側の同じ名前のスイッチと組で、Worker は 1 つのシャードの
+   * prepared を待たない (test/sim.ts の injectedFault が両方に入れる)。
+   */
+  commitWithoutAcks?: boolean;
+  /** Meta が、表定義の遷移が開いている間に、次の prepare を記録する (M21 の m21_red_two_open)。 */
+  overlappingTransitions?: boolean;
   /** Meta が、期限切れで消えた分割の枠を示す子の受け取りの始まりを断らない (モデル m15_red_late_start の 1 つ目の守り)。 */
   startWithoutSlot?: boolean;
   /** Meta が、親の fence の前に、分割の枠が生きていることを確かめない (モデル m15_red_late_start の 2 つ目の守り)。 */
   fenceWithoutSlot?: boolean;
   /** autocommit の書き込みが、他の取引の intent との UNIQUE を照合しない (2026-11 のレビューで見つかった欠陥)。 */
   autoIgnoresUniqueIntents?: boolean;
-  /** DDL を、持っている intent を決着させずに適用する。表や列が消えた後では、確定済みの取引の intent を適用できない。 */
+  /**
+   * 表定義の記録を、持っている intent を決着させずに適用する (M21 の m21_red_no_drain、_trial_no_drain、_drop_no_drain)。
+   * 表や列が消えた後では、確定済みの取引の intent を適用できない。
+   */
   ddlIgnoresIntents?: boolean;
-  /** DROP の守りの確認 (unchanged) が、決着していない intent を変更として数えない (specs/m14_rebuild_guard.qnt の m14_red_no_drain の 2 つ目の守り)。 */
+  /** DROP の守りの確認 (unchanged) が、決着していない intent を変更として数えない (M21 の m21_red_drop_no_drain の 2 つ目の守り)。 */
   unchangedIgnoresIntents?: boolean;
   /**
    * anchor が、同じ 2PC の ID の実行を 1 つずつにしない。abortIgnoresRecord と合わせると m17_red_resend になる。
@@ -522,9 +538,11 @@ export interface Faults {
    * 受け取った側が、移動より前の読みの時刻でも「行なし」と答える。
    */
   noRangeFloor?: boolean;
-  /** index を作っている最中の表への書き込みを、シャードが断らない (モデル m12_red_no_lock)。 */
+  /**
+   * prepare を適用したシャードが、fence の表への書き込みを断らない (M21 の m21_red_no_fence、_trial_no_fence、_drop_no_fence)。
+   */
   ignoreTableLock?: boolean;
-  /** index を公開する版を適用するとき、その版が運ぶ時刻まで時計を進めない (モデル m12_clock_red_no_clock)。 */
+  /** index を公開する commit を適用するとき、その commit が運ぶ時刻まで時計を進めない (M21 の m21_clock_red_no_clock)。 */
   publishWithoutClock?: boolean;
   /** 検証で F の代わりに T を使う。 */
   validateFromT?: boolean;
@@ -602,8 +620,11 @@ export class ReadTooOld extends Error {
 // 版 7 (2026-11-16): 書き込みの応答 (ExecRes) が、文が入れた行 (inserted) を運ぶ。Worker は、文の結果の lastInsertRowid を、これだけから
 // 決める (src/client/db.ts の lastInsertRowid)。版 6 のシャードは inserted を返さないので、新しい Worker と話すと、行を入れた文の
 // lastInsertRowid が null になる。新旧が混ざらないように、版 6 の要求は受け付けない。
-export const PROTOCOL_VERSION = 7;
-export const MIN_PROTOCOL_VERSION = 7;
+// 版 8 (2026-11-16): 表定義の変更を 2 相にした (docs/design-catalog-epoch.md の段 3)。シャードは Meta の列の prepare、commit、abort を
+// 適用し、新しい入口 prepared で prepare を適用したかと試した結果を答える。分割の枠の版 (startSplit の答え) は、表定義の epoch だけになった。
+// 版 7 のシャードは prepare の記録を適用できず、版 7 の Worker は Meta の古い入口 (applyDdl) を呼ぶので、版 7 の要求は受け付けない。
+export const PROTOCOL_VERSION = 8;
+export const MIN_PROTOCOL_VERSION = 8;
 
 export class VersionSkew extends Error {
   readonly retryable = true;
@@ -704,8 +725,13 @@ export function utf8Length(s: string): number {
  * (docs/design-catalog-epoch.md の段 2)。シャードは表定義と範囲表を、この写しを畳んで作る。Meta の表は変わらないが、版の数は
  * Meta とシャードで 1 つなので、版 3 の Meta も開かない。版 3 からの移行は書かない。版 3 のシャードを開くと、新しいコードは空の写しを
  * 読み、表定義をなくしたように見えるので、移行がないと言って起動を拒否する。
+ *
+ * 版 5 (2026-11-16): 表定義の変更を 2 相にした (docs/design-catalog-epoch.md の段 3)。Meta とシャードの __epoch の表定義の記録が、
+ * 1 つの版を運ぶ commit (DdlEntry) から、prepare、commit (of)、abort の 3 種類になった。Meta の __meta の build_lease は lease
+ * (開いている遷移の期限) に、splits の枠の version は schema (表定義の epoch) になった。版 4 からの移行は書かない。版 4 のデータを
+ * 開くと、新しいコードは版 4 の commit の記録を畳めないので、移行がないと言って起動を拒否する。
  */
-export const STORAGE_FORMAT = 4;
+export const STORAGE_FORMAT = 5;
 
 /** 版 n の保存データを版 n + 1 にする移行。鍵は n である。最初の公開の前の形式は持たない (公開前は後方互換を持たない)。 */
 const STORAGE_MIGRATIONS: Record<number, (b: Backend) => void> = {};

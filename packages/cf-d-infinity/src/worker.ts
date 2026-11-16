@@ -133,7 +133,6 @@ export class DinfShard extends DurableObject<Env> {
       peer: (id) => shardStub(env, id),
       meta: {
         epochsSince: (after) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).epochsSince(after) as never,
-        revokeDdl: (v, reason) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).revokeDdl(v, reason),
         startSplit: (id, move) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).startSplit(id, move),
         checkSplit: (id, move) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).checkSplit(id, move),
       },
@@ -210,9 +209,6 @@ export class DinfMeta extends DurableObject<Env> {
     this.core.setInitial(initial);
     return this.core.catalog();
   }
-  ddlSince(v: number) {
-    return this.core.ddlSince(v);
-  }
   epochsSince(after: number) {
     return this.core.epochsSince(after);
   }
@@ -233,24 +229,21 @@ export class DinfMeta extends DurableObject<Env> {
     return sql.exec(`SELECT at, ms, plan, shards, rows, changes, attempts, error, sql FROM __slow ORDER BY seq DESC LIMIT ?`, Math.max(1, Math.min(limit, SLOW_KEEP)))
       .toArray().map((r) => ({ ...(r as unknown as SlowQuery), error: (r.error as string | null) ?? undefined }));
   }
-  applyDdl(sql: string, initial: string[], basedOn?: number) {
+  prepare(sql: string, initial: string[], opts: { guard?: string[] }, basedOn?: number) {
     this.core.setInitial(initial);
-    return this.core.applyDdl(sql, basedOn);
+    return this.core.prepare(sql, opts, basedOn);
   }
-  revokeDdl(version: number, reason: string) {
-    return this.core.revokeDdl(version, reason);
+  commit(epoch: number, acks: string[], at?: number) {
+    return this.core.commit(epoch, acks, at);
+  }
+  abort(epoch: number, reason: string) {
+    return this.core.abort(epoch, reason);
+  }
+  renew(epoch: number) {
+    return this.core.renew(epoch);
   }
   switchRange(move: Interval & { to: string; from?: string }) {
     return this.core.switchRange(move);
-  }
-  publishIndex(table: string, name: string, version: number, at: number) {
-    return this.core.publishIndex(table, name, version, at);
-  }
-  renewLock(version: number) {
-    return this.core.renewLock(version);
-  }
-  lockTables(tables: string[], basedOn?: number) {
-    return this.core.lockTables(tables, basedOn);
   }
   beginSplit(move: SplitMove, basedOn: number) {
     return this.core.beginSplit(move, basedOn);
@@ -269,9 +262,6 @@ export class DinfMeta extends DurableObject<Env> {
   }
   batonSecret() {
     return this.core.batonSecret();
-  }
-  finishLock(version: number, sql: string) {
-    return this.core.finishLock(version, sql);
   }
   allocate(table: string, n: number, min?: number) {
     return this.core.allocate(table, n, min);
@@ -456,16 +446,14 @@ export function clusterOf(env: Env, count?: number, prefix = "shard"): Cluster {
   return {
     shard: (id) => shardStub(env, id),
     catalog: () => meta.catalog(initial) as unknown as Promise<Catalog>,
-    applyDdl: (sql, basedOn) => meta.applyDdl(sql, initial, basedOn) as unknown as Promise<Catalog>,
+    prepare: (sql, opts, basedOn) => meta.prepare(sql, initial, opts, basedOn) as never,
+    commit: (epoch, acks, at) => meta.commit(epoch, acks, at) as never,
+    abort: (epoch, reason) => meta.abort(epoch, reason),
+    renew: (epoch) => meta.renew(epoch),
     switchRange: (move) => meta.switchRange(move) as never,
-    publishIndex: (table, name, version, at) => meta.publishIndex(table, name, version, at) as never,
-    revokeDdl: (version, reason) => meta.revokeDdl(version, reason),
-    renewLock: (version) => meta.renewLock(version),
-    lockTables: (tables, basedOn) => meta.lockTables(tables, basedOn) as never,
     beginSplit: (move, basedOn) => meta.beginSplit(move, basedOn) as never,
     endSplit: (id) => meta.endSplit(id),
     splits: () => meta.splits() as never,
-    finishLock: (version, sql) => meta.finishLock(version, sql) as never,
     allocate: (table, n, min) => meta.allocate(table, n, min),
   };
 }
@@ -598,14 +586,10 @@ export async function clusterStatus(env: Env, name = "shard", shards?: number) {
 
 /** 利用者が実行した DDL を、実行した順に返す。論理エクスポートの先頭に置く。 */
 export async function schemaSql(env: Env, name = "shard"): Promise<string[]> {
-  const { ddl } = await env.DINF_META.getByName(name).ddlSince(0);
-  // 適用できずに取り消された文と、それを取り消した文は書き出さない。
-  const reverted = new Set(ddl.flatMap((e) => (e.reverts === undefined ? [] : [e.reverts, e.version])));
-  return ddl.flatMap((e) => {
-    if (typeof e.user !== "string" || e.user.trim() === "" || reverted.has(e.version)) return [];
-    // shard key は主キーの先頭の列で決まるので、利用者の文面のままで、取り込み先でも行の置き場所は同じになる。
-    return [e.user];
-  });
+  // 表定義の履歴には、commit された文だけが入る (取り消された文はない)。shard key は主キーの先頭の列で決まるので、利用者の文面のままで、
+  // 取り込み先でも行の置き場所は同じになる。
+  const { ddl } = (await clusterOf(env, undefined, name).catalog()) as Catalog;
+  return ddl.filter((s) => s.trim() !== "");
 }
 
 /** 表の行を、シャードの順、主キーの順に少しずつ返す。cursor が null になったら終わりである。 */
@@ -639,7 +623,8 @@ async function admin(env: Env, path: string, b: AdminReq): Promise<unknown> {
       // 上の /ddl と同じ理由で、Db の DDL を通す。
       await new Db(cluster, { ids: sharedIds }).ddl(b.sql!);
       if (name === "shard") cached = null;
-      return (await cluster.catalog()).version;
+      // 表定義の epoch (段 3 から、表定義の版の数はない)。
+      return (await cluster.catalog()).schema;
     }
     case "/admin/split": return split(cluster, shardName(name, b.parent), shardName(name, b.child));
     case "/admin/rowstats": {

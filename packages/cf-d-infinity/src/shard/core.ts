@@ -25,10 +25,8 @@ export interface ShardDeps extends KernelDeps {
   meta: {
     /** Meta の epoch の列の、epoch が after より後の記録 (meta.ts の epochsSince)。シャードは、これを自分の写し __epoch に足す。 */
     epochsSince(after: number): Promise<Logged[]>;
-    /** 適用できなかった版の取り消しを求める。取り消す版の番号か、取り消せなければ null が返る。 */
-    revokeDdl(version: number, reason: string): Promise<number | null>;
-    /** 分割の枠を示して、子が受け取り始める。分割の版と、その表定義の epoch が返る (meta.ts の startSplit)。 */
-    startSplit(id: string, move: SplitMove): Promise<{ version: number; schema: number }>;
+    /** 分割の枠を示して、子が受け取り始める。分割の表定義の epoch が返る (meta.ts の startSplit)。 */
+    startSplit(id: string, move: SplitMove): Promise<{ schema: number }>;
     /** 分割の枠が生きていて、子が受け取り始めていることを確かめる (meta.ts の checkSplit)。 */
     checkSplit(id: string, move: SplitMove): Promise<void>;
   };
@@ -250,6 +248,9 @@ export class ShardCore implements ShardApi {
   }
   unchanged(req: { spans: Span[]; from: Ts; schema: number }): Promise<{ ok: boolean; reason?: string }> {
     return this.start("unchanged", { req });
+  }
+  prepared(req: { epoch: number; early?: true }): Promise<{ ok: boolean; reason?: string }> {
+    return this.start("prepared", { req });
   }
   finalize(req: { txn: string; c: Ts; pieces?: Piece[] }): Promise<void> {
     return this.start("finalize", { req });

@@ -1,13 +1,15 @@
 // Review of f2224ce, fix 6 (schema changes and splits exclude each other). Passes since 2026-11-11: a split holds the maintenance slot at Meta, which records no schema change while it does, and the split uses the version Meta gives with the slot (invariant 4, specs/m15_maintenance_slot.qnt).
 //
-// Db.record() asks every shard "are you moving?" (syncSchema) and then records the new version at Meta. The two steps
-// are not atomic. If a split fences the shard in between, the version is recorded anyway. From then on every Worker
-// plans with the new version, and the parent and the child refuse it ("schema change is waiting for a shard split")
-// until the split has moved all its data - for every statement that touches them, not only for DDL.
+// Before 2026-11-11, Db.record() asked every shard "are you moving?" (syncSchema) and then recorded the new version at
+// Meta. The two steps were not atomic. If a split fenced the shard in between, the version was recorded anyway. From then
+// on every Worker planned with the new version, and the parent and the child refused it ("schema change is waiting for a
+// shard split") until the split had moved all its data - for every statement that touches them, not only for DDL.
+// Since catalog epoch stage 3 (2026-11-16) the driver no longer asks the shards first: it reads the catalog and asks
+// Meta to record the prepare. The replay starts the split between those two steps.
 import { describe, expect, it } from "vitest";
 import { split } from "../src/autoscaler";
 import { Db } from "../src/client/db";
-import { SimCluster } from "./sim";
+import { SimCluster, withOverrides } from "./sim";
 
 const outcome = async <T>(p: Promise<T>) => p.then((v) => ({ ok: v as unknown }), (e: Error) => ({ err: e.message }));
 
@@ -25,18 +27,22 @@ describe("a schema change recorded just after a split fenced a shard", () => {
     let splitting: Promise<unknown> = Promise.resolve();
     let started = false;
     c.net.gate = (m) => (m.method === "drain" ? drainHeld : undefined);
-    c.net.reply = async (m) => {
-      // The DDL driver has just been told by s0 that it is not moving. Before the driver records the new version,
-      // the autoscaler starts a split of s0 and gets as far as the range-table switch.
-      if (started || m.method !== "syncSchema") return;
-      started = true;
-      splitting = outcome(split(c, "s0", "s1"));
-      for (let i = 0; i < 500 && (await c.cores.get("s0")!.moves({})).outgoing.length === 0; i++) await c.sleep(2);
-      for (let i = 0; i < 500 && (await c.catalog()).routing.ranges.length < 2; i++) await c.sleep(2);
-    };
-    const before = (await c.catalog()).version;
-    const ddl = await outcome(new Db(c, { splitWaitMs: 300 }).ddl("ALTER TABLE other ADD COLUMN x INTEGER"));
-    const recorded = (await c.catalog()).version;
+    const driver = withOverrides(c, {
+      prepare: async (sql, opts, basedOn) => {
+        // The DDL driver has read the catalog. Before it asks Meta to record the prepare, the autoscaler starts a split of s0
+        // and gets as far as the range-table switch.
+        if (!started) {
+          started = true;
+          splitting = outcome(split(c, "s0", "s1"));
+          for (let i = 0; i < 500 && (await c.cores.get("s0")!.moves({})).outgoing.length === 0; i++) await c.sleep(2);
+          for (let i = 0; i < 500 && (await c.catalog()).routing.ranges.length < 2; i++) await c.sleep(2);
+        }
+        return c.prepare(sql, opts, basedOn);
+      },
+    });
+    const before = (await c.catalog()).schema;
+    const ddl = await outcome(new Db(driver, { splitWaitMs: 300 }).ddl("ALTER TABLE other ADD COLUMN x INTEGER"));
+    const recorded = (await c.catalog()).schema;
 
     // The split is still moving data (drain is held). Point reads and writes by primary key normally work during a split.
     const reads: Record<string, number> = {};

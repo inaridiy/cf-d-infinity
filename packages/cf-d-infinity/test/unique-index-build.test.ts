@@ -4,16 +4,17 @@
 // 引いていた。既存の行に重複があれば DDL は失敗して取り消されるが、その前に実行された文は、存在しないことになる index を
 // もとに、結果を変えていた (読みが UNIQUE 違反で失敗する、INSERT OR REPLACE が行を消す)。
 //
-// いまは、index を作り始める版が表を書き込み禁止にし、index は公開まで見えない (specs/m12_unique_index_build.qnt)。
-// 読みは index と無関係に答え、書き込みは作り終えるまで待つ。作る側が止まっても、期限が来れば取り消される。
+// いまは、index を作る表定義の遷移の prepare が表を書き込み禁止にし、index は commit まで見えない (M21 の BUILD の場面。
+// specs/m21_catalog_epoch.qnt)。読みは index と無関係に答え、書き込みは作り終えるまで待つ。作る側が止まっても、期限が来れば
+// Meta が abort する。
 import { describe, expect, it } from "vitest";
 import { Db, type ClientFaults } from "../src/client/db";
 import { ownerOf } from "../src/routing";
 import { encode } from "../src/shard/rows";
 import type { Faults } from "../src/types";
-import { INDEX_LEASE_MS } from "../src/meta";
+import { LEASE_MS } from "../src/meta";
 import { duplicates, hold, indexAgreement, rawRows, tenantOn } from "./ddl-harness";
-import { SimCluster } from "./sim";
+import { SimCluster, withOverrides } from "./sim";
 
 const outcome = (p: Promise<unknown>) => p.then(() => "ok", (e: Error) => e.message);
 const TABLE = "CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, v INTEGER, PRIMARY KEY (tenant_id, id))";
@@ -35,7 +36,7 @@ describe("CREATE UNIQUE INDEX on a table that already has duplicate values, whil
     const paused = hold(c, "gate", (m) => m.from === "client" && m.method === "exec" && /FROM "t"\s+ORDER BY/.test((m.req as { sql: string }).sql) && ++scans === 2);
     // 作る側の延長は、この試験の都合で止めておく。作る側が要求の途中で止まった (Worker が落ちた) のと同じになる。
     // 延長が続く場合は、下の「a build that keeps renewing」が確かめる。
-    const builder = new Db(Object.assign(Object.create(c) as SimCluster, { renewLock: () => new Promise<{ leaseMs: number }>(() => {}) }));
+    const builder = new Db(withOverrides(c, { renew: () => new Promise<{ leaseMs: number }>(() => {}) }));
     const ddl = builder.ddl("CREATE UNIQUE INDEX u ON t(v)").then(() => "ok", (e: Error) => e.message);
     await paused.reached;
     const original = [{ tenant_id: A, id: 1, v: 7 }, { tenant_id: A, id: 2, v: 8 }, { tenant_id: B, id: 1, v: 7 }, { tenant_id: B, id: 2, v: 8 }];
@@ -68,13 +69,13 @@ describe("CREATE UNIQUE INDEX on a table that already has duplicate values, whil
   it("is withdrawn when the statement that builds it stops renewing its lease, and the waiting write goes through", async () => {
     const { c, A, paused, ddl, original } = await setup();
     const before = c.time;
-    // 作る側は止まったまま戻ってこない (setup の作る側は、延長を止めてある)。書き込みは、Meta が取り消すまで待つ。
+    // 作る側は止まったまま戻ってこない (setup の作る側は、延長を止めてある)。書き込みは、Meta が abort するまで待つ。
     await new Db(c).query("INSERT INTO t VALUES (?, 9, 8)", [A]);
-    expect(c.time - before).toBeGreaterThanOrEqual(INDEX_LEASE_MS / 2);
-    expect(c.time - before).toBeLessThan(INDEX_LEASE_MS * 2);
+    expect(c.time - before).toBeGreaterThanOrEqual(LEASE_MS / 2);
+    expect(c.time - before).toBeLessThan(LEASE_MS * 2);
     const cat = await c.catalog();
-    expect({ building: cat.tables.t!.building, built: cat.tables.t!.globalIndexes, listed: cat.indexes.u }).toEqual({ building: undefined, built: [], listed: undefined });
-    // 遅れて戻ってきた作る側は、公開できない。取り消された理由を受け取る。
+    expect({ open: cat.open, built: cat.tables.t!.globalIndexes, listed: cat.indexes.u }).toEqual({ open: undefined, built: [], listed: undefined });
+    // 遅れて戻ってきた作る側は、commit できない。abort された理由を受け取る。
     paused.release();
     expect(await ddl).toMatch(/stopped before it finished and was withdrawn/);
     expect(await rows(c)).toEqual([...original, { tenant_id: A, id: 9, v: 8 }].sort((x, y) => x.tenant_id - y.tenant_id || x.id - y.id));
@@ -82,7 +83,8 @@ describe("CREATE UNIQUE INDEX on a table that already has duplicate values, whil
   });
 });
 
-// specs/m11_schema_change.qnt の m11_red_early_public。index は、既存の行の項目を全部書き終えてから公開する (PUBLIC_LAST)。
+// specs/m11_schema_change.qnt の m11_red_early_public (M21 の m21_red_early_commit も同じ形)。index は、既存の行の項目を全部書き終えてから
+// 公開する (PUBLIC_LAST)。
 // モデルの反例と同じ順で流す: 行が 1 つある表に index を記録し (issue)、行の項目を書く前に公開する (publish)。公開された index は、
 // その行の項目を持たない。M11 の index は (値, 行) の集合で、実装は M12 の、書き込みを止めて作る形だが、公開の位置の守りは同じである。
 describe("a UNIQUE index that spans shards is published after the existing rows are indexed (m11_red_early_public)", () => {
@@ -151,12 +153,12 @@ describe("a table whose rows are being indexed", () => {
   });
 });
 
-// specs/m12_unique_index_build.qnt の m12_red_scan_early。既存の行を読む要求は、index を記録した版 (表を書き込み禁止にする版) を
-// 名乗る。シャードはその版を適用してから答えるので、読んだ後で、その行は変わらない (SCAN_AT_VERSION)。実装では、先に全シャードへ
-// その版を適用させることでも守っている。モデルの反例と同じ順で流す: index を記録する (ddlStart)。s0 の行を、s0 がまだ禁止を
-// 適用していないうちに読む (backfill)。index を知らない Worker が、その行の値を書き換えて確定する (plan、prepare、commit)。
-// 各シャードが版を適用し (applyVer)、s1 の行を読み、公開する。
-describe("the rows are read for the index only after their shard applied the write lock (m12_red_scan_early)", () => {
+// M21 の m21_red_scan_early (specs/m12_unique_index_build.qnt の m12_red_scan_early)。既存の行を読む要求は、index を作る遷移の prepare の
+// epoch (表を書き込み禁止にする記録) を名乗る。シャードはその記録を適用してから答えるので、読んだ後で、その行は変わらない。実装では、
+// 先に全シャードの prepared の ok を集めることでも守っている。モデルの反例と同じ順で流す: prepare を記録する。s0 の行を、s0 がまだ
+// 禁止を適用していないうちに読む (backfill)。index を知らない Worker が、その行の値を書き換えて確定する。各シャードが prepare を適用し、
+// s1 の行を読み、commit する。
+describe("the rows are read for the index only after their shard applied the write lock (m21_red_scan_early)", () => {
   const scenario = async (clientFaults?: ClientFaults) => {
     const c = new SimCluster({ shards: 2, clientFaults });
     await new Db(c).ddl(TABLE);
@@ -184,13 +186,14 @@ describe("the rows are read for the index only after their shard applied the wri
     expect(await scenario()).toEqual({ early: "waiting", ddl: "ok", write: "ok", missing: [], dangling: [] });
   });
 
-  it("put back: a shard read before it applied the lock takes the write, and the index keeps the value the row no longer has", async () => {
-    expect(await scenario({ scanBeforeLock: true })).toEqual({ early: "ok", ddl: "ok", write: "ok", missing: [encode([9])], dangling: [encode([7])] });
+  it("put back (checkBeforePrepare): a shard read before it applied the lock takes the write, and the index keeps the value the row no longer has", async () => {
+    expect(await scenario({ checkBeforePrepare: true })).toEqual({ early: "ok", ddl: "ok", write: "ok", missing: [encode([9])], dangling: [encode([7])] });
   });
 });
 
 // index の公開は、文の意味を変える。だから、時刻の順の中に 1 点を持つ。index を使わずに確定した書き込みは、その点より前で、
-// index を使う文は、その点より後である。公開の版が時刻を運び、シャードは、その版を適用するときに時計をそこまで進める。
+// index を使う文は、その点より後である。公開の commit が時刻を運び、シャードは、その commit を適用するときに時計をそこまで進める
+// (M21 の m21_clock_red_no_clock、M12 の m12_clock_red_no_clock)。
 describe("the publication of a UNIQUE index that spans shards", () => {
   /** s1 の時計は s0 より 5 秒進んでいる。s1 で index なしに書いた値を、index が出来た後で、s0 だけを触る文が使おうとする。 */
   const afterPublish = async (faults?: Faults) => {
@@ -222,10 +225,10 @@ describe("the publication of a UNIQUE index that spans shards", () => {
   });
 });
 
-// specs/m12_unique_index_build.qnt の m12_clock_red_skip_empty。公開の時刻は、行を読んだシャードの時計の最大である。行のないシャードも
+// M21 の m21_clock_red_skip_empty (specs/m12_unique_index_build.qnt の m12_clock_red_skip_empty)。公開の時刻は、行を読んだシャードの時計の最大である。行のないシャードも
 // 読み、その時計を入れる (SCAN_EVERY_SHARD)。そのシャードで、行を消した書き込みの時刻も、公開の時刻より前に来なければならない。
 // モデルの反例と同じ順で流す: 時計の進んだ s1 で、index を使わない書き込みが確定する (ここでは行を消す)。index を記録し、各シャードが
-// 版を適用する。行のある s0 だけを読み、公開する。s0 が公開の版を適用し、index を使う文が s0 で読む時刻を決める。
+// prepare を適用する。行のある s0 だけを読み、公開する。s0 が公開の commit を適用し、index を使う文が s0 で読む時刻を決める。
 // 実装は、行がないことを読んで知るので、欠陥のスイッチは、行のないシャードの時計を捨てる形で、読まなかったのと同じにする。
 describe("the publication timestamp of a UNIQUE index includes the clocks of shards with no rows (m12_clock_red_skip_empty)", () => {
   /** s1 の時計は s0 より 5 秒進んでいる。s1 の行を index なしに消してから index を作る。index を作るとき、s1 に表の行はない。 */
@@ -289,6 +292,6 @@ describe("the lease on a table whose rows are being indexed", () => {
   it("ends at its upper bound even while the build keeps renewing it", async () => {
     const r = await slowBuild({ leaseMs: 1_000, buildMaxMs: 3_000 });
     expect(r.out).toMatch(/did not finish within 3 seconds and was withdrawn/);
-    expect({ building: r.cat.tables.t!.building, built: r.cat.tables.t!.globalIndexes }).toEqual({ building: undefined, built: [] });
+    expect({ open: r.cat.open, built: r.cat.tables.t!.globalIndexes }).toEqual({ open: undefined, built: [] });
   });
 });

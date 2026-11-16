@@ -1,43 +1,46 @@
 import { SqlError, checkStorageFormat, type Backend, type Faults, type TableDef, type Ts } from "./types";
-import { parseDdl, publishBuild, type IndexInfo, type SchemaView } from "./sql/ddl";
+import { parseDdl, type DdlMode, type IndexInfo, type ParsedDdl } from "./sql/ddl";
 import { systemRuntime, type Runtime } from "./runtime";
 import { CAPTURE_TABLES } from "./shard/rows";
 import { checkInterval, contains, initialRouting, overlaps, rangeText, sameInterval, type Interval, type Routing } from "./routing";
-import { fold, splitId, type DdlEntry, type EpochRecord, type Logged, type Snapshot } from "./catalog";
-
-export type { DdlEntry } from "./catalog";
+import { describeOpen, fold, refusal, splitId, type EpochRecord, type Logged, type OpenDdl, type Snapshot } from "./catalog";
 
 /**
- * 既存の行から index を作る間は、表への書き込みが止まる。その止め方の期限。
- * 作る側は、作業の合間に期限を延ばし続ける (MetaCore.renewLock)。作る側 (Worker の 1 回の呼び出し) が止まると延長も止まり、
- * INDEX_LEASE_MS のうちに Meta が取り消す。延ばし続けても、作り始めてから INDEX_BUILD_MAX_MS を過ぎれば取り消す。
+ * 表定義の遷移の期限 (docs/design-catalog-epoch.md の「期限」)。prepare から commit か abort までの間、fence の表への書き込みが止まる。
+ * 進める側 (DDL を出した Worker の 1 回の呼び出し) は、作業の合間に期限を延ばし続ける (MetaCore.renew)。進める側が止まると延長も
+ * 止まり、LEASE_MS のうちに Meta が abort を記録する。延ばし続けても、prepare から TRANSITION_MAX_MS を過ぎれば abort する。
  * 書き込みが止まる時間の上限である。
  */
-export const INDEX_LEASE_MS = 5_000;
-export const INDEX_BUILD_MAX_MS = 300_000;
+export const LEASE_MS = 5_000;
+export const TRANSITION_MAX_MS = 300_000;
 
 /**
- * DDL の版が、呼び出し側の見た版から進んでいた。表定義を取り直してやり直す。schema は、その版の表定義の epoch である。
- * DO の間ではクラスが落ちるので、どちらの数も文に書く。
+ * 表定義の epoch が、呼び出し側の見た epoch から進んでいた。表定義を取り直してやり直す。
+ * DO の間ではクラスが落ちるので、数を文に書く。
  */
 export class SchemaMoved extends Error {
   readonly retryable = true;
-  constructor(readonly version: number, readonly schema: number) {
-    super(`schema moved to version ${version} (schema epoch ${schema})`);
+  constructor(readonly schema: number) {
+    super(`schema moved to epoch ${schema}`);
   }
 }
 
+/** 開いている表定義の遷移の、Meta の外に見せる部分。 */
+export interface OpenTransition {
+  epoch: number;
+  mode: DdlMode;
+  fence: string[];
+  /** mode build のとき、作っている index の名前。 */
+  index?: string;
+}
+
 export interface Catalog {
-  /** 表定義の版 (DdlEntry.version)。Meta の入口 (basedOn、取り消し、公開) は、段 3 まで、この数で話す。 */
-  version: number;
   tables: Record<string, TableDef>;
   views: Record<string, string>;
   indexes: Record<string, IndexInfo>;
-  /** Worker の SQLite で再生する DDL の履歴。sqlite_master と PRAGMA はこれから答える。 */
+  /** Worker の SQLite で再生する DDL の履歴。sqlite_master と PRAGMA はこれから答える。commit された文だけが入る。 */
   ddl: string[];
   routing: Routing;
-  /** 最新の版が取り消しなら、取り消された版と理由。DDL を出した側が、失敗を利用者へ返すのに使う。 */
-  revoked?: { version: number; reason: string };
   /**
    * このスナップショットの epoch (畳んだ最後の epoch)。要求が運び (ExecReq.epoch)、シャードは、これが自分より新しく、要求の行が
    * 自分のスナップショットで自分のものでなければ、列を適用してから所有を確かめ直す (段 2)。
@@ -45,17 +48,31 @@ export interface Catalog {
   epoch: number;
   /** 表定義が最後に変わった epoch。要求が運び (ExecReq.schema)、シャードは自分の表定義の epoch と等しいことを確かめる (段 2)。 */
   schema: number;
+  /** 開いている表定義の遷移。fence の表への書き込みは、シャードが TableLocked で断る。 */
+  open?: OpenTransition;
+  /** 最後の表定義の記録が abort なら、その遷移と理由。 */
+  aborted?: { of: number; reason: string };
 }
 
-/**
- * スナップショットを、Worker とシャードに渡す形 (Catalog) にする。開いている遷移と移動は、まだ Meta の外に出さない。
- * epoch と schema は、段 2 で足した (要求が運ぶ)。段 1 の比べ合い (test/meta-old.ts) は、比べる前に、この 2 つを落とす。
- */
+/** prepare の答え。epoch は記録した prepare の epoch で、何もしない DDL (IF NOT EXISTS など) なら null (何も記録しない)。 */
+export interface Prepared {
+  epoch: number | null;
+  mode: DdlMode;
+  /** prepare の ddl (commit で表定義に入るもの)。mode build の進める側は、ここから作る index を知る。 */
+  ddl?: ParsedDdl;
+  /** prepare を記録した後のスナップショット。 */
+  catalog: Catalog;
+}
+
+/** スナップショットを、Worker とシャードに渡す形 (Catalog) にする。 */
 function catalogOf(s: Snapshot): Catalog {
-  const cat: Catalog = { version: s.version, tables: s.tables, views: s.views, indexes: s.indexes, ddl: s.ddl, routing: s.routing } as Catalog;
-  if (s.revoked) cat.revoked = s.revoked;
-  cat.epoch = s.epoch;
-  cat.schema = s.schema;
+  const cat: Catalog = { tables: s.tables, views: s.views, indexes: s.indexes, ddl: s.ddl, routing: s.routing, epoch: s.epoch, schema: s.schema };
+  if (s.open) {
+    const o: OpenTransition = { epoch: s.open.epoch, mode: s.open.mode, fence: s.open.fence };
+    if (s.open.mode === "build") o.index = Object.keys(s.open.ddl.indexes ?? {})[0]!;
+    cat.open = o;
+  }
+  if (s.aborted) cat.aborted = s.aborted;
   return cat;
 }
 
@@ -66,7 +83,7 @@ export function readEpochs(b: Backend, after = -1): Logged[] {
     .map((r) => ({ epoch: r.epoch as number, rec: JSON.parse(r.rec as string) as EpochRecord }));
 }
 
-/** index を作っている最中で、別の表定義の変更を記録できない。終わるのを待ってやり直す。 */
+/** 表定義の遷移か分割が進行中で、別の表定義の変更を記録できない。終わるのを待ってやり直す。 */
 export class SchemaBusy extends Error {
   readonly retryable = true;
   constructor(readonly what: string) {
@@ -75,7 +92,8 @@ export class SchemaBusy extends Error {
 }
 
 /**
- * 分割が持つ、保守の操作の枠 (specs/m15_maintenance_slot.qnt)。分割どうしは枠を共有でき、DDL とは排他である。
+ * 分割が持つ、保守の操作の枠 (specs/m15_maintenance_slot.qnt。段 4 で、移動の記録 move-start と move-end に置き換わる)。
+ * 分割どうしは枠を共有でき、表定義の遷移とは排他である。
  * 枠を取った直後は期限がある。分割を進める側が、子が受け取り始める前に止まっても、枠が残らないようにするためである。
  * 子が受け取り始めると (startSplit)、期限を外す。分割は取り消せないので、進める側 (Autoscaler) が再開して終える。
  */
@@ -83,8 +101,8 @@ export interface SplitSlot extends Interval {
   id: string;
   parent: string;
   child: string;
-  /** 分割の版。子はこの版で受け取り始め、親はこの版まで追いついてから fence する。 */
-  version: number;
+  /** 分割の表定義の epoch。子はこの epoch で受け取り始め、親はこの epoch まで追いついてから fence する。 */
+  schema: number;
   started: boolean;
   until: number;
 }
@@ -100,20 +118,26 @@ function assertInterval(x: Interval): void {
   }
 }
 
-/** 表への書き込みを止めている作業の名前。誤りの文に使う。 */
-function describe(e: DdlEntry): string {
-  return e.build ? `CREATE INDEX ${e.build.index}` : `the lock on ${e.guard!.tables.join(", ")} before DROP TABLE`;
+/** 開いている表定義の遷移の期限。 */
+interface Lease {
+  epoch: number;
+  started: number;
+  until: number;
 }
+
+/** Meta の SQLite で試した文を巻き戻すための印。 */
+const ROLLBACK = Symbol("rollback");
 
 /**
  * 表定義、DDL 履歴、範囲表、rowid の採番を持つ。hot path には載せない。
- * 表定義の版と範囲表の切り替えは、epoch の列 (__epoch、src/catalog.ts) に記録し、答えは列を畳んで作る (段 1。
- * docs/design-catalog-epoch.md)。入口の名前と答えは、列を入れる前と同じである。
+ * 表定義の遷移と範囲表の切り替えは、epoch の列 (__epoch、src/catalog.ts) に記録し、答えは列を畳んで作る。
+ * 表定義の変更は 2 相である (段 3。docs/design-catalog-epoch.md の「表定義の遷移」)。prepare が表への書き込みを止め、進める側が
+ * 全シャードの ok を集めた後で commit が確定する。失敗か期限切れなら abort が禁止を解く。取り消しの文 (逆操作) はない。
  */
 export class MetaCore {
   private rt: Runtime;
   private leaseMs: number;
-  private buildMaxMs: number;
+  private maxMs: number;
   /** 欠陥を再導入するスイッチ。検査が欠陥を見つけることを確かめる試験だけが渡す。 */
   private faults: Faults;
   constructor(
@@ -121,8 +145,8 @@ export class MetaCore {
     opts: { runtime?: Runtime; leaseMs?: number; buildMaxMs?: number; faults?: Faults } = {},
   ) {
     this.rt = opts.runtime ?? systemRuntime;
-    this.leaseMs = opts.leaseMs ?? INDEX_LEASE_MS;
-    this.buildMaxMs = opts.buildMaxMs ?? INDEX_BUILD_MAX_MS;
+    this.leaseMs = opts.leaseMs ?? LEASE_MS;
+    this.maxMs = opts.buildMaxMs ?? TRANSITION_MAX_MS;
     this.faults = opts.faults ?? {};
     b.exec(`CREATE TABLE IF NOT EXISTS __epoch(epoch INTEGER PRIMARY KEY, rec TEXT NOT NULL)`);
     b.exec(`CREATE TABLE IF NOT EXISTS __seq(name TEXT PRIMARY KEY, next INTEGER NOT NULL)`);
@@ -133,21 +157,23 @@ export class MetaCore {
   }
 
   /**
-   * シャードで実行する文を、Meta 自身の SQLite の空の表でも実行しておく。新しい DDL は、ここで通ってから記録する。
-   * 構文は通るが SQLite が拒否する文 (NOT NULL で既定値のない ADD COLUMN、重複した列名など) を記録すると、
-   * 全シャードが適用に失敗し続け、直すための DDL も通らなくなる。
+   * シャードで実行する文を、Meta 自身の SQLite の空の表でも実行しておく。新しい DDL は、ここで試して通ってから prepare を記録し、
+   * commit を記録するときに、もう一度実行して残す。構文は通るが SQLite が拒否する文 (NOT NULL で既定値のない ADD COLUMN、
+   * 重複した列名など) を記録すると、全シャードの試しが失敗し、DDL は必ず abort になる。空の表で断れば、それより前に分かる。
    * 写し終えた位置 (__meta の shadow) は epoch である。
    */
   private replayShadow(): void {
     const done = (this.b.exec(`SELECT v FROM __meta WHERE k = 'shadow'`)[0]?.v as number | undefined) ?? 0;
-    for (const { epoch, rec } of readEpochs(this.b, done)) {
-      if (rec.kind !== "commit" || !("ddl" in rec)) continue;
-      // この仕組みより前に記録された文は、通らなくても記録を変えられない。できるだけ追従する。
-      for (const s of rec.ddl.sql) {
+    const prepares = new Map<number, Extract<EpochRecord, { kind: "prepare" }>>();
+    for (const { epoch, rec } of readEpochs(this.b)) {
+      if (rec.kind === "prepare") prepares.set(epoch, rec);
+      if (epoch <= done || rec.kind !== "commit") continue;
+      const p = prepares.get(rec.of);
+      for (const s of [...(p?.staging?.sql ?? []), ...(p?.ddl.sql ?? [])]) {
         try {
           this.b.exec(s);
         } catch {
-          // 続ける
+          // 写しは記録を変えられない。できるだけ追従する。
         }
       }
       this.shadowAt(epoch);
@@ -172,14 +198,14 @@ export class MetaCore {
 
   /**
    * 列の最後まで畳んだもの。最初の範囲表は作らない。
-   * 呼ばれるたびに畳む (段 1 と同じ)。答えの object は呼び出し側へそのまま渡り、シミュレータでは Worker がそれを持ち続けるので、
+   * 呼ばれるたびに畳む。答えの object は呼び出し側へそのまま渡り、シミュレータでは Worker がそれを持ち続けるので、
    * 控えを共有しない。畳んだ結果を覚えるのは、自分の写しを持つシャードである (kernel.ts の snap)。
    */
   private snapshot(): Snapshot {
     return fold(readEpochs(this.b));
   }
 
-  /** 最初の範囲表を、まだなければ epoch 0 に書く。範囲表を最初に引いたときに作るのは、列を入れる前と同じである。 */
+  /** 最初の範囲表を、まだなければ epoch 0 に書く。範囲表を最初に引いたときに作る。 */
   private ensureGenesis(): void {
     if (this.b.exec(`SELECT 1 FROM __epoch WHERE epoch = 0`).length > 0) return;
     const rec: EpochRecord = { kind: "genesis", routing: initialRouting(this.initialShards) };
@@ -209,20 +235,6 @@ export class MetaCore {
     return this.snapshot().routing;
   }
 
-  /** 表定義の版の履歴。after より後の版を返す。 */
-  private entries(after = 0): DdlEntry[] {
-    return readEpochs(this.b).flatMap(({ rec }) => (rec.kind === "commit" && "ddl" in rec && rec.ddl.version > after ? [rec.ddl] : []));
-  }
-
-  /**
-   * 表への書き込みを止めている作業 (index の作成か、DROP の前の書き込み禁止) を記録した版。最新の版がそれであるときだけ、作業の最中である。
-   * 作業の間は、ほかの表定義の変更を記録しない。だから、終わり方 (公開、DROP、取り消し) は「最新の版がこの版のまま」のときだけ
-   * 次の版を積み、どれか 1 つしか起きない。列の上では、開いている表定義の遷移 (Snapshot.open) である。
-   */
-  private building(): DdlEntry | null {
-    return (this.snapshot().open?.ddl as DdlEntry | undefined) ?? null;
-  }
-
   /**
    * Hrana の baton に署名する鍵。DINF_BATON_SECRET が設定されていないときに使う。最初に呼ばれたときに乱数で作って保存し、
    * 以後は同じ値を返す。データ用のトークンから計算できる鍵だと、トークンを持つ人が取引の状態を書き換えた baton を作れる。
@@ -245,69 +257,52 @@ export class MetaCore {
   }
 
   /**
-   * 保守の操作の枠を、誰が持っているか。DDL を記録する場所と、分割が枠を取る場所が、この 1 つで確かめる。
-   * exclusive は表への書き込みを止めている作業 (index の作成、DROP の前の禁止)。splits は進行中の分割である。
+   * 表定義の遷移を開いてよいか。だめなら、待ってやり直せる誤りを投げる。
+   * 表定義の遷移は 1 つずつ開く (M21 の ONE_OPEN。refusal の one-open)。分割の枠がある間は開かない (DDL_WAITS_MOVE。段 4 までは枠が守る)。
    */
-  private holders(): { exclusive: DdlEntry | null; splits: SplitSlot[] } {
-    return { exclusive: this.building(), splits: this.splitSlots() };
-  }
-
-  /** DDL を記録してよいか。だめなら、待ってやり直せる誤りを投げる。 */
-  private assertFreeForDdl(): void {
-    const h = this.holders();
-    if (h.exclusive) throw new SchemaBusy(describe(h.exclusive));
-    if (h.splits.length > 0) throw new SchemaBusy(`a shard split of ${h.splits.map((x) => x.parent).join(", ")}`);
+  private assertFreeForDdl(s: Snapshot): void {
+    const r = refusal(s, { kind: "prepare", mode: "plain", ddl: { sql: [], defs: [], drops: [], user: null }, fence: [] });
+    if (r?.rule === "one-open" && !this.faults.overlappingTransitions) throw new SchemaBusy(describeOpen(r.open));
+    const splits = this.splitSlots();
+    if (splits.length > 0) throw new SchemaBusy(`a shard split of ${splits.map((x) => x.parent).join(", ")}`);
   }
 
   /**
-   * 分割のために、保守の操作の枠を取る。basedOn は、呼び出し側が全シャードへ適用させた版で、最新の版と違えば断る。
-   * こうすると、分割の途中に、最新の版の取り消し (シャードが適用に失敗した版) が入ることもない。
-   * 同じ範囲の分割の枠がもうあれば、それを返す (分割の再開)。
+   * 分割のために、保守の操作の枠を取る。basedOn は、呼び出し側が全シャードへ適用させた表定義の epoch で、最新と違えば断る。
+   * 表定義の遷移が開いている間は取らない (M21 の MOVE_WAITS_DDL)。同じ範囲の分割の枠がもうあれば、それを返す (分割の再開)。
    */
   async beginSplit(move: SplitMove, basedOn: number): Promise<SplitSlot> {
     this.expire();
     const list = this.splitSlots();
     const same = list.find((x) => sameSplit(x, move));
     if (same) return same;
-    const cat = this.current();
-    if (basedOn !== cat.version) throw new SchemaMoved(cat.version, cat.schema);
-    const h = this.holders();
-    if (h.exclusive) throw new SchemaBusy(describe(h.exclusive));
+    const s = this.current();
+    if (basedOn !== s.schema) throw new SchemaMoved(s.schema);
+    if (s.open) throw new SchemaBusy(describeOpen(s.open));
     assertInterval(move);
     const slot: SplitSlot = {
       id: splitId(move),
-      parent: move.parent, child: move.child, start: move.start, end: move.end, version: cat.version, started: false, until: this.rt.now() + this.leaseMs,
+      parent: move.parent, child: move.child, start: move.start, end: move.end, schema: s.schema, started: false, until: this.rt.now() + this.leaseMs,
     };
     this.setSplitSlots([...list, slot]);
     return slot;
   }
 
   /**
-   * 子が受け取り始める。枠が生きていれば、期限を外して分割の版と、その版の表定義の epoch を返す。枠がなければ (期限切れ) 断る。
-   * シャードは表定義の epoch で比べるので (段 2)、子は schema まで列を適用してから受け取り始める。
+   * 子が受け取り始める。枠が生きていれば、期限を外して分割の表定義の epoch を返す。枠がなければ (期限切れ) 断る。
+   * 子は、その epoch まで列を適用してから受け取り始める。
    */
-  async startSplit(id: string, move: SplitMove): Promise<{ version: number; schema: number }> {
+  async startSplit(id: string, move: SplitMove): Promise<{ schema: number }> {
     this.expire();
     const list = this.splitSlots();
     const slot = list.find((x) => x.id === id);
-    // 欠陥のスイッチ: 枠が期限で消えていても断らず、いまの版で受け取り始めさせる。枠のないまま分割が進み、DDL が記録される。
-    if (!slot && this.faults.startWithoutSlot) {
-      const cat = this.current();
-      return { version: cat.version, schema: cat.schema };
-    }
+    // 欠陥のスイッチ: 枠が期限で消えていても断らず、いまの表定義で受け取り始めさせる。枠のないまま分割が進み、DDL が記録される。
+    if (!slot && this.faults.startWithoutSlot) return { schema: this.current().schema };
     if (!slot || !sameSplit(slot, move)) {
       throw new SqlError(`split ${id}: no such split slot (it expired before the child started, or it is for another range)`);
     }
     if (!slot.started) this.setSplitSlots(list.map((x) => (x.id === id ? { ...x, started: true } : x)));
-    return { version: slot.version, schema: this.schemaOf(slot.version) };
-  }
-
-  /** 表定義の版 version を記録した commit の epoch。版 0 (表定義の変更がまだない) は 0 である。 */
-  private schemaOf(version: number): number {
-    if (version === 0) return 0;
-    const hit = readEpochs(this.b).find(({ rec }) => rec.kind === "commit" && "ddl" in rec && rec.ddl.version === version);
-    if (!hit) throw new SqlError(`schema version ${version} is not recorded`);
-    return hit.epoch;
+    return { schema: slot.schema };
   }
 
   /** 親が fence する前に、枠が生きていて、子が受け取り始めていることを確かめる。 */
@@ -342,63 +337,65 @@ export class MetaCore {
   }
 
   /**
-   * 期限を過ぎた index の作成を取り消す。外から呼ばれるたびに、最初に確かめる。
-   * 書き込みを断られた Worker も、版を進めたいシャードも、Meta に尋ねる。だから、タイマーがなくても、待っている者がいれば取り消される。
+   * 開いている表定義の遷移の期限。prepare の epoch、prepare の時刻、いまの期限。遷移は 1 つずつ開くので、ふつうは 0 か 1 個である
+   * (欠陥のスイッチ overlappingTransitions を入れた Meta だけが、2 つ持つ)。
    */
-  private expire(): void {
-    // 子が受け取り始める前に、期限を過ぎた分割の枠を捨てる。
-    const slots = this.splitSlots();
-    const live = slots.filter((x) => x.started || this.rt.now() <= x.until);
-    if (live.length !== slots.length) this.setSplitSlots(live);
-    const b = this.building();
-    if (!b) return;
-    const lease = this.lease();
-    const now = this.rt.now();
-    if (lease?.version === b.version && now <= lease.until) return;
-    const reason = lease?.version === b.version && now > lease.started + this.buildMaxMs
-      ? `${describe(b)} did not finish within ${Math.round(this.buildMaxMs / 1000)} seconds and was withdrawn; the table is unchanged`
-      : `${describe(b)} stopped before it finished and was withdrawn; the table is unchanged`;
-    this.revoke(b.version, reason);
+  private leases(): Lease[] {
+    const r = this.b.exec(`SELECT v FROM __meta WHERE k = 'lease'`)[0];
+    return r ? (JSON.parse(r.v as string) as Lease[]) : [];
   }
-
-  /** 作っている最中の index の期限。版、作り始めた時刻、いまの期限。 */
-  private lease(): { version: number; started: number; until: number } | null {
-    const r = this.b.exec(`SELECT v FROM __meta WHERE k = 'build_lease'`)[0];
-    return r ? (JSON.parse(r.v as string) as { version: number; started: number; until: number }) : null;
+  private lease(epoch: number): Lease | undefined {
+    return this.leases().find((l) => l.epoch === epoch);
   }
-  private setLease(l: { version: number; started: number; until: number }): void {
-    this.b.exec(`INSERT INTO __meta(k, v) VALUES ('build_lease', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, JSON.stringify(l));
+  private setLease(epoch: number, l: Lease | null): void {
+    const list = [...this.leases().filter((x) => x.epoch !== epoch), ...(l ? [l] : [])];
+    this.b.exec(`INSERT INTO __meta(k, v) VALUES ('lease', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, JSON.stringify(list));
   }
 
   /**
-   * 表への書き込みを止めている作業の期限を延ばす。version は作業を始めた版で、まだ作業の最中でなければ断る。
-   * 取り消された後の延長が、作業を生き返らせることはない (公開と同じ確認。specs/m12_unique_index_build.qnt の ONE_EXIT)。
+   * 期限を過ぎた表定義の遷移を abort する。外から呼ばれるたびに、最初に確かめる。
+   * 書き込みを断られた Worker も、列を取りに来るシャードも、Meta に尋ねる。だから、タイマーがなくても、待っている者がいれば abort される。
+   * 子が受け取り始める前に期限を過ぎた分割の枠も、ここで捨てる。
    */
-  async renewLock(version: number): Promise<{ leaseMs: number }> {
-    this.expire();
-    const b = this.building();
-    const lease = this.lease();
-    if (!b || b.version !== version || lease?.version !== version) {
-      throw new SqlError(`the schema change that locked the table is no longer in progress`);
+  private expire(): void {
+    const slots = this.splitSlots();
+    const live = slots.filter((x) => x.started || this.rt.now() <= x.until);
+    if (live.length !== slots.length) this.setSplitSlots(live);
+    const now = this.rt.now();
+    for (const o of this.snapshot().opens) {
+      const lease = this.lease(o.epoch);
+      if (lease && now <= lease.until) continue;
+      const reason = lease && now > lease.started + this.maxMs
+        ? `${describeOpen(o)} did not finish within ${Math.round(this.maxMs / 1000)} seconds and was withdrawn; the table is unchanged`
+        : `${describeOpen(o)} stopped before it finished and was withdrawn; the table is unchanged`;
+      this.b.tx(() => {
+        this.record({ kind: "abort", of: o.epoch, reason });
+        this.setLease(o.epoch, null);
+      });
     }
-    this.setLease({ ...lease, until: Math.min(this.rt.now() + this.leaseMs, lease.started + this.buildMaxMs) });
+  }
+
+  /**
+   * 表定義の遷移の期限を延ばす。epoch は prepare の epoch で、その遷移がもう開いていなければ断る。
+   * abort された後の延長が、遷移を生き返らせることはない (commit と同じ確かめ。M21 の ONE_EXIT)。
+   */
+  async renew(epoch: number): Promise<{ leaseMs: number }> {
+    this.expire();
+    const open = this.snapshot().opens.some((o) => o.epoch === epoch);
+    const lease = this.lease(epoch);
+    if (!open || !lease) throw new SqlError(`the schema change that locked the table is no longer in progress`);
+    this.setLease(epoch, { ...lease, until: Math.min(this.rt.now() + this.leaseMs, lease.started + this.maxMs) });
     return { leaseMs: this.leaseMs };
   }
 
   async catalog(): Promise<Catalog> {
     this.expire();
-    return this.current();
+    return catalogOf(this.current());
   }
 
-  private current(): Catalog {
+  private current(): Snapshot {
     this.ensureGenesis();
-    return catalogOf(this.snapshot());
-  }
-
-  async ddlSince(version: number): Promise<{ version: number; ddl: DdlEntry[] }> {
-    this.expire();
-    const ddl = this.entries(version);
-    return { version: ddl.at(-1)?.version ?? version, ddl };
+    return this.snapshot();
   }
 
   /**
@@ -411,120 +408,126 @@ export class MetaCore {
     return readEpochs(this.b, after);
   }
 
-  /** 表定義の版を 1 つ、commit の記録として足す。シャードで実行する文は、同じ取引の中で Meta の SQLite でも実行する。 */
-  private append(p: Omit<DdlEntry, "version">, version: number): void {
-    const entry: DdlEntry = { ...p, version };
+  /**
+   * 文を Meta の SQLite の空の表で試して巻き戻す (replayShadow)。SQLite が拒否する文は、ここで断る。
+   * commit で残すときと同じく、内部の表 (staging) を先に作る。
+   */
+  private tryShadow(p: Pick<ParsedDdl, "sql" | "staging">): void {
+    try {
+      this.b.tx(() => {
+        for (const s of [...(p.staging?.sql ?? []), ...p.sql]) this.b.exec(s);
+        throw ROLLBACK;
+      });
+    } catch (e) {
+      if (e === ROLLBACK) return;
+      throw new SqlError((e as Error).message);
+    }
+  }
+
+  /**
+   * 表定義の遷移を開く (prepare を記録する)。basedOn は、呼び出し側が文を解釈した表定義の epoch で、最新と違えば SchemaMoved で断る
+   * (取り消しがないので、意味は「文を解釈した表定義が最新である」ことだけである)。遷移が開いているか分割の枠があれば SchemaBusy。
+   * guard は、取引が読んだ表の DROP で、その取引が読んだ表である (mode guard。読んだ範囲は、進める側が commit の前に確かめる)。
+   * 何もしない DDL (IF NOT EXISTS で表がある、など) は、何も記録せずに epoch: null を返す。
+   */
+  async prepare(sql: string, opts: { guard?: string[] } = {}, basedOn?: number): Promise<Prepared> {
+    this.expire();
+    const s = this.current();
+    if (basedOn !== undefined && basedOn !== s.schema) throw new SchemaMoved(s.schema);
+    this.assertFreeForDdl(s);
+    const parsed = parseDdl(sql, s);
+    if (parsed.noop) return { epoch: null, mode: "plain", catalog: catalogOf(s) };
+    let mode: DdlMode = parsed.mode ?? "plain";
+    let fence = parsed.fence ?? [];
+    const guard = opts.guard ?? [];
+    if (guard.length > 0) {
+      if (!guard.every((t) => parsed.drops.includes(t))) throw new SqlError(`DROP TABLE: the statement does not drop ${guard.join(", ")}`);
+      mode = "guard";
+      fence = [...new Set([...fence, ...guard])];
+    }
+    this.tryShadow(parsed);
+    const { mode: _m, fence: _f, staging, ...ddl } = parsed;
+    const rec: EpochRecord = { kind: "prepare", mode, ddl, fence, ...(staging ? { staging } : {}) };
+    const now = this.rt.now();
+    const epoch = this.b.tx(() => {
+      const e = this.record(rec);
+      this.setLease(e, { epoch: e, started: now, until: now + this.leaseMs });
+      return e;
+    });
+    return { epoch, mode, ddl, catalog: catalogOf(this.snapshot()) };
+  }
+
+  /**
+   * 表定義の遷移を確定する (commit を記録する)。epoch は prepare の epoch、acks は prepared に ok と答えたシャード、at は index を
+   * 公開する commit が運ぶ時刻である。確かめるのは 3 つ (設計書の「Meta の入口」)。
+   *   1. その遷移が開いている。期限切れか失敗で abort された後の commit は通らない (M21 の ONE_EXIT)。先に expire を通す。
+   *   2. acks が、範囲表の全シャードを含む (ALL_ACKS)。遷移が開いている間は分割が始まらないので、シャードの集合は prepare から変わらない。
+   * 文は、Meta の SQLite でも実行して残す。
+   */
+  async commit(epoch: number, acks: string[], at?: Ts): Promise<Catalog> {
+    this.expire();
+    let s = this.current();
+    let of = epoch;
+    const r = refusal(s, { kind: "commit", of: epoch }, acks);
+    if (r?.rule === "one-exit") {
+      if (!this.faults.commitAfterAbort) throw new SqlError(this.closedReason(epoch));
+      of = this.reopen(epoch);
+      s = this.snapshot();
+    } else if (r?.rule === "all-acks" && !this.faults.commitWithoutAcks) {
+      throw new SqlError(`the schema change of epoch ${epoch} was not prepared on ${r.missing.join(", ")}; it was not committed`);
+    }
+    const open = s.opens.find((o) => o.epoch === of)!;
     this.b.tx(() => {
       try {
-        for (const s of entry.sql) this.b.exec(s);
+        for (const x of [...(open.staging?.sql ?? []), ...open.ddl.sql]) this.b.exec(x);
       } catch (e) {
         throw new SqlError((e as Error).message);
       }
-      this.shadowAt(this.record({ kind: "commit", ddl: entry }));
+      const c = this.record({ kind: "commit", of, ...(at === undefined ? {} : { at }) });
+      this.shadowAt(c);
+      this.setLease(of, null);
     });
+    return catalogOf(this.snapshot());
   }
 
   /**
-   * DDL を記録する。basedOn は呼び出し側が全シャードへ適用し終えた版で、現在の版と違えば断る。
-   * こうすると、新しい版が記録されるのは、前の版を全シャードが適用した後だけになる。
-   * シャードが適用に失敗した版を取り消せるのは、その後に別の版が積まれていないからである。
+   * 欠陥のスイッチ commitAfterAbort: 閉じた遷移の prepare を、もう一度記録する (同じ文、同じ fence)。遅れた commit は、こちらを確定する。
+   * abort から開き直すまでの間、表への書き込みは止まっていない。
    */
-  async applyDdl(sql: string, basedOn?: number): Promise<Catalog> {
-    this.expire();
-    const cat = this.current();
-    if (basedOn !== undefined && basedOn !== cat.version) throw new SchemaMoved(cat.version, cat.schema);
-    this.assertFreeForDdl();
-    const parsed = parseDdl(sql, cat);
-    if (!parsed.noop) {
-      this.append(parsed, cat.version + 1);
-      const now = this.rt.now();
-      if (parsed.build) this.setLease({ version: cat.version + 1, started: now, until: now + this.leaseMs });
-    }
-    return this.current();
+  private reopen(epoch: number): number {
+    const hit = readEpochs(this.b).find((x) => x.epoch === epoch && x.rec.kind === "prepare");
+    if (!hit) throw new SqlError(this.closedReason(epoch));
+    // 期限は付けない。すぐ後の commit が閉じる。
+    return this.record(hit.rec);
   }
 
-  /**
-   * シャードが適用できなかった版を取り消す。取り消す文を次の版として記録し、その版を返す。取り消せなければ null。
-   * 取り消せるのは、最新の版で、取り消す文を持つものだけである。
-   */
-  async revokeDdl(version: number, reason: string): Promise<number | null> {
-    this.expire();
-    return this.revoke(version, reason);
-  }
-
-  private revoke(version: number, reason: string): number | null {
+  /** 閉じた遷移に commit が届いたときの誤りの文。abort されたなら、その理由である。 */
+  private closedReason(epoch: number): string {
     const log = readEpochs(this.b);
-    const all = log.flatMap(({ epoch, rec }) => (rec.kind === "commit" && "ddl" in rec ? [{ epoch, e: rec.ddl }] : []));
-    const done = all.find((x) => x.e.reverts === version);
-    if (done) return done.e.version;
-    const last = all.at(-1);
-    const e = last?.e;
-    if (!last || !e || e.version !== version || !e.undo || e.reverts !== undefined) return null;
-    // 取り消す版の直前の表定義。列を、その版の 1 つ前の epoch まで畳む。
-    const before: SchemaView = fold(log, last.epoch - 1);
-    const names = e.defs.map((d) => d.name);
-    this.append({
-      sql: e.undo.sql,
-      defs: names.flatMap((n) => (before.tables[n] ? [before.tables[n]!] : [])),
-      drops: names.filter((n) => !before.tables[n]),
-      user: e.undo.user,
-      dropIndexes: Object.keys(e.indexes ?? {}).filter((n) => !before.indexes[n]),
-      reverts: version,
-      reason,
-    }, version + 1);
-    return version + 1;
+    const aborted = log.find((x) => x.rec.kind === "abort" && x.rec.of === epoch)?.rec as Extract<EpochRecord, { kind: "abort" }> | undefined;
+    if (aborted) return aborted.reason;
+    if (log.some((x) => x.rec.kind === "commit" && x.rec.of === epoch)) return `the schema change of epoch ${epoch} was already committed`;
+    return `the schema change of epoch ${epoch} is not open`;
   }
 
   /**
-   * 既存の行の項目を埋め終えた index を公開する。version は index を作り始めた版で、それが最新の版のままでなければ断る。
-   * 期限切れで取り消された後に、遅れてきた公開が通ることはない。at は公開の時刻 (DdlEntry.at)。
+   * 表定義の遷移を取り消す (abort を記録する)。禁止を解き、prepare が作った内部の表を消させるだけで、利用者の表に触る文を持たない。
+   * その遷移が、もう abort されていれば (期限切れ)、記録せずに、その理由を返す。呼び出し側は、自分の理由と違えば、そちらを利用者へ返す。
+   * もう commit された遷移は取り消せない (M21 の ONE_EXIT)。
    */
-  async publishIndex(table: string, name: string, version: number, at: Ts): Promise<Catalog> {
+  async abort(epoch: number, reason: string): Promise<{ reason: string }> {
     this.expire();
-    const b = this.building();
-    if (!b || b.version !== version || b.build!.table !== table || b.build!.index !== name) {
-      throw new SqlError(`CREATE INDEX ${name}: the index is no longer being built`);
+    const s = this.snapshot();
+    if (refusal(s, { kind: "abort", of: epoch, reason }) === null) {
+      this.b.tx(() => {
+        this.record({ kind: "abort", of: epoch, reason });
+        this.setLease(epoch, null);
+      });
+      return { reason };
     }
-    this.append({ ...publishBuild(this.current().tables[table]!, b.build!), at }, b.version + 1);
-    return this.current();
-  }
-
-  /**
-   * 取引が読んだ表を DROP する前に、その表を書き込み禁止にする (specs/m14_rebuild_guard.qnt)。表定義の形は変えない。
-   * 次の版は、finishLock が記録する DROP か、取り消しである。期限は index の作成と同じく、延ばし続ける。
-   */
-  async lockTables(tables: string[], basedOn?: number): Promise<Catalog> {
-    this.expire();
-    const cat = this.current();
-    if (basedOn !== undefined && basedOn !== cat.version) throw new SchemaMoved(cat.version, cat.schema);
-    this.assertFreeForDdl();
-    const defs = tables.map((t) => {
-      const def = cat.tables[t];
-      if (!def) throw new SqlError(`no such table: ${t}`);
-      return { ...structuredClone(def), locked: `DROP TABLE ${t} by a transaction that read it` };
-    });
-    const version = cat.version + 1;
-    this.append({ sql: [], defs, drops: [], user: null, guard: { tables }, undo: { sql: [], user: null } }, version);
-    const now = this.rt.now();
-    this.setLease({ version, started: now, until: now + this.leaseMs });
-    return this.current();
-  }
-
-  /** 書き込み禁止の版 (lockTables) を、その DROP で終える。version は禁止の版で、それが最新の版のままでなければ断る。 */
-  async finishLock(version: number, sql: string): Promise<Catalog> {
-    this.expire();
-    const b = this.building();
-    if (this.faults.dropAfterExpiry && !(b?.guard && b.version === version)) {
-      // 欠陥のスイッチ: DROP が禁止と結び付いていない。期限切れで禁止が解けた後でも、最新の版の次に DROP を記録する。
-      const cat = this.current();
-      this.append(parseDdl(sql, cat), cat.version + 1);
-      return this.current();
-    }
-    if (!b?.guard || b.version !== version) throw new SqlError(`DROP TABLE: the lock on the table was withdrawn before the table was dropped`);
-    const parsed = parseDdl(sql, this.current());
-    if (!b.guard.tables.every((t) => parsed.drops.includes(t))) throw new SqlError(`DROP TABLE: the statement does not drop ${b.guard.tables.join(", ")}`);
-    this.append(parsed, version + 1);
-    return this.current();
+    const why = this.closedReason(epoch);
+    if (/was already committed|is not open/.test(why)) throw new SqlError(`cannot withdraw: ${why}`);
+    return { reason: why };
   }
 
   /** rowid を n 個採番する。min は利用者が明示した値で、これより大きい値から続ける。 */
@@ -538,3 +541,5 @@ export class MetaCore {
     return start;
   }
 }
+
+export type { OpenDdl };

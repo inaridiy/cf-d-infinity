@@ -1,12 +1,10 @@
 import { compoundTerms, depthOf, SHARD_LIMITS } from "../src/shard-limits";
 import { createHash } from "node:crypto";
-import { appendFileSync, mkdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { Db, type ClientFaults, type Cluster } from "../src/client/db";
 import { keyString } from "../src/keys";
 import { fold, type EpochRecord } from "../src/catalog";
-import { MetaCore, type SplitMove, type SplitSlot } from "../src/meta";
-import { MetaCore as OldMeta, stage1Answer, stage1Error } from "./meta-old";
+import { MetaCore, type Catalog, type SplitMove, type SplitSlot } from "../src/meta";
 import { initialRouting, shardsOf, tokenOf, type Interval, type Routing } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
@@ -391,9 +389,14 @@ export class SimNet {
 /** Worker の側の欠陥のスイッチの名前 (src/client/db.ts の ClientFaults)。 */
 const CLIENT_FAULTS = new Set([
   "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
-  "publishBeforeBackfill", "scanBeforeLock", "scanSkipsEmpty", "guardFromCommitTs", "splitWithoutSync",
+  "publishBeforeBackfill", "checkBeforePrepare", "scanSkipsEmpty", "guardFromCommitTs", "splitWithoutSync",
   "lockedReadsSkipValidation", "secondDmlNewSince", "secondDmlNewSpanSince",
 ]);
+/**
+ * Worker と Meta の両方が読むスイッチの名前。1 つの欠陥を、2 つの守りを外して戻す (commitWithoutAcks は、Worker が 1 つのシャードの
+ * prepared を待たず、Meta が ok の集合を確かめない)。injectedFault は、両方に入れる。
+ */
+const BOTH_FAULTS = new Set(["commitWithoutAcks"]);
 /** 範囲の作り方の欠陥のスイッチの名前 (src/client/spans.ts の spanFaults)。test/setup.ts が入れる。 */
 export const SPAN_FAULTS = new Set(["rowSpanDespiteUnique"]);
 /** 行イメージを値に戻すところの欠陥のスイッチの名前 (src/shard/rows.ts の imageFaults)。test/setup.ts が入れる。 */
@@ -403,10 +406,13 @@ export const IMAGE_FAULTS = new Set(["roundedImages"]);
  * 環境変数 FAULT で、欠陥のスイッチを 1 つ、全部のシミュレータに入れる。乱択の検査が、その欠陥を見つけるかを測るためにある
  * (scripts/fault-table.mjs)。試験が自分で入れるスイッチには、上書きせずに足す。
  */
-export function injectedFault(): { name: string; side: "shard" | "client" | "span" | "image" } | null {
+export function injectedFault(): { name: string; side: "shard" | "client" | "both" | "span" | "image" } | null {
   const name = process.env.FAULT;
   if (!name) return null;
-  return { name, side: CLIENT_FAULTS.has(name) ? "client" : SPAN_FAULTS.has(name) ? "span" : IMAGE_FAULTS.has(name) ? "image" : "shard" };
+  return {
+    name,
+    side: BOTH_FAULTS.has(name) ? "both" : CLIENT_FAULTS.has(name) ? "client" : SPAN_FAULTS.has(name) ? "span" : IMAGE_FAULTS.has(name) ? "image" : "shard",
+  };
 }
 
 export interface SimOptions {
@@ -437,7 +443,7 @@ export interface SimOptions {
   noImageCheck?: boolean;
   /** 仮想の実行環境の seed。同じ seed なら同じ実行になる。 */
   seed?: number;
-  /** index を既存の行から作る間の、書き込み禁止の期限と、その上限 (ms)。既定は meta.ts の INDEX_LEASE_MS と INDEX_BUILD_MAX_MS。 */
+  /** 表定義の遷移 (prepare から commit か abort まで) の、書き込み禁止の期限と、その上限 (ms)。既定は meta.ts の LEASE_MS と TRANSITION_MAX_MS。 */
   leaseMs?: number;
   buildMaxMs?: number;
   /**
@@ -502,63 +508,16 @@ export const realTimeCluster = { now: false };
 export function withOverrides(c: SimCluster, over: Partial<Cluster>): Cluster {
   return new Proxy(c as unknown as Cluster, { get: (t, p, r) => (p in over ? (over as Record<string | symbol, unknown>)[p] : Reflect.get(t, p, r)) });
 }
+/**
+ * RPC m が、表定義の記録 version (表定義の epoch) をシャードへ届ける要求か。段 3 から、prepare の記録は、進める側が prepared で届け、
+ * commit と abort の記録は、終えた後の syncSchema で届く。試験が、記録がシャードへ届くのを止める (net.gate) のに使う。
+ */
+export const delivers = (m: Pick<Rpc, "method" | "req">, version: number): boolean =>
+  (m.method === "prepared" && (m.req as { epoch: number }).epoch === version) ||
+  (m.method === "syncSchema" && (m.req as { schema: number }).schema === version);
+
 /** 行イメージの検査を、いまの試験の間だけ止めているか (SimOptions の noImageCheck)。test/setup.ts が試験ごとに戻す。 */
 export const imageCheckOff = { now: false };
-
-/**
- * META_SHADOW=<ディレクトリ> のとき、Meta の呼び出しを、段 1 より前の Meta (test/meta-old.ts) にも同じ順で流し、答えを比べる
- * (docs/design-catalog-epoch.md の段 1 の検査 (b))。違えば、呼び出しと 2 つの答えを、そのディレクトリのプロセスごとのファイルに書く。
- * 返すのは新しい Meta の答えなので、実行は変わらない。古い Meta には時計だけを渡し、乱数を渡さない。baton の鍵の乱数を取り合うと、
- * 実行が変わるからである。そのため baton の鍵は比べない。保存データから起動するクラスタ (stored) には掛けない。
- */
-function shadowMeta(next: MetaCore, old: OldMeta, dir: string): MetaCore {
-  const show = (x: unknown) => JSON.stringify(x, (_k, v) => (typeof v === "bigint" ? `${v}n` : v)) ?? "undefined";
-  // 新しい Meta の答えは、段 2 で足したもの (Catalog の epoch と schema など) を落としてから比べる (meta-old.ts の stage1Answer)。
-  const outcome = (r: PromiseSettledResult<unknown>, stage1: boolean): string => {
-    if (r.status === "fulfilled") return show(stage1 ? stage1Answer(r.value) : r.value);
-    if (stage1) {
-      const x = stage1Error(r.reason);
-      return `throws ${x.name}: ${x.message} ${show(x.fields)}`;
-    }
-    const e = r.reason as Error;
-    return `throws ${e?.constructor?.name}: ${e?.message} ${show({ ...e })}`;
-  };
-  const settle = (f: () => unknown): Promise<unknown> => {
-    try {
-      return Promise.resolve(f());
-    } catch (e) {
-      return Promise.reject(e);
-    }
-  };
-  mkdirSync(dir, { recursive: true });
-  return new Proxy(next, {
-    get(target, k, receiver) {
-      const f = Reflect.get(target, k, receiver) as unknown;
-      if (typeof f !== "function" || k === "batonSecret") return f;
-      const g = Reflect.get(old, k) as ((...a: unknown[]) => unknown) | undefined;
-      // 段 2 で足した入口 (epochsSince) は、古い Meta にないので比べない。
-      if (typeof g !== "function") return f;
-      return (...args: unknown[]) => {
-        const copy = structuredClone(args);
-        let out: unknown;
-        let thrown: { e: unknown } | null = null;
-        try {
-          out = (f as (...a: unknown[]) => unknown).apply(target, args);
-        } catch (e) {
-          thrown = { e };
-        }
-        const mine = thrown ? Promise.reject(thrown.e) : Promise.resolve(out);
-        void Promise.allSettled([mine, settle(() => g.apply(old, copy))]).then(([a, b]) => {
-          const x = outcome(a!, true);
-          const y = outcome(b!, false);
-          if (x !== y) appendFileSync(`${dir}/${process.pid}.txt`, `${String(k)} ${show(copy)}\n  new: ${x}\n  old: ${y}\n`);
-        });
-        if (thrown) throw thrown.e;
-        return out;
-      };
-    },
-  });
-}
 
 export class SimCluster implements Cluster {
   /** 起動時のシャード。増設後の一覧は catalog の routing を見る。 */
@@ -594,8 +553,8 @@ export class SimCluster implements Cluster {
 
   constructor(private o: SimOptions = {}) {
     const injected = injectedFault();
-    if (injected?.side === "shard") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
-    this.clientFaults = injected?.side === "client" ? { ...o.clientFaults, [injected.name]: true } : o.clientFaults;
+    if (injected?.side === "shard" || injected?.side === "both") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
+    this.clientFaults = injected?.side === "client" || injected?.side === "both" ? { ...o.clientFaults, [injected.name]: true } : o.clientFaults;
     if (process.env.RPC_TRACE) tracedNets.push(this.net);
     if (o.noImageCheck) imageCheckOff.now = true;
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
@@ -604,12 +563,6 @@ export class SimCluster implements Cluster {
     this.shardIds = o.stored ? [...o.stored.shards.keys()] : Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
     this.metaBackend = new SqliteBackend(o.stored?.meta);
     this.meta = new MetaCore(this.metaBackend, this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs, faults: o.faults });
-    if (process.env.META_SHADOW && !o.stored) {
-      const rt = this.runtime;
-      const clock: Runtime = { now: () => rt.now(), after: (ms, fn) => rt.after(ms, fn), cancel: (h) => rt.cancel(h), random: () => 0, uuid: () => "shadow" };
-      const old = new OldMeta(new SqliteBackend(), this.shardIds, { runtime: clock, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs, faults: o.faults });
-      this.meta = shadowMeta(this.meta, old, process.env.META_SHADOW);
-    }
     for (const id of this.shardIds) this.core(id);
   }
 
@@ -684,7 +637,7 @@ export class SimCluster implements Cluster {
       runtime: this.runtime,
       peer: (to) => this.stub(id, to),
       meta: {
-        epochsSince: (after) => this.meta.epochsSince(after), revokeDdl: (v, reason) => this.meta.revokeDdl(v, reason),
+        epochsSince: (after) => this.meta.epochsSince(after),
         startSplit: (id, move) => this.meta.startSplit(id, move), checkSplit: (id, move) => this.meta.checkSplit(id, move),
       },
       background: (p) => {
@@ -835,23 +788,20 @@ export class SimCluster implements Cluster {
   catalog() {
     return this.meta.catalog();
   }
-  applyDdl(sql: string, basedOn?: number) {
-    return this.meta.applyDdl(sql, basedOn);
+  prepare(sql: string, opts: { guard?: string[] } = {}, basedOn?: number) {
+    return this.meta.prepare(sql, opts, basedOn);
+  }
+  commit(epoch: number, acks: string[], at?: Ts) {
+    return this.meta.commit(epoch, acks, at);
+  }
+  abort(epoch: number, reason: string) {
+    return this.meta.abort(epoch, reason);
+  }
+  renew(epoch: number) {
+    return this.meta.renew(epoch);
   }
   switchRange(move: Interval & { to: string; from?: string }) {
     return this.meta.switchRange(move);
-  }
-  publishIndex(table: string, name: string, version: number, at: Ts) {
-    return this.meta.publishIndex(table, name, version, at);
-  }
-  revokeDdl(version: number, reason: string) {
-    return this.meta.revokeDdl(version, reason);
-  }
-  renewLock(version: number) {
-    return this.meta.renewLock(version);
-  }
-  lockTables(tables: string[], basedOn?: number) {
-    return this.meta.lockTables(tables, basedOn);
   }
   beginSplit(move: SplitMove, basedOn: number) {
     return this.meta.beginSplit(move, basedOn);
@@ -863,16 +813,30 @@ export class SimCluster implements Cluster {
     return this.meta.splits();
   }
   /**
-   * 試験が分割の段を自分で進めるための、分割の枠。Autoscaler の split と同じく、全シャードに最新の版を適用させてから取る。
+   * 試験が分割の段を自分で進めるための、分割の枠。Autoscaler の split と同じく、全シャードに最新の表定義を適用させてから取る。
    * 返る id を、beginIncoming と fence に渡す。
    */
   async reserveSplit(parent: string, child: string, range: Interval): Promise<SplitSlot> {
     const cat = await this.catalog();
     for (const id of shardsOf(cat.routing)) await this.shard(id).syncSchema({ schema: cat.schema });
-    return this.meta.beginSplit({ parent, child, ...range }, cat.version);
+    return this.meta.beginSplit({ parent, child, ...range }, cat.schema);
   }
-  finishLock(version: number, sql: string) {
-    return this.meta.finishLock(version, sql);
+  /**
+   * 試験が、表定義の変更を 1 手ずつ進めるための入口。DDL の prepare を記録し、全シャードの prepared の ok を集めて commit する
+   * (Db の changeSchema の、mode ごとの仕事を除いた形)。どこかのシャードが ok と答えなければ abort し、その理由で失敗する。
+   */
+  async applyDdl(sql: string): Promise<Catalog> {
+    const cat = await this.catalog();
+    const p = await this.meta.prepare(sql, {}, cat.schema);
+    if (p.epoch === null) return p.catalog;
+    const shards = shardsOf(p.catalog.routing);
+    const answers = await Promise.all(shards.map((id) => this.shard(id).prepared({ epoch: p.epoch! })));
+    const bad = answers.find((a) => !a.ok);
+    if (bad) {
+      await this.meta.abort(p.epoch, bad.reason ?? "refused");
+      throw new Error(bad.reason);
+    }
+    return this.meta.commit(p.epoch, shards);
   }
   allocate(table: string, n: number, min?: number) {
     return this.meta.allocate(table, n, min);

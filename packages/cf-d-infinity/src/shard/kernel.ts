@@ -19,7 +19,8 @@ import {
   ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, TableLocked, WriteOutsideClaim, checkStorageFormat, isWideSpan,
   spanCovers, utf8Length, unprotectedSpans,
 } from "../types";
-import { fold, isDdlRecord, type DdlEntry, type Logged, type Snapshot } from "../catalog";
+import { describeOpen, fencedBy, fold, isDdlRecord, type Logged, type OpenDdl, type Snapshot } from "../catalog";
+import type { ParsedDdl } from "../sql/ddl";
 import { blockOf, checkInterval, overlaps, rangeText, sameInterval, slotAligned, slotOf, tokenOf, type Interval } from "../routing";
 import { keyString } from "../keys";
 import { type Runtime, systemRuntime } from "../runtime";
@@ -316,13 +317,13 @@ export interface CatchUpFrame {
   got?: Logged[];
 }
 
-/** schemaFailed の frame。 */
-export interface SchemaFailedFrame {
-  entry: DdlEntry;
-  message: string;
-  asked?: true;
-  /** 取り消す版の番号。取り消せなければ null。 */
-  reverted?: number | null;
+/** prepared (表定義の遷移の prepare を適用したかを答える) の frame。 */
+export interface PreparedFrame {
+  req: { epoch: number; early?: true };
+  /** prepare の epoch まで、列の適用を待った。 */
+  reached?: true;
+  /** 欠陥のスイッチ checkBeforePrepare: 適用せずに読んだ、その prepare の記録。 */
+  got?: Logged[];
 }
 
 /** settleAllIntents の frame。 */
@@ -344,8 +345,8 @@ export interface ArriveFrame {
 /** beginIncoming の frame。 */
 export interface BeginIncomingFrame {
   req: Interval & { from: string; slot: string };
-  /** Meta が返した、受け取り始める版と、その表定義の epoch。 */
-  slot?: { version: number; schema: number };
+  /** Meta が返した、受け取り始める表定義の epoch。 */
+  slot?: { schema: number };
   reached?: true;
   stored?: true;
 }
@@ -596,7 +597,7 @@ export interface Sig {
   reach: [ReachFrame, void];
   apply: [ApplyFrame, void];
   catchUp: [CatchUpFrame, void];
-  schemaFailed: [SchemaFailedFrame, void];
+  prepared: [PreparedFrame, { ok: boolean; reason?: string }];
   settleAll: [SettleAllFrame, void];
   arrive: [ArriveFrame, void];
   beginIncoming: [BeginIncomingFrame, { schema: number }];
@@ -865,18 +866,18 @@ export class ShardKernel {
     this.b.exec(`INSERT INTO __meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, k, v);
   }
 
-  /** 適用に失敗し、取り消せもしなかった DDL。直るまで、このシャードは要求を受けられない。 */
-  private schemaStuck: { version: number; message: string } | null = null;
+  /**
+   * 適用に失敗した commit。試しに通った文が、同じ行に対して通らなかった (保存の障害のほかには起きないはずである。M21 の commitApplies)。
+   * 取り消しはないので、直るまで、このシャードは要求を受けられない。health が報告する。
+   */
+  private schemaStuck: { epoch: number; message: string } | null = null;
 
   private def(table: string): TableDef {
     const d = this.defs.get(table);
     if (!d) throw new SqlError(`no such table: ${table}`);
     return d;
   }
-  /**
-   * 写しを畳み直し、表定義と表定義の epoch を取り直す。取り消された版と、それを取り消す版は、畳むと取り消す前の表定義に戻るので、
-   * 適用のときに実行を飛ばした組 (applyStep の skip) も、飛ばさなかった組も、同じ表定義になる。
-   */
+  /** 写しを畳み直し、表定義と表定義の epoch を取り直す。 */
   private resnap(): void {
     this.snap = fold(this.log);
     this.defs = new Map(Object.entries(this.snap.tables));
@@ -1233,7 +1234,7 @@ export class ShardKernel {
       oldestIntentMs: oldest === 0 ? 0 : Math.max(0, this.deps.clock.now() - tsToPhysical(oldest)),
       unapplied: one(`SELECT count(*) v FROM __txn WHERE status = 'committed' AND done = 0`),
       redriveErrors: this.lastRedriveErrors,
-      schemaError: this.schemaStuck ? `schema change ${this.schemaStuck.version}: ${this.schemaStuck.message}` : null,
+      schemaError: this.schemaStuck ? `schema change of epoch ${this.schemaStuck.epoch}: ${this.schemaStuck.message}` : null,
       incoming: this.incoming.length,
       outgoing: this.fenced.filter((f) => !f.done).length,
       logGenerations: this.logGens().length,
@@ -1897,9 +1898,10 @@ export class ShardKernel {
 
   /**
    * 取引がこのシャードに書く変更を、確定の前に確かめる。書き込みは、取引でも autocommit でも、必ずここを通る。
-   *   表が書き込み禁止でないこと。index を既存の行から作っている間、その表の行は変わってはならない。
+   *   表が書き込み禁止でないこと。表定義の遷移の prepare から commit か abort まで、fence の表の行は変わってはならない。
    *   変更ログの 1 行に収まること。
-   * 書き込み禁止の印は表定義にあるので、要求の版が現行であることを確かめた同期区間の印を受け取る。
+   * 書き込み禁止は、このシャードのスナップショットの開いている遷移なので、要求の表定義の epoch が現行であることを確かめた
+   * 同期区間の印を受け取る。
    */
   private assertWriteSetFits(_sec: Section<"schema">, writes: Change[]): void {
     this.assertUnlocked(writes);
@@ -1911,13 +1913,15 @@ export class ShardKernel {
     }
   }
 
-  /** 書き込む表が、表定義の変更で書き込み禁止になっていないか。 */
+  /**
+   * 書き込む表が、開いている表定義の遷移の fence にないか (docs/design-catalog-epoch.md の「要求ごとの確かめ」の書き込み禁止)。
+   * 禁止は、このシャードが prepare を適用したときから、commit か abort を適用するまで続く。
+   */
   private assertUnlocked(writes: Pick<Change, "table">[]): void {
-    if (this.faults.ignoreTableLock) return;
+    if (this.faults.ignoreTableLock || this.snap.opens.length === 0) return;
     for (const w of writes) {
-      const def = this.defs.get(w.table);
-      if (def?.building) throw new TableLocked(w.table, `CREATE INDEX ${def.building.name}`);
-      if (def?.locked) throw new TableLocked(w.table, def.locked);
+      const by = fencedBy(this.snap, w.table);
+      if (by) throw new TableLocked(w.table, describeOpen(by));
     }
   }
 
@@ -2161,10 +2165,17 @@ export class ShardKernel {
   }
 
   /**
-   * Meta の列の続きを取り、順に 1 つずつ写しに足す。表定義の版 (段 1 の commit の記録) は、文を実行してから足す。
-   * 先に、このシャードが持つ intent をすべて決着させる。intent の行イメージは DDL より前の表の形なので、
-   * 表や列が消えた後では適用できない。確定済みの取引がそうなると、再駆動が永久に失敗する。
-   * 範囲の記録 (move-start、move-end) は、文を持たない。写しに足すだけで、intent の決着も要らない (catchUpStep)。
+   * Meta の列の続きを取り、順に 1 つずつ写しに足す (docs/design-catalog-epoch.md の「列の適用」)。
+   * 先に、このシャードが持つ intent をすべて決着させる。intent の行イメージは DDL より前の表の形なので、表や列が消えた後では
+   * 適用できない。確定済みの取引がそうなると、再駆動が永久に失敗する。prepare の後は fence の表に新しい intent ができないので、
+   * commit の文は、決着していない書き込みのない表に掛かる。
+   * 記録ごとの手は次のとおりで、どれも記録を写しに足すのと同じ 1 つの同期の取引で行う。
+   *   prepare  staging の表 (index の表) を作る。以後、fence の表への書き込みを断る (assertUnlocked)。利用者の表には触らない。
+   *   commit   prepare の ddl の文を実行する。at があれば時計を進め、ddlFloor を取り直す。
+   *   abort    staging の表を名前で消す。禁止が解ける。
+   *   範囲の記録 (genesis、move-start、move-end)  文を持たない (catchUpStep も、これだけを適用する)。
+   * commit の文が通らなければ (試しに通った文が、同じ行に対して通らない。保存の障害のほかには起きないはずである)、取り消しはせず、
+   * このシャードは止まる (schemaStuck。health が報告する)。
    */
   private applyStep(f: ApplyFrame): Step<void, ApplyFrame> {
     if (!f.settled) {
@@ -2176,46 +2187,88 @@ export class ShardKernel {
       if (!this.faults.ddlIgnoresIntents) return wait(this.call("settleAll", {}));
     }
     if (!f.got) return wait({ kind: "meta", method: "epochsSince", args: [this.applied] }, "got");
-    // 取り消された版と、それを取り消す版 (段 1 の形)。このシャードがまだ適用していなければ、両方とも実行しない。
-    // 版は DdlEntry.version の数で比べる (表定義の epoch ではない)。
-    const skip = new Set<number>();
-    for (const { rec } of f.got) {
-      if (rec.kind === "commit" && "ddl" in rec && rec.ddl.reverts !== undefined && rec.ddl.reverts > this.snap.version) skip.add(rec.ddl.reverts).add(rec.ddl.version);
-    }
-    let stored = false;
     for (const x of f.got) {
       if (x.epoch <= this.applied) continue;
       if (x.epoch !== this.applied + 1) throw new SqlError(`shard ${this.id} has applied the epoch log up to ${this.applied}, but the next record is epoch ${x.epoch}`);
       const rec = x.rec;
-      if (rec.kind === "prepare" || rec.kind === "abort" || (rec.kind === "commit" && !("ddl" in rec))) {
-        throw new SqlError(`epoch ${x.epoch}: shard ${this.id} cannot apply a ${rec.kind} record of a two-phase schema change (stage 3)`);
-      }
-      const e: DdlEntry | null = rec.kind === "commit" ? rec.ddl : null;
-      const skipped = e !== null && skip.has(e.version);
+      const statements = this.statementsOf(rec);
       try {
         this.b.tx(() => {
-          if (e && !skipped) for (const stmt of e.sql) this.b.exec(stmt);
+          for (const stmt of statements) this.b.exec(stmt);
           this.store(x);
         });
       } catch (err) {
-        if (stored) this.resnap();
-        if (!e) throw err;
-        return tail(this.call("schemaFailed", { entry: e, message: (err as Error).message }));
+        if (rec.kind !== "commit") throw err;
+        this.schemaStuck = { epoch: x.epoch, message: (err as Error).message };
+        throw new SqlError(`schema change of epoch ${x.epoch} cannot be applied on shard ${this.id}: ${(err as Error).message}`);
       }
       this.log.push(x);
-      stored = true;
-      if (!e) continue;
-      this.schemaStuck = null;
       this.resnap();
-      // index を公開する版は、時刻を運ぶ。index を使わずに確定した書き込みは、どのシャードのものも、この時刻以下である。
+      if (rec.kind !== "commit") continue;
+      this.schemaStuck = null;
+      // index を公開する commit は、時刻を運ぶ。index を使わずに確定した書き込みは、どのシャードのものも、この時刻以下である。
       // ここから先、このシャードで読む文は index を使う。その文が、時刻の順で、それらの書き込みの後ろに来るようにする。
-      if (e.at !== undefined && !this.faults.publishWithoutClock) this.observe(e.at);
+      if (rec.at !== undefined && !this.faults.publishWithoutClock) this.observe(rec.at);
       // 変更ログの行イメージは DDL より前の形なので、それより古い T は読み戻せない。
       this.ddlFloor = this.issue();
       this.metaSet("ddl_floor", this.ddlFloor);
     }
-    if (stored) this.resnap();
     return done(undefined);
+  }
+
+  /** 記録を写しに足すときに、同じ取引で実行する文。いまのスナップショット (記録の直前まで畳んだもの) から決める。 */
+  private statementsOf(rec: Logged["rec"]): string[] {
+    switch (rec.kind) {
+      case "prepare":
+        return rec.staging?.sql ?? [];
+      case "commit":
+        return this.openOf(rec.of).ddl.sql;
+      case "abort":
+        return (this.openOf(rec.of).staging?.defs ?? []).map((d) => `DROP TABLE IF EXISTS ${q(d.name)}`);
+      default:
+        return [];
+    }
+  }
+  private openOf(epoch: number): OpenDdl {
+    const o = this.snap.opens.find((x) => x.epoch === epoch);
+    if (!o) throw new SqlError(`shard ${this.id}: epoch ${epoch} is not an open schema change in the epoch log it applied`);
+    return o;
+  }
+
+  /**
+   * 表定義の遷移の prepare を適用したかを答える (ShardApi.prepared)。epoch まで列を適用し (intent を決着させ、fence の表への
+   * 書き込みを止める)、その遷移が自分のスナップショットで開いていれば ok を返す。mode が trial なら、書き込みを止めた表に文を試して
+   * 巻き戻し、SQLite が通したかを返す。表は止まっているので、試した結果は commit を適用するまで変わらない。
+   * 遷移がもう開いていなければ (先に abort を適用した)、ok: false を返す。
+   */
+  private preparedStep(f: PreparedFrame): Step<{ ok: boolean; reason?: string }, PreparedFrame> {
+    const { epoch, early } = f.req;
+    if (early) {
+      // 欠陥のスイッチ checkBeforePrepare (Worker の側): 列を適用せずに、記録だけを読んで、いまの表で試す。表は止まっていない。
+      if (!f.got) return wait({ kind: "meta", method: "epochsSince", args: [epoch - 1] }, "got");
+      const rec = f.got.find((x) => x.epoch === epoch)?.rec;
+      if (rec?.kind !== "prepare") return done({ ok: false, reason: `epoch ${epoch} is not a schema change` });
+      return done(rec.mode === "trial" ? this.trial(rec.ddl) : { ok: true });
+    }
+    if (!f.reached) {
+      f.reached = true;
+      return wait(this.call("reach", { schema: epoch, catchUp: false }));
+    }
+    const open = this.snap.opens.find((o) => o.epoch === epoch);
+    if (!open) return done({ ok: false, reason: `stale epoch: the schema change of epoch ${epoch} is no longer open on shard ${this.id}` });
+    return done(open.mode === "trial" ? this.trial(open.ddl) : { ok: true });
+  }
+
+  /** 表定義の変更の文を、巻き戻す取引の中で実行し、SQLite が通したかを返す (mode trial)。 */
+  private trial(d: Pick<ParsedDdl, "sql">): { ok: boolean; reason?: string } {
+    try {
+      this.rollback(() => {
+        for (const stmt of d.sql) this.b.exec(stmt);
+      });
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, reason: (e as Error)?.message ?? String(e) };
+    }
   }
 
   /**
@@ -2237,23 +2290,6 @@ export class ShardKernel {
     }
     if (stored) this.resnap();
     return done(undefined);
-  }
-
-  /**
-   * このシャードの行では DDL を適用できなかった。重複のある列への UNIQUE index や、既存の行が CHECK に反する ADD COLUMN で起きる。
-   * 放置すると、このシャードは全要求を断り続ける。Meta に取り消しを求め、取り消す版ごと読み飛ばして先へ進む。
-   */
-  private schemaFailedStep(f: SchemaFailedFrame): Step<void, SchemaFailedFrame> {
-    const e = f.entry;
-    if (!f.asked) {
-      f.asked = true;
-      return wait({ kind: "meta", method: "revokeDdl", args: [e.version, f.message], orNull: true }, "reverted");
-    }
-    if (f.reverted === null) {
-      this.schemaStuck = { version: e.version, message: f.message };
-      throw new SqlError(`schema change ${e.version} cannot be applied on shard ${this.id}: ${f.message}`);
-    }
-    return tail(this.call("apply", { catchUp: true }));
   }
 
   /**
@@ -3008,9 +3044,9 @@ export class ShardKernel {
   }
 
   /**
-   * 表を消す前の確認 (Db の guardedDrop、specs/m14_rebuild_guard.qnt)。
-   * 先に、表を書き込み禁止にする版を適用する。適用の前に intent を全部決着させ、適用の後は、その表への書き込みを断る。
-   * だから、ここで変更がなければ、表を消すまで、読んだ範囲は変わらない。
+   * 表を消す前の確認 (Db の changeSchema の mode guard、M21 の DROP の場面)。
+   * 先に、表を書き込み禁止にする prepare (要求の schema) を適用する。適用の前に intent を全部決着させ、適用の後は、その表への書き込みを
+   * 断る。だから、ここで変更がなければ、表を消すまで、読んだ範囲は変わらない。
    */
   private unchangedStep(f: UnchangedFrame): Step<{ ok: boolean; reason?: string }, UnchangedFrame> {
     const req = f.req;
@@ -3302,7 +3338,7 @@ export class ShardKernel {
     reach: { step: this.reachStep },
     apply: { step: this.applyStep },
     catchUp: { step: this.catchUpStep },
-    schemaFailed: { step: this.schemaFailedStep },
+    prepared: { step: this.preparedStep },
     settleAll: { step: this.settleAllStep },
     arrive: { step: this.arriveStep },
     beginIncoming: { step: this.beginIncomingStep },

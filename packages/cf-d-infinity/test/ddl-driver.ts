@@ -86,6 +86,7 @@ export async function stopsEverywhere(s: Scenario): Promise<string[]> {
   const free = driver(dry.c, null);
   const whole = await outcome(dry.run(new Db(free.cluster)));
   const steps = free.calls;
+  if (process.env.SHOW_STEPS) console.log(`${s.name}: ${whole}\n  ${steps.join(" ")}`);
   expect(steps.length).toBeGreaterThan(1);
   for (let i = 0; i < steps.length; i++) {
     const at = { i, step: steps[i] };

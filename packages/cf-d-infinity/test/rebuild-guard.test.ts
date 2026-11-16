@@ -16,20 +16,20 @@ import { drizzleMigrationsTable } from "../src/binding";
 import { D1Compatible } from "../src/client/d1";
 import { Db, type ClientFaults } from "../src/client/db";
 import { keyString } from "../src/keys";
-import type { Catalog } from "../src/meta";
+import { readEpochs, type Catalog } from "../src/meta";
 import { ownerOf } from "../src/routing";
 import type { Faults } from "../src/types";
 import { ADD, INIT, REBUILD, migrations } from "./drizzle-fixtures";
 import { clientOf } from "./libsql";
-import { SimCluster } from "./sim";
+import { delivers, SimCluster, withOverrides } from "./sim";
 
 const outcome = (p: Promise<unknown>) => p.then(() => "ok", (e: Error) => e.message);
 
 /**
- * 表定義の epoch version (段 2 から、syncSchema は表定義の epoch を運ぶ) がシャードへ届くのを止める。止めている間に write を流し、
- * それから届ける。この試験の間は分割がないので、次の表定義の記録の epoch は、いまの epoch に 1 を足したものである。
- * capture を渡すと、その版がシャードへ届くときの表定義を取っておき、write に渡す。書き込む側が、書き込み禁止の 1 つ前の版を持つためである。
- * 新しい表定義を取りに行くと、その要求が、書き込み禁止の版をシャードに適用させてしまう。
+ * 表定義の記録 version (表定義の epoch) がシャードへ届くのを止める。止めている間に write を流し、それから届ける。この試験の間は
+ * 分割がないので、次の表定義の記録 (DROP の prepare) の epoch は、いまの epoch に 1 を足したものである。
+ * capture を渡すと、その記録がシャードへ届くときの表定義を取っておき、write に渡す。書き込む側が、書き込み禁止の 1 つ前の表定義を
+ * 持つためである。新しい表定義を取りに行くと、その要求が、書き込み禁止の prepare をシャードに適用させてしまう。
  */
 function writeWhileHeld(c: SimCluster, version: number, write: (cat?: Catalog) => Promise<unknown>, capture?: number): Promise<string> {
   let release!: () => void;
@@ -38,10 +38,8 @@ function writeWhileHeld(c: SimCluster, version: number, write: (cat?: Catalog) =
   const hit = new Promise<void>((r) => (reached = r));
   let snapshot: Promise<Catalog> | undefined;
   c.net.gate = (m) => {
-    if (m.method !== "syncSchema") return undefined;
-    const v = (m.req as { schema: number }).schema;
-    if (v === capture) snapshot ??= c.catalog();
-    if (v !== version) return undefined;
+    if (capture !== undefined && delivers(m, capture)) snapshot ??= c.catalog();
+    if (!delivers(m, version)) return undefined;
     reached();
     return held;
   };
@@ -98,12 +96,15 @@ describe("a transaction that rebuilds a table another connection writes to", () 
       expect(await outcome(db.query(s))).toBe("ok");
     }
     expect(await RESULT(c, "SELECT id, v, w FROM t ORDER BY id")).toEqual([{ id: 1, v: 1, w: null }, { id: 2, v: 2, w: null }]);
-    // 書き込み禁止を掛けた版と、それを終えた DROP の版がある。
-    expect((await c.meta.ddlSince(0)).ddl.filter((e) => e.guard).map((e) => e.guard!.tables)).toEqual([["t"]]);
+    // 書き込みを止めた DROP の遷移 (mode guard) が 1 つあり、確定した。
+    const log = readEpochs(c.metaBackend);
+    const guards = log.flatMap((x) => (x.rec.kind === "prepare" && x.rec.mode === "guard" ? [x] : []));
+    expect(guards.map((x) => (x.rec as { fence: string[] }).fence)).toEqual([["t"]]);
+    expect(log.some((x) => x.rec.kind === "commit" && x.rec.of === guards[0]!.epoch)).toBe(true);
   });
 });
 
-// specs/m14_rebuild_guard.qnt の m14_red_no_drain。書き込み禁止の版を適用するシャードは、その表の intent を決着させてからでないと、
+// M21 の m21_red_drop_no_drain (specs/m14_rebuild_guard.qnt の m14_red_no_drain)。書き込み禁止の prepare を適用するシャードは、その表の intent を決着させてからでないと、
 // 読んだ後の変更の有無を確かめられない。モデルの反例と同じ順で流す: 作り直す取引が表を読んで写す。別の取引が、その表の行を
 // 書いて確定する (anchor は別のシャードで、行のシャードへの phase 2 は届かないまま、intent が残る)。作り直す取引が DROP する。
 describe("the guard settles intents before it checks for changes (m14_red_no_drain)", () => {
@@ -127,7 +128,7 @@ describe("the guard settles intents before it checks for changes (m14_red_no_dra
     await w.query("SELECT v FROM u WHERE id = ?", [u1]);
     await w.query("UPDATE u SET v = 2 WHERE id = ?", [u2]);
     await w.query("INSERT INTO t VALUES (?, 4)", [t4]);
-    // DROP は、写した部分を先に確定し、それから書き込み禁止の版を記録してシャードに適用させる。その適用を止めている間に、
+    // DROP は、写した部分を先に確定し、それから書き込み禁止の prepare を記録してシャードに適用させる。その適用を止めている間に、
     // 別の取引を確定させる。写した部分の確定の後なので、その検証には当たらない。
     const lock = (await c.catalog()).epoch + 1;
     let release!: () => void;
@@ -138,7 +139,7 @@ describe("the guard settles intents before it checks for changes (m14_red_no_dra
     const hit = new Promise<void>((r) => (reached = r));
     c.net.gate = (m) => {
       if (m.method === "finalize" && m.to === "s0") return held;
-      if (m.method === "syncSchema" && (m.req as { schema: number }).schema === lock) {
+      if (delivers(m, lock)) {
         reached();
         return lockHeld;
       }
@@ -180,37 +181,43 @@ describe("the guard settles intents before it checks for changes (m14_red_no_dra
   });
 });
 
-// specs/m14_rebuild_guard.qnt の m14_red_untied。DROP は、書き込み禁止の唯一の終わり方として記録する。禁止が期限で取り消された後の
-// DROP は通さない (TIED)。モデルの反例と同じ順で流す: 作り直す取引が表を読んで写し、確定する。書き込み禁止の版を記録し、全シャードが
-// 適用し、読んだ後に変更がないことを確かめる。ここで DROP を進める側が止まり、禁止が期限で取り消される (expire)。別の接続が表へ書いて
-// 確定する。遅れて届いた DROP を記録する。
-describe("the DROP after a rebuild is recorded only while the lock still holds (m14_red_untied)", () => {
+// M21 の m21_red_drop_untied (specs/m14_rebuild_guard.qnt の m14_red_untied)。DROP の commit は、開いている遷移の唯一の終わり方として
+// 記録する。禁止が期限で abort された後の commit は通さない (ONE_EXIT)。モデルの反例と同じ順で流す: 作り直す取引が表を読んで写し、
+// 確定する。書き込み禁止の prepare を記録し、全シャードが適用し、読んだ後に変更がないことを確かめる。ここで DROP を進める側が止まり、
+// 遷移が期限で abort される (expire)。別の接続が表へ書いて確定する。遅れて届いた commit を記録させる。
+describe("the DROP after a rebuild is committed only while the lock still holds (m21_red_drop_untied)", () => {
   const scenario = async (faults: Faults = {}) => {
     const c = new SimCluster({ shards: 2, faults });
     await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)");
     await new Db(c).query("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)");
-    // DROP を進める側は、確かめた後で止まる。期限を延ばさず、DROP の記録は、通すまで Meta に届かない。
+    // DROP を進める側は、確かめた後で止まる。期限を延ばさず、commit の記録は、通すまで Meta に届かない。
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     let reached!: () => void;
     const hit = new Promise<void>((r) => (reached = r));
-    const stalled = Object.assign(Object.create(c) as SimCluster, {
-      renewLock: () => new Promise<{ leaseMs: number }>(() => {}),
-      finishLock: async (version: number, sql: string) => {
-        reached();
-        await held;
-        return c.finishLock(version, sql);
+    // 止まるのは DROP の遷移だけである (armed の後)。その前の CREATE TABLE は、ふつうに進む。
+    let armed = false;
+    const stalled = withOverrides(c, {
+      renew: (epoch) => (armed ? new Promise<{ leaseMs: number }>(() => {}) : c.renew(epoch)),
+      commit: async (epoch, acks, at) => {
+        if (armed) {
+          reached();
+          await held;
+        }
+        return c.commit(epoch, acks, at);
       },
     });
     const db = new Db(stalled);
     await db.query("BEGIN");
     await db.query("CREATE TABLE __new_t(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)");
     await db.query("INSERT INTO __new_t(id, v) SELECT id, v FROM t");
+    armed = true;
     const dropping = outcome(db.query("DROP TABLE t"));
     await hit;
-    // 別の接続の書き込みは、禁止に断られ、期限で取り消されるのを待ってから通る。
+    armed = false;
+    // 別の接続の書き込みは、禁止に断られ、期限で abort されるのを待ってから通る。
     const written = await outcome(new Db(c).query("INSERT INTO t VALUES (4, 4)"));
-    const revoked = (await c.catalog()).revoked?.reason ?? null;
+    const revoked = (await c.catalog()).aborted?.reason ?? null;
     release();
     const drop = await dropping;
     const rename = drop === "ok" ? await outcome(db.query("ALTER TABLE __new_t RENAME TO t")) : "skipped";
@@ -227,8 +234,8 @@ describe("the DROP after a rebuild is recorded only while the lock still holds (
     expect(r.rows).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }]);
   });
 
-  it("put back: a DROP not tied to the lock goes through after it lapsed, and the row is lost", async () => {
-    const r = await scenario({ dropAfterExpiry: true });
+  it("put back (commitAfterAbort): a DROP not tied to the lock goes through after it lapsed, and the row is lost", async () => {
+    const r = await scenario({ commitAfterAbort: true });
     expect(r.written).toBe("ok");
     expect(r.revoked).toMatch(/stopped before it finished and was withdrawn/);
     expect({ drop: r.drop, rename: r.rename }).toEqual({ drop: "ok", rename: "ok" });
@@ -239,7 +246,7 @@ describe("the DROP after a rebuild is recorded only while the lock still holds (
 // specs/m14_rebuild_guard.qnt の m14_red_commit_ts。DROP の前の確認は、取引が読んだ範囲に、読んだ時刻より後の変更がないかを見る
 // (CHECK_FROM_READ)。copy が読んだシャードは、どれも読んだ時刻を見ている。確定の時刻は、見ていないシャードがあり、そこでの後の書き込みは、
 // 確定の時刻より小さい時刻を持ち得る。モデルの反例と同じ順で流す: copy が全シャードで表を読む。時計の進んだシャード (anchor) で確定する。
-// 別の接続が、確定の時刻を見ていないシャードの古い表へ書いて確定する。書き込み禁止の版を記録し、全シャードが適用し、確かめ、DROP する。
+// 別の接続が、確定の時刻を見ていないシャードの古い表へ書いて確定する。書き込み禁止の prepare を記録し、全シャードが適用し、確かめ、DROP する。
 // 実装では、確定の時刻は、読んだシャードの全部に、確定の前の refresh で届く (specs/m1_serializable_commit.qnt の m1_red_c の守り)。
 // だから、確定の時刻と比べても、それだけでは見落とさない。モデルの「確定の時刻を見ていないシャード」は、refresh が時計を進めないときに現れる。
 describe("the guard checks for changes from the time the copy read the table (m14_red_commit_ts)", () => {
@@ -267,7 +274,7 @@ describe("the guard checks for changes from the time the copy read the table (m1
     await other.query("SELECT count(*) FROM t");
     // anchor の時計が進む (モデルの tick)。s1 の時計は 5 秒遅れていて、読みの要求が運んだ時刻のまま進まない。
     await c.sleep(100);
-    // copy の確定の phase 2 が s1 に届くのを止める。書き込み禁止の版の適用を止めている間に、別の接続が s1 へ書く。
+    // copy の確定の phase 2 が s1 に届くのを止める。書き込み禁止の prepare の適用を止めている間に、別の接続が s1 へ書く。
     const lock = (await c.catalog()).epoch + 1;
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
@@ -279,7 +286,7 @@ describe("the guard checks for changes from the time the copy read the table (m1
     c.net.gate = (m) => {
       if (m.method === "commit") anchor ??= m.to;
       if (m.method === "finalize" && m.to === "s1") return held;
-      if (m.method === "syncSchema" && (m.req as { schema: number }).schema === lock) {
+      if (delivers(m, lock)) {
         reached();
         return lockHeld;
       }
@@ -372,11 +379,11 @@ describe("a Drizzle migration that rebuilds a table while the application writes
     await client.execute(drizzleMigrationsTable());
     expect(await outcome(migrate(drizzle(client), { migrationsFolder: migrations([INIT, ADD]) }))).toBe("ok");
     await client.execute("INSERT INTO users(id, email, name, age) VALUES (1, 'a@x', 'A', 30), (2, 'b@x', NULL, 40)");
-    // 作り直しの移行は、PRAGMA、新しい表の作成 (+1)、行を写す、古い表の DROP の前の書き込み禁止 (+2) の順に進む。
-    // アプリは、新しい表を作った版の表定義を持って書く (capture)。
+    // 作り直しの移行は、PRAGMA、新しい表の作成 (prepare +1、commit +2)、行を写す、古い表の DROP の前の書き込み禁止 (prepare +3) の順に
+    // 進む。アプリは、新しい表を作った commit の表定義を持って書く (capture)。
     const v = (await c.catalog()).epoch;
     const app = (cat?: Catalog) => new Db(c, { catalog: cat }).query("INSERT INTO users(id, email, name) VALUES (3, 'c@x', 'C')");
-    return { c, client, app, lock: v + 2, capture: v + 1 };
+    return { c, client, app, lock: v + 3, capture: v + 2 };
   };
   const users = (c: SimCluster) => RESULT(c, "SELECT id, email FROM users ORDER BY id");
 
@@ -405,7 +412,7 @@ describe("a write to a table locked by a schema change", () => {
     // 禁止を掛けた側は延長しないので、期限を長くしておく。
     const c = new SimCluster({ shards: 2, leaseMs: 120_000 });
     await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)");
-    await c.lockTables(["t"]);
+    await c.prepare("DROP TABLE t", { guard: ["t"] });
     const t0 = c.time;
     const r = await outcome(new Db(c).query("INSERT INTO t VALUES (1, 1)"));
     expect(r).toMatch(/^conflict: locked: table t is being changed by a schema change/);

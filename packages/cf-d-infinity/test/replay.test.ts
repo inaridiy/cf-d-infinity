@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import { changesSchema, Db, Txn, type ClientFaults, type Cluster } from "../src/client/db";
 import { handlePipeline, type PipelineReq } from "../src/client/hrana";
 import type { Faults, Value } from "../src/types";
+import { readEpochs } from "../src/meta";
 import { quiescentProblems } from "./invariants";
 import { replay, type ReplayReport, type StatementRecord, type TxnRecord } from "./replay";
 import { asNumbers, prng, seedsOr, SimCluster } from "./sim";
@@ -234,11 +235,15 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
       history.push(rec);
       try {
         await new Db(c).ddl(sql);
-        const at = (await c.meta.ddlSince(0)).ddl.findLast((e) => e.at !== undefined && e.indexes?.[`tok_${col}`] !== undefined)?.at;
-        if (at === undefined) throw new Error(`the version that published tok_${col} carries no timestamp`);
+        // index を公開した commit の記録が運ぶ時刻 (Meta の epoch の列から読む)。
+        // 同じ index の prepare は、先に重複で abort されたものもある。確定した prepare を、commit の of から引く。
+        const log = readEpochs(c.metaBackend);
+        const builds = new Set(log.filter((x) => x.rec.kind === "prepare" && x.rec.ddl.indexes?.[`tok_${col}`] !== undefined).map((x) => x.epoch));
+        const at = log.findLast((x) => x.rec.kind === "commit" && builds.has(x.rec.of))?.rec as { at?: number } | undefined;
+        if (at?.at === undefined) throw new Error(`the commit that published tok_${col} carries no timestamp`);
         rec.statements[0]!.values = [];
         rec.outcome = "committed";
-        rec.at = at + 0.5;
+        rec.at = at.at + 0.5;
         made.add(col);
         ddlLog.push(`${col}: ok`);
       } catch (e) {
@@ -261,8 +266,8 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
           first ??= shard;
           return c.shard(shard);
         },
-        runtime: c.runtime, reference: c.reference, catalog: () => c.catalog(), applyDdl: (q, b) => c.applyDdl(q, b),
-        publishIndex: (t, n, v, at) => c.publishIndex(t, n, v, at), revokeDdl: (v, r) => c.revokeDdl(v, r), renewLock: (v) => c.renewLock(v), lockTables: (t, b) => c.lockTables(t, b), finishLock: (v, q) => c.finishLock(v, q), beginSplit: (m, b) => c.beginSplit(m, b), endSplit: (id) => c.endSplit(id), splits: () => c.splits(), allocate: (t, n, m) => c.allocate(t, n, m), switchRange: (m) => c.switchRange(m),
+        runtime: c.runtime, reference: c.reference, catalog: () => c.catalog(), prepare: (q, o, b) => c.prepare(q, o, b),
+        commit: (e, a, at) => c.commit(e, a, at), abort: (e, r) => c.abort(e, r), renew: (e) => c.renew(e), beginSplit: (m, b) => c.beginSplit(m, b), endSplit: (id) => c.endSplit(id), splits: () => c.splits(), allocate: (t, n, m) => c.allocate(t, n, m), switchRange: (m) => c.switchRange(m),
       };
       if (rnd() < 0.4) {
         // 取引の外の 1 文。
