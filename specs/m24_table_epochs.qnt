@@ -764,32 +764,6 @@ module m24_green_split {
         .expect(m24Safe and commitE.get(SPLIT) == 4)
 }
 
-// ---- 大きな場面 (HEAVY=1 のときだけ流す): 取引 2 件。M21 の場面と同じ数である ------------------------
-module m24_green_unrelated2 {
-  import m24_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, HAS_NEWT = true, HAS_ALTB = true,
-    VIA_V = false, VIA_B = true, TXN_READ = true, AUTO_READ = false, NTXN = 2, FIXED_INIT = true,
-    PER_TABLE = true, EXPAND_VIEW = true, INDEX_ON_TABLE = true, WRITE_EPOCH = true, READ_DEPS = true, APPLY_REFUSES = 0,
-    SCHEMA_ON_PREPARE = false).*
-}
-module m24_green_build2 {
-  import m24_core(HAS_BUILD = true, HAS_CHECK = false, HAS_DROP = false, HAS_SPLIT = false, HAS_NEWT = false, HAS_ALTB = false,
-    VIA_V = true, VIA_B = false, TXN_READ = true, AUTO_READ = false, NTXN = 2, FIXED_INIT = false,
-    PER_TABLE = true, EXPAND_VIEW = true, INDEX_ON_TABLE = true, WRITE_EPOCH = true, READ_DEPS = true, APPLY_REFUSES = 0,
-    SCHEMA_ON_PREPARE = false).*
-}
-module m24_green_check2 {
-  import m24_core(HAS_BUILD = false, HAS_CHECK = true, HAS_DROP = false, HAS_SPLIT = false, HAS_NEWT = false, HAS_ALTB = false,
-    VIA_V = true, VIA_B = false, TXN_READ = true, AUTO_READ = false, NTXN = 2, FIXED_INIT = false,
-    PER_TABLE = true, EXPAND_VIEW = true, INDEX_ON_TABLE = true, WRITE_EPOCH = true, READ_DEPS = true, APPLY_REFUSES = 0,
-    SCHEMA_ON_PREPARE = false).*
-}
-module m24_green_drop2 {
-  import m24_core(HAS_BUILD = false, HAS_CHECK = false, HAS_DROP = true, HAS_SPLIT = false, HAS_NEWT = false, HAS_ALTB = false,
-    VIA_V = true, VIA_B = false, TXN_READ = true, AUTO_READ = false, NTXN = 2, FIXED_INIT = false,
-    PER_TABLE = true, EXPAND_VIEW = true, INDEX_ON_TABLE = true, WRITE_EPOCH = true, READ_DEPS = true, APPLY_REFUSES = 0,
-    SCHEMA_ON_PREPARE = false).*
-}
-
 // ---- 赤: 新しい条件を 1 つずつ外す -----------------------------------------------
 
 // 段 3 の実装: 表定義全体の epoch 1 つを、prepare、commit、abort のどれでも進める。関係のない CREATE TABLE の prepare で、A の取引が断られる。

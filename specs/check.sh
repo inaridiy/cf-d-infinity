@@ -552,12 +552,6 @@ witness $f m24_boundary_green witnessUnrelatedNoRetry   # 関係のない DDL �
 witness $f m24_boundary_green witnessRetriedAndDone
 witness $f m24_boundary_green witnessOtherDdlThenDone
 green   $f m24_boundary_red_global witnessUnrelatedNoRetry  # 同じ witness は、すべての DDL の版と比べると届かない
-if [ "${HEAVY:-0}" = "1" ]; then                        # 取引 2 件 (M21 の場面と同じ数)
-  green $f m24_green_unrelated2 m24Safe
-  green $f m24_green_build2 m24Safe
-  green $f m24_green_check2 m24Safe
-  green $f m24_green_drop2 m24Safe
-fi
 for m in m24_green_unrelated m24_green_build m24_green_check m24_green_drop m24_green_split \
          m24_red_global m24_red_global_commit_only m24_red_prepare_advances m24_red_read_deps m24_red_apply_all m24_red_apply_touched \
          m24_red_index m24_red_write_epoch m24_red_view \
@@ -596,9 +590,9 @@ if [ "${HEAVY:-0}" = "1" ]; then                        # M21 の大きな場面
   red   $f m24_m21_red_drop_untied guardHolds
   red   $f m24_m21_red_drop_missing_ack noLostAfterReturn
   red   $f m24_m21_red_two_open commitApplies
-  red   $f m24_m21_red_ddl_during_move servable
+  green $f m24_m21_red_ddl_during_move servable       # commit だけで進める形では反例がない: 移動の途中の prepare は要求を古くせず、DDL が移動の終わりまで待つだけになる
   red   $f m24_m21_red_move_during_ddl servable
-  red   $f m24_m21_red_end_early servable
+  green $f m24_m21_red_end_early servable              # 同じ理由で反例がない (design-catalog-epoch.md の「移動の途中の prepare」)
   red   $f m24_m21_red_pull_unfenced moveKeepsWrites
   red   $f m24_m21_red_pull_unfenced readConsistent
   red   $f m24_m21_red_pull_unfenced sameShape

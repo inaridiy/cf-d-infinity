@@ -1103,9 +1103,22 @@ P のロックの TTL は、Q で待っている間は延びないからであ�
 
 1. 失敗した DDL は、触った表の取引も古くしない。SQLite では、失敗した DDL は何も変えない。prepare でも進めると、失敗した B の DDL が、B を読んだ取引を断る (`m24_red_prepare_advances`。`noRefusalWithoutChange` を破る)。
 2. 書き込みは、prepare から終わりまで、書き込み禁止が止める。prepare より前に計画した書き込みは、禁止の間は待ち、abort の後はそのまま通り、commit の後は古い計画として断られる (`m24_green_check` の `witnessAcrossFailedTouched`)。
-3. M21 の不変条件 (`noServeBelowAck` を除く) は、M21 の全部の場面で、commit だけで進める形でも成り立つ。M21 の赤も、全部が同じ不変条件を破る (下の「モデル」)。`noServeBelowAck` は、この形では定義から成り立たない。
+3. M21 の不変条件 (`noServeBelowAck` を除く) は、M21 の全部の場面で、commit だけで進める形でも成り立つ (`specs/m24b_m21_commit_only.qnt` の緑)。M21 の赤 28 個 (35 本) は、2 本を除いて、同じ不変条件を破る。除いた 2 本は、下の「移動の途中の prepare」である。`noServeBelowAck` は、この形では定義から成り立たない。
 
 この形で要るものは 2 つで、上の表に入れた。遷移の仕事の要求が prepare の epoch を別に運ぶこと、書き込み禁止で待つ文が遷移が閉じるまで待つことである。
+
+#### 移動の途中の prepare
+
+commit だけで進める形で M21 の赤を流し直すと、`m21_red_ddl_during_move` (移動の途中に prepare を記録する) と `m21_red_end_early` (子が受け取り終える前に move-end を記録し、その後で prepare を記録する) の `servable` に、反例がなくなった (565,944 と 367,636 状態)。
+段 3 の形では、prepare が表定義の epoch を進めるので、その epoch で計画した要求を、prepare を適用できない移動の途中のシャードが断った。
+commit だけで進める形では、prepare はどの epoch も進めず、要求は prepare の適用を待たない。
+commit は、移動の途中のシャードが prepare を適用して ok と答えるまで記録されないので、DDL は移動が終わるまで待つだけになる。
+逆向き (遷移が開いている間に移動を始める、`m21_red_move_during_ddl`) は、この形でも破れる。移動の前に ok と答えたシャードの分で commit が記録でき、それを移動の途中のシャードが適用できず、最新の要求を断るからである。
+
+それでも、Meta の `ddl-waits-move` (移動の間は prepare を記録しない) と、子が受け取り終えてから move-end を記録することは残す。
+移動の途中に prepare を記録すると、移動していないシャードが prepare を適用して表への書き込みを止め、その禁止が移動の終わりまで (長い移動では、遷移の期限の 5 分まで) 続くからである。
+2 つは、この形では、安全のためではなく、書き込みが止まる時間のための条件になる。
+段 4 で、`m21_red_ddl_during_move` と `m21_red_end_early` の再生を書くときは、`servable` ではなく、この形 (禁止が移動の終わりまで続く) を確かめるか、D の行にする。これは、決めたこと 6 を改めるときに決める。
 
 ### 取引の中の DDL (M13)
 

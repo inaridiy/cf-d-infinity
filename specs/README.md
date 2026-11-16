@@ -1551,7 +1551,10 @@ M21 のファイルは変えていない (`test/catalog-m21.test.ts` が、そ�
 `pinned` は、名乗り直す手がないので、いつも成り立つ。
 
 2026-11-16 に、TLC (heap 2.5 GB、4 workers) で流した。
-既定の 56 個 (緑、赤、witness) と `run` の試験 23 個が、期待どおりだった。HEAVY の 42 個の結果は、表の下に書いた。
+既定の 56 個 (緑、赤、witness) と `run` の試験 23 モジュール (27 本) が、期待どおりだった。
+HEAVY の 38 個 (M21 の 3 つの場面と、M21 の赤の 35 本) は、表の下に書いた。M21 の赤のうち 2 本には、commit だけで進める形では反例がなかったので、`check.sh` では緑として確かめる。
+赤と witness の状態数は、TLC が最初の反例を見つけた所で止まるので、流すたびに少し変わる。表は最後に流したものである。
+既定の節の時間は、後で測り直す。
 
 | 種類 | インスタンス | invariant | 到達状態数 (distinct) | 確かめること |
 |---|---|---|---|---|
@@ -1560,55 +1563,55 @@ M21 のファイルは変えていない (`test/catalog-m21.test.ts` が、そ�
 | green | `m24_green_check` | `m24Safe` | 391,605 | A の、行で失敗し得て形を変える DDL と、関係のない `CREATE TABLE` |
 | green | `m24_green_drop` | `m24Safe` | 131,090 | DROP TABLE A と、関係のない `CREATE TABLE`。V を通る読みも断られる |
 | green | `m24_green_split` | `m24Safe` | 272,399 | 移動と、関係のない `CREATE TABLE` |
-| red | `m24_red_global` | `noRefusalUnrelated` | 551 | 段 3 の形: 表定義全体の epoch 1 つを、どの記録でも進める。`CREATE TABLE N` の prepare で、A の取引が断られる |
-| red | `m24_red_global_commit_only` | `noRefusalUnrelated` | 30,552 | 全体の epoch 1 つを、commit だけで進める。`CREATE TABLE N` の commit で、A の取引が断られる |
-| red | `m24_red_prepare_advances` | `noRefusalWithoutChange` | 792 | 表ごとだが、prepare と abort でも進める。失敗する B の DDL の prepare で、B を読んだ取引が断られる |
-| red | `m24_red_read_deps` | `planMatches` | 25,997 | 書き込みの計画が読んだ表 (B) を、要求が運ばない |
+| red | `m24_red_global` | `noRefusalUnrelated` | 541 | 段 3 の形: 表定義全体の epoch 1 つを、どの記録でも進める。`CREATE TABLE N` の prepare で、A の取引が断られる |
+| red | `m24_red_global_commit_only` | `noRefusalUnrelated` | 30,638 | 全体の epoch 1 つを、commit だけで進める。`CREATE TABLE N` の commit で、A の取引が断られる |
+| red | `m24_red_prepare_advances` | `noRefusalWithoutChange` | 773 | 表ごとだが、prepare と abort でも進める。失敗する B の DDL の prepare で、B を読んだ取引が断られる |
+| red | `m24_red_read_deps` | `planMatches` | 28,163 | 書き込みの計画が読んだ表 (B) を、要求が運ばない |
 | red | `m24_red_apply_all` | `noRefusalUnrelated` | 146 | 段 3 の `schemaChanging`: 記録の適用中に、どの要求も断る |
-| red | `m24_red_apply_touched` | `noRefusalWithoutChange` | 283 | 記録の適用中に、記録が触る表に頼る要求を、待たせずに断る |
-| red | `m24_red_index` | `indexMatches` | 94,553 | index の DDL を、表とは別のものとして数える (`m21_red_stale` と同じ形) |
-| red | `m24_red_index` | `planMatches` | 60,564 | |
-| red | `m24_red_write_epoch` | `indexMatches` | 94,541 | 書き込みが、表の読みの epoch を比べる |
-| red | `m24_red_view` | `readConsistent` | 12,893 | view を通る計画が、元の表を運ばない。A の DROP の後で、V を通る読みに答える |
-| red | `m24_red_view` | `planMatches` | 12,759 | |
-| witness | `m24_green_unrelated` | `witnessAcrossUnrelated` | 167,637 | 取引が、計画の後の関係のない `CREATE TABLE` の commit と、関係のない DDL の abort を、両方とも適用したシャードで受け付けられ、確定する |
-| witness | `m24_green_unrelated` | `witnessAcrossFailedRead` | 10,346 | B を読んだ計画の書き込みが、B の DDL の abort の後で、計画し直さずに確定する |
-| witness | `m24_green_unrelated` | `witnessRefusedChanged` | 31,673 | B の DDL が確定すれば、B を読んだ計画は断られる |
-| witness | `m24_green_check` | `witnessAcrossFailedTouched` | 18,844 | A の DDL の prepare より前の計画の書き込みが、禁止の間は待ち、DDL の abort の後で確定する |
-| witness | `m24_green_check` | `witnessTrialRejectedThenWrite` | 21,558 | |
-| witness | `m24_green_check` | `witnessCheckCommittedThenWrite` | 131,630 | |
-| witness | `m24_green_build` | `witnessReadAcrossIndex` | 60,460 | index の commit より前に計画した読みが、commit を適用したシャードで答えられる |
-| witness | `m24_green_build` | `witnessPublicThenWrite` | 99,437 | |
-| witness | `m24_green_drop` | `witnessDroppedAfterWrites` | 39,589 | |
-| witness | `m24_green_split` | `witnessServedWhileDriverDead` | 6,215 | |
-| witness | `m24_green_split` | `witnessPinnedSurvives` | 326 | |
-| witness | `m24_green_split` | `witnessParentAnswersUncut` | 245 | |
+| red | `m24_red_apply_touched` | `noRefusalWithoutChange` | 276 | 記録の適用中に、記録が触る表に頼る要求を、待たせずに断る |
+| red | `m24_red_index` | `indexMatches` | 94,689 | index の DDL を、表とは別のものとして数える (`m21_red_stale` と同じ形) |
+| red | `m24_red_index` | `planMatches` | 60,454 | |
+| red | `m24_red_write_epoch` | `indexMatches` | 94,589 | 書き込みが、表の読みの epoch を比べる |
+| red | `m24_red_view` | `readConsistent` | 12,870 | view を通る計画が、元の表を運ばない。A の DROP の後で、V を通る読みに答える |
+| red | `m24_red_view` | `planMatches` | 12,735 | |
+| witness | `m24_green_unrelated` | `witnessAcrossUnrelated` | 167,527 | 取引が、計画の後の関係のない `CREATE TABLE` の commit と、関係のない DDL の abort を、両方とも適用したシャードで受け付けられ、確定する |
+| witness | `m24_green_unrelated` | `witnessAcrossFailedRead` | 10,415 | B を読んだ計画の書き込みが、B の DDL の abort の後で、計画し直さずに確定する |
+| witness | `m24_green_unrelated` | `witnessRefusedChanged` | 31,848 | B の DDL が確定すれば、B を読んだ計画は断られる |
+| witness | `m24_green_check` | `witnessAcrossFailedTouched` | 18,866 | A の DDL の prepare より前の計画の書き込みが、禁止の間は待ち、DDL の abort の後で確定する |
+| witness | `m24_green_check` | `witnessTrialRejectedThenWrite` | 20,665 | |
+| witness | `m24_green_check` | `witnessCheckCommittedThenWrite` | 132,736 | |
+| witness | `m24_green_build` | `witnessReadAcrossIndex` | 60,430 | index の commit より前に計画した読みが、commit を適用したシャードで答えられる |
+| witness | `m24_green_build` | `witnessPublicThenWrite` | 102,528 | |
+| witness | `m24_green_drop` | `witnessDroppedAfterWrites` | 38,687 | |
+| witness | `m24_green_split` | `witnessServedWhileDriverDead` | 6,320 | |
+| witness | `m24_green_split` | `witnessPinnedSurvives` | 277 | |
+| witness | `m24_green_split` | `witnessParentAnswersUncut` | 247 | |
 | green | `m24_red_global` | `witnessAcrossUnrelated` | 163,707 | 同じ witness は、段 3 の形では届かない |
 | green | `m24_red_global_commit_only` | `witnessAcrossUnrelated` | 267,282 | 全体の epoch を commit だけで進めても届かない |
 | green | `m24_red_prepare_advances` | `witnessAcrossFailedRead` | 242,702 | prepare でも進めると、B の DDL が失敗しても、B を読んだ取引は確定できない |
 | green | `m24_floor_green` | `floorSafe` | 1,903 | 床を表ごとに持ち、形を変えた表にだけ置き、読む表の行だけを読み戻す |
-| red | `m24_floor_red_global` | `noRefusalUnrelated` | 524 | 段 3 の形: 床がシャードに 1 つ |
-| red | `m24_floor_red_restore_all` | `noRefusalUnrelated` | 518 | 床は表ごとだが、読み戻すのは、すべての表の行 |
-| red | `m24_floor_red_no_floor` | `noRestoreAcross` | 498 | 形を変えた表に床を置かない |
-| witness | `m24_floor_green` | `witnessServedBelow` | 509 | B の DDL より古い T で、T より後に確定のある A を読み戻して答える |
-| witness | `m24_floor_green` | `witnessRefusedB` | 600 | B の DDL より前の B の確定を読み戻す読みは、断られる |
+| red | `m24_floor_red_global` | `noRefusalUnrelated` | 522 | 段 3 の形: 床がシャードに 1 つ |
+| red | `m24_floor_red_restore_all` | `noRefusalUnrelated` | 530 | 床は表ごとだが、読み戻すのは、すべての表の行 |
+| red | `m24_floor_red_no_floor` | `noRestoreAcross` | 598 | 形を変えた表に床を置かない |
+| witness | `m24_floor_green` | `witnessServedBelow` | 460 | B の DDL より古い T で、T より後に確定のある A を読み戻して答える |
+| witness | `m24_floor_green` | `witnessRefusedB` | 613 | B の DDL より前の B の確定を読み戻す読みは、断られる |
 | green | `m24_lock_green` | `holderSurvives` | 648 | prepare は行ロックを待ち、書き込み禁止に当たったロックを持つ取引は、遷移を取り消させる |
 | red | `m24_lock_red_no_wait` | `holderSurvives` | 735 | prepare が行ロックを待たない |
-| red | `m24_lock_red_no_wound` | `holderSurvives` | 88 | 書き込み禁止に当たった、ロックを持つ取引が、遷移を取り消させない |
+| red | `m24_lock_red_no_wound` | `holderSurvives` | 91 | 書き込み禁止に当たった、ロックを持つ取引が、遷移を取り消させない |
 | witness | `m24_lock_green` | `witnessDdlAfterTxn` | 636 | 書いた取引が確定し、DDL は、その後で確定する |
-| witness | `m24_lock_green` | `witnessWoundThenCommit` | 433 | 別のシャードの書き込み禁止に当たった取引が、DDL を取り消させて確定する |
-| witness | `m24_lock_green` | `witnessDdlBusy` | 220 | シャードのロックの待ちが上限を過ぎて DDL が失敗し、取引が確定する |
+| witness | `m24_lock_green` | `witnessWoundThenCommit` | 431 | 別のシャードの書き込み禁止に当たった取引が、DDL を取り消させて確定する |
+| witness | `m24_lock_green` | `witnessDdlBusy` | 231 | シャードのロックの待ちが上限を過ぎて DDL が失敗し、取引が確定する |
 | green | `m24_boundary_green` | `boundarySafeAll` | 127 | M13 の設計を、表ごとに比べる形で |
 | red | `m24_boundary_red_main` | `prefixOfScript` | 9 | M13 の `m13_red_main` |
 | red | `m24_boundary_red_pin_only` | `ownDdlVisible` | 17 | M13 の `m13_red_pin_only` |
-| red | `m24_boundary_red_repin` | `pinned` | 79 | M13 の `m13_red_repin` |
-| red | `m24_boundary_red_retry_whole` | `prefixOfScript` | 107 | M13 の `m13_red_retry_whole` |
+| red | `m24_boundary_red_repin` | `pinned` | 86 | M13 の `m13_red_repin` |
+| red | `m24_boundary_red_retry_whole` | `prefixOfScript` | 112 | M13 の `m13_red_retry_whole` |
 | red | `m24_boundary_red_ddl_anyway` | `prefixOfScript` | 17 | M13 の `m13_red_ddl_anyway` |
-| red | `m24_boundary_red_global` | `noRefusalUnrelated` | 82 | すべての DDL の版と比べる (M13 と段 3 の形) |
+| red | `m24_boundary_red_global` | `noRefusalUnrelated` | 81 | すべての DDL の版と比べる (M13 と段 3 の形) |
 | witness | `m24_boundary_green` | `witnessUnrelatedNoRetry` | 125 | 関係のない DDL が区切りの途中に入っても、やり直さずに終わる |
-| witness | `m24_boundary_green` | `witnessRetriedAndDone` | 111 | |
-| witness | `m24_boundary_green` | `witnessOtherDdlThenDone` | 88 | |
-| green | `m24_boundary_red_global` | `witnessUnrelatedNoRetry` | (下) | 同じ witness は、すべての DDL の版と比べると届かない |
+| witness | `m24_boundary_green` | `witnessRetriedAndDone` | 110 | |
+| witness | `m24_boundary_green` | `witnessOtherDdlThenDone` | 85 | |
+| green | `m24_boundary_red_global` | `witnessUnrelatedNoRetry` | 138 | 同じ witness は、すべての DDL の版と比べると届かない |
 | green | `m24_m21_green_split_txns` | `epochSafeCommitOnly` | 75,003 | M21 の `m21_green_split_txns` を、commit だけで進める形で |
 | green | `m24_m21_green_split` | `epochSafeCommitOnly` | 195,824 | M21 の `m21_green_split` を、commit だけで進める形で |
 
@@ -1617,10 +1620,48 @@ HEAVY=1 のときだけ流すもの。
 | 種類 | インスタンス | invariant | 到達状態数 (distinct) | 確かめること |
 |---|---|---|---|---|
 | green | `m24_m21_green_drop` | `epochSafeCommitOnly` | 723,604 | M21 の `m21_green_drop` を、commit だけで進める形で |
-| green | `m24_m21_green_ddl2` | `epochSafeCommitOnly` | (下) | M21 の `m21_green_ddl2` を、同じく |
-| green | `m24_m21_green_split_build` | `epochSafeCommitOnly` | (流していない) | M21 の `m21_green_split_build` を、同じく |
-| red | `m24_m21_red_*` (28 個、35 本) | M21 の赤と同じ (`noServeBelowAck` を除く) | (下) | M21 の赤を、commit だけで進める形で |
-| green | `m24_green_unrelated2`、`_build2`、`_check2`、`_drop2` | `m24Safe` | (下) | 取引 2 件 |
+| green | `m24_m21_green_ddl2` | `epochSafeCommitOnly` | 525,350 | M21 の `m21_green_ddl2` を、同じく |
+| green | `m24_m21_green_split_build` | `epochSafeCommitOnly` | 1,613,382 | M21 の `m21_green_split_build` を、同じく (725 秒) |
+| red | `m24_m21_red_online` | `indexMatches` | 264,150 | M21 の赤を、commit だけで進める形で。以下同じ |
+| red | `m24_m21_red_online` | `notRelied` | 264 | |
+| red | `m24_m21_red_no_fence` | `indexMatches` | 231,053 | |
+| red | `m24_m21_red_visible` | `notRelied` | 251 | |
+| red | `m24_m21_red_no_drain` | `noWriteWhileFenced` | 9,226 | |
+| red | `m24_m21_red_stale` | `indexMatches` | 214,606 | |
+| red | `m24_m21_red_two_exits` | `oneExit` | 73,108 | |
+| red | `m24_m21_red_two_exits` | `indexMatches` | 76,436 | |
+| red | `m24_m21_red_repin` | `indexMatches` | 272,304 | |
+| red | `m24_m21_red_repin` | `pinned` | 210,540 | |
+| red | `m24_m21_red_scan_early` | `indexMatches` | 97,676 | |
+| red | `m24_m21_red_no_recheck` | `indexMatches` | 693,961 | |
+| red | `m24_m21_red_early_commit` | `indexMatches` | 318 | |
+| red | `m24_m21_red_trial_no_fence` | `commitApplies` | 314,472 | |
+| red | `m24_m21_red_trial_missing_ack` | `commitApplies` | 7,977 | |
+| red | `m24_m21_red_trial_early` | `commitApplies` | 250,603 | |
+| red | `m24_m21_red_trial_no_drain` | `commitApplies` | 290,508 | |
+| red | `m24_m21_red_drop_no_fence` | `guardHolds` | 90,387 | |
+| red | `m24_m21_red_drop_no_check` | `guardHolds` | 53,448 | |
+| red | `m24_m21_red_drop_check_early` | `guardHolds` | 37,746 | |
+| red | `m24_m21_red_drop_no_drain` | `guardHolds` | 81,102 | |
+| red | `m24_m21_red_drop_no_drain` | `noResurrect` | 69,843 | |
+| red | `m24_m21_red_drop_untied` | `guardHolds` | 89,290 | |
+| red | `m24_m21_red_drop_missing_ack` | `noLostAfterReturn` | 1,568 | |
+| red | `m24_m21_red_two_open` | `commitApplies` | 119,929 | |
+| green | `m24_m21_red_ddl_during_move` | `servable` | 565,944 | 反例がない。移動の途中に prepare を記録しても、prepare は要求を古くせず、DDL が移動の終わりまで待つだけになる (設計の文書の「移動の途中の prepare」) |
+| green | `m24_m21_red_ddl_during_move` | `epochSafeCommitOnly` | 565,944 | 同じインスタンスで、`noServeBelowAck` を除く M21 の不変条件の全部 (check.sh には入れていない) |
+| red | `m24_m21_red_move_during_ddl` | `servable` | 24,924 | 逆向きは、この形でも破れる。移動の前に ok と答えたシャードの分で commit が記録され、移動の途中のシャードが適用できない |
+| green | `m24_m21_red_end_early` | `servable` | 367,636 | 反例がない。理由は `ddl_during_move` と同じ |
+| green | `m24_m21_red_end_early` | `epochSafeCommitOnly` | 367,636 | 同じインスタンスで、M21 の不変条件の全部 (check.sh には入れていない) |
+| red | `m24_m21_red_pull_unfenced` | `moveKeepsWrites` | 1,230 | |
+| red | `m24_m21_red_pull_unfenced` | `readConsistent` | 2,145 | |
+| red | `m24_m21_red_pull_unfenced` | `sameShape` | 21,284 | |
+| red | `m24_m21_red_fence_first` | `servable` | 58 | |
+| red | `m24_m21_red_owner_unchecked` | `moveKeepsWrites` | 2,007 | |
+| red | `m24_m21_red_owner_unchecked` | `readConsistent` | 2,674 | |
+| red | `m24_m21_red_strict_epoch` | `pinnedSurvives` | 151 | |
+
+M24 の本体の場面は、取引 1 件である。取引 2 件の場面 (M21 の index の作成、CHECK、DROP と同じ数) は、この作業の計算機では、取引 1 件の場面の数十倍を超えて 5 分で終わらなかったので、インスタンスを置いていない。
+取引 2 件が index の項目を取り合う形は、M21 の場面を commit だけで進める形 (`m21_alt_commit_only_build`、`m24_m21_green_drop` など) が確かめる。表ごとの比べ方と取引 2 件の組み合わせは、確かめていない。
 
 モデルにないもの。
 
