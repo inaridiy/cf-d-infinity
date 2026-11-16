@@ -755,7 +755,7 @@ meta の呼び出しは RPC の列に出ないので、`ddlSince` から `epochs
 
 - 37 の 3 つの形 (上)。
 - Hrana の baton の取引は、要求ごとに、その要求の接続の範囲表で組み立て直す (`Txn.load`) ので、分割の前に書いた行が動くと、上と同じく、行ロックを取る文が取引自身の書き込みを見ないまま答える (`test/open/baton-own-write-across-split.test.ts`)。段 2 より前のコードでも同じである。不変条件の候補: 取引の文は、取引自身の書き込みを必ず見る (見られないなら答えない)。持ち主は Worker の取引の層。
-- `Db.attemptStatement` は、失敗した文の採番を、同じブロックなら無条件に戻す。worker.ts は同じ isolate の接続でブロックを共有するので、その間にほかの接続が同じブロックから取っていれば、その番号をもう一度配り、後の INSERT が主キーの UNIQUE で失敗する (`test/open/shared-rowid-block-rollback.test.ts`)。不変条件の候補: 採番した rowid は、どの接続にも 1 度しか配らない。
+- `Db.attemptStatement` は、失敗した文の採番を、同じブロックなら無条件に戻す。worker.ts は同じ isolate の接続でブロックを共有するので、その間にほかの接続が同じブロックから取っていれば、その番号をもう一度配り、後の INSERT が主キーの UNIQUE で失敗する (`test/shared-rowid-block-rollback.test.ts`)。不変条件の候補: 採番した rowid は、どの接続にも 1 度しか配らない。
 
 ### 段 3 に要るもの
 
