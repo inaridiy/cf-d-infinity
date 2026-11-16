@@ -12,6 +12,7 @@ import { DatabaseSync } from "node:sqlite";
 import { bindParams, ident, parseStatements, render, type Node } from "../src/sql/cst";
 import { returningClause, rewriteReturning } from "../src/sql/returning";
 import type { Faults } from "../src/types";
+import { insertedRowids } from "./inserted-rowid";
 import { clientOf } from "./libsql";
 import { prng, SimCluster } from "./sim";
 
@@ -131,22 +132,29 @@ export async function runTyped(
     lite.exec(s);
     await client.execute(s);
   }
+  // 文の結果の lastInsertRowid も、どの経路でも 1 つの規則で比べる (test/inserted-rowid.ts)。
+  const inserted = insertedRowids(lite);
   const out: TypedRun = { problems: [], statements: 0 };
   const shown = (x: unknown) => JSON.stringify(x);
   for (const step of steps) {
     out.statements++;
     const norm = step.normalize ?? ((rows: Cell[][]) => rows);
     let want: Cell[][] | "ok" | "error";
+    let wantRowid: bigint | null = null;
     try {
+      inserted.start();
       const rows = referenceRows(lite, step.sql, step.args);
       want = rows === "ok" ? "ok" : norm(rows);
+      wantRowid = inserted.last();
     } catch {
       want = "error";
     }
     let got: Cell[][] | "ok" | string;
+    let gotRowid: bigint | null = null;
     try {
       const res = await client.execute({ sql: step.sql, args: step.args as never });
       got = res.columns.length ? norm(res.rows.map((r) => res.columns.map((_c, i) => cell(r[i])))) : "ok";
+      gotRowid = res.lastInsertRowid ?? null;
     } catch (e) {
       const m = (e as Error).message;
       got = /unsupported:/.test(m) ? `unsupported ${m.slice(0, 200)}` : want === "error" ? "error" : `error ${m.slice(0, 160)}`;
@@ -156,6 +164,9 @@ export async function runTyped(
     const same = Array.isArray(want) && Array.isArray(got) ? sameRows(want, got) : want === got;
     if (!same) {
       out.problems.push(`${step.sql} ${shown(step.args.map(cell))}\n  sqlite: ${shown(want).slice(0, 300)}\n  ours:   ${shown(got).slice(0, 300)}`);
+      if (o.stopAtFirst) break;
+    } else if (want !== "error" && wantRowid !== gotRowid) {
+      out.problems.push(`${step.sql} ${shown(step.args.map(cell))}\n  sqlite: lastInsertRowid ${wantRowid}\n  ours:   lastInsertRowid ${gotRowid}`);
       if (o.stopAtFirst) break;
     }
   }

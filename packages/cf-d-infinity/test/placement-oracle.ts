@@ -5,7 +5,8 @@
 // 比べるのは、設計が置き場所に依らないと約束していることだけである (下の「何を比べるか」)。約束のない違いは、数えて報告する。
 //
 // 台本は置き場所を知らない。キーを持ち主のシャードで選ばない (再現の試験の `on("s0")` のような選び方をしない)。主キーは明示し、
-// rowid の採番、lastInsertRowid、REAL の和は使わない。結果の順序は、一意な列の ORDER BY で決める。
+// rowid の採番と REAL の和は使わない。結果の順序は、一意な列の ORDER BY で決める。文の lastInsertRowid は、どの経路でも
+// 1 つの規則 (test/inserted-rowid.ts) で比べる。
 //
 // 何を比べるか (docs/overview.md の「Time and isolation」、docs/sql-language.md の「取引」):
 //   - autocommit の文: 開始前に確定した書き込みを全部見る (読み)、最新の状態に書く (書き込み)。置き場所の全部で同じで、
@@ -67,6 +68,7 @@ import { keyString } from "../src/keys";
 import { ownerOf, shardsOf, SUBSLOTS } from "../src/routing";
 import type { Value } from "../src/types";
 import { rawRows } from "./ddl-harness";
+import { insertedRowids } from "./inserted-rowid";
 import { quiescentProblems } from "./invariants";
 import { asNumbers, prng, REFERENCE_ONLY, SimCluster } from "./sim";
 
@@ -225,7 +227,8 @@ export function makeScript(seed: number): Script {
 // ---- 結果 ----
 
 export type Outcome =
-  | { kind: "rows"; rows: Value[][]; changes: number }
+  /** last は文の lastInsertRowid (test/inserted-rowid.ts の規則)。行を入れなかった文は null。 */
+  | { kind: "rows"; rows: Value[][]; changes: number; last: number | null }
   | { kind: "error"; cls: "busy" | "constraint" | "unsupported" | "error"; message: string };
 
 export function errorOf(e: unknown): Outcome {
@@ -238,12 +241,12 @@ export function errorOf(e: unknown): Outcome {
 
 /** 比べるための文字列。誤りは種類で比べる。種類が error のものは文言も比べる (SQLite の文言で返す約束である)。 */
 export function keyOf(o: Outcome, withMessage = true): string {
-  if (o.kind === "rows") return JSON.stringify({ rows: o.rows, changes: o.changes });
+  if (o.kind === "rows") return JSON.stringify({ rows: o.rows, changes: o.changes, last: o.last });
   return o.cls === "error" && withMessage ? `error ${o.message}` : o.cls;
 }
 
 export const show = (o: Outcome | undefined): string =>
-  o === undefined ? "(not run)" : o.kind === "rows" ? `${JSON.stringify(o.rows).slice(0, 160)}${o.changes ? ` changes=${o.changes}` : ""}` : `${o.cls}: ${o.message.slice(0, 120)}`;
+  o === undefined ? "(not run)" : o.kind === "rows" ? `${JSON.stringify(o.rows).slice(0, 160)}${o.changes ? ` changes=${o.changes}` : ""}${o.last !== null ? ` lastInsertRowid=${o.last}` : ""}` : `${o.cls}: ${o.message.slice(0, 120)}`;
 
 // ---- 置き場所 ----
 
@@ -326,21 +329,23 @@ export const KNOWN_OPEN: Known[] = [
 ];
 
 const toH = (v: number) => ({ type: "integer" as const, value: String(v) });
+/** lastInsertRowid を、台本の値と同じ JS の数にする (台本の rowid は小さい)。 */
+const rowidOf = (v: bigint | string | null | undefined): number | null => (v === null || v === undefined ? null : Number(v));
 const fromH = (v: { type: string; value?: string | number }): Value =>
   v.type === "null" ? null : v.type === "integer" || v.type === "float" ? Number(v.value) : (v.value as Value);
 
 interface HranaOut {
   baton: string | null;
-  results: ({ type: "ok"; response: { result: { rows: { type: string; value?: string }[][]; affected_row_count: number } } } | { type: "error"; error: { message: string } })[];
+  results: ({ type: "ok"; response: { result: { rows: { type: string; value?: string }[][]; affected_row_count: number; last_insert_rowid: string | null } } } | { type: "error"; error: { message: string } })[];
 }
 
 /** 取引の接続。3 通りの出し方を同じ形にする。 */
 function txDriver(c: SimCluster, s: Script) {
   const begin = s.immediate ? "BEGIN IMMEDIATE" : "BEGIN";
-  const asRows = async (p: Promise<{ values: Value[][]; changes: number }>): Promise<Outcome> => {
+  const asRows = async (p: Promise<{ values: Value[][]; changes: number; lastInsertRowid?: bigint | null }>): Promise<Outcome> => {
     try {
       const r = await p;
-      return { kind: "rows", rows: asNumbers(r.values), changes: r.changes };
+      return { kind: "rows", rows: asNumbers(r.values), changes: r.changes, last: rowidOf(r.lastInsertRowid) };
     } catch (e) {
       return errorOf(e);
     }
@@ -351,7 +356,7 @@ function txDriver(c: SimCluster, s: Script) {
     return {
       async begin(): Promise<Outcome> {
         tx = await db.begin();
-        return { kind: "rows", rows: [], changes: 0 };
+        return { kind: "rows", rows: [], changes: 0, last: null };
       },
       exec: (sql: string, params: number[]) => asRows(tx!.query(sql, params)),
       commit: () => asRows(tx!.commit().then(() => ({ values: [], changes: 0 }))),
@@ -374,7 +379,8 @@ function txDriver(c: SimCluster, s: Script) {
     baton = res.baton;
     const r = res.results[0]!;
     if (r.type === "error") return errorOf(new Error(r.error.message));
-    return { kind: "rows", rows: r.response.result.rows.map((row) => row.map(fromH)), changes: r.response.result.affected_row_count };
+    const { result } = r.response;
+    return { kind: "rows", rows: result.rows.map((row) => row.map(fromH)), changes: result.affected_row_count, last: rowidOf(result.last_insert_rowid) };
   };
   return { begin: () => one(begin), exec: one, commit: () => one("COMMIT"), rollback: () => one("ROLLBACK") };
 }
@@ -444,7 +450,7 @@ export async function runPlacement(s: Script, p: Placement, o: { mask: boolean }
     };
     const writerStep = async (step: Step) => {
       const promise = writers[step.conn as "w1" | "w2"].query(step.sql!, step.params!).then(
-        (r): Outcome => ({ kind: "rows", rows: asNumbers(r.values), changes: r.changes }),
+        (r): Outcome => ({ kind: "rows", rows: asNumbers(r.values), changes: r.changes, last: rowidOf(r.lastInsertRowid) }),
         errorOf,
       );
       const flag = { i: step.i, promise, done: false };
@@ -563,14 +569,14 @@ interface Evaluated {
 }
 
 export class Model {
-  private dbs = new Map<string, DatabaseSync>();
+  private dbs = new Map<string, { db: DatabaseSync; inserted: ReturnType<typeof insertedRowids> }>();
   private memo = new Map<string, Evaluated>();
 
-  private open(rows: Rows): { db: DatabaseSync; key: string } {
+  private open(rows: Rows): { db: DatabaseSync; inserted: ReturnType<typeof insertedRowids>; key: string } {
     const key = rowsKey(rows);
-    let db = this.dbs.get(key);
-    if (!db) {
-      db = new DatabaseSync(":memory:");
+    let open = this.dbs.get(key);
+    if (!open) {
+      const db = new DatabaseSync(":memory:");
       for (const s of SCHEMA) db.exec(s);
       for (const [t, list] of Object.entries(rows)) {
         const st = db.prepare(`INSERT INTO ${t} VALUES (${TABLES[t]!.cols.map(() => "?").join(", ")})`);
@@ -578,12 +584,13 @@ export class Model {
       }
       if (this.dbs.size > 400) {
         const [k0, d0] = this.dbs.entries().next().value!;
-        d0.close();
+        d0.db.close();
         this.dbs.delete(k0);
       }
-      this.dbs.set(key, db);
+      open = { db, inserted: insertedRowids(db) };
+      this.dbs.set(key, open);
     }
-    return { db, key };
+    return { ...open, key };
   }
 
   private read(db: DatabaseSync): Rows {
@@ -601,17 +608,19 @@ export class Model {
     const memoKey = `${rowsKey(rows)}\0${sql}\0${params.join(",")}`;
     const hit = this.memo.get(memoKey);
     if (hit) return hit;
-    const { db } = this.open(rows);
+    const { db, inserted } = this.open(rows);
     db.exec("SAVEPOINT m");
     let res: Evaluated;
     try {
+      inserted.start();
       const st = db.prepare(sql);
       let out: Outcome;
       if (st.columns().length > 0) {
         st.setReturnArrays(true);
-        out = { kind: "rows", rows: st.all(...(params as never[])) as unknown as Value[][], changes: 0 };
+        out = { kind: "rows", rows: st.all(...(params as never[])) as unknown as Value[][], changes: 0, last: rowidOf(inserted.last()) };
       } else {
-        out = { kind: "rows", rows: [], changes: Number(st.run(...(params as never[])).changes) };
+        const changes = Number(st.run(...(params as never[])).changes);
+        out = { kind: "rows", rows: [], changes, last: rowidOf(inserted.last()) };
       }
       const after = this.read(db);
       res = { out, delta: diff(rows, after), after };
@@ -626,7 +635,7 @@ export class Model {
   }
 
   close(): void {
-    for (const db of this.dbs.values()) db.close();
+    for (const { db } of this.dbs.values()) db.close();
     this.dbs.clear();
     this.memo.clear();
   }
