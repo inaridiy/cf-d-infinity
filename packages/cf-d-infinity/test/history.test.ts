@@ -75,7 +75,10 @@ describe("history checker while the shards of a move restart and its driver stop
     it(`stays serializable, and every move finishes (seed ${seed})`, async () => {
       const r = await once(seed);
       expect(r.counts.moves).toBeGreaterThan(0);
-      expect(r.history.filter((h) => !h.readOnly).length).toBeGreaterThan(20);
+      // 全部の文を基準経路で実行する組 (REFERENCE=full) では、どの読みも全表の読みで、移動の途中の親と子は、それを migrating で断る。
+      // 子が再起動すると、alarm (5 秒後) が続きを進めるまで受け取り中なので、その間の取引はほとんど断られる (seed 1 から 300 の 15 個で、
+      // 確定した書き込みの取引が 20 以下だった。seed 2 は 240 のうち 15)。その組では、確定した取引の数を求めない。
+      expect(r.history.filter((h) => !h.readOnly).length).toBeGreaterThan(process.env.REFERENCE === "full" ? 0 : 20);
       expect(r.violations.slice(0, 3)).toEqual([]);
       expect(r.problems.slice(0, 5)).toEqual([]);
     }, 120_000);
