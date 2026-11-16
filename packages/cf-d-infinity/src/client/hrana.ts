@@ -54,8 +54,25 @@ const fromBase64 = (s: string) => Uint8Array.from(atob(s.padEnd(Math.ceil(s.leng
 
 const INT64_MIN = -(2n ** 63n);
 const INT64_MAX = 2n ** 63n - 1n;
-/** 標準の base64 (RFC 4648 の 4 節)。末尾の埋め草 (`=`) は、あってもなくてもよい (前から、埋め草のない base64 も受け付けている)。 */
-const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}(?:==)?|[A-Za-z0-9+/]{3}=?)?$/;
+/**
+ * 標準の base64 (RFC 4648 の 4 節) か。末尾の埋め草 (`=`) は、あってもなくてもよい (前から、埋め草のない base64 も受け付けている)。
+ * 正規表現で書くと、繰り返しが数 MB の文字列 (本文は 8 MB まで) でスタックを使い切るので、文字を 1 つずつ見る。
+ */
+function isBase64(s: string): boolean {
+  let n = s.length;
+  let pad = 0;
+  while (pad < 2 && n > 0 && s.charCodeAt(n - 1) === 61 /* = */) {
+    n--;
+    pad++;
+  }
+  for (let i = 0; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 43 || c === 47)) return false;
+  }
+  // 最後の組は 2 文字か 3 文字 (1 文字では 1 バイトにならない)。埋め草は、その組を 4 文字にする数だけ置ける。
+  if (n % 4 === 1) return false;
+  return pad === 0 || (n % 4 !== 0 && (n + pad) % 4 === 0);
+}
 
 /**
  * 引数の誤り (計画書の未解決の問題 51)。code は、sqld が引数の誤りに使う ARGS_INVALID である (Hrana の仕様は code を決めておらず、
@@ -98,7 +115,7 @@ function fromH(v: unknown, label: string): Value {
       return h.value;
     case "blob":
       if (typeof h.base64 !== "string") throw bad(`is a blob with ${shown(h.base64)} in "base64"; a blob carries its bytes as a base64 string`);
-      if (!BASE64.test(h.base64)) throw bad(`is a blob whose "base64" is not base64`);
+      if (!isBase64(h.base64)) throw bad(`is a blob whose "base64" is not base64`);
       return fromBase64(h.base64);
   }
   const type = h.type === undefined ? "no type" : `the type ${typeof h.type === "string" ? JSON.stringify(h.type.slice(0, 40)) : shown(h.type)}`;

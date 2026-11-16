@@ -46,6 +46,11 @@ const MISMATCHED: unknown[] = [
   { type: "blob", base64: "!!!!" },
   { type: "blob", base64: "QUJD=" },
   { type: "blob", base64: "A" },
+  { type: "blob", base64: "=" },
+  { type: "blob", base64: "QQ=" },
+  { type: "blob", base64: "QUI==" },
+  { type: "blob", base64: "QU=I" },
+  { type: "blob", base64: "QUI-" },
   { type: "integer", value: 5 },
   { type: "integer", value: "abc" },
   { type: "integer", value: "5.0" },
@@ -75,6 +80,9 @@ const ACCEPTED: [unknown, { type: string; value?: unknown; base64?: string }[]][
   // @libsql/client (js-base64) は埋め草を付けるが、付けない base64 も受け付ける (前から)。
   [{ type: "blob", base64: "QUI" }, [{ type: "text", value: "blob" }, { type: "blob", base64: "QUI=" }]],
   [{ type: "blob", base64: "" }, [{ type: "text", value: "blob" }, { type: "blob", base64: "" }]],
+  [{ type: "blob", base64: "QQ==" }, [{ type: "text", value: "blob" }, { type: "blob", base64: "QQ==" }]],
+  [{ type: "blob", base64: "QQ" }, [{ type: "text", value: "blob" }, { type: "blob", base64: "QQ==" }]],
+  [{ type: "blob", base64: "+/8=" }, [{ type: "text", value: "blob" }, { type: "blob", base64: "+/8=" }]],
 ];
 
 /** 内部の関数の誤り (TypeError など) の文面。利用者に見せる誤りに、これが混じってはならない。 */
@@ -112,6 +120,16 @@ describe("Hrana arguments whose value does not match their type", () => {
   it("still bind a value that matches its type, as before", async () => {
     const c = new SimCluster({ shards: 2 });
     for (const [arg, row] of ACCEPTED) expect.soft(await execute(c, SELECT, { args: [arg] }), JSON.stringify(arg)).toEqual({ row });
+  });
+
+  it("check the base64 of a blob as large as a request may carry, without running out of stack", async () => {
+    // HTTP の本文は 8 MB まで (src/entry.ts の ENTRY_LIMITS.bodyChars)。base64 の正規表現は、繰り返しで数 MB の文字列のスタックを使い切った。
+    const c = new SimCluster({ shards: 2 });
+    const n = 5_500_000;
+    const base64 = Buffer.alloc(n, 0xab).toString("base64");
+    expect(await execute(c, "SELECT length(?1) AS n", { args: [{ type: "blob", base64 }] })).toEqual({ row: [{ type: "integer", value: String(n) }] });
+    expect(await execute(c, "SELECT length(?1) AS n", { args: [{ type: "blob", base64: `${base64.slice(0, -4)}!!!!` }] }))
+      .toMatchObject({ error: expect.stringMatching(/^argument 1 is a blob whose "base64" is not base64/), code: "ARGS_INVALID" });
   });
 
   it("write nothing, and leave the rest of the pipeline and its transaction running", async () => {
