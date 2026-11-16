@@ -57,7 +57,9 @@ async function measure(name: string, changes: number, op: (i: number) => string 
   let read = 0;
   for (const [k, v] of Object.entries(s)) {
     if (!/ __/.test(k)) read += v.rowsRead;
-    if (k.endsWith(" __meta") || v.rowsWritten === 0) continue;
+    // 変更ログの世代を作る文 (`CREATE __log_g…`) は、世代が切り替わった操作にだけ課金される。いつ切り替わるかは時計と実行の
+    // 進み方で決まり、書き込みの形では決まらない (2026-11-16、同じ操作が 20.95 と 21.35 を行き来した差は、これだった)。数えない。
+    if (k.endsWith(" __meta") || v.rowsWritten === 0 || /^CREATE __log_g\d+$/.test(k)) continue;
     written += v.rowsWritten;
     // 変更ログの表の名前 (`__log_g<グループ>`) は、置き場所で決まる。内訳では 1 つにまとめる。
     const part = k.replace(/ __log_g\d+$/, " __log");
