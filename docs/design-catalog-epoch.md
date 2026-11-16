@@ -1,6 +1,6 @@
 # CatalogEpoch による Meta の一本化の設計
 
-状態：設計。段 1 (列と畳み込み) を実装した (2026-11-15、末尾の「段 1 の結果」)。段 2 から段 4 の実装はまだない。モデルは M21 (`specs/m21_catalog_epoch.qnt`) にあり、結果は [specs/README.md](../specs/README.md) の M21 の節に書いた。持ち主の判断が要ることと決めたことは、「段 1 の結果」の前にまとめた。
+状態：設計。段 1 (列と畳み込み)、段 2 (要求が epoch を運ぶ)、段 3 (DDL の 2 相化) を実装した (2026-11-15 と 16、末尾の「段 1 の結果」から「段 3 の結果」)。段 4 (移動) の実装はまだない。モデルは M21 (`specs/m21_catalog_epoch.qnt`) にあり、結果は [specs/README.md](../specs/README.md) の M21 の節に書いた。持ち主の判断が要ることと決めたことは、「段 1 の結果」の前にまとめた。
 作成日：2026-11-14
 前提：[overview.md](./overview.md)、[design-subslots.md](./design-subslots.md)、[specs/README.md](../specs/README.md) の M11 から M15、M18、M19、M5b
 
@@ -493,7 +493,7 @@ M21 は、進める側がどこで止まっても、次の 2 つが成り立つ�
 
 1. 書き込みが止まる DDL が増えることを認める。進め方を 1 通りにするためである。止まるのは `prepare` から `commit` か `abort` までで、行を確かめる DDL では、その確かめの時間を含む。`docs/sql-language.md` に書く。
 2. 新しい表を作るだけの DDL でも、`prepare` の往復を挟む。
-3. 試適用で index を 2 度作るかどうかは、段 3 で、行の多い表で測ってから決める。
+3. 試適用で index を 2 度作るかどうかは、段 3 で、行の多い表で測ってから決める。段 3 で測り、2 度作る形のままにした (「段 3 の結果」の測り)。
 4. 移動は、`move-start` の後は子が自分の alarm で進める。止まった分割の間、全表の読みが `migrating:` で断られる時間を短くするためである。
 5. 順序は計画書の順番のとおりにする。値の作り直しの段 3 の後、token の区間の段 2 の前に、段 1 から段 4 を入れる。
 6. 表定義の epoch は、`prepare`、`commit`、`abort` のどれでも進める (M21 が全部の赤を確かめた形)。`commit` だけで進める案は、取引を古くする回数が減るので、実装の後で、赤をその案の上でも確かめ直してから採るかを決める。
@@ -775,3 +775,219 @@ meta の呼び出しは RPC の列に出ないので、`ddlSince` から `epochs
 「取引は、最初に読むか書くかしたときのスナップショットを確定まで使う」と「範囲表だけが進んだ後も、取引は古いスナップショットのまま進む」は、表定義の部分について読む。
 要求が `epoch` と `schema` を運ぶこと、シャードが所有を自分のスナップショットで引くことは変わらない。
 範囲表の取り直しだけを先に入れても安全である。確かめは今と同じく読んだシャードへ行き、親は `NotOwner`、子は床で断るので、取引は競合で失敗する (M23 の `m23_impl`。答えは誤らないが、規則 4 はまだ破れている)。
+
+## 段 3 の結果 (2026-11-16)
+
+段 3 で、どの DDL も、Meta の列の `prepare` から `commit` か `abort` へ進むようになった。
+取り消し (逆操作の文を持つ次の版)、`TableDef.building` と `locked`、DROP の前の書き込み禁止の版 (`lockTables`、`finishLock`)、記録の前に重複を調べる `Db.checkUnique` はなくなった。
+分割の枠 (`SplitSlot`) と、範囲の移動の手順は段 2 のままである (段 4)。
+通信の版は 8、保存の形式は版 5 で、どちらも移行は書かない。
+
+### 記録と期限
+
+| 記録 | Meta が書くとき | シャードがすること (記録を写しに足すのと同じ 1 つの同期の取引で) |
+|---|---|---|
+| `{ kind: "prepare", mode, ddl, fence, staging? }` | `MetaCore.prepare(sql, { guard }, basedOn)`。`basedOn` が最新の表定義の epoch でなければ `SchemaMoved`。遷移が開いているか分割の枠があれば `SchemaBusy`。文 (`staging.sql` と `ddl.sql`) を Meta の SQLite の空の表で試して巻き戻し、通れば記録して、期限を付ける | 先に intent を全部決着させる (今までどおり、表定義の記録の前に `settleAll`)。`staging.sql` (index の表) を作る。以後、`fence` の表への書き込みを `TableLocked` で断る (`assertUnlocked` が、スナップショットの開いている遷移を見る) |
+| `{ kind: "commit", of, at? }` | `MetaCore.commit(epoch, acks, at)`。遷移が開いていること (ONE_EXIT)、`acks` が範囲表の全シャードを覆うこと (ALL_ACKS) を確かめ (`refusal` の `one-exit` と `all-acks`)、文を Meta の SQLite でも実行して残す。期限を消す | prepare の `ddl.sql` を実行する。`at` があれば時計を進め、`ddlFloor` を取り直す。失敗すれば、取り消さずに止まる (`schemaStuck`、health の `schemaError`) |
+| `{ kind: "abort", of, reason }` | `MetaCore.abort(epoch, reason)`。進める側が失敗したとき。期限切れなら `expire` が書く。もう abort された遷移には記録せず、記録した理由を返す。commit された遷移は断る | `staging` の表を名前で消す。禁止が解ける |
+
+期限は `__meta` の `lease` (`[{ epoch, started, until }]`) で、prepare が付け、commit と abort が消す。
+進める側は期限の半分ごとに `MetaCore.renew(epoch)` で延ばし、止まれば 5 秒 (`LEASE_MS`) のうちに、延ばし続けても prepare から 5 分 (`TRANSITION_MAX_MS`) で、Meta の入口の `expire` が abort を書く。
+abort の理由は「(遷移の名前) stopped before it finished and was withdrawn; the table is unchanged」か「... did not finish within 300 seconds ...」で、遷移の名前は、index の作成なら `CREATE INDEX <名前>`、取引が読んだ表の DROP なら `the lock on <表> before DROP TABLE`、ほかは文そのものである (`src/catalog.ts` の `describeOpen`)。
+
+シャードの新しい入口 `prepared({ epoch })` は、prepare の epoch まで列を適用し、その遷移が自分のスナップショットで開いていれば ok を返す。
+mode が `trial` なら、書き込みを止めた表に `ddl.sql` を試して巻き戻し (`ShardKernel.trial`、rollback-read と同じ形)、SQLite が通したかを返す。
+もう開いていなければ (先に abort を適用した) ok: false を返す。
+
+### 進め方
+
+`Db.changeSchema` は、どの DDL も同じ手で進める。新しい表を作るだけの DDL も同じである (決めたこと 2)。
+
+1. 表定義を取り、文を Worker の SQLite で再生できることを確かめ (`assertReplays`)、Meta に prepare を記録させる (`prepareDdl`)。`SchemaMoved` なら取り直し、`SchemaBusy` なら待つ (60 秒)。何もしない DDL (IF NOT EXISTS で表がある、など) は、何も記録されずに終わる。
+2. 期限を延ばし始め、範囲表の全シャードに `prepared` を尋ねる (`preparedAll`)。どれかが ok でなければ、その理由で失敗する。移動の途中で適用を待つシャードには、待って尋ね直す。
+3. mode ごとの仕事をする (`work`)。`build` は止まった行を読んで index の表へ項目を書き、読んだ時刻の最大を `at` にする。`guard` は、取引が読んだ範囲を持つシャードに `unchanged` を尋ねる。
+4. Meta に commit を記録させる。どこかで失敗すれば abort を記録させ、Meta が先に abort していれば、その理由を返す。
+5. commit を全シャードに適用させる (`syncAll`)。書き込みの禁止を早く解くためで、失敗は捨てる。
+
+進める側の手を、進める側の止まる検査 (`test/ddl-driver-stops.test.ts`) が止めずに流したときの列は次のとおりである (2 シャード。`catalog` は数えない)。
+
+| 場面 | 手の列 |
+|---|---|
+| 片方のシャードの行が CHECK に反する ADD COLUMN | `prepare` `renew` `s0.prepared` `s1.prepared` `abort` `s0.syncSchema` `s1.syncSchema` |
+| 行のある表への、シャードをまたぐ UNIQUE の index | `prepare` `renew` `s0.prepared` `s1.prepared` `s0.exec` `s1.exec` `s1.exec` `s1.commitLocal` `s0.exec` `s0.commitLocal` `commit` `s0.syncSchema` `s1.syncSchema` |
+| 同じ batch が読んだ表の DROP | (読む取引の手の後で) `prepare` `renew` `s0.prepared` `s1.prepared` `s0.unchanged` `s1.unchanged` `commit` `s0.syncSchema` `s1.syncSchema` |
+
+段 3 より前の、行で失敗する DDL の列は `s0.syncSchema` `s1.syncSchema` `applyDdl` `s0.syncSchema` `s1.syncSchema` `s0.syncSchema` `s1.syncSchema` だった (記録の前の適用、記録、記録の後の適用、取り消しの後の適用)。
+
+### mode と fence
+
+| DDL | mode | fence |
+|---|---|---|
+| CREATE TABLE、CREATE VIEW、DROP VIEW、DROP INDEX、列だけの一意でない CREATE INDEX | `plain` | なし |
+| DROP TABLE、ALTER TABLE ... RENAME TO | `plain` | 対象の表 |
+| シャード内の UNIQUE index、式か WHERE のある index | `trial` | 対象の表 |
+| ALTER TABLE ... ADD COLUMN | `trial` | 対象の表 |
+| 行のある表への、シャードをまたぐ UNIQUE の index | `build` | 対象の表 (staging は `__gidx_<index>`) |
+| 取引が読んだ表の DROP TABLE | `guard` | 消す表 |
+
+### 消したもの
+
+| 場所 | 消したもの |
+|---|---|
+| `src/meta.ts` | `applyDdl`、`revokeDdl` と `revoke`、`publishIndex`、`lockTables`、`finishLock`、`renewLock`、`building`、`holders`、`ddlSince`、`entries`、`append`、`schemaOf`、`build_lease`。`Catalog.version` と `Catalog.revoked`、`SchemaMoved.version`、`SplitSlot.version` (枠は表定義の epoch `schema` で持つ) |
+| `src/catalog.ts` | 段 1 の、`DdlEntry` を運ぶ `commit` の記録と `DdlEntry` (`version`、`reverts`、`reason`、`guard`)、`Snapshot.version` と `revoked` |
+| `src/sql/ddl.ts`、`src/types.ts` | `ParsedDdl.undo` と `build`、`publishBuild`、`TableDef.building` と `locked`、使われていなかった `MetaApi` |
+| `src/shard/kernel.ts`、`core.ts`、`step.ts` | `schemaFailed` の手続き、Meta への `revokeDdl`、取り消しの組を飛ばす処理 (`applyStep` の `skip`) |
+| `src/client/db.ts` | `record` (記録の前の全シャードへの適用)、`syncRecorded`、`guardedDrop`、`checkUnique`、`buildIndex`、`stillBuilding`、Cluster の 6 つの入口 |
+| `src/worker.ts` | Meta の DO の 6 つの入口と `ddlSince`。`schemaSql` (論理エクスポートの表定義) は `catalog().ddl` から作る。`/admin/ddl` は表定義の epoch を返す |
+| 欠陥のスイッチ | `dropAfterExpiry` (`commitAfterAbort` に広げた)、`scanBeforeLock` (`checkBeforePrepare` に広げた) |
+| 試験 | `test/meta-old.ts`、`META_SHADOW` (`test/sim.ts` の `shadowMeta`)、`stage1Answer` と `stage1Error`、`test/catalog.test.ts` の段 1 の比べ合い |
+
+古い Meta との比べ合いを消す前に、残る使い道がないことを確かめた。
+比べ合いは、新旧の Meta の同じ名前の入口を同じ順で呼んで答えを比べるもので、段 3 の Meta には、比べていた入口のうち表定義の 6 つ (`applyDdl`、`revokeDdl`、`publishIndex`、`lockTables`、`finishLock`、`renewLock`) がない。
+残る入口 (`catalog`、分割の枠の 5 つ、`switchRange`、`allocate`) の答えも、表定義の版の数と取り消しの印がなくなり、表定義の epoch が prepare と abort でも進むので、同じにならない。
+乱択の比べ合い (`test/catalog.test.ts` の 60 seed) の並びは、どれも表定義の 6 つの入口を呼ぶ。
+表定義の遷移の条件は、M21 と突き合わせる `test/catalog-m21.test.ts` (段 3 でも変えずに通る) と、`test/catalog.test.ts` の書き直した試験、下の再生が確かめる。
+
+### 決めたこと 3 (試しで index を 2 度作るか) の測り
+
+シャード内の UNIQUE index (`CREATE UNIQUE INDEX ux ON p(tenant_id, code)`、主キー 2 列、`code` は 30 字ほどの TEXT) を、行の数を変えて node:sqlite (Node 24) で作った。
+3 回流した中央値である。
+
+| 行 | 1 度だけ作る | 試して巻き戻す | 試した後に作る |
+|---|---|---|---|
+| 100,000 | 35 ms | 34 ms | 30 ms |
+| 1,000,000 | 399 ms | 402 ms | 399 ms |
+
+試しの費用は、index を 1 度作るのと同じで、書き込みが止まる時間は、その分だけ長くなる (100 万行のシャードで約 0.4 秒)。
+試しで index を 2 度作る形のままにした。
+`prepare` で本物の index を作り、`abort` で名前で消す形にすると、作るのは 1 度で済むが、`prepare` が利用者の表に触ることになり、遅れて `prepare` と `abort` を続けて見るシャードと、分割で生まれたシャードが、作って消すことになる。
+節約できるのは 100 万行で 0.4 秒ほどで、書き込みが止まる時間の上限 (5 分) と比べて小さい。
+DO の SQLite が取引 (`transactionSync`) の中の DDL を巻き戻し、確定のときに同じ文がもう一度通ることは、手元の workerd で確かめた。Meta は DDL ごとに、文を自分の SQLite の取引の中で試して巻き戻す (`tryShadow`) ので、workerd の試験の全部の DDL がこの経路を通る。シャードの試しが通る場合と通らない場合は、`test/workerd.test.ts` の「tries a change that can fail on rows on the fenced table ...」が通す。
+巻き戻した書き込みが課金されるかは、Cloudflare で測っていない (`docs/platform-facts.md` にない)。持ち主の許可を得た計測の項目に足す。
+
+### 設計の本文からずれたところ
+
+- `prepare` の `staging` の表定義は、prepare を畳んだときから `Snapshot.tables` に載り、abort で消える。進める側が、commit の前に、その表へ項目を書くからである。利用者の文からは見えない (内部の名前で、Worker の SQLite の履歴にもない)。
+- `build` の prepare の `ddl` は、出来上がった形 (表定義の `globalIndexes` に index を足したもの、index の表の表定義、`indexes`、利用者の文) を持ち、行の側の index (`__gidx_<index>__rows`、一意でない) を作る文だけを `ddl.sql` に置く。
+- どの `ADD COLUMN` も `trial` にした。`CHECK` と `NOT NULL` だけでなく、STRICT の表の既定値の型も既存の行で確かめられ、SQLite の `ADD COLUMN` は表の形を書き換えるだけなので、試すのは安い。`NOT NULL` で既定値のない `ADD COLUMN` は、新しい SQLite では空の表では通るので、Meta では断られず、行のあるシャードの試しで断られる。
+- DDL の遷移と分割の排他は、段 4 まで分割の枠が守る。`refusal` の `ddl-waits-move` と `move-waits-ddl` は使わない。試験が `switchRange` を直に呼んで `endSplit` を呼ばないと、列に開いた移動が残り、`ddl-waits-move` で全部の DDL が止まるからである。Meta が `refusal` で決めるのは、`one-open`、`one-exit`、`all-acks` の 3 つである。
+- スナップショットは、開いている遷移を一覧 (`Snapshot.opens`) でも持つ。欠陥のスイッチ `overlappingTransitions` を入れた Meta の列も畳むためで、Meta の条件が守られていれば、1 つか空である。期限も遷移ごとに持つ。
+- `commitAfterAbort` は、閉じた遷移の遅れた commit を受けて、同じ prepare をもう一度記録し、それを確定する。列は壊れず、abort から開き直すまでの書き込みは止まっていない。
+- `commitWithoutAcks` は、Worker の側で最後のシャードに `prepared` も、commit の後の適用も送らない。Meta の側では ok の集合を確かめない。`FAULT=` は両方に入れる (`test/sim.ts` の `BOTH_FAULTS`)。
+- `prepared` の要求の `early` は、欠陥のスイッチ `checkBeforePrepare` だけが付ける。シャードは列を適用せずに、記録を読んで、いまの表で試す。
+- 重複のある列への `CREATE UNIQUE INDEX` (行が同じシャードにある) の誤りの文が、D∞ の文 (`UNIQUE constraint failed: p has duplicate values`) から SQLite の文 (`UNIQUE constraint failed: p.tenant_id, p.code`) になった。記録の前に調べていた `Db.checkUnique` がなくなり、各シャードの試しが SQLite の文を返すからである。`test/schema-failure.test.ts` のほかの場面 (行の片方が反する部分 UNIQUE、CHECK に反する ADD COLUMN) の文は変わらない。
+- 分割の途中に出した DDL の誤りの文が「a shard split is in progress」から「a shard split of s0 is in progress」になった。記録の前に全シャードへ移動の途中かを尋ねる手がなくなり、Meta の枠の `SchemaBusy` で待つからである。
+- 分割の枠を取る前の全シャードへの適用 (`reserveSplit`) は残した。段 3 からは安全のためには要らない (取り消しがないので、枠の後に表定義の記録が入らない)。欠陥のスイッチ `splitWithoutSync` は、段 3 から何も戻さない。枠と一緒に段 4 で消す。
+
+### 検査
+
+先に今のコードで用意した検査 (規則 2)。
+
+- 進める側を各手の前で止める検査 (`test/ddl-driver-stops.test.ts`、`test/ddl-driver.ts`)。手の列を止めずに流して取り、手ごとに最初から流し直して、その手の前で止める。止めた後で、文は効いたか効かなかったかのどちらかであること、表へ書けること、別の DDL が通ること、全シャードが最新の表定義を適用でき、適用の失敗を報告していないことを確かめる。段 3 より前のコードで、index の作成と、読んだ表の DROP の場面は通り、行で失敗する ADD COLUMN の場面は落ちた。Meta が版を記録した後、シャードへ適用させる前に進める側が止まると、取り消しは、どれかの要求が行の反するシャードに版を適用させるまで起きず、その間、ほかの接続は列を足した表定義で計画した (4 つの値の INSERT が「table p has 5 columns but 4 values were supplied」で失敗した)。どこでも効かない文が、効いたように見えた。この場面は `test/open/` に置いてから段 3 に入り、段 3 で 3 つとも通ったので、戻した。
+- `test/schema-failure.test.ts` は、重複のある UNIQUE と CHECK に反する行の場面の誤りの文を、完全に一致で確かめるようにした。段 3 で変わったのは、上に書いた 1 つだけである。どの場面でも、表は書けるままである。
+- `test/open/split-reserve-revoked.test.ts` を、段 3 の形に写して `test/split-reserve-revoked.test.ts` へ移した。行で失敗する DDL を進める側が、s1 の試しが通らないのを見て abort を記録し、全シャードに適用させる前に止まる。分割の枠を取る前の適用は、prepare と abort を順に適用するだけで断られず、split() は 1 回で通る。
+
+M21 の段 3 の赤の再生は `docs/model-coverage.md` の M21 の行にある。
+新しく書いたのは `test/m21-two-phase.test.ts` の 9 つの場面で、どれも、直したコードで正しく終わることと、欠陥のスイッチを入れると、モデルの反例と同じ不変条件が破れることを確かめる。
+スイッチは、表を作った後で入れる (場面の前提の表を作る DDL にスイッチが掛からないように)。
+
+| M21 の赤 | スイッチ | スイッチを入れたときの姿 |
+|---|---|---|
+| `m21_red_trial_no_fence` | `ignoreTableLock` | 試しの後に CHECK に反する行が入り、s0 が commit を適用できずに止まる |
+| `m21_red_trial_no_drain` | `ddlIgnoresIntents` | 試しが決着していない intent の行を見落とし、s0 が commit を適用できずに止まる |
+| `m21_red_trial_early` | `checkBeforePrepare` | prepare を適用する前に試し、その後の書き込みを受けて、s0 が止まる |
+| `m21_red_drop_check_early` | `checkBeforePrepare` | prepare の前に「変更なし」と答え、その後に書かれた行が DROP で消える |
+| `m21_red_drop_no_fence` | `ignoreTableLock` | 確かめた後に書かれた行が DROP で消える |
+| `m21_red_trial_missing_ack` | `commitWithoutAcks` | 答えなかったシャードが commit を適用できずに止まる。Meta の確かめだけを残すと、Meta が commit を断る |
+| `m21_red_drop_missing_ack` | `commitWithoutAcks` | prepare を適用しなかったシャードが、DROP が完了を返した後の書き込みを受け、その行が消える |
+| `m21_red_two_exits` | `commitAfterAbort` | 期限で abort された index の遅れた commit が通り、項目のない index が公開される (abort の適用が index の表を消すので、abort の後の行だけでなく、全部の行が index から引けない) |
+| `m21_red_two_open` | `overlappingTransitions` | モデルの順 (index を作っている間に同じ表の DROP が確定する) では、Meta が commit のときに自分の SQLite で文を実行するので、消えた表への index の commit が記録されずに断られる (2 つ目の守り)。同じ欠陥は ADD COLUMN の順で表に出る: index の commit が、列を足す前の表定義で、足した列を表定義から消す |
+
+`m21_red_early_commit` は、`commitWithoutAcks` だけでは届かない。index の作成の行の走査は prepare の epoch を名乗るので、飛ばされたシャードも、行を読まれる前に prepare を適用するからである。モデルの順 (項目を書く前に commit する) は、`publishBeforeBackfill` が `test/unique-index-build.test.ts` で再生する。
+`test/ddl-concurrent.test.ts` の「DDL が全シャードに適用される前に完了を返す」欠陥の検査の検査 (lost-write check) は、確定の後の `syncSchema` を空にする形から、どのシャードも prepare を適用せずに ok と答え、確定の後にも適用しない形にした。`commitWithoutAcks` (3 つのうち 1 つのシャードを飛ばす) では、この作業負荷は seed 201 から 260 で 1 度も当たらなかった。
+
+M12 と M14 の行は、M21 の行に置き換えた (決めたこと 7)。M15 の行は、段 4 で分割の枠がなくなるまで残す。`m15_red_no_based_on` は、段 3 から形がない (取り消しがないので、枠の後に表定義の記録が入らない) ので D にした。M11 と M13 の行は残す。
+
+### 比べたもの
+
+RPC の列。`test/history.test.ts` と `test/replay.test.ts` の既定の seed (61 件) を、段 3 の前 (`6c24560`) と後 (`3b6d6d7`) で `RPC_TRACE` を付けて流し、送り元、宛先、種類の列を比べた。
+3 件は同じ (クラスタを作らない集計の試験で、列が空) で、58 件が違った。
+
+| 違った試験 | 原因 |
+|---|---|
+| `history` の 33 件と、`replay` の DDL を作業負荷の前にだけ流す場面の 9 件 (42 件) | シャードに表定義を適用させる要求 (`syncSchema` と、新しい `prepared`) を除くと、列は同じである。どの試験も表を作る DDL で始まり、DDL 1 つの要求が、記録の前の `syncSchema` と記録の後の `syncSchema` から、`prepared` と commit の後の `syncSchema` に替わった。42 件とも、シャードごとに、前の `syncSchema` の数と、後の `prepared` と `syncSchema` の数の和が等しい |
+| `replay` の「実行の途中で index を作る」の seed 1 から 8 (8 件) | 作業負荷の途中で DDL を流す場面である。DDL の要求の種類が替わり (上と同じ)、取り消しの後の全シャードへの適用がなくなったので、最初の DDL から後の列の交わり方が変わる。数を出す印を一時的に入れて seed 1 を流した (前後とも試験は通る): DDL は前後とも 11 回で、成否も同じ (7 回通り、4 回は重複で失敗)。シャードごとの表定義の要求は、前が `syncSchema` 27 回 (記録の前の適用 11、記録の後の適用 11、index の作成の終わり (公開か取り消し) の後の適用 5)、後が `prepared` 11 回と `syncSchema` 11 回 (commit か abort の後の適用) だった。書き込みが `TableLocked` で待ったのは、前後とも 0 回、古い表定義で断られて計画し直したのは、前後とも 2 回だった |
+| `replay` の「SQL の BEGIN と Hrana の batch で表定義を変える取引」の seed 1 から 8 (8 件) | 同じく作業負荷の途中の DDL である。seed 1 の数: 前は DDL を 117 回出し、99 回が記録され、16 回は何もしない DDL (IF NOT EXISTS など。記録されない) で、2 回は失敗した。記録の前に全シャードへ適用させる手は 161 回あった (`schema moved` と `schema busy` のやり直しを含み、何もしない DDL も送る)。後は DDL を 99 回出し、91 回が prepare から commit まで進み、8 回は何もしない DDL で、シャードに要求を送らなかった。古い表定義で断られて計画し直した文は、前が 124 回、後が 75 回だった。取引と batch のやり直しの回数が変わり、出した DDL の数も変わる。`TableLocked` の待ちは、前後とも 0 回だった |
+
+数を出す印は、`Db.changeSchema` の出口と、`Db.onRetry`、`Db.schemaMovedPast` に一時的に入れ、比べた後で戻した。
+
+欠陥の表 (`scripts/fault-table.mjs --from 1 --to 40 --procs 3`、コミットした作業ツリーで。前は `6c24560`、後は `3b6d6d7`)。
+各欄は、落ちた試験の数 / 流した seed ごとの試験の数である。
+
+| 欠陥 (前 / 後) | 段 | replay | history | ddl-concurrent |
+|---|---|---|---|---|
+| (なし) | 前 | 0/120 | 0/240 | 0/520 |
+| (なし) | 後 | 0/120 | 0/240 | 0/520 |
+| `ddlIgnoresIntents` | 前 | 30/120 | 0/240 | 142/520 |
+| `ddlIgnoresIntents` | 後 | 31/120 | 0/240 | 104/520 |
+| `unchangedIgnoresIntents` | 前 | 0/120 | 0/240 | 0/520 |
+| `unchangedIgnoresIntents` | 後 | 0/120 | 0/240 | 0/520 |
+| `ignoreTableLock` | 前 | 8/120 | 0/240 | 85/520 |
+| `ignoreTableLock` | 後 | 7/120 | 0/240 | 80/520 |
+| `noSchemaRecheck` | 前 | 0/120 | 0/240 | 39/520 |
+| `noSchemaRecheck` | 後 | 0/120 | 0/240 | 1/520 |
+| `publishBeforeBackfill` | 前 | 40/120 | 0/240 | 120/520 |
+| `publishBeforeBackfill` | 後 | 39/120 | 0/240 | 120/520 |
+| `publishWithoutClock` | 前 | 0/120 | 0/240 | 0/520 |
+| `publishWithoutClock` | 後 | 1/120 | 0/240 | 0/520 |
+| `scanSkipsEmpty` | 前 | 0/120 | 0/240 | 0/520 |
+| `scanSkipsEmpty` | 後 | 0/120 | 0/240 | 0/520 |
+| `guardFromCommitTs` | 前 | 0/120 | 0/240 | 0/520 |
+| `guardFromCommitTs` | 後 | 0/120 | 0/240 | 0/520 |
+| `repinOnRestore` | 前 | 0/120 | 0/240 | 0/520 |
+| `repinOnRestore` | 後 | 0/120 | 0/240 | 0/520 |
+| `dropAfterExpiry` / `commitAfterAbort` | 前 | 0/120 | 0/240 | 0/520 |
+| `dropAfterExpiry` / `commitAfterAbort` | 後 | 0/120 | 0/240 | 0/520 |
+| `scanBeforeLock` / `checkBeforePrepare` | 前 | 2/120 | 0/240 | 64/520 |
+| `scanBeforeLock` / `checkBeforePrepare` | 後 | 2/120 | 0/240 | 61/520 |
+| `commitWithoutAcks` (新) | 後 | 0/120 | 0/240 | 0/520 |
+| `overlappingTransitions` (新) | 後 | 0/120 | 0/240 | 0/520 |
+
+見つけた数が減った行と、その理由。
+
+- `noSchemaRecheck` の ddl-concurrent (39 から 1)。場面ごとに数えた (同じ seed の範囲を `scripts/sweep.mjs` で流した): 前は「分割と CREATE INDEX と ADD COLUMN」が 17、「分割と CREATE UNIQUE INDEX と ADD COLUMN」が 19、「ADD COLUMN」が 2、「複数の表の取引と DROP TABLE」が 1 で、ほとんどが、行イメージの形の検査 (`test/setup.ts`) が見つけた、列を足す前の形の書き込みだった。後は「分割と CREATE UNIQUE INDEX と ADD COLUMN」の seed 31 の 1 つである。M21 では、待ちの後の版の確かめ直し (`m21_red_no_recheck` が外すもの、`noServeBelowAck` を守る) と、prepare の書き込み禁止 (`noWriteWhileFenced` を守る) は別の守りである。段 3 より前の ADD COLUMN には書き込み禁止がなく、待ちの間に列が足された古い計画の書き込みは、確かめ直しだけが止めていた。段 3 から ADD COLUMN は prepare から commit まで表への書き込みを止めるので、確かめ直しを外しても、古い計画の書き込みは、待ちの後で書き込み禁止に断られる (`assertUnlocked` は要求の表定義の epoch に依らない)。確かめ直しが要るのは、待ちが prepare の前から commit の後までをまたぐ書き込みと、書き込みを止めない表 (読み、ほかの表) だけになり、乱択の作業負荷の待ちは、ほとんどそこまで長くない。待ちが 2 つの記録をまたぐ形は、`test/stale-plan-after-wait.test.ts` と ddl-concurrent の BUG-3 の再生が決まった順で流し、スイッチを入れると落ちる (`m21_red_no_recheck` の行)。
+- `ddlIgnoresIntents` の ddl-concurrent (142 から 104)。場面ごとの数は、前、後の順に、複数の表の取引と DROP TABLE が 25、21、DROP と同じ名前の CREATE が 18、18、ADD COLUMN が 21、16、分割と CREATE INDEX と ADD COLUMN が 10、1、分割と CREATE UNIQUE INDEX と ADD COLUMN が 16、12、列の順を変えた作り直しが 24、19、移行の道具の作り直しが 28、17 である。どの場面も見つける。M21 で intent の決着が守るのは、prepare を適用したシャードで、書き込みを止めた表に、決着していない書き込みが後から入らないこと (`m21_red_no_drain` の `noWriteWhileFenced`) である。乱択の検査が見るのは、その後の commit が表の形を変えるか表を消したときに、まだ決着していない intent が、新しい形の表に当てはめられるか、消えた表に残る姿だけである。段 3 では、prepare と commit の間に全シャードへの往復 (と試し) があり、prepare のときに飛んでいた intent の多くは、commit を適用する前に決着する。intent が commit の適用まで残る実行だけが見つかるので、数が減る。決まった順の再生 (`m21_red_no_drain`、`_trial_no_drain`、`_drop_no_drain` の行) は、スイッチを入れると落ちる。
+- `ignoreTableLock` (replay 8 から 7、ddl-concurrent 85 から 80)、`publishBeforeBackfill` の replay (40 から 39)、`scanBeforeLock` / `checkBeforePrepare` の ddl-concurrent (64 から 61)。どれも、index の作成の守りを外すスイッチで、守りの位置 (prepare を適用したシャードが書き込みを断る、項目を書いてから commit する、prepare を適用してから行を読む) は段 3 の前後で同じである (M21 の `m21_red_no_fence`、`_early_commit`、`_scan_early`)。どれも seed 1 から見つかり、違いは数 seed で、RPC の列の比べ合いのとおり、最初の DDL の後の交わり方が変わったことによる。決まった順の再生は、スイッチを入れると落ちる。`checkBeforePrepare` は、試しと DROP の前の確かめも早めるが、ddl-concurrent の ADD COLUMN は CHECK を持たず、行で失敗し得ないので、試しを早めても答えは変わらない。その 2 つの形は `test/m21-two-phase.test.ts` が流す。
+
+新しい 2 つのスイッチは、乱択の検査では見つからない。`commitWithoutAcks` は 3 つのうち 1 つのシャードを飛ばすだけで、飛ばしたシャードは、次の要求で prepare と commit を続けて適用する。古い表定義で計画した書き込みが、そのシャードに、その前に届く実行が要る (ddl-concurrent の lost-write の検査の検査で、seed 201 から 260 に 1 度もなかった)。`overlappingTransitions` は、2 つ目の DDL が 1 つ目の遷移の間に記録される実行が要るが、作業負荷の DDL は 1 つの接続から順に出る。どちらも `test/m21-two-phase.test.ts` が決まった順で再生する。
+
+### 乱択の検査
+
+段 3 の後のコード (`c2ac670`) で流した。
+
+| 検査 | seed | 結果 |
+|---|---|---|
+| `test/ddl-concurrent.test.ts` (sim) | 1 から 500 | 6,500 件が通り、落ちたものはない (3 プロセスで 2,053 秒) |
+| `test/ddl-concurrent.test.ts` (`REFERENCE=scans`) | 1 から 100 | 1,300 件が通り、落ちたものはない (807 秒) |
+| `test/ddl-concurrent.test.ts` (`REFERENCE=full`) | 1 から 100 | 1,300 件が通り、落ちたものはない (2,273 秒) |
+| `test/replay.test.ts` の「実行の途中で index を作る」(sim、reference-scans、reference-full) | 1 から 200 | 600 件が通り、落ちたものはない (80 秒) |
+
+`ddl-concurrent` は基準経路の 2 つの組 (`vitest.config.ts` の oracles) に入っていないので、`REFERENCE` を環境変数で渡して sim の組で流した。渡した値が効いていることは、seed 1 の 1 つの場面で RPC を数えて確かめた (通常の経路は 1,616 回で `execAuto` が 53 回、`REFERENCE=scans` は 1,847 回で `execAuto` が 0 回、`REFERENCE=full` は 7,845 回)。
+「実行の途中で index を作る」は、段 3 の直後のコード (`3b6d6d7`) でも seed 1 から 200 を流し、600 件が通った。
+全部の試験 (`npx vitest run --maxWorkers=3`、4 つの組) も `c2ac670` で流し、182 ファイルのうち 175 が通り 7 が飛ばされ、1,946 件のうち 1,908 件が通り、38 件が飛ばされ、落ちたものはなかった。
+欠陥の表と RPC の列は `3b6d6d7` で取った。その後の `5189ca9` は、シャードが写しを畳み直す回数を減らすだけで (範囲の記録の後の畳み直しを、次の表定義の記録の前まで遅らせる)、畳んだ結果も RPC も変えない。`c2ac670` は試験と文書だけである。
+
+### 見つけて直していないもの
+
+段 3 の作業の中で新しく見つけた欠陥は、進める側を止める検査が段 3 より前のコードで見つけた 1 つ (行で失敗する DDL が、取り消されるまでの間、ほかの接続に見える) で、段 3 で直った。
+`test/open/` の再現 (13 ファイル) は、段 3 の前後で流し、どれも落ち、最初の誤りの文も前後で同じだった (段 3 で直って移した `split-reserve-revoked` を除く)。
+
+### 段 4 に要るもの
+
+- `startMove` と `endMove`。分割の枠 (`SplitSlot`、`beginSplit`、`startSplit`、`checkSplit`、`endSplit`、`splits`)、`fence` と `beginIncoming` の RPC、`switchRange`、`reserveSplit` を消す。DDL と移動の排他を、`refusal` の `ddl-waits-move` と `move-waits-ddl` で、列から決める (段 3 では、枠の `assertFreeForDdl` と `beginSplit` の `open` の確かめが守っている)。消す欠陥のスイッチは `startWithoutSlot`、`fenceWithoutSlot`、`splitWithoutSync` (段 3 から何も戻さない) で、足すのは `ddlDuringMove`、`moveDuringDdl`、`endBeforeDrained`、`pullWithoutEpoch`。
+- `docs/model-coverage.md` の M15 の行を、M21 の段 4 の赤 (`m21_red_ddl_during_move`、`_move_during_ddl`、`_end_early`、`_pull_unfenced`、`_fence_first`) に置き換える。`test/open/fenced-before-switch.test.ts` を本試験へ移す。
+- `test/split-slot.test.ts` を、`test/ddl-driver.ts` と同じ形 (手の列の番号で止める) の、分割を進める側の検査に書き直す。止まる位置は、`startMove` の前後、`drain` の途中、`endMove` の前である。
+- `Db.preparedAll` の、移動の途中のシャードを待って尋ね直す手は、Meta が移動の間に prepare を記録しなくなれば (DDL_WAITS_MOVE が列で決まれば)、起きなくなる。残すか消すかを決める。
+- 決めたこと 6 の、表定義の epoch を commit だけで進める案は、段 3 の実装の上で、赤を確かめ直してから採るかを決める (段 3 は、どの記録でも進める)。
+- `specs/README.md` の M21 の節は、段 3 に合わせて直す必要がある (この作業は `specs/` を書かないので、直していない)。「Meta が条件として使うのは段 3 と段 4 から」は、段 3 で `one-open`、`one-exit`、`all-acks` を使い始めたことに、「実装が入った時点で、M12、M14、M15 は M21 が置き換える」は、M12 と M14 を段 3 で、M15 を段 4 で置き換えることにする。
