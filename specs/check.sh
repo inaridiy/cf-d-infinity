@@ -540,6 +540,21 @@ red     $f m24_lock_red_no_wound holderSurvives         # 書き込み禁止に�
 witness $f m24_lock_green witnessDdlAfterTxn
 witness $f m24_lock_green witnessWoundThenCommit
 witness $f m24_lock_green witnessDdlBusy
+# 取り消させた DDL のやり直し (決めた設計。時刻あり。DDL の成否は利用者の時刻だけで決まり、行の置き場所に依らない)
+green   $f m24_retry_green retrySafe                    # 取り消された DDL を、同じ期限の中で、新しい epoch の prepare でやり直す。禁止に当たった取引は、そのシャードの行のロックを取る
+green   $f m24_retry_no_retry_same retrySafe            # やり直さない形でも、行が 1 つのシャードにあれば SQLite と同じ (下の赤と合わせて、成否が置き場所で決まる)
+red     $f m24_retry_red_no_retry asSqlite              # やり直さない (m24_lock の形): 行が 2 つのシャードにあると、DDL が期限より前に失敗する
+red     $f m24_retry_red_restart asSqlite               # やり直すたびに、期限を数え直す
+red     $f m24_retry_red_same_epoch checkSawRows        # やり直しが、取り消された試みの prepare の epoch と ok を使う
+red     $f m24_retry_red_no_hold noReblock              # 禁止に当たった取引に、シャードがロックを与えない: 取り消しとやり直しが繰り返す
+red     $f m24_retry_red_no_wait holderSurvives         # prepare が行ロックを待たない
+red     $f m24_retry_red_no_wound holderNotDelayed      # 取引が DDL を取り消させない: 取引の文が、期限まで DDL を待つ
+witness $f m24_retry_green witnessWoundRetryCommit      # 行が 2 つのシャード。取り消し、やり直し、取引が期限のうちに確定し、DDL が確定する
+witness $f m24_retry_green witnessSplitBusy             # 行が 2 つのシャード。取引が期限を過ぎてロックを持ち、やり直した DDL が期限に失敗する
+witness $f m24_retry_green witnessSameCommit            # 行が 1 つのシャード。DDL は取引を待ち、その確定の後で確定する
+witness $f m24_retry_green witnessSameBusy              # 行が 1 つのシャード。取引が期限を過ぎてロックを持ち、DDL が期限に失敗する
+live    $f m24_retry_green retryLive                    # 活性: 始めた DDL は終わり、時刻は上限まで進み、送られた文は答えを得る
+live_red $f m24_retry_red_no_hold ddlTerminates         # ロックを与えないと、取り消しとやり直しが、同じ刻みの中で限りなく続く
 # 取引の中の DDL (M13 を表ごとにしたもの)
 green   $f m24_boundary_green boundarySafeAll
 red     $f m24_boundary_red_main prefixOfScript
@@ -556,7 +571,10 @@ for m in m24_green_unrelated m24_green_build m24_green_check m24_green_drop m24_
          m24_red_global m24_red_global_commit_only m24_red_prepare_advances m24_red_read_deps m24_red_apply_all m24_red_apply_touched \
          m24_red_index m24_red_write_epoch m24_red_view \
          m24_floor_green m24_floor_red_global m24_floor_red_restore_all m24_floor_red_no_floor \
-         m24_lock_green m24_lock_red_no_wait m24_lock_red_no_wound m24_boundary_green m24_boundary_red_global; do tests $f $m; done
+         m24_lock_green m24_lock_red_no_wait m24_lock_red_no_wound \
+         m24_retry_green m24_retry_no_retry_same m24_retry_red_no_retry m24_retry_red_restart m24_retry_red_same_epoch \
+         m24_retry_red_no_hold m24_retry_red_no_wait m24_retry_red_no_wound \
+         m24_boundary_green m24_boundary_red_global; do tests $f $m; done
 # 決めたこと 6 の確かめ直し: M21 の場面を、epoch を commit だけで進める形で (index の作成と CHECK は、M21 の m21_alt_commit_only_*)
 f=m24b_m21_commit_only.qnt
 green   $f m24_m21_green_split_txns epochSafeCommitOnly

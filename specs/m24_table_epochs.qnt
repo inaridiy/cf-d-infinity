@@ -990,11 +990,14 @@ module m24_floor_red_no_floor {
 // D∞ の悲観の取引 (SQL の BEGIN と Hrana の baton。Drizzle の libSQL の取引もこれ) は、書いた行のロックを、行のシャードに持つ。
 // ロックの TTL は 5 秒で、そのシャードで文を実行するたびに延びる。段 3 の実装の prepare は intent を決着させるだけで、ロックを
 // 待たない。そのため、書いた取引の COMMIT が、DDL の後で古い計画として断られる。
-// 決めた設計:
+// ここで確かめる条件 (取引の側の 2 つ):
 //   WAIT_LOCKS  シャードは、表 X の prepare を、X の行のロックがある間は適用しない。待ちの上限は busy_timeout と同じ 5 秒で、
 //               過ぎれば prepared に ok でないと答え、DDL が SQLITE_BUSY で失敗する (shardBusy)。
 //   WOUND       X の行のロックを持つ取引の書き込みか COMMIT が、別のシャードで X の書き込み禁止に当たったら、Worker が Meta に
-//               その遷移を取り消させる (開いていれば abort が記録される。DDL は SQLITE_BUSY で失敗する)。
+//               その遷移を取り消させる (開いていれば abort が記録される)。
+// このモデルでは、取り消された DDL は SQLITE_BUSY で失敗する。そのため DDL の成否が、取引の行の置き場所で決まる (規則 4 に反する)。
+// 決めた設計は、取り消された DDL を、同じ期限の中でやり直す形で、下の m24_retry_* が確かめる。このモデルは、ロックの TTL が
+// 切れる手 (下の idleExpire と blockedExpire) と取引の側の 2 つの条件を、時刻なしで確かめるものとして残す。
 // モデルは、表 X の行 x1 (シャード P) と x2 (Q)、悲観の取引 1 件 (x1 を書き、x2 を書き、COMMIT する)、X の DDL 1 回。
 // 取引の計画は DDL より前のスナップショットである。
 // ロックが切れる手は 2 つある。idleExpire は、取引がそのシャードで 5 秒以上文を実行しなかったこと (利用者が待たせた) で、
@@ -1124,6 +1127,7 @@ module m24_lock_core {
   val witnessDdlBusy = not(ddlBusy and pc == 3)
 }
 
+// 取引の側の 2 つの条件を入れた形。取引は生き残るが、取り消された DDL はやり直さずに失敗する (決めた設計は m24_retry_green)。
 module m24_lock_green {
   import m24_lock_core(WAIT_LOCKS = true, WOUND = true).*
   // x1 を P に書いた後、Q が prepare を適用した。x2 の書き込みが Q の書き込み禁止に当たり、取引が DDL を取り消させて、確定する。
@@ -1149,6 +1153,442 @@ module m24_lock_red_no_wound {
     init.then(write).then(prepareDdl).then(applyPrepare(Q)).then(blockedExpire(P)).then(applyPrepare(P))
         .then(ack(P)).then(ack(Q)).then(commitDdl).then(applyEnd(Q)).then(write)
         .expect(not(holderSurvives))
+}
+
+// ---- 取り消させた DDL のやり直し (書いた取引が、別のシャードで書き込み禁止に当たったとき) ---------------------------
+//
+// m24_lock の WOUND は、ロックを持つ取引が別のシャードで書き込み禁止に当たると、DDL を取り消させ、DDL は SQLITE_BUSY で失敗する。
+// 行が 1 つのシャードにあれば、DDL は 5 秒まで待ち、その間に取引が確定すれば通る。行が 2 つのシャードにあり、2 つ目の書き込みが、
+// prepare を先に適用したシャードに当たると、DDL はすぐに失敗する。DDL の成否が行の置き場所で決まるので、規則 4 に反する。
+// 決めた設計 (2026-11-16):
+//   WAIT_LOCKS   シャードは、開いている試みの prepare を、表の行のロックがある間は適用しない (m24_lock のまま)。
+//   WOUND        ロックを持つ取引の文が、開いている試みの書き込み禁止に当たったら、Worker が Meta に、その試みを取り消させる
+//                (m24_lock のまま)。
+//   HOLD         禁止に当たったシャードは、その書き込みを断る (TableLocked) ときに、行のロックを取引に与える (書かずに)。
+//                取引の Worker は、そのシャードを、ロックを持つシャードに数える (COMMIT と ROLLBACK で放す)。
+//   RETRY        進める側 (DDL の文を受けた Worker) は、取り消された DDL を、新しい試みでやり直す。
+//   KEEP_BUDGET  やり直しも、DDL を始めたときの期限 (busy_timeout と同じ 5 秒) の中で行う。期限が来たら、開いている試みを
+//                取り消し、DDL は SQLITE_BUSY で失敗する。
+//   FRESH_EPOCH  やり直しは、新しい epoch の prepare を記録し、全部のシャードの ok を集め直す。
+// HOLD がないと、取り消しの後で、そのシャードが、取引の書き込みより先に、やり直しの prepare を適用し得る。取引はまた禁止に当たり、
+// 取り消しとやり直しが、期限まで繰り返す (m24_retry_red_no_hold)。
+//
+// 時刻: 刻み (tick) は、内部の手 (シャードの適用と ok、進める側の commit、やり直しと期限、禁止に当たったロックと取り消させる手、
+// 送られた文の実行) がどれもできないときにだけ進む。RPC は 5 秒に比べて十分に速い、という仮定である。利用者の手 (文を送る、DDL を
+// 始める) は、いつでもよい。期限 B は 2 刻みで、時刻は 0〜MAXT。
+// モデルは、表 X の行 x1 と x2 (置き場所は、シャード P と Q の 4 通りから init が選ぶ)、悲観の取引 1 件 (x1 を書き、x2 を書き、
+// COMMIT する)、X の DDL 1 回。取引の計画は、DDL より前の表定義である。ロックの TTL は、この instance にない (m24_lock にある)。
+// 試みは、シャードごとに、いまの試みについての位置 (cur) と、前の試みの禁止がまだ残っているか (lag) だけで表す。閉じた試みの
+// prepare と終わりは、待たずに続けて適用するので、まとめて 1 手にした。やり直しの回数に上限を置かずに、状態は有限になる。
+//
+// invariant:
+//   asSqlite          DDL の結果は、利用者の時刻 (x1 を送った時刻 tW、COMMIT を送った時刻 tC、DDL を始めた時刻 d0) だけで決まり、
+//                     SQLite (busy_timeout 5 秒) と同じである。DDL を始める前の刻みに x1 を送り、期限 (d0 + B) までに COMMIT を
+//                     送らなかったときだけ SQLITE_BUSY で、それも期限より前には失敗しない。期限のうちに放されたなら確定する。DDL は
+//                     期限までに終わる。置き場所を使わないので、どの置き場所でも結果が同じになる。同じ刻みの競り (x1 を d0 に送る、
+//                     COMMIT を期限の刻みに送る) は、SQLite でもどちらが先にロックを取るかで決まるので、両方を許す。
+//   holderSurvives    行を書いた取引は、DDL のために断られない (txnNotRefused: 取引は断られない。まだ何も書いていなければ計画し直す)
+//   holderNotDelayed  ロックを持つ取引の文は、DDL を待って時刻をまたがない (SQLite では、ロックを持つ側は DDL を待たない)
+//   noReblock         取引は、同じシャードで、同じ DDL の書き込み禁止に 2 度当たらない (取り消しとやり直しが繰り返さない。代わりの
+//                     性質で、本来の性質は、時刻が進むこと (timeAdvances) である)
+//   checkSawRows      DDL の commit が頼る ok は、どれも、そのシャードがその後で行の書き込みを受けていないものである
+//                     (シャードの確かめ (CHECK の試し、index の行の走査) が、DDL の確定する行を全部見た)
+module m24_retry_core {
+  const WAIT_LOCKS: bool
+  const WOUND: bool
+  const HOLD: bool
+  const RETRY: bool
+  const KEEP_BUDGET: bool
+  const FRESH_EPOCH: bool
+  // ---- 場面 ----
+  const SAME_SHARD: bool        // 行 x1 と x2 を同じシャードに置く置き場所だけにする (置き場所で成否が変わる形を示すため)
+
+  pure val P = 1
+  pure val Q = 2
+  pure val SHARDS = Set(1, 2)
+  pure val B = 2                // DDL の期限 (busy_timeout の 5 秒) を、刻みの数で
+  pure val MAXT = 4
+
+  // いまの試み
+  pure val NONE = 0
+  pure val OPEN = 1
+  pure val COMMITTED = 2
+  pure val ABORTED = 3
+  // DDL の結果
+  pure val RUNNING = 0
+  pure val OK = 1
+  pure val BUSY = 2
+
+  var now: int
+  var sh1: int                  // 行 x1 のシャード
+  var sh2: int                  // 行 x2 のシャード
+  // ---- DDL ----
+  var meta: int                 // いまの試み: NONE (まだ始めていない)、OPEN、COMMITTED、ABORTED
+  var dres: int                 // DDL の結果: RUNNING、OK、BUSY
+  var dstart: int               // 期限を数え始めた時刻 (-1 まだ)
+  var cur: int -> int           // シャード -> いまの試みについて: 0 prepare を適用していない、1 prepare を適用した (書き込み禁止)、
+                                // 2 終わりを適用した
+  var lag: int -> bool          // シャード -> 前の試みの prepare を適用したまま、その abort をまだ適用していない (書き込み禁止)
+  var acked: Set[int]           // いまの試みに ok と答えたシャード (FRESH_EPOCH = false では、前の試みの答えも残る)
+  // ---- 取引 ----
+  var pc: int                   // 0 x1 を書く前、1 x1 を書いた、2 x2 を書いた、3 確定した、4 断られた
+  var pend: bool                // 利用者が次の文を送り、まだ答えがない
+  var locks: int -> bool        // シャード -> 取引のロックがある
+  var rebased: bool             // 取引は、DDL の commit の後の表定義で計画し直した
+  // ---- ghost ----
+  var d0: int                   // DDL を始めた時刻 (-1 まだ)
+  var dEnd: int                 // DDL が終わった時刻
+  var tW: int                   // 利用者が x1 の書き込みを送った時刻
+  var tC: int                   // 利用者が COMMIT を送った時刻
+  var refusedHolder: bool       // 行を書いた取引が、DDL のために断られた
+  var delayed: bool             // ロックを持つ取引の文が、答えのないまま時刻をまたいだ
+  var reblocked: bool           // 取引が、取り消させたことのあるシャードで、また開いている試みの禁止に当たって取り消させた
+  var badCheck: bool            // DDL の commit が、その後で行の書き込みを受けたシャードの ok に頼った
+  var retried: bool             // 進める側がやり直した (witness 用)
+  var woundAt: Set[int]         // 取引が禁止に当たって取り消させたシャード
+  var late: Set[int]            // ok と答えた後で、行の書き込みを受けたシャード
+
+  pure val noLocks: int -> bool = SHARDS.mapBy(_ => false)
+
+  action initWith(a: int, b: int): bool = all {
+    now' = 0, sh1' = a, sh2' = b,
+    meta' = NONE, dres' = RUNNING, dstart' = -1, cur' = SHARDS.mapBy(_ => 0), lag' = SHARDS.mapBy(_ => false), acked' = Set(),
+    pc' = 0, pend' = false, locks' = noLocks, rebased' = false,
+    d0' = -1, dEnd' = -1, tW' = -1, tC' = -1,
+    refusedHolder' = false, delayed' = false, reblocked' = false, badCheck' = false, retried' = false,
+    woundAt' = Set(), late' = Set(),
+  }
+  action init = { nondet a = oneOf(SHARDS) nondet b = oneOf(SHARDS) all { not(SAME_SHARD) or a == b, initWith(a, b) } }
+
+  action keepDdl = all { meta' = meta, dres' = dres, dstart' = dstart, cur' = cur, lag' = lag, acked' = acked }
+  action keepTxn = all { pc' = pc, pend' = pend, locks' = locks, rebased' = rebased }
+  action keepTimes = all { d0' = d0, dEnd' = dEnd, tW' = tW, tC' = tC }
+  action keepFlags = all {
+    refusedHolder' = refusedHolder, delayed' = delayed, reblocked' = reblocked, badCheck' = badCheck, retried' = retried,
+    woundAt' = woundAt, late' = late,
+  }
+  action keepEnv = all { now' = now, sh1' = sh1, sh2' = sh2 }
+
+  // ---- 見えるもの ----
+  def deadline: int = dstart + B
+  def closed: bool = meta == COMMITTED or meta == ABORTED
+  /** シャード s は、書き込みを止めている (いまの試みか、前の試みの prepare を適用して、終わりをまだ適用していない)。 */
+  def fenced(s: int): bool = cur.get(s) == 1 or lag.get(s)
+  /** s の禁止は、開いている試みのものである (取り消させる相手がいる)。 */
+  def openFence(s: int): bool = cur.get(s) == 1 and meta == OPEN
+  /** s は DDL の commit を適用した。DDL より前の計画は古い。 */
+  def stale(s: int): bool = cur.get(s) == 2 and meta == COMMITTED and not(rebased)
+  def holder: bool = pc == 1 or pc == 2
+  def lockSet: Set[int] = SHARDS.filter(s => locks.get(s))
+  /** 送られた文が触るシャード。書き込みは行のシャード、COMMIT はロックを持つシャード。 */
+  def reqShards: Set[int] = if (pc == 0) Set(sh1) else if (pc == 1) Set(sh2) else lockSet
+  def blockers: Set[int] = reqShards.filter(s => openFence(s))
+
+  // ---- 内部の手ができるか。tick の条件と、手の条件の両方に、この定義だけを使う ----
+  def canExec: bool = pend and pc <= 2 and not(reqShards.exists(s => fenced(s)))
+  def canHold: bool = HOLD and pend and pc == 1 and fenced(sh2) and not(locks.get(sh2))
+  def canWound: bool =
+    WOUND and meta == OPEN and pend and holder and blockers != Set() and (not(HOLD) or blockers.forall(s => locks.get(s)))
+  def canApplyPrep(s: int): bool = meta == OPEN and cur.get(s) == 0 and not(lag.get(s)) and (not(WAIT_LOCKS) or not(locks.get(s)))
+  def canApplyEnd(s: int): bool = closed and cur.get(s) != 2 and not(lag.get(s))
+  def canApplyLag(s: int): bool = lag.get(s)
+  def canAck(s: int): bool = meta == OPEN and cur.get(s) == 1 and not(acked.contains(s))
+  def canCommitDdl: bool = dres == RUNNING and meta == OPEN and acked == SHARDS and now <= deadline
+  def canRetry: bool = RETRY and dres == RUNNING and meta == ABORTED and now < deadline
+  def canExpire: bool = dres == RUNNING and meta != NONE and now >= deadline
+  def urgent: bool = or {
+    canExec, canHold, canWound, canCommitDdl, canRetry, canExpire,
+    SHARDS.exists(s => canApplyPrep(s) or canApplyEnd(s) or canApplyLag(s) or canAck(s)),
+  }
+
+  // ---- 利用者 ----
+  // 取引の次の文を送る (x1 の書き込み、x2 の書き込み、COMMIT)。送らずに待ってもよい。
+  action issue = all {
+    not(pend), pc <= 2,
+    pend' = true, pc' = pc, locks' = locks, rebased' = rebased,
+    tW' = if (pc == 0) now else tW, tC' = if (pc == 2) now else tC, d0' = d0, dEnd' = dEnd,
+    keepDdl, keepFlags, keepEnv,
+  }
+  // 別の接続が DDL を始める。最初の試みの prepare を記録する。
+  action startDdl = all {
+    meta == NONE, now + B <= MAXT,
+    meta' = OPEN, dres' = RUNNING, dstart' = now, cur' = cur, lag' = lag, acked' = acked,
+    d0' = now, dEnd' = dEnd, tW' = tW, tC' = tC,
+    keepTxn, keepFlags, keepEnv,
+  }
+  // 時刻が進む。内部の手がどれもできないときだけ。
+  action tick = all {
+    now < MAXT, not(urgent),
+    now' = now + 1, sh1' = sh1, sh2' = sh2,
+    delayed' = (delayed or (pend and holder)),
+    refusedHolder' = refusedHolder, reblocked' = reblocked, badCheck' = badCheck, retried' = retried, woundAt' = woundAt, late' = late,
+    keepDdl, keepTxn, keepTimes,
+  }
+
+  // ---- 取引 ----
+  // 送られた文を、シャードが実行する。書き込み禁止のシャードがあれば待つ。古い計画なら断られる (まだ何も書いていなければ、新しい
+  // 表定義で計画し直す。Txn.rebase。文は送られたまま)。
+  action exec = all {
+    canExec,
+    val refused = reqShards.exists(s => stale(s))
+    val s = if (pc == 0) sh1 else sh2
+    all {
+      if (refused and pc == 0) all {
+        rebased' = true, pc' = pc, pend' = pend, locks' = locks, refusedHolder' = refusedHolder, late' = late,
+      } else if (refused) all {
+        pc' = 4, pend' = false, locks' = noLocks, rebased' = rebased, refusedHolder' = true, late' = late,
+      } else if (pc <= 1) all {
+        pc' = pc + 1, pend' = false, locks' = locks.set(s, true), rebased' = rebased, refusedHolder' = refusedHolder,
+        late' = if (dres == RUNNING and acked.contains(s)) late.union(Set(s)) else late,
+      } else all {
+        pc' = 3, pend' = false, locks' = noLocks, rebased' = rebased, refusedHolder' = refusedHolder, late' = late,
+      },
+      delayed' = delayed, reblocked' = reblocked, badCheck' = badCheck, retried' = retried, woundAt' = woundAt,
+      keepDdl, keepTimes, keepEnv,
+    }
+  }
+  // HOLD: ロックを持つ取引の x2 の書き込みが、書き込み禁止に当たった。シャードは書き込みを断り、行のロックを取引に与える。
+  action holdAtFence = all {
+    canHold,
+    locks' = locks.set(sh2, true), pc' = pc, pend' = pend, rebased' = rebased,
+    keepDdl, keepTimes, keepFlags, keepEnv,
+  }
+  // WOUND: ロックを持つ取引の文が、開いている試みの書き込み禁止に当たった。Worker が Meta に、その試みを取り消させる。
+  // RETRY がなければ、DDL はここで SQLITE_BUSY で失敗する (m24_lock の形)。
+  action wound = all {
+    canWound,
+    meta' = ABORTED,
+    dres' = if (RETRY) dres else BUSY,
+    dEnd' = if (RETRY) dEnd else now,
+    reblocked' = (reblocked or blockers.exists(s => woundAt.contains(s))),
+    woundAt' = woundAt.union(blockers),
+    dstart' = dstart, cur' = cur, lag' = lag, acked' = acked,
+    d0' = d0, tW' = tW, tC' = tC,
+    refusedHolder' = refusedHolder, delayed' = delayed, badCheck' = badCheck, retried' = retried, late' = late,
+    keepTxn, keepEnv,
+  }
+
+  // ---- 進める側 ----
+  // RETRY: 取り消された DDL を、新しい試みでやり直す。期限は数え直さない (KEEP_BUDGET)。新しい epoch の prepare を記録し、ok を
+  // 集め直す (FRESH_EPOCH)。前の試みの prepare を適用したまま abort をまだ適用していないシャードは、その禁止が残る (lag)。
+  action retry = all {
+    canRetry,
+    meta' = OPEN, dres' = dres,
+    dstart' = if (KEEP_BUDGET) dstart else now,
+    cur' = SHARDS.mapBy(_ => 0),
+    lag' = SHARDS.mapBy(s => lag.get(s) or cur.get(s) == 1),
+    acked' = if (FRESH_EPOCH) Set() else acked,
+    late' = if (FRESH_EPOCH) Set() else late,
+    retried' = true,
+    refusedHolder' = refusedHolder, delayed' = delayed, reblocked' = reblocked, badCheck' = badCheck, woundAt' = woundAt,
+    keepTxn, keepTimes, keepEnv,
+  }
+  // 全部のシャードが ok と答えた。期限のうちなら、commit を記録する。
+  action commitDdl = all {
+    canCommitDdl,
+    meta' = COMMITTED, dres' = OK, dEnd' = now,
+    badCheck' = (badCheck or late != Set()),
+    dstart' = dstart, cur' = cur, lag' = lag, acked' = acked,
+    d0' = d0, tW' = tW, tC' = tC,
+    refusedHolder' = refusedHolder, delayed' = delayed, reblocked' = reblocked, retried' = retried, woundAt' = woundAt, late' = late,
+    keepTxn, keepEnv,
+  }
+  // 期限が来た。開いている試みを取り消し、DDL は SQLITE_BUSY で失敗する。
+  action expire = all {
+    canExpire,
+    meta' = if (meta == OPEN) ABORTED else meta, dres' = BUSY, dEnd' = now,
+    dstart' = dstart, cur' = cur, lag' = lag, acked' = acked,
+    d0' = d0, tW' = tW, tC' = tC,
+    keepTxn, keepFlags, keepEnv,
+  }
+
+  // ---- シャード ----
+  // いまの試みの prepare を適用する。ロックがある間は待つ (WAIT_LOCKS)。
+  action applyPrep(s: int): bool = all {
+    canApplyPrep(s),
+    cur' = cur.set(s, 1), meta' = meta, dres' = dres, dstart' = dstart, lag' = lag, acked' = acked,
+    keepTxn, keepTimes, keepFlags, keepEnv,
+  }
+  // 閉じた試みの終わりを適用する。prepare をまだ適用していなければ、prepare と終わりを、待たずに続けて適用する。
+  action applyEnd(s: int): bool = all {
+    canApplyEnd(s),
+    cur' = cur.set(s, 2), meta' = meta, dres' = dres, dstart' = dstart, lag' = lag, acked' = acked,
+    keepTxn, keepTimes, keepFlags, keepEnv,
+  }
+  // 前の試みの abort を適用して、その禁止を解く。
+  action applyLag(s: int): bool = all {
+    canApplyLag(s),
+    lag' = lag.set(s, false), meta' = meta, dres' = dres, dstart' = dstart, cur' = cur, acked' = acked,
+    keepTxn, keepTimes, keepFlags, keepEnv,
+  }
+  // いまの試みの prepare を適用したシャードが、ok と答える (行の確かめは、ここで行う)。
+  action ack(s: int): bool = all {
+    canAck(s),
+    acked' = acked.union(Set(s)), meta' = meta, dres' = dres, dstart' = dstart, cur' = cur, lag' = lag,
+    keepTxn, keepTimes, keepFlags, keepEnv,
+  }
+
+  action step = any {
+    issue, startDdl, tick, exec, holdAtFence, wound, retry, commitDdl, expire,
+    { nondet s = oneOf(SHARDS) any { applyPrep(s), applyEnd(s), applyLag(s), ack(s) } },
+  }
+
+  // ---- 不変条件 -------------------------------------------------------------
+  def D0: int = d0 + B
+  /** 取引は、DDL の期限のあいだずっとロックを持っていた (x1 を d0 より前の刻みに送り、COMMIT を期限の刻みまでに送っていない)。 */
+  def heldThrough: bool = tW >= 0 and tW < d0 and not(tC >= 0 and tC <= D0)
+  /** 取引は、期限のうちにロックを放した (x1 を d0 より後の刻みに送ったか送っていない、または COMMIT を期限より前の刻みに送った)。 */
+  def releasedInTime: bool = not(tW >= 0 and tW <= d0) or (tC >= 0 and tC < D0)
+  val asSqlite = d0 < 0 or and {
+    dres != BUSY or (dEnd >= D0 and not(releasedInTime)),
+    dres != OK or not(heldThrough),
+    not(dres == RUNNING and now > D0),
+  }
+  val holderSurvives = not(refusedHolder)
+  val txnNotRefused = pc != 4
+  val holderNotDelayed = not(delayed)
+  val noReblock = not(reblocked)
+  val checkSawRows = not(badCheck)
+  val retrySafe = and { asSqlite, holderSurvives, txnNotRefused, holderNotDelayed, noReblock, checkSawRows }
+
+  // ---- witness (時刻は競りのないものだけ。置き場所ごとに、確定と SQLITE_BUSY) ----
+  def strictHolder: bool = tW >= 0 and tW < d0
+  // 行が 2 つのシャードにある。取引が DDL を取り消させ、進める側がやり直し、取引が期限より前に確定して、DDL が確定する
+  val witnessWoundRetryCommit = not(sh1 != sh2 and woundAt != Set() and retried and strictHolder and tC > d0 and tC < D0
+                                    and dres == OK and pc == 3)
+  // 同じく、取引が期限を過ぎてロックを持ち続け、やり直した DDL が期限に SQLITE_BUSY で失敗し、取引はその後で確定する
+  val witnessSplitBusy = not(sh1 != sh2 and retried and strictHolder and tC > D0 and dres == BUSY and pc == 3)
+  // 行が 1 つのシャードにある。DDL は取引を待ち、取引が期限より前に確定して、DDL が確定する
+  val witnessSameCommit = not(sh1 == sh2 and strictHolder and tC > d0 and tC < D0 and dres == OK and pc == 3)
+  // 同じく、取引が期限を過ぎてロックを持ち続け、DDL が期限に SQLITE_BUSY で失敗する
+  val witnessSameBusy = not(sh1 == sh2 and strictHolder and tC > D0 and dres == BUSY and pc == 3)
+
+  // ---- 活性 -----------------------------------------------------------------
+  // 内部の手と刻みに、弱い公平性を置く (送られた文の実行も弱い公平性。強くすると、HOLD がないときの繰り返しが隠れる)。
+  // 利用者の手 (文を送る、DDL を始める) には置かない。
+  val vars = (now, sh1, sh2, meta, dres, dstart, cur, lag, acked, pc, pend, locks, rebased, d0, dEnd, tW, tC,
+              refusedHolder, delayed, reblocked, badCheck, retried, woundAt, late)
+  temporal fairness = and {
+    weakFair(exec, vars), weakFair(holdAtFence, vars), weakFair(wound, vars), weakFair(retry, vars),
+    weakFair(commitDdl, vars), weakFair(expire, vars), weakFair(tick, vars),
+    weakFair(applyPrep(P), vars), weakFair(applyPrep(Q), vars), weakFair(applyEnd(P), vars), weakFair(applyEnd(Q), vars),
+    weakFair(applyLag(P), vars), weakFair(applyLag(Q), vars), weakFair(ack(P), vars), weakFair(ack(Q), vars),
+  }
+  // 始めた DDL は、いつか終わる
+  temporal ddlTerminates = fairness implies always((d0 >= 0 and dres == RUNNING) implies eventually(dres != RUNNING))
+  // 時刻は、いつか上限まで進む (内部の手が、同じ刻みの中で限りなく続かない)
+  temporal timeAdvances = fairness implies eventually(now == MAXT)
+  // 送られた文は、いつか答えを得る
+  temporal stmtCompletes = fairness implies always(pend implies eventually(not(pend)))
+  temporal retryLive = fairness implies and {
+    always((d0 >= 0 and dres == RUNNING) implies eventually(dres != RUNNING)),
+    eventually(now == MAXT),
+    always(pend implies eventually(not(pend))),
+  }
+}
+
+// 決めた設計。行が 2 つのシャードにあり、x2 の書き込みが Q の書き込み禁止に当たる。取引は Q のロックを取り、DDL を取り消させ、
+// 進める側がやり直す。やり直しの prepare は、P と Q で取引のロックを待ち、取引の COMMIT の後で確定する。
+module m24_retry_green {
+  import m24_retry_core(WAIT_LOCKS = true, WOUND = true, HOLD = true, RETRY = true, KEEP_BUDGET = true, FRESH_EPOCH = true,
+    SAME_SHARD = false).*
+  run woundRetryTest =
+    initWith(P, Q).then(issue).then(exec).then(tick)
+        .then(startDdl).then(applyPrep(Q)).then(ack(Q))
+        .expect(not(canApplyPrep(P)) and not(urgent))
+        .then(issue).then(holdAtFence).then(wound).then(retry).then(applyLag(Q))
+        .expect(not(canApplyPrep(Q)) and canExec)
+        .then(exec).then(tick).then(issue).then(exec)
+        .then(applyPrep(P)).then(applyPrep(Q)).then(ack(P)).then(ack(Q)).then(commitDdl)
+        .expect(retrySafe and dres == OK and pc == 3 and retried and dEnd == 2)
+  // 同じ置き場所で、取引が期限を過ぎてロックを持ち続ける。DDL は期限に SQLITE_BUSY で失敗し、取引はその後で確定する。
+  run busyTest =
+    initWith(P, Q).then(issue).then(exec).then(tick)
+        .then(startDdl).then(applyPrep(Q)).then(ack(Q))
+        .then(issue).then(holdAtFence).then(wound).then(retry).then(applyLag(Q)).then(exec)
+        .then(tick).then(tick)
+        .expect(canExpire and urgent)
+        .then(expire).then(applyEnd(P)).then(applyEnd(Q)).then(tick).then(issue).then(exec)
+        .expect(retrySafe and dres == BUSY and dEnd == 3 and pc == 3)
+}
+// RETRY がない (m24_lock の形)。取り消された DDL は、期限より前に SQLITE_BUSY で失敗する。行が 1 つのシャードにあれば、同じ時刻の
+// 並びで、DDL は待って確定する。
+module m24_retry_red_no_retry {
+  import m24_retry_core(WAIT_LOCKS = true, WOUND = true, HOLD = true, RETRY = false, KEEP_BUDGET = true, FRESH_EPOCH = true,
+    SAME_SHARD = false).*
+  run noRetryTest =
+    initWith(P, Q).then(issue).then(exec).then(tick)
+        .then(startDdl).then(applyPrep(Q)).then(ack(Q))
+        .then(issue).then(holdAtFence).then(wound)
+        .expect(dres == BUSY and dEnd == 1 and not(asSqlite))
+}
+// 同じ形 (RETRY がない) で、行を 1 つのシャードに置く。取引は禁止に当たらず、DDL は待って、SQLite と同じ結果になる。
+// m24_retry_red_no_retry と合わせて、やり直さない形の成否が、行の置き場所で決まることを示す。
+module m24_retry_no_retry_same {
+  import m24_retry_core(WAIT_LOCKS = true, WOUND = true, HOLD = true, RETRY = false, KEEP_BUDGET = true, FRESH_EPOCH = true,
+    SAME_SHARD = true).*
+  run sameShardTest =
+    initWith(P, P).then(issue).then(exec).then(tick)
+        .then(startDdl).then(applyPrep(Q)).then(ack(Q))
+        .then(issue).then(exec)
+        .expect(not(urgent) and dres == RUNNING)
+        .then(tick).then(issue).then(exec)
+        .then(applyPrep(P)).then(ack(P)).then(commitDdl)
+        .expect(retrySafe and dres == OK and dEnd == 2)
+}
+// やり直すたびに、期限を数え直す。DDL は、最初の期限を過ぎても終わらず、SQLite なら SQLITE_BUSY になる DDL が確定し得る。
+module m24_retry_red_restart {
+  import m24_retry_core(WAIT_LOCKS = true, WOUND = true, HOLD = true, RETRY = true, KEEP_BUDGET = false, FRESH_EPOCH = true,
+    SAME_SHARD = false).*
+  run restartTest =
+    initWith(P, Q).then(issue).then(exec).then(tick)
+        .then(startDdl).then(applyPrep(Q)).then(ack(Q)).then(tick)
+        .then(issue).then(holdAtFence).then(wound).then(retry).then(applyLag(Q)).then(exec)
+        .then(tick).then(tick)
+        .expect(dres == RUNNING and now == 4 and not(asSqlite))
+}
+// やり直しが、取り消された試みと同じ prepare の epoch を使う。Q の、取引の x2 より前の ok が、やり直しの commit に数えられる。
+module m24_retry_red_same_epoch {
+  import m24_retry_core(WAIT_LOCKS = true, WOUND = true, HOLD = true, RETRY = true, KEEP_BUDGET = true, FRESH_EPOCH = false,
+    SAME_SHARD = false).*
+  run sameEpochTest =
+    initWith(P, Q).then(issue).then(exec).then(tick)
+        .then(startDdl).then(applyPrep(Q)).then(ack(Q))
+        .then(issue).then(holdAtFence).then(wound).then(retry).then(applyLag(Q)).then(exec)
+        .expect(late == Set(Q))
+        .then(issue).then(exec).then(applyPrep(P)).then(ack(P)).then(commitDdl)
+        .expect(dres == OK and not(checkSawRows))
+}
+// 禁止に当たった取引に、シャードがロックを与えない。取り消しの後で、Q が、取引の書き込みより先に、やり直しの prepare を適用し、
+// 取引はまた禁止に当たる。取り消しとやり直しが、同じ刻みの中で繰り返す。
+module m24_retry_red_no_hold {
+  import m24_retry_core(WAIT_LOCKS = true, WOUND = true, HOLD = false, RETRY = true, KEEP_BUDGET = true, FRESH_EPOCH = true,
+    SAME_SHARD = false).*
+  run noHoldTest =
+    initWith(P, Q).then(issue).then(exec).then(tick)
+        .then(startDdl).then(applyPrep(Q)).then(ack(Q))
+        .then(issue).then(wound).then(retry).then(applyLag(Q)).then(applyPrep(Q)).then(wound)
+        .expect(not(noReblock) and now == 1)
+}
+// prepare が行ロックを待たない。DDL が、取引のロックがあるまま確定し、取引の x2 の書き込みが古い計画として断られる。
+module m24_retry_red_no_wait {
+  import m24_retry_core(WAIT_LOCKS = false, WOUND = true, HOLD = true, RETRY = true, KEEP_BUDGET = true, FRESH_EPOCH = true,
+    SAME_SHARD = false).*
+  run noWaitTest =
+    initWith(P, Q).then(issue).then(exec).then(tick)
+        .then(startDdl).then(applyPrep(P)).then(applyPrep(Q)).then(ack(P)).then(ack(Q)).then(commitDdl)
+        .then(applyEnd(P)).then(applyEnd(Q)).then(issue).then(exec)
+        .expect(not(holderSurvives) and pc == 4)
+}
+// 取引が DDL を取り消させない。x2 は Q の禁止で待ち、P は取引のロックを待つ。どちらも進まず、取引の文が、期限まで時刻をまたいで待つ。
+module m24_retry_red_no_wound {
+  import m24_retry_core(WAIT_LOCKS = true, WOUND = false, HOLD = true, RETRY = true, KEEP_BUDGET = true, FRESH_EPOCH = true,
+    SAME_SHARD = false).*
+  run noWoundTest =
+    initWith(P, Q).then(issue).then(exec).then(tick)
+        .then(startDdl).then(applyPrep(Q)).then(ack(Q))
+        .then(issue).then(holdAtFence).then(tick)
+        .expect(not(holderNotDelayed))
 }
 
 // ---- 取引の中の DDL の順序 (M13 を表ごとにしたもの) -------------------------------------
