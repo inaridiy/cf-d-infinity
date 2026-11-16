@@ -13,11 +13,11 @@ import { SHARD_LIMITS, ShardLimit, shardLimitOf, withinShardLimits } from "../sh
 import type {
   Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, LockOwner,
   Participant, Piece, PiecePayload, PieceWant, Pos, PrepareReq, PrepareRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts,
-  TxnStatus, Value,
+  TxnStatus, Plain, Value,
 } from "../types";
 import {
-  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, TableLocked, checkStorageFormat, isWideSpan, spanCovers, utf8Length,
-  unprotectedSpans,
+  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, TableLocked, WriteOutsideClaim, checkStorageFormat, isWideSpan,
+  spanCovers, utf8Length, unprotectedSpans,
 } from "../types";
 import type { DdlEntry } from "../meta";
 import { blockOf, checkInterval, overlaps, rangeText, sameInterval, slotAligned, slotOf, tokenOf, type Interval } from "../routing";
@@ -25,10 +25,10 @@ import { keyString } from "../keys";
 import { type Runtime, systemRuntime } from "../runtime";
 import { attempt, done, tail, unwrap, wait, type Effect, type Fork, type Outcome, type PeerCall, type Program, type Step } from "./step";
 import {
-  CAPTURE_TABLES, applyChanges, asSqlError, capturedChanges, checkAfter, decode, deleteRow, encode, imageSql, insertRow, keyWhere, pkValues, q,
-  returnedRows, rowwiseRestore, selectGroup, selectRow, setBasedRestore, tupleKey, typedScanList, typedValues,
+  CAPTURE_TABLES, applyChanges, asSqlError, capturedChanges, checkAfter, decode, deleteRow, encode, imageSql, insertRow, pkValues, predicateRowSql, q,
+  queryAll, returnedRows, rowwiseRestore, selectGroup, selectRow, setBasedRestore, tupleKey,
 } from "./rows";
-import { parseTuple, type Tuple } from "../value";
+import { decodeElem, decodeReturned, decodeTuple, parseTuple, selectElemSql, tupleSql, typedReadSql, type Tuple } from "../value";
 
 /**
  * 核の依存。同期のものだけである。相手のシャード、Meta、背景の仕事は、殻の依存 (core.ts の ShardDeps) にあり、核からは見えない。
@@ -59,6 +59,25 @@ export interface KernelDeps {
    * 指定すると、文ごとに、範囲の外の行を消した状態でも同じ結果になるかを確かめる。本番では指定しない。
    */
   spanEscape?: (e: SpanEscape) => void;
+  /**
+   * 試験用の検査。シャードが書き込みを受け入れる前に、その書き込みを渡す (書き込みの守り claimed の入口)。守りを欠陥のスイッチで
+   * 外していても呼ぶ。シミュレータは、守りとは別に、宣言した範囲と、範囲表での持ち主を確かめる。本番では指定しない。
+   */
+  writeCheck?: (e: WriteCheck) => void;
+}
+
+/** シャードが受け入れようとしている書き込み (KernelDeps.writeCheck)。 */
+export interface WriteCheck {
+  shard: string;
+  /**
+   * 文の実行なら、その文と、文が宣言した範囲。取引が溜めた変更を確定のときに受け取る経路 (commitLocal、prepare) では null である。
+   * そこでは、変更それぞれが名乗る行が、宣言である。
+   */
+  sql: string | null;
+  spans: Span[] | null;
+  changes: Change[];
+  /** 変更の表の定義。行イメージから行のキーを読むのに使う。 */
+  def(table: string): TableDef;
 }
 
 /** 文の結果が、宣言した範囲の外の行に依存していた。範囲の外の行は決着も検証もされないので、取引の検証が成り立たない。 */
@@ -110,7 +129,23 @@ function imageFits<T>(write: () => T): T {
     throw e;
   }
 }
-/** 値のおおよその大きさ (バイト)。上限の判定に使うだけで、正確である必要はない。 */
+/**
+ * 宣言した範囲 s が、変更の行を覆うか (書き込みの守り ShardKernel.claimed)。覆い方は spanCovers と同じで、全表の範囲に claim が
+ * あれば、claim の token の区間に載る行だけを覆う (Span.claim)。
+ */
+function declares(s: Span, c: Pick<Change, "table" | "pk" | "sk">): boolean {
+  if (!spanCovers(s, c.table, c.pk, c.sk)) return false;
+  if (!isWideSpan(s) || s.claim === undefined) return true;
+  const token = tokenOf(c.sk, c.pk);
+  return s.claim.some((x) => token >= x.start && token < x.end);
+}
+/** 型つきの読みに包んだ文。同じ形の読みが何度も届くので、文ごとに覚える (ShardKernel.executed)。 */
+const wrappedReads = new Map<string, string>();
+
+/**
+ * 値のおおよその大きさ (バイト)。上限の判定に使うだけで、正確である必要はない。値に戻した後で数える (INTEGER と REAL は 8 バイト)。
+ * 型つきの読みの印 (`i`、`t`) は数えないので、段 2 までと同じ数になり、集める予算の配り方は変わらない。
+ */
 const sizeOf = (v: Value): number =>
   typeof v === "string" ? v.length * 2 : v instanceof Uint8Array ? v.byteLength : 8;
 
@@ -715,7 +750,7 @@ export class ShardKernel {
    * 変更ログを commit_ts の昇順で読む。世代は commit_ts の範囲で分かれているので、古い世代から順に読めば全体も昇順になる。
    * where は `commit_ts > ?` のような条件で、各世代の表に同じものを付ける。
    */
-  private logScan(where: string, params: Value[], limit?: number): Row[] {
+  private logScan(where: string, params: Plain[], limit?: number): Row[] {
     const out: Row[] = [];
     for (const g of this.logGens()) {
       const rest = limit === undefined ? "" : ` LIMIT ${limit - out.length}`;
@@ -729,7 +764,7 @@ export class ShardKernel {
    * 変更ログを commit 時刻の順に 1 行ずつ読む。fn が false を返したらそこでやめる。
    * 保持窓の全行を配列にすると、書き込みの多いシャードでは起動と過去時点の読みがメモリを使い切る。
    */
-  private logEach(where: string, params: Value[], fn: (commitTs: Ts, txn: string, blob: string) => boolean | void): void {
+  private logEach(where: string, params: Plain[], fn: (commitTs: Ts, txn: string, blob: string) => boolean | void): void {
     for (const g of this.logGens()) {
       const { rows } = this.b.iterate(`SELECT commit_ts, txn, blob FROM __log_g${g} ${where} ORDER BY commit_ts`, ...params);
       for (const r of rows) {
@@ -796,10 +831,10 @@ export class ShardKernel {
     else this.b.exec(`DELETE FROM __txn WHERE done = 1 AND at < ?`, cutoff);
   }
 
-  private metaGet(k: string): Value {
+  private metaGet(k: string): Plain {
     return this.b.exec(`SELECT v FROM __meta WHERE k = ?`, k)[0]?.v ?? null;
   }
-  private metaSet(k: string, v: Value): void {
+  private metaSet(k: string, v: Plain): void {
     this.b.exec(`INSERT INTO __meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, k, v);
   }
 
@@ -905,6 +940,17 @@ export class ShardKernel {
     }
     if (!slotAligned(x)) throw new SqlError(`moving a part of a slot is not supported yet: ${rangeText(x)}`);
   }
+  /**
+   * 区間 area (shard key sk の 1 行か、そのブロック) を、このシャードが持っていないときの、断る誤り。持っていれば null。
+   * 時刻に依らない部分だけを見る。手放した (fence した) 範囲は NotOwner で、受け取り中の範囲のまだ届いていないグループは競合である。
+   * 同期区間の入口 (assertOwned) と、書き込みの守り (claimed) が、同じこの規則で所有を引く。
+   */
+  private notOwned(sk: string, area: Interval): Error | null {
+    const f = this.fencedIn(area);
+    if (f && !this.faults.ignoreFence) return new NotOwner(f.to);
+    if (this.incomingIn(area) && !this.arrived.has(sk)) return new ConflictError(`group not arrived: ${sk}`);
+    return null;
+  }
   private sksOf(spans: Span[], writes: Pick<Change, "sk">[] = []): string[] {
     const out = new Set<string>(writes.map((w) => w.sk));
     for (const s of spans) if (s.kind === "pk" || s.kind === "sk" || (s.kind === "pred" && s.sk)) out.add(s.sk!);
@@ -922,9 +968,8 @@ export class ShardKernel {
    */
   private assertOwned({ spans, writes, at: T }: Rows): void {
     for (const { sk, area } of this.areasOf(spans, writes)) {
-      const f = this.fencedIn(area);
-      if (f && !this.faults.ignoreFence) throw new NotOwner(f.to);
-      if (this.incomingIn(area) && !this.arrived.has(sk)) throw new ConflictError(`group not arrived: ${sk}`);
+      const refused = this.notOwned(sk, area);
+      if (refused) throw refused;
       const m = this.arrived.get(sk);
       if (m !== undefined && T !== null && T < m && !this.faults.servePastMove) throw new ReadTooOld(`moved at ${m}`);
       // 範囲の床。受け取り終えた範囲のキーは、到着の記録があってもなくても、T < m では答えない。
@@ -1026,13 +1071,16 @@ export class ShardKernel {
         const keyset = cursor.after !== null && cursor.after.every((v) => v !== null);
         const where = keyset ? `WHERE (${cols}) > (${def.shardKey.map(() => "?").join(", ")})` : "";
         const skip = keyset ? 0 : (cursor.skip ?? 0);
-        const { rows } = this.b.iterate(
-          `SELECT DISTINCT ${cols} FROM ${q(def.name)} ${where} ORDER BY ${cols} LIMIT -1 OFFSET ${skip}`,
-          ...(keyset ? cursor.after! : []),
+        // shard key の値は、タプルで読む。素の列で読むと、DO のドライバは 2^53 を超える INTEGER を丸める。丸めたキーのグループは、
+        // 移動で運ばれずに取り残される。
+        const { rows } = this.b.query(
+          `SELECT ${tupleSql(def.shardKey.map(q))} FROM (SELECT DISTINCT ${cols} FROM ${q(def.name)} ${where} ORDER BY ${cols} LIMIT -1 OFFSET ${skip})`,
+          keyset ? cursor.after! : [],
         );
         let read = 0;
-        for (const r of rows) {
+        for (const raw of rows) {
           read++;
+          const r = decodeTuple(parseTuple(raw[0] as string));
           add(keyString(r));
           if (out.length >= req.limit) {
             // NULL を含む shard key は行の比較で絞れないので、読んだ数で続きを表す。
@@ -1099,7 +1147,7 @@ export class ShardKernel {
   }
 
   health(_req: Record<string, never>): ShardHealth {
-    const one = (sql: string, ...params: Value[]) => (this.b.exec(sql, ...params)[0]?.v as number | null) ?? 0;
+    const one = (sql: string, ...params: Plain[]) => (this.b.exec(sql, ...params)[0]?.v as number | null) ?? 0;
     const oldest = one(`SELECT min(prepare_ts) v FROM __intents`);
     return {
       id: this.id, schema: this.schema, format: STORAGE_FORMAT, bytes: this.b.size(),
@@ -1123,26 +1171,28 @@ export class ShardKernel {
     const def = this.defs.get(req.table);
     if (!def) throw new SqlError(`no such table: ${req.table}`);
     const cols = def.pk.map(q).join(", ");
-    // 型のない列の型を一緒に読む (走査と同じ列の並び)。値の作り直しの段 3 で、型つきの読みに替わる。
-    const list = typedScanList(def);
+    // 列ごとに要素の式を掛けて、型ごと読む (docs/design-values.md の「エクスポートと取り込み」)。D∞ が作る文で、列の参照だけを
+    // 読むので、包む CTE は要らない。PRIMARY KEY のない表は rowid も読む (行の所在を決める値である)。
+    const columns = [...(def.implicitRowid ? ["rowid"] : []), ...def.columns];
+    const list = columns.map((c) => selectElemSql(c === "rowid" ? "rowid" : q(c))).join(", ");
     const keyset = req.after !== null && req.after.every((v) => v !== null);
     const where = keyset ? `WHERE (${cols}) > (${def.pk.map(() => "?").join(", ")})` : "";
     const limit = Math.max(1, Math.min(req.limit, 5000));
     // 主キーに NULL を含む行は、行の比較では「その次」を表せない。その場合は、読んだ行数で続きを表す。
     const offset = keyset ? "" : ` OFFSET ${Math.max(0, Math.floor(req.skip ?? 0))}`;
-    const { columns, rows } = this.b.iterate(
-      `SELECT ${list} FROM ${q(def.name)} ${where} ORDER BY ${cols} LIMIT ${limit}${offset}`, ...(keyset ? req.after! : []),
+    const { rows } = this.b.query(
+      `SELECT ${list} FROM ${q(def.name)} ${where} ORDER BY ${cols} LIMIT ${limit}${offset}`, keyset ? req.after! : [],
     );
     const out: Value[][] = [];
     let bytes = 0;
-    for (const r of rows) {
+    for (const raw of rows) {
+      const r = raw.map(decodeElem);
       out.push(r);
       for (const v of r) bytes += sizeOf(v);
       // 1 回の応答が大きくなりすぎないよう、行数の上限より先にバイト数で切る。続きは次の呼び出しで読む。
       if (bytes > 4_000_000) break;
     }
-    const typed = typedValues(def, columns, out);
-    return { columns: typed.columns, rows: typed.rows, pk: def.pk.map((c) => typed.columns.indexOf(c)) };
+    return { columns, rows: out, pk: def.pk.map((c) => columns.indexOf(c)) };
   }
 
   metrics(_req: Record<string, never>): ShardMetrics {
@@ -1334,9 +1384,8 @@ export class ShardKernel {
       return this.rollback(() => {
         deleteRow(this.b, def, pk);
         insertRow(this.b, def, row);
-        const key = keyWhere(def.pk, `${q(s.alias)}.`);
-        const sql = `SELECT 1 FROM ${q(def.name)} AS ${q(s.alias)} WHERE (${s.where}) AND ${key} LIMIT 1`;
-        return this.b.exec(sql, ...s.params, ...pkValues(pk)).length > 0;
+        // 利用者の表に触る文なので、query で読む。結果に INTEGER を返さない (query は INTEGER をドライバの数で読む文を受けない)。
+        return queryAll(this.b, predicateRowSql(def, s.alias, s.where), [...s.params, ...pkValues(pk)]).length > 0;
       });
     } catch {
       return true;
@@ -1420,33 +1469,85 @@ export class ShardKernel {
    * どの文の形にも同じ検査が掛かるので、範囲の作り方を文の形ごとに確かめなくてよい。
    *
    * 要求の文は、run か、ここを通して実行する。同期区間の印を受け取るのは、区間に入っていない入口が文を実行できないように
-   * するためである。
+   * するためである。文が捕捉した変更は、ここで書き込みの守り (claimed) に掛ける。要求の文を実行する経路 (exec の下書き、悲観的な
+   * DML、autocommit の下書きと高速経路) は、どれもここを通るので、守りを経路ごとに並べない。
    */
-  private checked<T>(_sec: Section<"owned">, req: ExecReq, exec: () => T): T {
+  private checked<T extends { changes: Change[] } | null>(sec: Section<"owned">, req: ExecReq, exec: () => T): T {
+    // 範囲の検査の下書きの中では、守りを掛けない。下書きは巻き戻すので、守りは、結果を返す 1 回に掛ければ足りる。
+    if (this.checking) return exec();
     const report = this.deps.spanEscape;
-    if (!report || this.checking) return exec();
-    this.checking = true;
-    try {
-      const probe = (): string => {
-        try {
-          return encode(exec());
-        } catch (e) {
-          return `error: ${e === FALLBACK ? "fallback" : ((e as Error)?.message ?? String(e))}`;
+    if (report) {
+      this.checking = true;
+      try {
+        const probe = (): string => {
+          try {
+            return encode(exec());
+          } catch (e) {
+            return `error: ${e === FALLBACK ? "fallback" : ((e as Error)?.message ?? String(e))}`;
+          }
+        };
+        const narrowed = this.rollback(() => (this.deleteOutside(req) ? probe() : null));
+        if (narrowed !== null) {
+          const full = this.rollback(probe);
+          // random() などで実行のたびに結果が変わる文は、比べても意味がない。同じ状態で 2 回実行して確かめる。
+          const stable = full === this.rollback(probe);
+          if (stable && full !== narrowed) report({ shard: this.id, sql: req.sql, params: req.params, spans: req.spans, full, narrowed });
         }
-      };
-      const narrowed = this.rollback(() => (this.deleteOutside(req) ? probe() : null));
-      if (narrowed !== null) {
-        const full = this.rollback(probe);
-        // random() などで実行のたびに結果が変わる文は、比べても意味がない。同じ状態で 2 回実行して確かめる。
-        const stable = full === this.rollback(probe);
-        if (stable && full !== narrowed) report({ shard: this.id, sql: req.sql, params: req.params, spans: req.spans, full, narrowed });
+      } finally {
+        this.checking = false;
       }
-    } finally {
-      this.checking = false;
     }
-    return exec();
+    const out = exec();
+    // 守りが断ると、呼び出し側の巻き戻し (rollback か b.tx) が、文の書き込みを全部取り消す。変更は、返しも溜めもしない。
+    if (out) this.claimed(sec, out.changes, req);
+    return out;
   }
   private checking = false;
+
+  /**
+   * 書き込みの守り (計画書の不変条件 1 の書き込みの側: 行は、その token を持つシャードにだけある。未解決の問題 35)。
+   * シャードが受け入れようとしている変更の行のどれもが、次の 2 つを満たすことを確かめる。満たさない行が 1 つでもあれば、
+   * WriteOutsideClaim で書き込みの全体を断る。断った書き込みは、本体にも、intent にも、Worker へ返す変更にも残らない。
+   *   1. 行の token を、このシャードが持っている。所有は、同期区間の入口 (assertOwned) と同じ規則 (notOwned) で引く。
+   *   2. 行が、宣言の中にある。文の実行なら、文が宣言した範囲のどれかが行を覆う (全表の範囲は、claim の token の区間の中の行だけを
+   *      覆う)。取引が溜めた変更を確定のときに受け取る経路 (req が null。commitLocal と prepare) では、変更が名乗る行 (持ち主を
+   *      enter が確かめた行) が宣言で、変更後の行イメージのキーが、名乗る行と同じでなければならない。
+   *
+   * Worker は文を、宣言した範囲の持ち主へ送る。宣言の外の行を書いた文は、行を持ち主でないシャードに置くか、同じ行を 2 つの
+   * シャードに置く。今までは Worker だけがこれを守っていた。所有は「手放していない」で引くので、分割で生まれた兄弟のシャードの
+   * 行は、所有の確かめ (1) を通ってしまう。それを止めるのは 2 である。
+   *
+   * 掛けるのは、要求の文の実行 (checked) と、取引の変更の受け入れ (commitLocal、prepareSync) だけである。もう決まった書き込みは
+   * 掛けずに受け入れる: 確定した intent の適用 (finalize)、移動の後に転送された phase 2、届いた piece (receive、pull の応答)、
+   * 過去の時点への巻き戻し (restore)、overlay の適用。どれも、行の置き場所を、すでに一度この守りか移動の手順が決めている。
+   * 断ると、確定した取引が適用できなくなるか、移動が終わらない。
+   *
+   * いまの Worker は、書き込みの文に全表の範囲を付けない (書き込みは shard key で絞った宛先へだけ送る)。付ける経路を足すなら、
+   * 次に気を付ける。範囲表の古い Worker の claim は、後で受け取った範囲を含まない。受け取ったシャードは同じ文をこの守りで断り、
+   * 渡した側は NotOwner で断る。その経路を足す者は、Worker が経路の拒否を先に扱い、範囲表を取り直して文を計画し直すように
+   * しなければならない (いまの Worker は、先に返った誤りを返す)。そうしないと、分割の途中の文が、どちらの拒否が先に返るかで、
+   * やり直されたり失敗したりする (AGENTS.md の規則 4)。
+   */
+  private claimed(_sec: Section<"owned">, changes: Change[], req: Pick<ExecReq, "sql" | "spans"> | null): void {
+    if (changes.length === 0) return;
+    this.deps.writeCheck?.({ shard: this.id, sql: req?.sql ?? null, spans: req?.spans ?? null, changes, def: (t) => this.def(t) });
+    if (this.faults.ignoreWriteClaim) return;
+    const report = "nothing was written; the request was built wrongly, please report this";
+    for (const c of changes) {
+      const row = `${c.table} row ${c.pk}`;
+      if (!req && c.after) {
+        const k = tupleKey(this.def(c.table), c.after);
+        if (k.pk !== c.pk || k.sk !== c.sk) {
+          throw new WriteOutsideClaim(`a change for ${row} on shard ${this.id} carries the image of ${c.table} row ${k.pk}; ${report}`);
+        }
+      }
+      const refused = this.notOwned(c.sk, this.areaOf(c.sk, c.pk));
+      if (refused) throw new WriteOutsideClaim(`shard ${this.id} does not own ${row} (${refused.message}); ${report}`);
+      if (req && !req.spans.some((s) => declares(s, c))) {
+        throw new WriteOutsideClaim(`the statement wrote ${row} (shard key ${c.sk}) on shard ${this.id}, outside the spans it declared; ${report}`);
+      }
+    }
+  }
 
   /** 範囲の外の行を、利用者の表と index の表から消す。行が多すぎて検査を省くときは false を返す。 */
   private deleteOutside(req: ExecReq): boolean {
@@ -1458,11 +1559,11 @@ export class ShardKernel {
       // 条件の span は、条件に合う行の主キーを先に求める。
       const matching = spans.flatMap((s) => {
         if (s.kind !== "pred") return [];
-        const keys = this.b.raw(`SELECT ${imageSql(def)} FROM ${q(def.name)} AS ${q(s.alias)} WHERE (${s.where})`, ...s.params).values
+        const keys = queryAll(this.b, `SELECT ${imageSql(def)} FROM ${q(def.name)} AS ${q(s.alias)} WHERE (${s.where})`, s.params)
           .map((r) => tupleKey(def, parseTuple(r[0] as string))).filter((k) => s.sk === undefined || s.sk === k.sk);
         return [new Set(keys.map((k) => k.pk))];
       });
-      for (const r of this.b.raw(`SELECT ${imageSql(def)} FROM ${q(def.name)}`).values) {
+      for (const r of queryAll(this.b, `SELECT ${imageSql(def)} FROM ${q(def.name)}`, [])) {
         if (++seen > SPAN_CHECK_MAX_ROWS) return false;
         const key = tupleKey(def, parseTuple(r[0] as string));
         // 取引が自分で書いた行は、ほかの取引から守る必要がないので、範囲に入っていなくてよい。
@@ -1486,7 +1587,7 @@ export class ShardKernel {
     // REPLACE が暗黙に消す行は recursive_triggers がないと DELETE trigger を発火しない。
     this.b.exec(`PRAGMA recursive_triggers = ON`);
     this.b.exec(`INSERT INTO __cap_on VALUES (1)`);
-    const out = this.b.raw(req.sql, ...req.params);
+    const out = this.returned(req, queryAll(this.b, req.sql, req.params));
     // 文が変更した行の数は、SQLite に尋ねる。捕捉した変更の数とは違う。REPLACE が消した行は、SQLite は数えない。
     // 捕捉のための trigger の中の書き込みは、changes() に入らない。
     const count = this.b.exec(`SELECT changes() AS n`)[0]!.n as number;
@@ -1500,14 +1601,46 @@ export class ShardKernel {
     return { ...out, changes, count };
   }
 
+  /**
+   * 書き込みの文の結果 (利用者の RETURNING) を値に戻す。Worker は RETURNING の項を要素の式に書き換えて送り (src/sql/returning.ts)、
+   * 書き換える前の文の列名を columns に付ける。列名のない書き込みが行を返したら、書き換えていない RETURNING なので、断る。
+   * 素のまま返すと、DO のドライバが丸めた INTEGER を、黙って REAL として返すことになる。
+   */
+  private returned(req: ExecReq, rows: Plain[][]): { columns: string[]; values: Value[][] } {
+    if (rows.length > 0 && req.columns.length === 0) throw new SqlError("a write that returns rows must name its result columns (protocol 5); please report this");
+    return { columns: req.columns, values: rows.map((r) => r.map(decodeReturned)) };
+  }
+
+  /**
+   * シャードが実行する形の文。読みは、型つきの読みに包む (src/value.ts の typedReadSql、docs/design-values.md の「シャードからの
+   * 読み」)。DO の SQL の API は INTEGER を丸めた数で返すので、それを知る場所をここ 1 か所にする。列の数は Worker が渡す
+   * (ExecReq.columns)。書き込みは、Worker が RETURNING を書き換えた文をそのまま実行する。
+   */
+  private executed(req: Pick<ExecReq, "sql" | "columns" | "write">): string {
+    if (req.write) return req.sql;
+    if (req.columns.length === 0) throw new SqlError("a read must name its result columns (protocol 5); please report this");
+    const fenced = !this.faults.unfencedRead;
+    const key = `${req.columns.length}\0${fenced}\0${req.sql}`;
+    let hit = wrappedReads.get(key);
+    if (hit === undefined) {
+      hit = typedReadSql(req.sql, req.columns.length, selectElemSql, fenced);
+      if (wrappedReads.size >= 512) wrappedReads.delete(wrappedReads.keys().next().value!);
+      wrappedReads.set(key, hit);
+    }
+    return hit;
+  }
+
   /** 読み取りの文を実行し、上限を超えた時点で打ち切る。全行を集めてから数えると、数える前にメモリが尽きる。 */
   private readLimited(req: ExecReq): { columns: string[]; values: Value[][]; bytes?: number; over?: boolean } {
     const maxRows = Math.min(req.maxRows ?? SHARD_MAX_ROWS, SHARD_MAX_ROWS);
     const maxBytes = Math.min(req.maxBytes ?? SHARD_MAX_BYTES, SHARD_MAX_BYTES);
-    const { columns, rows } = this.b.iterate(req.sql, ...req.params);
+    // 文の種類ごとの行数の集計 (src/worker.ts の rowStats) は、包む前の文面で数える。
+    const { rows } = this.b.query(this.executed(req), req.params, req.sql);
+    const columns = req.columns;
     const values: Value[][] = [];
     let bytes = 0;
-    for (const row of rows) {
+    for (const raw of rows) {
+      const row = raw.map(decodeElem);
       values.push(row);
       for (const v of row) bytes += sizeOf(v);
       if (values.length > maxRows) throw new SqlError(`result too large: more than ${maxRows} rows from one shard; narrow the query`);
@@ -1524,8 +1657,9 @@ export class ShardKernel {
    * Worker から届いた文を、DO の SQLite の上限で測る。超える文は、何も読まず書かずに ShardLimit で断る。Worker はそれを受けて、
    * 文を基準経路で実行し直す (src/shard-limits.ts、計画書の不変条件 13)。
    */
-  private withinLimits(req: Pick<ExecReq, "sql" | "params">): void {
-    const over = shardLimitOf(req.sql, req.params ?? []);
+  private withinLimits(req: Pick<ExecReq, "sql" | "params" | "columns" | "write">): void {
+    // 実行する形 (読みは包んだ後の文) で測る。
+    const over = shardLimitOf(this.executed(req), req.params ?? []);
     if (over) throw new ShardLimit(over);
   }
 
@@ -1552,7 +1686,7 @@ export class ShardKernel {
       return this.b.tx(() => {
         const before = span.kind === "pk" && capture === "update" ? selectRow(this.b, def, span.pk) : null;
         const was = before && tupleKey(def, before).pk;
-        const rows = returnedRows(def, this.b.raw(returning, ...req.params).values, capture !== "delete");
+        const rows = returnedRows(def, queryAll(this.b, returning, req.params), capture !== "delete");
         if (capture === "update" && (rows.length > 1 || (rows.length === 1 && was !== tupleKey(def, rows[0]!).pk))) {
           throw FALLBACK;
         }
@@ -1765,6 +1899,13 @@ export class ShardKernel {
       // 参加者が非オーナーなら取引は abort で、Worker が経路を更新して再実行する。
       this.releaseLocks(req.txn);
       return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+    }
+    try {
+      // 取引が溜めた変更の行を、intent を置く前に確かめる (書き込みの守り)。断れば、anchor が取引を中止する。
+      this.claimed(sec, req.writes, null);
+    } catch (e) {
+      this.releaseLocks(req.txn);
+      return { ok: false, reason: (e as Error).message };
     }
     this.count("writes", req.spans, req.writes);
     const reason = this.validate(sec, req.txn, req.T, req.writes, req.spans);
@@ -2694,6 +2835,8 @@ export class ShardKernel {
     const sec = this.enter({ schema: req.schema, spans: req.spans, writes: req.writes, at: req.T });
     try {
       this.assertWriteSetFits(sec, req.writes);
+      // 取引が溜めた変更の行を、適用する前に確かめる (書き込みの守り)。
+      this.claimed(sec, req.writes, null);
     } catch (e) {
       this.releaseLocks(req.txn);
       throw e;

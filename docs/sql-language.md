@@ -66,7 +66,8 @@ SQLite 自身の適合試験 sqllogictest と、本物の SQLite との差分テ
 | 主キーの列に NULL のある行 | 断る。SQLite は INTEGER でない主キーに NULL をいくつでも入れられるが、行を主キーの値で名指しするので区別できない。`INTEGER PRIMARY KEY` に NULL を渡すと rowid が入るのは SQLite と同じである |
 | 書き込みの文の中の `sqlite_master` と PRAGMA の関数 (`pragma_table_info(...)` など) | 断る。読みの文の中なら、利用者の表定義について答える (シャードの内部の表は見えない) |
 | shard key を含まない、UNIQUE の部分 index と式の index | 断る (`unsupported:`)。シャードをまたぐ UNIQUE の index の表は、列の値だけで項目を作るからである |
-| 名前が `__dinf_` で始まる列と表 | 断る (`unsupported:`)。Worker とシャードが文に足す列の別名に使う。同じ名前の列があると、足した列が利用者の列を上書きする。`$` で始まる列名は、行イメージが列名を持たなくなったので使える (2026-11-14) |
+| 文の `OR FAIL` と `OR ROLLBACK` (INSERT と UPDATE)、制約に書いた `ON CONFLICT` (ABORT 以外) | 断る (`unsupported:`)。OR FAIL は衝突した行より前の行の変更を残し、OR ROLLBACK は取引を終え、制約の ON CONFLICT は文の既定の衝突の処理を変える。どれも、D∞ はまだ SQLite と同じに運べない (2026-11-15 に差分の検査が見つけた)。断るのは文の形と表定義で決まる。文に書く `OR IGNORE`、`OR REPLACE`、`REPLACE`、`ON CONFLICT DO` は使える |
+| 名前が `__dinf_` で始まる表 | 断る。D∞ が文に足す CTE の名前 (型つきの読みの `__dinf_r`) と取り違えないためである。列の名前は予約しない。`$` で始まる列名は、行イメージが列名を持たなくなったので使え、`__dinf_` で始まる列名は、文に列の別名を足さなくなったので使える (2026-11-14) |
 
 ### DO の SQLite の制限
 
@@ -86,9 +87,11 @@ DO の SQLite には、文の長さ (100 KB)、束縛の変数 (100 個)、複�
 
 | 項目 | 差分 |
 |---|---|
-| 2^53 を超える整数 | Hrana で引数として渡すと断る (`unsupported:`)。JavaScript の数値を通るので、受け付けると黙って隣の値になる。SQL の中で計算して 2^53 を超えた値は、結果として返るときに精度が落ちる。Hrana では `float` として返す。±2^53 を超える整数を保存する書き込みは、どの経路でも `unsupported:` で断る。D∞ の値は JS の数で、DO の SQLite も読み出しで JS の数にするので、受け付けると、2^53 より下の桁だけが違う 2 つの主キーが同じ値になり、取引は丸めた値を書く (`test/wide-integers.test.ts`)。64 ビットの ID (Snowflake など) は TEXT で持つ |
-| 引数の型 | 差分はない。Hrana は要求に書いた型のまま束縛する (`integer` は INTEGER、`float` は REAL。sqld と同じ。@libsql/client は JS の数を `float`、BigInt と真偽値を `integer` で送る)。D1 互換の API と Service Binding は、整数の JS の数を INTEGER、ほかの数を REAL として束縛する (D1 と同じ)。DO の SQLite は JS の数を REAL として束縛するので、D∞ が文の中の引数を `(CAST(? AS INTEGER)+0)` に包んで、型を保つ。値は、どの経路で答えても、分割で運んでも、型を変えない |
-| 結果の数の型 | 整数の値の REAL (5.0 など) は、Hrana の `integer` で返す。DO の SQLite は、読み出しで INTEGER と REAL を区別しないからである。sqld は `float` で返す。`typeof()` は SQLite と同じ値を返す。REAL の無限大は、Hrana が JSON で運べないので、クライアントの誤りになる (sqld も同じ) |
+| 64 ビットの整数 | 差分はない (2026-11-14 から。`test/int64.test.ts`)。±2^63 の端まで、保存し、引数で渡し、SQL の中で計算し、結果で返し、分割で運び、エクスポートして取り込める (`test/export-import.test.ts`)。Hrana は 10 進の文字列 (`integer`) で運ぶ。D1 互換の API、Service Binding、HTTP の `/sql` と `/batch` の結果の INTEGER は、`intMode` で形を選ぶ (@libsql/client と同じ。2026-11-15 から)。既定の `"number"` は D1 と同じく JS の数で返し、±(2^53 - 1) を超える INTEGER を含む結果は、隣の値に丸めずに誤りにする。`last_row_id` は、`"number"` で JS の数にできなければ (2^53 を超える rowid を明示して入れたとき)、丸めずに「返す rowid がない」として扱う (Service Binding と HTTP の `lastInsertRowid` は `null`、D1 の `meta.last_row_id` は行を入れなかった文と同じ 0)。RETURNING のない INSERT は、SQLite と同じく成功する。`"bigint"` は INTEGER をすべて `bigint` で、`"string"` はすべて 10 進の文字列で返す。指定は `connect(env.DINF_DB, { intMode: "bigint" })`、HTTP の本文の `"intMode": "string"` である。HTTP は JSON なので `"bigint"` を断る。CLI (`npx cf-d-infinity sql`) は、`--param` の数字と、表と `--json` の INTEGER を、桁を落とさずに運ぶ |
+| 引数の型 | 差分はない。Hrana は要求に書いた型のまま束縛する (`integer` は INTEGER、`float` は REAL。sqld と同じ。@libsql/client は JS の数を `float`、BigInt と真偽値を `integer` で送る)。D1 互換の API と Service Binding は、安全な整数の JS の数を INTEGER、ほかの数を REAL、`bigint` を INTEGER として束縛する。安全な範囲の外の整数の値の JS の数 (2^60 など) は、渡された double のまま REAL である (INTEGER の列では、型の親和性が整数にする)。HTTP の `/sql` と `/batch` の本文の JSON では、数字だけで書いた literal は、64 ビットに収まれば元の数字のまま INTEGER になる (`9223372036854775807` は丸めない。JS のクライアントが `JSON.stringify` で書いた 2^60 も、数字だけなので INTEGER である)。ほかの literal (小数点か指数のあるもの、64 ビットに収まらないもの) は JS の数として読み、安全な整数なら INTEGER、ほかは REAL として束縛する。DO の SQLite は JS の数を REAL として束縛し、BigInt を束縛できないので、D∞ が文の中の引数を `(CAST(? AS INTEGER)+0)` に包んで、型を保つ (2^53 を超える INTEGER は 10 進の文字列を包む)。値は、どの経路で答えても、分割で運んでも、型を変えない |
+| 結果の数の型 | 差分はない (2026-11-14 から)。整数の値の REAL (5.0 など) は、Hrana の `float` で返る (sqld と同じ)。シャードは結果を型つきで読む (INTEGER と TEXT に印を付けて運ぶ)。REAL の無限大は、Hrana が JSON で運べないので、クライアントの誤りになる (sqld も同じ) |
+| NUL (U+0000) を含む TEXT | 差分はない (2026-11-14 から)。どの経路で答えても、全部を返す。Worker の SQLite のドライバは TEXT を最初の NUL で切るので、D∞ は TEXT を BLOB にして読む |
+| HTTP の `/sql` と `/batch` の JSON の BLOB と無限大 | 値を JSON の値のまま書くので、BLOB はバイトの番号を鍵にした object (`{"0":0,"1":255}`)、REAL の ±無限大は `null` になる。`hex()` か `quote()` で読むか、Hrana を使う。D1 互換の API と Service Binding は、structured clone で BLOB を `Uint8Array` のまま返す |
 | 暗黙の rowid と `INTEGER PRIMARY KEY` の採番 | 一意で増えるが連続しない。削除された番号は再利用しない。接続を跨ぐと順序も保証しない |
 
 ### 制約
@@ -128,6 +131,13 @@ autocommit の読み取りと取引の最初の読み取りでは、開始前に
 例外は取引の 2 文目以降である。
 読み取り時刻を進められなかった取引は最初のスナップショットのまま読み続けるので、別のシャードに後から確定した書き込みが見えないことがある。
 Serializable は保たれ、書き込みがあれば `COMMIT` の検証で競合になる。
+
+取引の途中で範囲の移動 (分割) があっても、取引は続けられる。
+動いた行への文は、新しい持ち主へ送る。
+動いた範囲を移動の時刻より前の読み取り時刻で読む文は、それまでの読みが今も成り立てば読み取り時刻を進めて読み、成り立たなければ競合 (`SQLITE_BUSY`) になる。
+どちらも、移動がなく、同じ行が別の接続に書かれたときと同じ扱いなので、答えは行の置き場所で変わらない。
+`not owner` で失敗することはない。
+(2026-11-15 に決めた約束である。今のコードは、動いた範囲に触る文を `not owner` で断る。`test/open/transaction-across-split.test.ts`。)
 
 ### 取引の中の DDL
 

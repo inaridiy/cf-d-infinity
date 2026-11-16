@@ -865,8 +865,10 @@ witness は 4 つである。`witnessCrossAppliedThenMoved` は、2 つの piece
 ### M21 `m21_catalog_epoch.qnt` — Meta の版と排他を、1 本の epoch の列と 2 相の遷移にまとめる
 
 2026-11-14 に書いた。
-実装より先に書いたモデルで、対応する実装はまだない。
+実装より先に書いたモデルである。
 設計は [docs/design-catalog-epoch.md](../docs/design-catalog-epoch.md) にある。
+2026-11-15 に設計の段 1 (Meta の `__epoch` の列と、`src/catalog.ts` の畳み込み) が入った。
+遷移の条件は `src/catalog.ts` の `refusal()` に書き、このモデルの乱択の実行と突き合わせている (`test/catalog-m21.test.ts`) が、Meta が条件として使うのは段 3 と段 4 からである。
 
 いまの Meta は、5 つの版と排他を別々に持っている。
 DDL の版と事後の取り消し、シャードをまたぐ UNIQUE の index を作る間の書き込み禁止 (M12)、DROP の前の書き込み禁止 (M14)、分割と DDL の枠 (M15)、範囲表の版である。
@@ -991,3 +993,134 @@ green、red、witness の 72 個と、`run` の試験 38 個が、期待どお�
 
 実装が入った時点で、M12、M14、M15 は M21 が置き換える。
 M11 と M13 は残す。
+
+### M22 `m22_unique_keys.qnt` — 主キー以外の UNIQUE を、キーの行 1 種類にまとめる (不変条件 2 と 7)
+
+2026-11-14 に書いた。
+実装より先に書いたモデルで、対応する実装はまだない。
+設計は [docs/design-unique-keys.md](../docs/design-unique-keys.md) にある。
+
+いまの UNIQUE は 2 通りである。
+shard key を含む UNIQUE はシャードの SQLite の UNIQUE index が守り、ほかの取引の未確定の値は、intent を全部試しに適用して確かめる (M16)。
+shard key を含まない UNIQUE は、index の表 `__gidx_<index>` (値を主キーにした 1 行) を、同じ取引で書く。
+前者は、グループを piece ごとに運ぶと、確定した取引が適用できなくなる。
+M20 の緑は規則を 3 つ足したが、その 1 つ (子はグループが揃うまで UNIQUE の値を書く文を受けない) は、大きなテナントが動く間、UNIQUE のある表への 1 行の INSERT まで `migrating:` で失敗させる。
+持ち主の決定 (大きなテナントの移動の間に文を失敗させない) とぶつかる。
+
+設計は、どの UNIQUE も `__gidx` と同じ形の **キーの行** で守る。
+キーの行は (制約, 値の正規形) を主キーにした 1 行で、その値を持つ行の主キー (holder) を持つ。
+値を書く取引は、行と一緒にキーの行を書く。値を取るキーの行は「ない」から holder へ、手放すキーの行は holder から「ない」へ。
+キーの行も行なので、置き場所、piece、持ち主の確かめ、intent、ロック、2PC は、行と同じ規則に乗る。
+shard key の列を BINARY で含む UNIQUE のキーの行は、テナントの slot のブロックに置き、テナントが分かれていなければ行と同じシャードにある。
+シャードの物理の index は一意でない。
+M20 の 3 つの規則はない。
+
+モデルの舞台は M20 と同じである。
+親 P、子 C、グループ 1 つ、行 2 つ (行 1 は piece 1、行 2 は piece 2)、値は 0 (行がないか NULL) と 1、2。
+値ごとにキーの位置が 1 つあり、それを覆う piece は最初に任意に選ぶ (行と同じ piece のことも、違う piece のこともある)。
+キーの行が「ない」ときも位置はあり、その位置を覆う piece が届けば、子は「ない」と言える (1 行の INSERT は、この形で確かめる)。
+移動は 2 通りで、定数で選ぶ。グループの全部が piece ごとに子へ移る形 (`MOVE_ALL`、design-subslots.md の段 2) と、piece 1 が親に残り、親が piece 1 の位置の書き込みを受け続ける形 (テナントを割る、段 4) である。
+後者でキーの位置が全部 piece 2 にあれば、行 1 から見て、シャードをまたぐ UNIQUE (キーの行が別のシャードにあり、行と別に動く) と同じ形になる。
+取引は 2 つで、1 行か 2 行の値を書く。
+計画 (`plan`) が、そのときの見える状態から行の古い値を読み、キーの行の変更を作る。
+シャードは、自分がいま持つ位置の部分を確かめて intent を置く。部分は、シャードごとに別の手で、別の時点に置かれる (行は子、キーの行は親、のように 2 つのシャードに分かれる)。
+確かめは、行もキーの行も同じで、ほかの取引の intent がないこと (ロック) と、値が計画の読んだものと同じことである。
+全部の部分の intent が置かれたら、anchor が確定できる。中止はいつでもできる。
+intent は、その位置の piece と一緒に動き、適用は、そのシャードがいま持つ intent をまとめて行う。
+piece は、切る、届く、ack の順に進み、決着させてから切る規則はない。
+時刻 (T、m、`write after T`) はモデルにない。計画の読んだ値と同じかどうかの確かめが、検証の代わりである。
+
+不変条件は 4 つで、`uniqueSafe` はその論理積である。
+
+- `committedApplies`: 確定した取引の適用も、piece の受け取りも失敗しない。物理の index は一意でないので、失敗するのは、キーの行の intent が確かめたときと違う値に当たる場合と、届いたキーの行が子の同じキーの行とぶつかる場合である。物理の index を一意にしたインスタンスでは、シャードの物理の表に同じ値の行ができる場合も含む。
+- `uniqueVisible`: 見える状態 (位置の持ち主の値に、確定して未適用の intent を重ねたもの) の行の値に、同じ値の行が 2 つない。キーの行からではなく、行の値から計算する。
+- `keysExact`: 見える状態のキーの行は、行の値のちょうど逆の写像である。値 v を持つ行が r だけであることと、キーの行 v の holder が r であることが同じである。
+- `noMigratingRefusal`: UNIQUE の値を書く取引を、移動の途中だという理由で断らない。受け入れの条件で、M20 の規則を入れたインスタンスだけが破る。
+
+活性 `writeTerminates`: 計画した取引は、Worker が中止しなくても、いつか確定か中止になる。
+仮定する公平性は、シャードが確かめられる部分を確かめること (prepare)、子が部分の位置を覆う piece を pull し、親がそれを切ること (`demandCut`)、切った piece が届くこと、全部の intent が置かれたら anchor が確定することで、どれも弱い公平性である。
+要らない piece を切る手と中止には、公平性を置いていない。移動が途中で止まっても、取引は終わる。
+取引 1 つのインスタンスで確かめた。
+
+決めた設計は、次の条件の上に立つ。1 つ外すと反例が出る。
+
+| 条件 (定数) | 外したインスタンス | 反例 |
+|---|---|---|
+| キーの部分は、キーの位置の持ち主が確かめる (`KEY_OWNER`) | `m22_red_key_at_row` | テナントを割る移動。r2 = 2 とキー 2 が子へ移り、親の控えが消える。親に残る r1 を 2 にする取引を、親が手元のキーの行 (もうない) で確かめて通す。シャードの中の UNIQUE index と同じ考え方である |
+| 子は、キーの位置を覆う piece が届くまで、そのキーを確かめない (`PULL_KEY`) | `m22_red_key_unarrived` | 行 1 の位置だけが子に届いている。r2 = 1 とキー 1 は親にある。子が、行 1 を 1 にする INSERT のキー 1 を「ない」と見て通す |
+| キーの行の intent は、ほかの取引の同じキーの部分を断る (`KEY_LOCK`) | `m22_red_no_key_lock` | 2 つの取引が、どちらも確定した状態だけを見て、別の行に同じ値を書く (M16 の `m16_red_body_only` の形) |
+| キーの持ち主は、確定したキーの行を確かめる (`KEY_BODY`) | `m22_red_no_key_body` | r1 = 1 が確定している。r2 を 1 にする取引が、intent のないキー 1 を通す |
+| キーの行は、行と同じ 2PC の参加者である (`KEY_IN_TXN`) | `m22_red_key_after_commit` | 2 つの取引が、行の部分だけで確定し、どちらも値 1 を持つ。キーの行は確定の後に書かれ、2 つ目は断られるが、もう確定している (`committedApplies` も破れる) |
+| 値を手放す行は、古い値のキーの行も消す (`RELEASE_OLD`) | `m22_red_keep_old_key` | r1 を 1 から 2 にする。キー 1 の行が r1 を指したまま残る。後で、誰も持っていない値 1 の INSERT が断られる |
+| キーの行の intent は、キーの位置の piece と一緒に動く (`KEY_INTENT_MOVES`) | `m22_red_key_intent_with_row` | キー 1 の位置は piece 2。行 1 とキー 1 に intent を置いた取引の、キー 1 の intent が行 1 と一緒に子へ行く。子が、持っていないキー 1 の行を書き、後から届いたキー 1 の行とぶつかる |
+| シャードの物理の index は一意でない (`PHYS_UNIQUE` が true なら一意) | `m22_red_physical_unique` | M20 の `m20_red_piecewise` の形。値を入れ替える取引の piece 1 の分を子が適用した後で、piece 2 が古い r2 を運ぶ。子の物理の表に同じ値の行が一時的に 2 つでき、一意の index が挿入を断る。親の側の形 (piece 2 を先に渡し、控えを持ったまま r1 を適用する) もある。見える状態は UNIQUE を守っている |
+| 子は、部分の位置を覆う piece だけを待つ (`CHILD_GROUP = 0`) | `m22_red_group_refuse`、`m22_live_red_group_wait` | M20 の規則。グループが揃うまで UNIQUE の値を書く取引を断ると、1 行の INSERT が `migrating` で失敗する。断らずに待つと、要らない piece が切られない限り、取引が終わらない |
+
+外しても破れない条件が 2 つある。
+決着させてから切る規則 (M20 の `SETTLE`) は、どの緑にもない。
+親が fence の後も、まだ切っていない piece の位置の prepare を受けても (`PARENT_UNTIL_CUT`、M20 の `PARENT_STOPS` を外す)、`uniqueSafe` は破れない (`m22_green_parent_until_cut`)。
+親が書き込みを止めるのは、時刻 m の規則 (M5b、M18) のためで、UNIQUE はこれに頼らない。
+
+| インスタンス | 性質 | 定数 | 到達状態数 (distinct) | 結果 |
+|---|---|---|---|---|
+| `m22_green` | `uniqueSafe` | グループの全部が piece 2 つで移る、取引 2 つ、キーの位置の piece は任意、最初の値は任意 | 4,307,108 | No violation |
+| `m22_green_split` | `uniqueSafe` | テナントを割る移動 (piece 1 は親に残る)、ほかは同じ | 1,211,580 | No violation |
+| `m22_green_parent_until_cut` | `uniqueSafe` | `m22_green` で、親が fence の後も、切っていない piece の位置の prepare を受ける | 5,738,668 | No violation |
+| `m22_green3_one` | `uniqueSafe` | piece 3 つ (piece 3 にはキーの位置だけが入り得る)、取引 1 つ、witness の印を持つ | 583,305 | No violation |
+| `m22_live` / `m22_live_split` | `writeTerminates` (時相) | 取引 1 つ、グループの全部が移る / テナントを割る | 44,536 / 12,348 | No violation |
+| `m22_red_key_at_row` | `uniqueVisible` | 条件を 1 つ外す (テナントを割る移動) | 反例 (214,703 で) | 反例 |
+| `m22_red_key_unarrived` | `uniqueVisible` | 同上 | 反例 (234,807 で) | 反例 |
+| `m22_red_no_key_lock` | `uniqueVisible` | 同上 | 反例 (176,359 で) | 反例 |
+| `m22_red_no_key_body` | `uniqueVisible` | 同上 | 反例 (8,264 で) | 反例 |
+| `m22_red_key_after_commit` | `uniqueVisible` | 同上 | 反例 (8,573 で) | 反例 |
+| `m22_red_keep_old_key` | `keysExact` | 同上 | 反例 (7,613 で) | 反例 |
+| `m22_red_key_intent_with_row` | `keysExact` / `committedApplies` | 同上 | 反例 (356,580 / 397,019 で) | 反例 |
+| `m22_red_physical_unique` | `committedApplies` | 同上 | 反例 (202,840 で) | 反例 |
+| `m22_red_physical_unique` | `uniqueVisible` | 同上 (`HEAVY=1` のときだけ) | 4,424,404 | No violation (見える状態は破れない) |
+| `m22_red_group_refuse` | `noMigratingRefusal` | M20 の規則で断る | 反例 (76,728 で) | 反例 |
+| `m22_live_red_group_wait` | `writeTerminates` (時相) | M20 の規則で待つ、取引 1 つ | 反例 (21,605 で) | 反例 |
+| `m22_green3_split` | `uniqueSafe` | piece 3 つ (piece 1 は親に残る)、取引 2 つ (`HEAVY=1` のときだけ。約 10 分) | 14,325,879 | No violation |
+| `m22_green3` | `uniqueSafe` | piece 3 つ、グループの全部が移る、取引 2 つ (`HEAVY=1` のときだけ) | (流していない) | |
+
+赤の到達状態数は、TLC が反例を見つけるまでに数えた数で、worker の並びで流すたびに少し変わる。
+状態数は、4 workers、heap 2.5 GB で測った。ほかの TLC と同時に走らせて、緑は 1 本 1 分から 4 分、赤と witness は 1 本 15 秒から 40 秒である。
+`check.sh` の M22 の節 (`HEAVY=1` の 3 本を除く 37 本) を、check.sh の関数のまま流して、全部が期待どおりで、13 分だった (2026-11-14)。
+
+witness は 7 つで、印を持つ同じ設定 (`m22_track`、`m22_track_split`、`m22_green3_one`) で調べる。
+安全性の緑は、状態を減らすために印を持たない (`m22_track` と同じ定数で印を持つ版の `uniqueSafe` は、6,905,168 状態で違反なし。piece の数を定数にする前のファイルで、1 度だけ流した。`check.sh` には入れていない)。
+7 つとも到達した (TLC が 9 万から 76 万状態で見つけた)。
+
+| witness | インスタンス | 内容 |
+|---|---|---|
+| `witnessWriteDuringMoveSamePiece` | `m22_track` | 移動の途中 (グループの piece の一部がまだ親にある) に、子が、行と同じ piece のキーを取る部分を受け、その取引が確定して適用される |
+| `witnessWriteDuringMoveOtherPiece` | `m22_green3_one` | 同じく、キーの位置が行と違う piece にある。子は、キーの位置を覆う piece を pull してから確かめる。piece 3 はまだ親にある |
+| `witnessKeyMovedThenChecked` | `m22_track` | キーの行が holder を持ったまま piece と一緒に子へ移り、子が、それを見て、同じ値を取る部分を断る |
+| `witnessPiecewiseApply` | `m22_track` | 確定した取引の intent が、2 度以上に分けて適用される |
+| `witnessSwapAcrossPieces` | `m22_track` | 値を 2 つの行の間で動かす取引 (入れ替えを含む) が、fence の後に、piece ごとに分けて適用される (M20 の反例の形が、ここでは通る) |
+| `witnessCrossShardConflict` | `m22_track_split` | 行とキーの行が別のシャードにあり、キーの持ち主が、ほかの行の持つ値だとして断る |
+| `witnessTwoShardCommit` | `m22_track_split` | 行は親、キーの行は子の 2PC で確定し、両方で適用される |
+
+決定的な run は、`m22_track` に 5 本 (入れ替え、行と同じ piece のキーの INSERT、まだ切っていない piece のキーの INSERT、移動の途中の衝突、未確定の intent との衝突)、`m22_track_split` に 2 本 (M20 の `m20_red_late_intent` の形が断られること、2 つのシャードの 2PC)、`m22_green3_one` に 1 本、各赤に反例の run がある。
+
+モデルが実装に求めること。
+
+- キーの行の変更は、行の変更と同じ取引の、同じ参加者の集まりに入る。キーの行の持ち主が別のシャードなら、2PC の参加者である。
+- prepare と 1 シャードの確定は、キーの行に、行と同じ確かめ (ほかの取引の intent がないこと、確定した値が取引の読んだものと同じこと) をする。未確定の値は、キーの表の主キーの一致で見つかる。試適用は要らない。
+- 値を手放す行の古いキーの行を消す。UPDATE で値を変える、DELETE、部分 index の条件から外れる、の 3 つである。
+- キーの行は、その位置の持ち主が確かめる。値を持つ行のシャードが、範囲の外のキーを手元のキーの表で確かめてはならない。
+- 子は、キーの位置を覆う piece が届くまで、そのキーを確かめない。届いていなければ、その位置の piece を pull する。グループの全体は待たない。
+- pull と ack は、キーの表の intent を、キーの表の位置で選ぶ (行の intent と同じ規則)。
+- シャードの物理の index は一意でない。
+
+モデルにないもの。
+
+- 時刻。キーの行の確かめは、計画の読んだ値と同じかどうかで表した。読んだ時刻より後の変更 (`write after T`)、piece の m、範囲の床は、M5b、M18、M19 のままである。
+- 文の意味。シャードの行ごとの衝突の確かめ、`NeedsReference`、基準経路の SQLite が決める衝突の処理は、SQLite との差分の検査が受け持つ (設計の文書の段 0 の (c))。モデルの取引は、1 つの値を 2 つの行に書かない。
+- キーの正規形と照合順序。照合順序のキーの検査が受け持つ (設計の文書の段 0 の (a))。
+- 1 つの値に、キーの位置が 1 つであること。モデルは、値ごとにキーの位置を 1 つ置いた。実装でこれが成り立つのは、正規形が SQLite の等しさの類ごとに 1 つで、token をその正規形から作るときだけである。同居の制約の token はテナントの shard key からも作るので、shard key の列を BINARY で比べる制約に限って同居にする (`UNIQUE (tenant COLLATE NOCASE, code)` は同居にしない)。
+- テナントの読み。キーの確かめは点の読みなので、claim は要らない。M19 が扱う。
+- index の作成。M21 の `BUILD` の場面が、値ごとに 1 項目の index (キーの行の形) を、2 つのシャードの行から作る。
+- Worker の行き先の選び方。モデルでは、どのシャードも、自分がいま持つ位置の部分を受けられる。古い範囲表の Worker の要求も、これに含まれる。
+- 取引の再試行、wound-wait、悲観のロックの待ち。断られた部分は、取引を中止する。
+- 2PC の中身 (M1、M9)。確定は 1 手で、全部の部分の intent が置かれた後だけである。
+- 行 3 つ、値 3 つ、取引 3 つ。piece 3 つで取引 2 つのインスタンスは `HEAVY=1` のときだけ流す。

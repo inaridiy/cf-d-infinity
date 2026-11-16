@@ -1,7 +1,7 @@
 import type { Affinity, GlobalIndexDef, TableDef } from "../types";
 import { SqlError } from "../types";
 import { captureDdl, dropCaptureDdl, q } from "../shard/rows";
-import { affinityOf, ident, parseStatements, text, type Node } from "./cst";
+import { affinityOf, ident, parseStatements, text, walk, type Node } from "./cst";
 
 export interface IndexInfo {
   table: string;
@@ -41,7 +41,7 @@ export interface ParsedDdl {
 
 /** 内部の表は `__` で始まる。利用者の表と名前が衝突すると、内部の状態を利用者の SQL で書き換えられる。 */
 const INTERNAL_NAMES = new Set([
-  "__arrived", "__cap", "__cap_on", "__ddl", "__fenced", "__incoming", "__intents", "__meta", "__moved", "__moved_txn",
+  "__arrived", "__cap", "__cap_on", "__ddl", "__epoch", "__fenced", "__incoming", "__intents", "__meta", "__moved", "__moved_txn",
   "__p", "__raw", "__routing", "__seq", "__slow", "__txn",
 ]);
 /**
@@ -52,25 +52,10 @@ const INTERNAL_NAMES = new Set([
 export const isInternalName = (name: string): boolean =>
   INTERNAL_NAMES.has(name.toLowerCase()) || /^(sqlite_|__gidx_|__cap_|__log_g)/i.test(name);
 
-/**
- * 列の名前のうち、内部で使う接頭辞。Worker やシャードが文に足す列の別名 (`__dinf_typeof_<i>` など) である。利用者の列がこの名前だと、
- * 足した列が利用者の列を上書きする (2026-11-13 の Codex の指摘 C3)。新しい別名は、この接頭辞で作る
- * (test/internal-columns.test.ts が、別名がここに当たることを確かめる)。
- *
- * 以前は `$` も予約していた。列名つきの JSON の行イメージで、`$b` という名前の列が BLOB の印 `{"$b": ...}` と見分けられず、
- * 確定した INSERT が消えたからである (指摘 C2)。行イメージはタプルになり、列名を持たないので、値の作り直しの段 2 で外した。
- * 印 `$b`、`$f` が残るのはキー文字列と baton の JSON で、どちらにも列名は入らない。`__dinf_` は、別名がなくなる段 3 で外す。
- */
-export const INTERNAL_COLUMN_PREFIXES = ["__dinf_"];
-export const isInternalColumn = (name: string): boolean =>
-  INTERNAL_COLUMN_PREFIXES.some((p) => name.toLowerCase().startsWith(p));
-
-function userColumn(name: string): string {
-  if (isInternalColumn(name)) {
-    throw new SqlError(`unsupported: column name ${name} is reserved for internal use (names starting with ${INTERNAL_COLUMN_PREFIXES.map((p) => `'${p}'`).join(" or ")})`);
-  }
-  return name;
-}
+// 列の名前は予約しない。段 2 までは、`$` (列名つきの JSON の行イメージで、`$b` という名前の列が BLOB の印 `{"$b": ...}` と見分け
+// られなかった。2026-11-13 の Codex の指摘 C2) と `__dinf_` (Worker やシャードが文に足す列の別名 `__dinf_typeof_<i>` が、同じ名前の
+// 利用者の列を上書きした。指摘 C3) を予約していた。行イメージは列名を持たないタプルになり (段 2)、文に足す別名もなくなった (段 3。
+// 型つきの読みの CTE の列 `"c0"` は位置で付けるので、利用者の列名とぶつからない)。docs/design-values.md の「消すものと、残す予約」。
 
 /** 対応していない機能は、黙って通さずに断る。エラーは必ず `unsupported:` で始める。 */
 const unsupported = (what: string): never => {
@@ -78,7 +63,7 @@ const unsupported = (what: string): never => {
 };
 
 function userName(name: string, what: string): string {
-  // `__dinf_` は、Worker が文に足す別名と CTE の名前に使う (Txn.insertSelect)。CTE には付けられるので、表の名前だけを断る。
+  // `__dinf_` で始まる表の名前は、D∞ が文に足す CTE の名前 (型つきの読みの `__dinf_r`) と取り違えないように、作らせない。
   if (isInternalName(name) || /^__dinf_/i.test(name)) throw new SqlError(`${what} name ${name} is reserved for internal use`);
   return name;
 }
@@ -162,8 +147,28 @@ export function assertPlainCreateTable(stmt: Node): void {
   if ((stmt.clauses ?? []).some((c: Node) => c.type === "as_clause")) unsupported("CREATE TABLE ... AS SELECT; create the table, then INSERT ... SELECT");
 }
 
+/**
+ * 衝突の処理は、文の意味である。SQLite だけが決め、D∞ は SQLite が実行した結果を捕捉して運ぶ (計画書の不変条件 14)。
+ * それを確かめきるまで、次の 2 つは形で断る (2026-11-15、UNIQUE の段 0 の差分の検査が、どちらも SQLite と違う答えを見つけた)。
+ * - 制約に書いた衝突の処理 (`UNIQUE ... ON CONFLICT REPLACE` など。既定の ABORT は書いても同じなので受け付ける)。D∞ は記録せず、
+ *   文の既定として効かせていなかった (test/open/unique-constraint-on-conflict の再現は、これで断る形になった)。
+ * - 文の `OR FAIL` と `OR ROLLBACK` (planStatement)。
+ * 文に書く衝突の処理 (OR IGNORE、OR REPLACE、REPLACE、ON CONFLICT DO) は使える。
+ */
+export function assertNoConstraintConflictAction(stmt: Node): void {
+  let found: string | undefined;
+  walk(stmt, (n) => {
+    const action = n.type === "on_conflict_clause" ? (n.resolutionKw?.name as string | undefined) : undefined;
+    if (action && action !== "ABORT") found ??= action;
+  });
+  if (found) {
+    unsupported(`ON CONFLICT ${found} on a constraint; write the conflict handling in the statement instead (INSERT OR IGNORE, INSERT OR REPLACE, or INSERT ... ON CONFLICT DO)`);
+  }
+}
+
 function createTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
   assertPlainCreateTable(stmt);
+  assertNoConstraintConflictAction(stmt);
   // TEMP の表は接続ごとのもので、シャードにも、Worker の SQLite にも置き場がない。普通の表として作ってしまうと、消えない。
   const kind = stmt.kind?.kindKw?.name;
   const schemaName = stmt.name?.type === "member_expr" ? ident(stmt.name.object).toLowerCase() : null;
@@ -195,7 +200,7 @@ function createTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
       if (c.type === "constraint_unique") uniqueSets.push(specCols(c));
       continue;
     }
-    const col = userColumn(ident(item.name));
+    const col = ident(item.name);
     columns.push(col);
     types.set(col, item.dataType ? text(item.dataType) : null);
     for (const raw of item.constraints ?? []) {
@@ -388,7 +393,7 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       const col = action.column;
       col.constraints = (col.constraints ?? []).filter((c: Node) => !isFk(inner(c)));
       sql.push(`ALTER TABLE ${q(name)} ADD COLUMN ${text(col)}`);
-      const added = userColumn(ident(col.name));
+      const added = ident(col.name);
       def.columns.push(added);
       // 型親和性と照合順序も記録する。無いと、この列の index を引くときに値を正規化できず、行を見つけられない。
       def.affinity[added] = affinityOf(col.dataType ? text(col.dataType) : null);
@@ -457,7 +462,9 @@ export function parseDdl(source: string, schema: SchemaView): ParsedDdl {
     case "create_index_stmt": return createIndex(clean, stmt, schema);
     case "drop_table_stmt": return dropTable(clean, stmt, schema);
     case "drop_index_stmt": return dropIndex(clean, stmt, schema);
-    case "alter_table_stmt": return alterTable(clean, stmt, schema);
+    case "alter_table_stmt":
+      assertNoConstraintConflictAction(stmt);
+      return alterTable(clean, stmt, schema);
     // trigger は受け付けない。本体が他の表を読み書きするので、1 シャードでは発火できない。
     case "create_trigger_stmt": return unsupported("CREATE TRIGGER");
     case "drop_trigger_stmt": {

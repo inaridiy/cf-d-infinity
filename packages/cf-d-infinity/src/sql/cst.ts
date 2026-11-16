@@ -1,7 +1,6 @@
 // 構文木の入口。文の意味は解釈せず、経路の決定に要る情報だけを取り出す。
 // 解析は自前のパーサ (parser.ts)、文面への出し直しは printer.ts が行う。
 import type { Affinity, Value } from "../types";
-import { isReal, realOf } from "../value";
 import { parseSql, type Node } from "./parser";
 import { print } from "./printer";
 
@@ -106,36 +105,53 @@ export function affinityOf(type: string | null): Affinity {
   return "NUMERIC";
 }
 
-/** 列の型親和性で値を揃える。`id = '1'` と INSERT の 1 を同じシャードへ送るためである。 */
+const INT64_MAX = 2n ** 63n - 1n;
 
 /**
- * 数の literal の値。SQLite は、小数点か指数のある literal と、64 ビットに収まらない整数の literal を REAL にする。
- * パーサの value は JS の数なので、`5.0` は整数の 5 になる。整数の値の REAL は印を付けて返す (src/value.ts)。
- * 付けないと、TEXT の列に入る値のキーが "5" になり、SQLite が入れる "5.0" と違うシャードを指す (2026-11-13 の Codex の指摘 C7)。
+ * 数の literal の値 (docs/design-values.md の「型の親和性の変換」)。SQLite は、小数点か指数のある literal と、64 ビットに収まらない
+ * 10 進の整数の literal を REAL にし、ほかの整数の literal を INTEGER にする。INTEGER は bigint、REAL は number で返す。
+ * 16 進の literal (`0x10`) は、64 ビットの 2 の補数として読む INTEGER である (`0xffffffffffffffff` は -1)。16 桁を超える 16 進の
+ * literal は SQLite が断るので、定数としては扱わない (null)。
  */
-function numberLiteral(text: string, value: number): Value {
-  if (/^0x/i.test(text)) return value;
-  if (/[.eE]/.test(text)) return realOf(value);
-  const big = BigInt(text.replaceAll("_", ""));
-  return big > 2n ** 63n - 1n ? realOf(value) : value;
+function numberLiteral(text: string): Value | null {
+  const t = text.replaceAll("_", "");
+  if (/^0x/i.test(t)) {
+    if (t.length - 2 > 16) return null;
+    return BigInt.asIntN(64, BigInt(t));
+  }
+  if (/[.eE]/.test(t)) return Number(t);
+  const big = BigInt(t);
+  return big > INT64_MAX ? Number(t) : big;
 }
 
 /** 定数として評価できるなら値を返す。 */
 export function constant(n: Node, values: Value[]): { value: Value } | null {
   switch (n?.type) {
-    case "number_literal": return { value: numberLiteral(n.text, n.value) };
+    case "number_literal": {
+      const v = numberLiteral(n.text);
+      return v === null ? null : { value: v };
+    }
     case "string_literal": return { value: n.value };
     case "null_literal": return { value: null };
-    case "boolean_literal": return { value: n.value ? 1 : 0 };
+    case "boolean_literal": return { value: n.value ? 1n : 0n };
     case "blob_literal": return { value: Uint8Array.from(n.value) };
     case "parameter": return { value: values[n._i] ?? null };
     case "paren_expr": return n.expr?.type === "list_expr" ? null : constant(n.expr, values);
     case "prefix_op_expr": {
       if (n.operator !== "-" && n.operator !== "+") return null;
+      // `-9223372036854775808` は、符号と数字を 1 つの literal として読む INTEGER である (SQLite と同じ)。数字だけを先に読むと、
+      // 64 ビットに収まらないので REAL になる。
+      if (n.operator === "-" && n.expr?.type === "number_literal" && /^0*9223372036854775808$/.test(n.expr.text.replaceAll("_", ""))) {
+        return { value: -(2n ** 63n) };
+      }
       const inner = constant(n.expr, values);
-      if (inner && isReal(inner.value)) return { value: n.operator === "-" ? realOf(-inner.value.real) : inner.value };
-      if (!inner || typeof inner.value !== "number") return null;
-      return { value: n.operator === "-" ? -inner.value : inner.value };
+      if (!inner) return null;
+      const v = inner.value;
+      if (typeof v === "number") return { value: n.operator === "-" ? -v : v };
+      if (typeof v !== "bigint") return null;
+      if (n.operator === "+") return { value: v };
+      // -(-2^63) は 64 ビットに収まらない。SQLite は REAL にするが、ここでは定数として扱わない。
+      return v === -(2n ** 63n) ? null : { value: -v };
     }
     default: return null;
   }

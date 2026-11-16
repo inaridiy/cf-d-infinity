@@ -475,6 +475,43 @@ for m in m21_green_build m21_green_check m21_green_drop m21_green_split m21_gree
          m21_red_two_open m21_red_ddl_during_move m21_red_move_during_ddl m21_red_end_early m21_red_pull_unfenced m21_red_fence_first \
          m21_red_owner_unchecked m21_red_strict_epoch m21_alt_commit_only_check m21_clock_red_no_clock m21_clock_red_skip_empty m21_guard_red_commit_ts; do tests $f $m; done
 
+echo "== M22 unique keys (主キー以外の UNIQUE をキーの行にまとめる。グループが piece ごとに動く間も、UNIQUE の値を書く文が通る。実装より先に書いたモデル)"
+f=m22_unique_keys.qnt
+green   $f m22_green uniqueSafe                         # グループの全部が piece ごとに移る。決着させてから切る規則も、子がグループを待つ規則もない
+green   $f m22_green_split uniqueSafe                   # テナントを割る移動。親は残る piece の書き込みを受け続け、キーの行が子にあれば 2PC
+green   $f m22_green_parent_until_cut uniqueSafe        # 外しても破れない: 親が、fence の後も、切っていない piece の位置の prepare を受ける
+green   $f m22_green3_one uniqueSafe                    # piece 3 つ (piece 3 にはキーの位置だけ)、取引 1 つ
+live    $f m22_live writeTerminates                     # 活性: 移動が止まっても (要らない piece が切られなくても)、計画した取引は終わる
+live    $f m22_live_split writeTerminates
+red     $f m22_red_key_at_row uniqueVisible             # キーを、値を持つ行のシャードが手元のキーの行で確かめる (シャードの中の index の考え方)
+red     $f m22_red_key_unarrived uniqueVisible          # 子が、届いていない piece のキーを「ない」と見なす
+red     $f m22_red_no_key_lock uniqueVisible            # キーの行の intent を、ほかの取引が見ない (M16 の m16_red_body_only の形)
+red     $f m22_red_no_key_body uniqueVisible            # キーの持ち主が、確定したキーの行を確かめない
+red     $f m22_red_key_after_commit uniqueVisible       # キーの行を行と同じ 2PC に入れず、確定の後に書く
+red     $f m22_red_keep_old_key keysExact               # 値を手放す行のキーの行を消さない
+red     $f m22_red_key_intent_with_row keysExact        # キーの行の intent が、値を持つ行の piece と一緒に動く
+red     $f m22_red_key_intent_with_row committedApplies
+red     $f m22_red_physical_unique committedApplies     # 物理の index を一意のままにする: piece ごとの適用で、子の挿入が断られる (m20_red_piecewise の形)
+if [ "${HEAVY:-0}" = "1" ]; then                        # 同上。見える状態は UNIQUE を守ったままで、破れるのは適用だけである (約 3 分)
+  green $f m22_red_physical_unique uniqueVisible
+fi
+red     $f m22_red_group_refuse noMigratingRefusal      # M20 の規則: 子は、グループが揃うまで、UNIQUE の値を書く取引を migrating で断る
+live_red $f m22_live_red_group_wait writeTerminates     # M20 の規則を、断らずに待つ形にしたもの: 要らない piece が切られなければ、取引が終わらない
+witness $f m22_track witnessWriteDuringMoveSamePiece    # 移動の途中に、行と同じ piece のキーを取る INSERT が、子で確定して適用される
+witness $f m22_green3_one witnessWriteDuringMoveOtherPiece   # 同じく、キーの位置が行と違う piece にある
+witness $f m22_track witnessKeyMovedThenChecked         # キーの行が holder を持ったまま子へ移り、子がそれで同じ値を断る
+witness $f m22_track witnessPiecewiseApply              # 確定した取引の intent が、2 度以上に分けて適用される
+witness $f m22_track witnessSwapAcrossPieces            # 値を 2 つの行の間で動かす取引が、fence の後に piece ごとに適用される
+witness $f m22_track_split witnessCrossShardConflict    # 行とキーの行が別のシャードにあり、キーの持ち主が断る
+witness $f m22_track_split witnessTwoShardCommit        # 行とキーの行が別のシャードの 2PC で確定し、両方で適用される
+if [ "${HEAVY:-0}" = "1" ]; then                        # piece 3 つ、取引 2 つ
+  green $f m22_green3 uniqueSafe
+  green $f m22_green3_split uniqueSafe
+fi
+for m in m22_track m22_track_split m22_green3_one m22_red_key_at_row m22_red_key_unarrived m22_red_no_key_lock m22_red_no_key_body \
+         m22_red_key_after_commit m22_red_keep_old_key m22_red_key_intent_with_row m22_red_physical_unique m22_red_group_refuse \
+         m22_live_red_group_wait; do tests $f $m; done
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect

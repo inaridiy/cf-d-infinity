@@ -1,6 +1,6 @@
 // DO の SQLite の上限 (計画書の不変条件 13)。
 //
-// DO の SQLite は、文の長さ、束縛の変数の数、複合 SELECT の項の数、1 つの値の大きさに上限がある。Worker は文をシャードへ
+// DO の SQLite は、文の長さ、束縛の変数の数、複合 SELECT の項の数、1 つの値の大きさ、式の木の深さに上限がある。Worker は文をシャードへ
 // 送る前に行をシャードごとに分けるので、同じ文でも、シャードが 1 つなら 1 つの長い文、2 つなら短い文 2 つになる。上限に
 // 当たった文をそのまま断ると、成否が行の置き場所で決まる (2026-11-13 の README の確認の指摘 1)。
 //
@@ -12,7 +12,7 @@
 //     条件を押し下げずに表を読むので、作りとして上限に収まる。
 import { expressionDepth } from "./sql/depth";
 import type { Value } from "./types";
-import { bindTyped } from "./value";
+import { bindTyped, typedReadSql } from "./value";
 
 /** DO の SQLite の公表されている上限 (Cloudflare の Durable Objects の limits) と、実測した複合 SELECT の項の数。 */
 export const SHARD_LIMITS = {
@@ -26,8 +26,8 @@ export const SHARD_LIMITS = {
   valueBytes: 2_000_000,
   /**
    * 式の木の深さ。公表の表にない。手元の workerd で測った (test/workerd-limits.test.ts)。数え方は src/sql/depth.ts にある。
-   * シャードは、届いた文の深さを測らない (見積もりは多めに出るので、利用者の文を断る理由にはしない)。D∞ が作る文は、
-   * 表を作るときに builtLimitOf で確かめる。
+   * 見積もりは SQLite の数え方より小さくならない (多めに出る)。シャードは、届いた文も、この見積もりで測って断る (段 3 から。計画書の
+   * 未解決の問題 39)。多めに出た文は基準経路で実行し直されるので、答えは変わらない (Worker の SQLite の上限は 1,000 である)。
    */
   exprDepth: 100,
   /**
@@ -76,11 +76,24 @@ export function compoundTerms(sql: string): number {
   return 1 + (code.match(/\b(UNION|INTERSECT|EXCEPT)\b/gi)?.length ?? 0);
 }
 
+/** 式の木の深さの見積もりを、文ごとに覚える。同じ形の文が何度も届くので、字句を読むのは 1 度で済む。 */
+const depths = new Map<string, number>();
+export function depthOf(sql: string): number {
+  let d = depths.get(sql);
+  if (d === undefined) {
+    d = expressionDepth(sql);
+    if (depths.size >= 1024) depths.delete(depths.keys().next().value!);
+    depths.set(sql, d);
+  }
+  return d;
+}
+
 /**
- * 文が上限を超えるなら、その理由を返す。超えなければ null。束縛のための書き換え (src/value.ts の bindTyped) で文が長くなるので、
- * 書き換えた後の文で測る。複合 SELECT の項は compoundTerms で多めに数える。
+ * 文が上限を超えるなら、その理由を返す。超えなければ null。束縛のための書き換え (src/value.ts の bindTyped) で文が長くなり、
+ * 整数の引数を包む式は深さを 2 足すので、書き換えた後の文で測る。複合 SELECT の項は compoundTerms で多めに数える。
+ * 式の木の深さは src/sql/depth.ts で多めに見積もる。読みは、シャードが型つきの読みに包んだ形で測る (包む式の分だけ、4 深くなる)。
  */
-export function shardLimitOf(sql: string, params: Value[]): string | null {
+export function shardLimitOf(sql: string, params: readonly Value[]): string | null {
   const b = bindTyped(sql, params, "real");
   const bytes = utf8.encode(b.sql).length;
   if (bytes > SHARD_LIMITS.sqlBytes) return `the statement is ${bytes} bytes, more than ${SHARD_LIMITS.sqlBytes}`;
@@ -91,22 +104,26 @@ export function shardLimitOf(sql: string, params: Value[]): string | null {
     const n = typeof p === "string" ? utf8.encode(p).length : p instanceof Uint8Array ? p.byteLength : 0;
     if (n > SHARD_LIMITS.valueBytes) return `a parameter is ${n} bytes, more than ${SHARD_LIMITS.valueBytes}`;
   }
+  const depth = depthOf(b.sql);
+  if (depth > SHARD_LIMITS.exprDepth) return `the statement has an expression tree ${depth} deep, more than ${SHARD_LIMITS.exprDepth}`;
   return null;
 }
 
 /** 文が収まるか。プランナが自分の作る文を確かめるのに使う。 */
-export const withinShardLimits = (sql: string, params: Value[]): boolean => shardLimitOf(sql, params) === null;
+export const withinShardLimits = (sql: string, params: readonly Value[]): boolean => shardLimitOf(sql, params) === null;
 
 /**
- * D∞ が作る文 (行イメージを読み書きする文、捕捉の trigger、走査) が上限を超えるなら、その理由を返す。shardLimitOf の上限に、
- * 式の木の深さを加える。深さも、束縛のための書き換えの後の文で測る (整数の引数を包む式は、深さを 2 足す)。
+ * 結果を返す読みの文が、シャードが実行する形 (型つきの読みに包んだ文、src/value.ts の typedReadSql) で上限に収まるか。n は結果の
+ * 列の数である。シャードは包んだ後の文を測る (ShardKernel.withinLimits) ので、プランナも同じ形で測る。包む前の文で測ると、
+ * 基準経路の走査がシャードで断られ、基準経路から先がない。
  */
-export function builtLimitOf(sql: string, params: Value[]): string | null {
-  const over = shardLimitOf(sql, params);
-  if (over) return over;
-  const depth = expressionDepth(bindTyped(sql, params, "real").sql);
-  return depth > SHARD_LIMITS.exprDepth ? `the statement has an expression tree ${depth} deep, more than ${SHARD_LIMITS.exprDepth}` : null;
-}
+export const withinReadLimits = (sql: string, params: readonly Value[], n: number): boolean => shardLimitOf(typedReadSql(sql, n), params) === null;
+
+/**
+ * D∞ が作る文 (行イメージを読み書きする文、捕捉の trigger) が上限を超えるなら、その理由を返す。表を作るときに確かめる
+ * (Db.assertReplays)。段 2 では、shardLimitOf に式の木の深さを加えた関数だった。段 3 で、shardLimitOf が深さも測るようになった。
+ */
+export const builtLimitOf = (sql: string, params: readonly Value[]): string | null => shardLimitOf(sql, params);
 
 const PREFIX = "shard limit: ";
 

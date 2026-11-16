@@ -9,17 +9,17 @@
 import { DatabaseSync } from "node:sqlite";
 import initSqlJs from "sql.js";
 import { beforeAll, describe, expect, it } from "vitest";
-import { realOf } from "../src/value";
+import type { Value } from "../src/types";
 import {
-  decodeElem, decodeTuple, encodeElem, encodeTuple, jsonElemSql, MAX_FUNCTION_ARGS, parseTuple, returningElemSql, selectElemSql, tupleSql, typedOf,
-  type Elem, type TypedValue,
+  decodeElem, decodeReturned, decodeScratch, decodeTuple, encodeElem, encodeTuple, jsonElemSql, MAX_FUNCTION_ARGS, parseTuple, returningElemSql,
+  scratchElemSql, selectElemSql, tupleSql, typedReadSql, type Elem,
 } from "../src/value";
 import { prng } from "./sim";
 import { bitsOf, doubles, EDGE_DOUBLES, INT64, int64s, sqljsBinding } from "./value-corpus";
 
 const hex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 /** 型と値を、比べられる文字にする。double はビットで比べる。-0.0 は 0.0 と区別しない (設計書の「JS の型」)。 */
-const shown = (v: TypedValue): string =>
+const shown = (v: Value): string =>
   v === null ? "NULL"
     : typeof v === "bigint" ? `INTEGER ${v}`
       : typeof v === "number" ? `REAL ${bitsOf(Object.is(v, -0) ? 0 : v)} (${v})`
@@ -35,12 +35,12 @@ const BLOBS = [new Uint8Array([]), new Uint8Array([0]), new Uint8Array([1, 2]), 
 const REALS = [...EDGE_DOUBLES, 0, -0, 5, 0.5, -0.25, 0.1 + 0.2, 1e20, 1e21, 1e-7, 123456789.123456789, Infinity, -Infinity, 1 / 3, 5e-324];
 
 /** 乱択の、型のある値。 */
-function values(n: number, seed: number): TypedValue[] {
+function values(n: number, seed: number): Value[] {
   const r = prng(seed);
   const pick = <T,>(xs: T[]) => xs[Math.floor(r() * xs.length)]!;
   const ints = [...INT64, ...int64s(200, seed + 1)];
   const reals = [...REALS, ...doubles(300, seed + 2)];
-  return Array.from({ length: n }, (): TypedValue => {
+  return Array.from({ length: n }, (): Value => {
     switch (Math.floor(r() * 5)) {
       case 0: return pick(ints);
       case 1: return pick(reals);
@@ -52,7 +52,7 @@ function values(n: number, seed: number): TypedValue[] {
 }
 
 /** 型を保って、sql.js の表に 1 行入れる文。 */
-function sqljsInsert(table: string, row: TypedValue[]): { sql: string; params: (string | number | Uint8Array | null)[] } {
+function sqljsInsert(table: string, row: Value[]): { sql: string; params: (string | number | Uint8Array | null)[] } {
   const { marks, params } = sqljsBinding(row);
   return { sql: `INSERT INTO ${table} VALUES (${marks.join(", ")})`, params };
 }
@@ -64,7 +64,7 @@ beforeAll(async () => {
 });
 
 /** 表を作り、行を入れ、1 列の文字列を返す文を、2 つのエンジンで実行する。 */
-function onBoth(columns: number, rows: TypedValue[][], read: (cols: string[]) => string): { node: string[]; sqljs: string[] } {
+function onBoth(columns: number, rows: Value[][], read: (cols: string[]) => string): { node: string[]; sqljs: string[] } {
   const cols = Array.from({ length: columns }, (_, i) => `c${i}`);
   const ddl = `CREATE TABLE w(${cols.join(", ")})`;
   const lite = new DatabaseSync(":memory:");
@@ -85,7 +85,7 @@ function onBoth(columns: number, rows: TypedValue[][], read: (cols: string[]) =>
 
 describe("an element", () => {
   it("is written in the form the design note gives", () => {
-    const cases: [TypedValue, Elem][] = [
+    const cases: [Value, Elem][] = [
       [null, null], [5n, "i5"], [-(2n ** 63n), "i-9223372036854775808"], [2n ** 63n - 1n, "i9223372036854775807"],
       [5, "r5.0"], [0.5, "r0.5"], [0.1 + 0.2, "r0.30000000000000004"], [1e21, "r1e+21"], [1e-7, "r1e-7"], [-0, "r0.0"],
       [Infinity, "r9.0e+999"], [-Infinity, "r-9.0e+999"], ["abc", "tabc"], ["", "t"], [new Uint8Array([0, 255]), "b00FF"], [new Uint8Array([]), "b"],
@@ -167,7 +167,7 @@ describe("the tuple expression", () => {
 
   it("gives back every double of the conversion corpus bit for bit", () => {
     const reals = [...doubles(20000, 2), ...EDGE_DOUBLES];
-    const rows: TypedValue[][] = [];
+    const rows: Value[][] = [];
     for (let i = 0; i < reals.length; i += 100) rows.push(Array.from({ length: 100 }, (_, j) => reals[i + j] ?? null));
     const got = onBoth(100, rows, (cols) => `SELECT ${tupleSql(cols)} AS t FROM w ORDER BY rowid`);
     for (const [engine, tuples] of Object.entries(got)) {
@@ -251,25 +251,51 @@ describe("the element expressions for result columns", () => {
     db.close();
   });
 
-  it("RETURNING: marks REAL too, so that an integer put into a REAL column comes back as REAL", () => {
-    const vs = plain(21);
+  it("RETURNING: marks every type and carries TEXT as a BLOB, so that a NUL and an integer put into a REAL column survive", () => {
+    // RETURNING の要素の式は、DO、node:sqlite、sql.js の 3 つで同じである (src/value.ts の returningElemSql)。TEXT を BLOB で運ぶので、
+    // NUL を含む TEXT も、node:sqlite と sql.js のドライバから全部届く。
+    const vs = values(600, 21);
     const lite = new DatabaseSync(":memory:");
     lite.exec("CREATE TABLE u(id INTEGER PRIMARY KEY, v, r REAL)");
     const st = lite.prepare(`INSERT INTO u(v, r) VALUES (?, ?) RETURNING ${returningElemSql("v")} AS v, ${returningElemSql("r")} AS r`);
     st.setReadBigInts(true);
-    const got = vs.map((v, i) => st.get(v as never, BigInt(i)) as { v: Elem | Uint8Array; r: Elem });
-    expect(got.map((g) => shown(decodeElem(g.v)))).toEqual(vs.map(shown));
-    // REAL の列に入れた整数は、REAL として返る (`r5.0`)。SELECT の形の式だと、ドライバには INTEGER が届く。
+    const got = vs.map((v, i) => st.get(v as never, BigInt(i)) as { v: string | Uint8Array | null; r: string });
+    expect(got.map((g) => shown(decodeReturned(g.v)))).toEqual(vs.map(shown));
+    // REAL の列に入れた整数は、REAL として返る (`r5.0`)。`ELSE c` で素のまま返すと、ドライバには INTEGER が届く。
     expect(got.map((g) => g.r)).toEqual(vs.map((_v, i) => `r${i}.0`));
-    expect(got.map((g) => shown(decodeElem(g.r)))).toEqual(vs.map((_v, i) => shown(i)));
+    expect(got.map((g) => shown(decodeReturned(g.r)))).toEqual(vs.map((_v, i) => shown(i)));
+    // ドライバから数が出てくることはない。
+    expect(got.every((g) => typeof g.v !== "bigint" && typeof g.v !== "number")).toBe(true);
+    const db = new SQL.Database();
+    db.run("CREATE TABLE u(id INTEGER PRIMARY KEY, v, r REAL)");
+    const onSqljs = vs.map((v, i) => {
+      const { marks, params } = sqljsBinding([v]);
+      return db.exec(`INSERT INTO u(v, r) VALUES (${marks[0]}, ${i}) RETURNING ${returningElemSql("v")}, ${returningElemSql("r")}`, params)[0]!.values[0]!;
+    });
+    expect(onSqljs.map((r) => shown(decodeReturned(r[0] as string | Uint8Array | null)))).toEqual(vs.map(shown));
+    expect(onSqljs.map((r) => shown(decodeReturned(r[1] as string)))).toEqual(vs.map((_v, i) => shown(i)));
+    db.close();
+  });
+
+  it("the Worker's SQLite: reads every value exactly, NUL included, with TEXT as a BLOB and useBigInt", () => {
+    // Worker の SQLite (sql.js) の型つきの読み (src/value.ts の scratchElemSql と typedReadSql。ScratchDb.select)。
+    const vs = values(600, 22);
+    const db = new SQL.Database();
+    db.run("CREATE TABLE u(id INTEGER PRIMARY KEY, v)");
+    for (const v of vs) {
+      const { sql, params } = sqljsInsert("u(v)", [v]);
+      db.run(sql, params);
+    }
+    const st = db.prepare(typedReadSql("SELECT v, typeof(v) FROM u ORDER BY id", 2, scratchElemSql));
+    const got: string[] = [];
+    while (st.step()) {
+      const [v, t] = (st as unknown as { get(p: null, c: { useBigInt: boolean }): unknown[] }).get(null, { useBigInt: true }).map(decodeScratch);
+      got.push(`${shown(v ?? null)} ${String(t)}`);
+    }
+    st.free();
+    db.close();
+    const typeOf = (v: Value) => (v === null ? "null" : typeof v === "bigint" ? "integer" : typeof v === "number" ? "real" : typeof v === "string" ? "text" : "blob");
+    expect(got).toEqual(vs.map((v) => `${shown(v)} ${typeOf(v === -0 ? 0 : v)}`));
   });
 });
 
-describe("the bridge from today's values", () => {
-  it("reads an integral JS number as INTEGER and a marked or fractional number as REAL", () => {
-    expect([typedOf(5), typedOf(realOf(5)), typedOf(0.5), typedOf("5"), typedOf(null)].map(shown)).toEqual([5n, 5, 0.5, "5", null].map(shown));
-    // 64 ビットに収まらない整数の値は、今の決まりでも REAL である。
-    expect(shown(typedOf(1e20))).toBe(shown(1e20));
-    expect(typedOf(new Uint8Array([1]))).toEqual(new Uint8Array([1]));
-  });
-});

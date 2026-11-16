@@ -27,6 +27,11 @@ Categories:
   bans and split slot ([design-catalog-epoch.md](./design-catalog-epoch.md)). Its 31 red modules (the `red` lines of
   the M21 section of `specs/check.sh`) get rows when the design is implemented. Many of them restate a red of M11 to
   M15 that already has a row here; those rows move to M21 when M12, M14 and M15 are retired.
+  M22 (`m22_unique_keys.qnt`) models every non-primary-key UNIQUE as key rows that move with their piece
+  ([design-unique-keys.md](./design-unique-keys.md)). It has 10 red modules (the `red` and `live_red` lines of the M22
+  section of `specs/check.sh`). Eight get rows, switches and replays when the design is implemented, and the rows of
+  M16 move to M22 then; `m22_red_group_refuse` and `m22_live_red_group_wait` restate M20's rule, which was never
+  implemented, and become D rows.
 
 | module | flaw modelled | fault switch | deterministic replay | cat |
 |---|---|---|---|---|
@@ -120,7 +125,7 @@ Categories:
 
 ## Switches that match no red module
 
-- `rowSpanDespiteUnique`: narrows a write's span to one row despite an in-shard UNIQUE. Used in span-check:25 and :32, review-regressions:57, health:76.
+- `rowSpanDespiteUnique`: narrows a write's span to one row despite an in-shard UNIQUE. Used in span-check:28, :38 and :45, review-regressions:57, health:76. Since 2026-11-14 the shard's write guard also refuses the REPLACE this switch narrows (span-check:38); span-check:28 turns the guard off to show the read check alone.
 - `autoIgnoresUniqueIntents`: autocommit write ignores UNIQUE values held by other transactions' intents. Used in review-regressions:65, health:76.
 - `noWriteSetLimit`: no write-set size check before commit. Used in limits:115.
 - `rowwiseUndo`: undo row by row, so a UNIQUE swap breaks the snapshot. Used in counterexamples:269.
@@ -128,6 +133,24 @@ Categories:
 - `childKeepsOldSchema`: split child does not catch up its schema when groups arrive. Only the `FAULT=` sweep uses it.
 - `validateFromT`: validates from T instead of F, which widens the window. Not the same as M9's `RED_F_IS_T` (that is `dmlAtT` + `dmlSkipsClock`). No test uses it.
 - `triggerCapture`: not a defect; it only forces the slower capture path. No test uses it.
+- `ignoreWriteClaim`: the shard's write guard is off, so a shard accepts captured changes and a transaction's writes
+  without checking that each row is its own and inside what the request declared (open problem 35: a Worker resent a
+  multi-row INSERT planned before a split, and both new shards took every row). Added 2026-11-14. No red module models
+  a Worker that declares less than its statement writes. The nearest is `m18_red_write_by_slot` (a shard accepts a write
+  of a piece it does not own), but its flaw is the granularity of the check, slot instead of piece, which the code cannot
+  show while every piece is a whole slot; it stays in P. Used in write-guard ("with the guard off (ignoreWriteClaim),
+  both new shards take every row ..." and "puts back the old behaviour with ignoreWriteClaim ...").
+- `unfencedRead` (a shard fault, `Faults`): the shard wraps a read for the typed read without the `LIMIT -1 OFFSET 0` fence,
+  so SQLite inlines the wrapped statement and evaluates `random()` once for the type and again for the value (values rework,
+  stage 3, `docs/design-values.md`). No model covers value encoding. Used in typed-diff ("finds a typed read without its fence
+  (unfencedRead), and passes the same reads with it"). The randomized generators do not catch it: none of them sends a
+  shard-answered read with a nondeterministic column, and the span check runs such a statement twice and compares, so the
+  dedicated test turns the span check off. Added 2026-11-15.
+- `roundedImages` (`imageFaults` in `src/shard/rows.ts`, `FAULT=roundedImages`): the INTEGER elements of a row-image tuple
+  are decoded with `Number`, so an integer beyond 2^53 is rounded wherever a row is written back from its image (a committed
+  transaction applied, rows moved by a split, a read at an older time). No model covers value encoding. Used in int64 ("finds the
+  rounding in a transaction across shards (roundedImages) ..." and "... in rows moved by a shard split ..."); with
+  `FAULT=roundedImages`, every int64 scenario test fails and typed-diff fails on seeds 1, 3 and 6 of its first block. Added 2026-11-15.
 
 ## Notes
 

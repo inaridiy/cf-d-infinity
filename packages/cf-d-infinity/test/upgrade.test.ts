@@ -95,7 +95,7 @@ async function workload(): Promise<SimCluster> {
   for (let t = 1; t <= 12; t++) {
     await db.query("INSERT INTO acct(tenant_id, id, email, n) VALUES (?, 1, ?, ?), (?, 2, NULL, 0)", [t, `u${t}@example.test`, t * 3, t]);
   }
-  const values: Value[] = [5, { real: 2 }, 2.5, "5", new Uint8Array([0, 255]), null, -3, { real: -0.0 + 7 }];
+  const values: Value[] = [5n, 2, 2.5, "5", new Uint8Array([0, 255]), null, -3n, -0.0 + 7];
   for (const [i, v] of values.entries()) await db.query("INSERT INTO kv(k, v, r) VALUES (?, ?, ?)", [`k${i}`, v, i % 2 ? "1e400" : i / 4]);
   await db.ddl("CREATE INDEX kv_r ON kv(r)");
   await db.ddl("ALTER TABLE kv ADD COLUMN extra TEXT DEFAULT 'x'");
@@ -107,7 +107,7 @@ async function workload(): Promise<SimCluster> {
     { sql: "UPDATE acct SET n = n + 1 WHERE tenant_id = 2 AND id = 1" },
   ]);
   await split(c, "s0", "s3");
-  await db.query("UPDATE kv SET v = ? WHERE k = 'k0'", [{ real: 9 }]);
+  await db.query("UPDATE kv SET v = ? WHERE k = 'k0'", [9]);
   await db.query("DELETE FROM logs WHERE msg = 'm3'");
   await c.settle();
   return c;

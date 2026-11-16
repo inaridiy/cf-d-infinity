@@ -1,20 +1,16 @@
-// 内部で使う列の名前を、利用者の列に使わせない (計画書の不変条件 5、2026-11-13 の Codex の指摘 C2、C3)。
+// 内部で使っていた列の名前が、利用者の列として使えること (計画書の不変条件 5、2026-11-13 の Codex の指摘 C2、C3)。
 //
-// 型のない列の型を読むために走査が足す別名 `__dinf_typeof_<i>` は、同じ名前の利用者の列を上書きした (C3)。名前の接頭辞を 1 つの
-// 一覧 (src/sql/ddl.ts の INTERNAL_COLUMN_PREFIXES) にまとめ、DDL がその名前の列を断る。ここでは、実際に使っている別名が一覧に
-// 当たること、その名前の列を CREATE TABLE と ADD COLUMN が断ることを確かめる。
-//
-// 以前は `$` で始まる列名も断っていた。行イメージが列名つきの JSON で、BLOB と無限大の値を `{"$b": 16 進}`、`{"$f": "Infinity"}` の
-// 印にしていたので、列名が `$b` か `$f` の行は、行そのものが印に見え、確定した INSERT が消えた (C2)。値の作り直しの段 2 で、
-// 行イメージは列名を持たないタプルになったので、予約を外した。そういう列が、取引、シャードをまたぐ確定、分割を通って使えることを
-// 確かめる。
+// 段 2 までは、2 つの接頭辞の列名を断っていた。
+// - `__dinf_`: 型のない列の型を読むために走査が足した別名 `__dinf_typeof_<i>` が、同じ名前の利用者の列を上書きした (C3)。値の作り直しの
+//   段 3 で、走査は型つきの読み (位置で名前を付けた CTE の列 `"c0"`) になり、文に足す別名はなくなった。予約を外した。
+// - `$`: 行イメージが列名つきの JSON で、BLOB と無限大の値を `{"$b": 16 進}`、`{"$f": "Infinity"}` の印にしていたので、列名が `$b` か
+//   `$f` の行は、行そのものが印に見え、確定した INSERT が消えた (C2)。段 2 で、行イメージは列名を持たないタプルになったので、外した。
+// そういう列が、取引、シャードをまたぐ確定、分割、行を集める読み、部分の集約を通って使えることを確かめる。
 import { describe, expect, it } from "vitest";
 import { split } from "../src/autoscaler";
 import { Db } from "../src/client/db";
 import { handlePipeline, type PipelineReq } from "../src/client/hrana";
-import { encode, typedScanList } from "../src/shard/rows";
-import { INTERNAL_COLUMN_PREFIXES, isInternalColumn } from "../src/sql/ddl";
-import type { TableDef } from "../src/types";
+import { encode } from "../src/shard/rows";
 import { encodeTuple } from "../src/value";
 import { SimCluster } from "./sim";
 
@@ -29,31 +25,35 @@ function keysIn(json: string): string[] {
 }
 
 describe("internal column names", () => {
-  it("covers every alias the scans add, and the row images carry no column names", () => {
+  it("the row images carry no column names", () => {
     // 行イメージはタプルなので、列名も印も入らない。BLOB と無限大の値も、要素の文字列になる。
     const after = encodeTuple([1n, new Uint8Array([1, 2]), Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]);
     expect(keysIn(encode({ table: "t", pk: "[1]", sk: "[1]", before: null, after }))).toEqual(["table", "pk", "sk", "before", "after"]);
-    const def = { name: "t", columns: ["id", "u", "w"], pk: ["id"], implicitRowid: false, affinity: { id: "INTEGER" } } as unknown as TableDef;
-    const aliases = [...typedScanList(def).matchAll(/AS "([^"]+)"/g)].map((m) => m[1]!);
-    expect(aliases.length).toBe(2); // 型のない列 2 つの型を読む列
-    for (const a of aliases) expect(isInternalColumn(a), a).toBe(true);
   });
 
-  it("refuses such a column in CREATE TABLE and ADD COLUMN, with unsupported:", async () => {
+  it("uses columns named like the old aliases (__dinf_typeof_0, __dinf_r, c0) in gathered reads, partial aggregates and writes", async () => {
+    // 段 2 までは、行を集める走査が、型のない列ごとに `__dinf_typeof_<i>` の列を足していた。いまは、型つきの読みの CTE の名前
+    // `__dinf_r` と、その列 `"c0"`、`"c1"` を、位置で付ける。どれも、利用者の列名と取り違えない。
     const db = new Db(new SimCluster({ shards: 2 }));
-    for (const name of ["__dinf_typeof_0", "__DINF_x"]) {
-      await expect(db.ddl(`CREATE TABLE t(id INTEGER PRIMARY KEY, "${name}" TEXT)`)).rejects.toThrow(/^unsupported: column name/);
-    }
-    await db.ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
-    await expect(db.ddl(`ALTER TABLE t ADD COLUMN "__dinf_typeof_0" TEXT`)).rejects.toThrow(/^unsupported: column name/);
-    expect(INTERNAL_COLUMN_PREFIXES).not.toContain("$");
+    await db.ddl(`CREATE TABLE t(id INTEGER PRIMARY KEY, "__dinf_typeof_0", "__DINF_x" TEXT, c0, "__dinf_r")`);
+    await db.ddl(`ALTER TABLE t ADD COLUMN "__dinf_c0" INTEGER`);
+    for (let i = 1; i <= 6; i++) await db.query(`INSERT INTO t VALUES (?, ?, ?, ?, ?, ?)`, [BigInt(i), i % 2 ? 5 : 5n, `x${i}`, "t", i * 1.5, BigInt(i)]);
+    // 2 つのシャードから集める読み。型のない列の 5.0 (REAL) と 5 (INTEGER) は、型ごと返る。
+    const all = await db.query(`SELECT id, typeof("__dinf_typeof_0") AS t, "__DINF_x", c0, "__dinf_r", "__dinf_c0" FROM t ORDER BY id`);
+    expect(all.rows).toEqual(Array.from({ length: 6 }, (_, k) => ({
+      id: k + 1, t: (k + 1) % 2 ? "real" : "integer", __DINF_x: `x${k + 1}`, c0: "t", __dinf_r: (k + 1) * 1.5, __dinf_c0: k + 1,
+    })));
+    // 部分の集約と、書き込み。
+    expect((await db.query(`SELECT count(*) AS n, sum("__dinf_c0") AS s, max("__dinf_r") AS m FROM t WHERE c0 = 't'`)).rows).toEqual([{ n: 6, s: 21, m: 9 }]);
+    await db.query(`UPDATE t SET "__dinf_typeof_0" = 'u' WHERE "__dinf_c0" >= 4`);
+    expect((await db.query(`SELECT count(*) AS n FROM t WHERE "__dinf_typeof_0" = 'u'`)).rows).toEqual([{ n: 3 }]);
   });
 
   it("keeps columns whose names only contain the prefixes", async () => {
     const db = new Db(new SimCluster({ shards: 2 }));
     await db.ddl(`CREATE TABLE t(id INTEGER PRIMARY KEY, "a$f" TEXT, "x__dinf_" TEXT, real INTEGER)`);
     await db.transaction(async (tx) => {
-      for (let i = 1; i <= 4; i++) await tx.query(`INSERT INTO t VALUES (?, 'x', 'y', ?)`, [i, i]);
+      for (let i = 1; i <= 4; i++) await tx.query(`INSERT INTO t VALUES (?, 'x', 'y', ?)`, [BigInt(i), BigInt(i)]);
     });
     expect((await db.query(`SELECT count(*) AS n, sum(real) AS s FROM t WHERE "a$f" = 'x'`)).rows).toEqual([{ n: 4, s: 10 }]);
   });
@@ -64,15 +64,16 @@ describe("internal column names", () => {
     // 型のない列にすると、BLOB と無限大の値がそのまま入る。以前の行イメージでは、`{"$b": "0102"}` の形の行が BLOB の印に見えた。
     await db.ddl(`CREATE TABLE m(id INTEGER PRIMARY KEY, "$b", "$f", "$x" TEXT)`);
     await db.ddl(`ALTER TABLE m ADD COLUMN "$i" INTEGER`);
-    const rows = Array.from({ length: 8 }, (_, i) => [i + 1, `0${i}`, i % 2 ? Number.POSITIVE_INFINITY : i, `x${i}`, i]);
+    const rows = Array.from({ length: 8 }, (_, i) => [BigInt(i + 1), `0${i}`, i % 2 ? Number.POSITIVE_INFINITY : BigInt(i), `x${i}`, BigInt(i)]);
     // 1 つの取引で 8 行を書く。行は 2 つのシャードに分かれるので、確定は 2 相で、行イメージは intent と変更ログを通る。
     await db.transaction(async (tx) => {
       for (const r of rows) await tx.query(`INSERT INTO m VALUES (?, ?, ?, ?, ?)`, r);
     });
     await db.query(`UPDATE m SET "$b" = x'0102' WHERE id = 2`);
     await db.query(`UPDATE m SET "$x" = "$x" || '!' WHERE "$i" >= 6`);
+    const num = (v: unknown) => (typeof v === "bigint" ? Number(v) : v);
     const want = rows.map(([id, b, f, x, n]) => ({
-      id, $b: id === 2 ? new Uint8Array([1, 2]) : b, $f: f, $x: (n as number) >= 6 ? `${x}!` : x, $i: n,
+      id: num(id), $b: id === 2n ? new Uint8Array([1, 2]) : b, $f: num(f), $x: (n as bigint) >= 6n ? `${x}!` : x, $i: num(n),
     }));
     const read = async () => (await db.query(`SELECT id, "$b", "$f", "$x", "$i" FROM m ORDER BY id`)).rows;
     expect(await read()).toEqual(want);

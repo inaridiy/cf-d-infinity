@@ -49,6 +49,9 @@ export interface ReplayReport {
   aborted: number;
 }
 
+/** 文の引数を、誤りの文に書く形にする。INTEGER の引数は bigint である。 */
+const paramsText = (params: unknown[]) => JSON.stringify(params, (_k, x) => (typeof x === "bigint" ? `${x}n` : x));
+
 const norm = (rows: unknown[][], ordered: boolean): string[] => {
   const out = rows.map((r) => JSON.stringify(r, (_k, x) => (x instanceof Uint8Array ? [...x] : x)));
   return ordered ? out : out.sort();
@@ -86,7 +89,7 @@ export function replay(ddl: string[], history: TxnRecord[]): ReplayReport {
       } catch (e) {
         got = { error: (e as Error).message };
       }
-      const where = `txn ${t.id} at ${t.at}: [${s.shape}] ${s.sql} ${JSON.stringify(s.params)}`;
+      const where = `txn ${t.id} at ${t.at}: [${s.shape}] ${s.sql} ${paramsText(s.params)}`;
       if ((s.error !== undefined) !== (got.error !== undefined)) {
         problems.push(`${where}\n  ours:   ${s.error !== undefined ? `ERROR ${s.error}` : JSON.stringify(s.values)}\n  sqlite: ${got.error !== undefined ? `ERROR ${got.error}` : JSON.stringify(got.values)}`);
       } else if (s.error === undefined) {
@@ -97,7 +100,7 @@ export function replay(ddl: string[], history: TxnRecord[]): ReplayReport {
           // 前後の取引も出す。並べ方の誤りか、読みの誤りかを見分けるのに要る。
           const i = order.indexOf(t);
           const near = order.slice(Math.max(0, i - 6), i + 7).map((x) =>
-            `    ${x === t ? ">" : " "} txn ${x.id} at ${x.at} ${x.readOnly ? "R" : "W"} [${x.start}..${x.end}] shards ${[...x.shards].sort().join(",")}: ${x.statements.map((y) => `${y.sql.slice(0, 70)} ${JSON.stringify(y.params)}${y.error ? " ERR" : ""}${y.readAt ? ` @${y.readAt}` : ""}${y.span ? ` [${y.span.join("..")}]` : ""}`).join(" ; ")}`);
+            `    ${x === t ? ">" : " "} txn ${x.id} at ${x.at} ${x.readOnly ? "R" : "W"} [${x.start}..${x.end}] shards ${[...x.shards].sort().join(",")}: ${x.statements.map((y) => `${y.sql.slice(0, 70)} ${paramsText(y.params)}${y.error ? " ERR" : ""}${y.readAt ? ` @${y.readAt}` : ""}${y.span ? ` [${y.span.join("..")}]` : ""}`).join(" ; ")}`);
           problems.push(`${where}\n  ours:   ${a.join(" ")}\n  sqlite: ${b.join(" ")}\n${near.join("\n")}`);
         } else if (s.changes !== undefined && got.changes !== undefined && s.changes !== got.changes) {
           // 返る行のない書き込みは、変更した行の数を比べる。無視されるはずの INSERT OR IGNORE が行を入れた、といった誤りは、
@@ -144,7 +147,7 @@ export function replay(ddl: string[], history: TxnRecord[]): ReplayReport {
     const seen = run(r);
     const recorded = r.statements.map((x) => (x.error !== undefined ? (/^unsupported:/.test(x.error) ? "skipped" : "error") : JSON.stringify(norm(x.values ?? [], /\bORDER\s+BY\b/i.test(x.sql)))));
     if (JSON.stringify(seen) !== JSON.stringify(recorded)) {
-      const show = (x: TxnRecord) => `txn ${x.id} at ${x.at} [${x.start}..${x.end}] shards ${[...x.shards].sort().join(",")}: ${x.statements.map((y) => `${y.sql.slice(0, 80)} ${JSON.stringify(y.params)}${y.error ? " ERR" : ""}`).join(" ; ")}`;
+      const show = (x: TxnRecord) => `txn ${x.id} at ${x.at} [${x.start}..${x.end}] shards ${[...x.shards].sort().join(",")}: ${x.statements.map((y) => `${y.sql.slice(0, 80)} ${paramsText(y.params)}${y.error ? " ERR" : ""}`).join(" ; ")}`;
       problems.push(`a read started after a write was acknowledged, and its result does not include that write\n  read:  ${show(r)}\n  writes: ${missed.map(show).join("\n          ")}\n  with the writes visible the read returns ${seen.join(" ")}\n  it returned ${recorded.join(" ")}`);
     }
   }

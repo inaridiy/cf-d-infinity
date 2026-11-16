@@ -1,10 +1,10 @@
 // 増設の手順が途中で終わったとき、重ねて実行されたときの回帰テスト。
 import { describe, expect, it } from "vitest";
 import { split } from "../src/autoscaler";
-import { Db, type Cluster } from "../src/client/db";
+import { Db } from "../src/client/db";
 import { planSplit } from "../src/routing";
 import { drain, quiescentProblems } from "./invariants";
-import { SimCluster } from "./sim";
+import { SimCluster, withOverrides } from "./sim";
 
 const ROWS = 400;
 async function seeded(): Promise<SimCluster> {
@@ -58,10 +58,7 @@ describe("a split that is interrupted or repeated", () => {
     const c = await seeded();
     const range = planSplit((await c.catalog()).routing, "s0")!;
     // 1 つ目の増設は、子の受け入れと親の fence の後、範囲表の切り替えで失敗した。
-    const metaDown: Cluster = {
-      shard: (id) => c.shard(id), catalog: () => c.catalog(), applyDdl: (q) => c.applyDdl(q), publishIndex: (t, n, v, at) => c.publishIndex(t, n, v, at), revokeDdl: (v, r) => c.revokeDdl(v, r), renewLock: (v) => c.renewLock(v), lockTables: (t, b) => c.lockTables(t, b), finishLock: (v, q) => c.finishLock(v, q), beginSplit: (m, b) => c.beginSplit(m, b), endSplit: (id) => c.endSplit(id), splits: () => c.splits(),
-      allocate: (t, n, m) => c.allocate(t, n, m), switchRange: async () => { throw new Error("meta unreachable"); },
-    };
+    const metaDown = withOverrides(c, { switchRange: async () => { throw new Error("meta unreachable"); } });
     expect(await outcome(split(metaDown, "s0", "s1", { range }))).toMatch(/meta unreachable/);
     expect(await outcome(split(c, "s0", "s2"))).toMatch(/already handing slots .* to s1/);
     // シャードに直接頼んでも通らない。
@@ -81,10 +78,7 @@ describe("a split that is interrupted or repeated", () => {
     const before = await c.catalog();
     await c.client().ddl("ALTER TABLE items ADD COLUMN extra INTEGER DEFAULT 5");
     // 増設を始めた側は、DDL の前の表定義を持っている。親はすでに新しい版にいる。
-    const stale: Cluster = {
-      shard: (id) => c.shard(id), catalog: async () => before, applyDdl: (q) => c.applyDdl(q), publishIndex: (t, n, v, at) => c.publishIndex(t, n, v, at), revokeDdl: (v, r) => c.revokeDdl(v, r), renewLock: (v) => c.renewLock(v), lockTables: (t, b) => c.lockTables(t, b), finishLock: (v, q) => c.finishLock(v, q), beginSplit: (m, b) => c.beginSplit(m, b), endSplit: (id) => c.endSplit(id), splits: () => c.splits(),
-      allocate: (t, n, m) => c.allocate(t, n, m), switchRange: (m) => c.switchRange(m),
-    };
+    const stale = withOverrides(c, { catalog: async () => before });
     expect(await outcome(split(stale, "s0", "s1"))).toBe("ok");
     await drain(c);
     expect(await census(c)).toEqual(whole);

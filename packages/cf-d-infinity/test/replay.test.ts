@@ -11,7 +11,7 @@ import { handlePipeline, type PipelineReq } from "../src/client/hrana";
 import type { Faults, Value } from "../src/types";
 import { quiescentProblems } from "./invariants";
 import { replay, type ReplayReport, type StatementRecord, type TxnRecord } from "./replay";
-import { prng, seedsOr, SimCluster } from "./sim";
+import { asNumbers, prng, seedsOr, SimCluster } from "./sim";
 
 const DDL = [
   `CREATE TABLE acct(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, email TEXT, code TEXT, v INTEGER NOT NULL DEFAULT 0, n INTEGER NOT NULL DEFAULT 0,
@@ -24,12 +24,14 @@ const DDL = [
 ];
 
 type Rnd = () => number;
-const int = (r: Rnd, n: number) => 1 + Math.floor(r() * n);
+// 整数の引数は INTEGER (bigint) で渡す。D∞ は JS の数を REAL として束縛するので、数で渡すと、整数の束縛 (`(CAST(? AS INTEGER)+0)`)
+// を並行の下で通らない (列の型の親和性が整数に戻すので、答えは変わらない)。
+const int = (r: Rnd, n: number) => BigInt(1 + Math.floor(r() * n));
 const tenant = (r: Rnd) => int(r, 4);
 const id = (r: Rnd) => int(r, 5);
 const email = (r: Rnd) => (r() < 0.15 ? null : `e${int(r, 6)}`);
 const code = (r: Rnd) => (r() < 0.15 ? null : `c${int(r, 4)}`);
-const v = (r: Rnd) => int(r, 4) - 1;
+const v = (r: Rnd) => int(r, 4) - 1n;
 const flatId = (r: Rnd) => int(r, 12);
 const tag = (r: Rnd) => `t${int(r, 3)}`;
 
@@ -268,7 +270,7 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
         rec.statements.push(s);
         try {
           const r = await new Db(seen).query(s.sql, s.params);
-          s.values = r.values;
+          s.values = asNumbers(r.values);
           if (s.shape.startsWith("W")) s.changes = r.changes;
           rec.outcome = "committed";
           rec.at = r.ts;
@@ -294,7 +296,7 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
             const from = ++tick;
             try {
               const r = await tx.query(s.sql, s.params);
-              s.values = r.values;
+              s.values = asNumbers(r.values);
               if (s.shape.startsWith("W")) s.changes = r.changes;
             } catch (e) {
               s.error = (e as Error).message;
@@ -418,7 +420,7 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
           const from = ++tick;
           try {
             const r = await db.query(sql, params);
-            st.values = r.values;
+            st.values = asNumbers(r.values);
             if (!/^\s*SELECT/i.test(sql)) st.changes = r.changes;
             if (!seg) {
               target.outcome = "committed";
@@ -504,7 +506,7 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
   const quiescent = await quiescentProblems(c);
   // 失敗した seed を調べるための書き出し。REPLAY_DUMP=<ファイル> で、取引の記録と RPC の記録を JSON で残す。
   if (process.env.REPLAY_DUMP) {
-    const plain = (_k: string, x: unknown) => (x instanceof Set ? [...x] : x instanceof Uint8Array ? [...x] : x);
+    const plain = (_k: string, x: unknown) => (x instanceof Set ? [...x] : x instanceof Uint8Array ? [...x] : typeof x === "bigint" ? `${x}n` : x);
     writeFileSync(process.env.REPLAY_DUMP, JSON.stringify({ seed, history, rpc: c.net.log }, plain));
   }
   const report = replay(ddl, history);

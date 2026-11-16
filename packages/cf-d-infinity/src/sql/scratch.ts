@@ -1,8 +1,9 @@
 // Worker の中の SQLite。シャードと同じエンジンで元の SQL を実行するので、式の意味を再実装せずに済む。
-import initSqlJs, { type Database, type SqlJsStatic } from "sql.js";
+import initSqlJs, { type Database, type SqlJsStatic, type Statement } from "sql.js";
 import type { Catalog } from "../meta";
-import { SqlError, type Backend, type Row, type Value } from "../types";
-import { bindTyped, isIntegerValue, isReal, restoreColumns } from "../value";
+import { SqlError, type Backend, type Plain, type PlainRow, type Value } from "../types";
+import { bindPlain, bindTyped, decodeScratch, restoreColumns, scratchElemSql, typedReadSql } from "../value";
+import { initStoredValue } from "./stored";
 
 // Emscripten の glue が self.location を参照する。Workers にはないので補う。
 if (typeof globalThis.location === "undefined") {
@@ -17,7 +18,11 @@ export function setSqlWasm(mod: WebAssembly.Module): void {
   wasmModule = mod;
 }
 
-function sqlJs(): Promise<SqlJsStatic> {
+/**
+ * sql.js を初期化する。isolate に 1 度だけである。型の親和性の変換 (src/sql/stored.ts の storedValue) の SQLite も、同じ engine で
+ * ここで開く。文を計画する前に、Db がこれを待つ (src/client/db.ts の runPlanned)。
+ */
+export function sqlJs(): Promise<SqlJsStatic> {
   engine ??= initSqlJs(
     wasmModule
       ? {
@@ -28,7 +33,10 @@ function sqlJs(): Promise<SqlJsStatic> {
           },
         } as never
       : undefined,
-  );
+  ).then(async (SQL) => {
+    await initStoredValue(SQL);
+    return SQL;
+  });
   return engine;
 }
 
@@ -43,7 +51,12 @@ export interface Compiled {
   read: string[];
   /** 文が表定義そのものを読む。 */
   metadata: boolean;
+  /** 結果の列名。SQLite が文を用意したときに付けた名前である。シャードへ送る読みの ExecReq.columns に使う。 */
+  columns: string[];
 }
+
+/** 結果を返す文 (SELECT、VALUES、WITH で始まる文) か。型つきの読みに包めるのは、この形の文だけである。 */
+export const readsRows = (sql: string): boolean => /^\s*(?:(?:--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)\s*)*(SELECT|VALUES|WITH)\b/i.test(sql);
 
 /**
  * 文から、文字列の literal と注釈を除き、識別子を残した文面。引用した識別子 ("..."、`...`、[...]) は中身を残す。
@@ -109,35 +122,74 @@ export function identifierText(sql: string): string {
 
 export class ScratchDb implements Backend {
   constructor(private db: Database) {}
-  iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
-    const { columns, values } = this.raw(sql, ...params);
-    return { columns, rows: values };
-  }
+
   /**
-   * 文を実行する。SQLite のエラー (構文、制約の違反) は SqlError にして投げる。
+   * 文を用意して、束縛して、行を読む。SQLite のエラー (構文、制約の違反) は SqlError にして投げる。
    * シャードで実行した文のエラーも SqlError で届くので、文がどちらで実行されたかで、エラーの型が変わらない。
    */
-  raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] } {
-    let st: ReturnType<Database["prepare"]> | undefined;
+  private run<T>(sql: string, params: Plain[], columns: Map<string, string> | null, read: (st: Statement) => T): { columns: string[]; out: T } {
+    let st: Statement | undefined;
     try {
-      // sql.js は安全な整数を INTEGER として束縛する。整数の値の REAL は包む (src/value.ts)。
-      const b = bindTyped(sql, params, "integer");
-      st = this.db.prepare(b.sql);
-      st.bind(b.params as never);
-      const columns = restoreColumns(st.getColumnNames(), b.columns);
-      const values: Value[][] = [];
-      while (st.step()) values.push(st.get() as Value[]);
-      return { columns, values };
+      st = this.db.prepare(sql);
+      st.bind(params as never);
+      return { columns: restoreColumns(st.getColumnNames(), columns), out: read(st) };
     } catch (e) {
       throw e instanceof SqlError ? e : new SqlError(e instanceof Error ? e.message : String(e));
     } finally {
       st?.free();
     }
   }
-  exec(sql: string, ...params: Value[]): Row[] {
+
+  private rows(b: { sql: string; params: Plain[]; columns: Map<string, string> | null }, bigints = false): { columns: string[]; values: Plain[][] } {
+    const { columns, out } = this.run(b.sql, b.params, b.columns, (st) => {
+      const values: Plain[][] = [];
+      // sql.js の型定義は get の 2 つ目の引数 (useBigInt) を持たない。
+      const get = st as unknown as { get(params: null, config?: { useBigInt: boolean }): Plain[] };
+      while (st.step()) values.push(get.get(null, bigints ? { useBigInt: true } : undefined));
+      return values;
+    });
+    return { columns, values: out };
+  }
+
+  // 内部の入口。sql.js は、32 ビットに収まる整数の値の数を INTEGER として束縛する。ほかの整数の値は包む (src/value.ts の bindPlain)。
+  iterate(sql: string, ...params: Plain[]): { columns: string[]; rows: Iterable<Plain[]> } {
+    const { columns, values } = this.raw(sql, ...params);
+    return { columns, rows: values };
+  }
+  raw(sql: string, ...params: Plain[]): { columns: string[]; values: Plain[][] } {
+    return this.rows(bindPlain(sql, params, "integer"));
+  }
+  exec(sql: string, ...params: Plain[]): PlainRow[] {
     const { columns, values } = this.raw(sql, ...params);
     return values.map((v) => Object.fromEntries(columns.map((c, i) => [c, v[i] ?? null])));
   }
+  /** 利用者の表に触る文 (Backend.query)。値を型ごと束縛し、ドライバの値を返す。 */
+  query(sql: string, params: readonly Value[]): { columns: string[]; rows: Iterable<Plain[]> } {
+    const { columns, values } = this.rows(bindTyped(sql, params, "integer"));
+    return { columns, rows: values };
+  }
+
+  /**
+   * 結果を返す文を、型ごと正確に読む (docs/design-values.md の「Worker の SQLite」)。文を型つきの読みに包み、TEXT を BLOB で
+   * 運び、`useBigInt` で読む (src/value.ts の scratchElemSql)。sql.js のドライバは結果の TEXT を最初の NUL で切るので、素の列では
+   * 読まない。結果の列の数と名前は、包む前の文を用意して取る。
+   */
+  select(sql: string, params: readonly Value[]): { columns: string[]; values: Value[][] } {
+    const b = bindTyped(sql, params, "integer");
+    const { columns } = this.run(b.sql, [], b.columns, () => null);
+    const wrapped = typedReadSql(b.sql, columns.length, scratchElemSql);
+    const { values } = this.rows({ sql: wrapped, params: b.params, columns: null }, true);
+    return { columns, values: values.map((r) => r.map(decodeScratch)) };
+  }
+
+  /**
+   * 包めない文 (PRAGMA、EXPLAIN) の結果を読む。INTEGER は `useBigInt` で bigint、REAL は number で読む。TEXT は素の列で読むので、
+   * NUL を含む TEXT は切れる。表定義の名前と型の文字列だけを返す文に使う。
+   */
+  pragma(sql: string, params: readonly Value[]): { columns: string[]; values: Value[][] } {
+    return this.rows(bindTyped(sql, params, "integer"), true) as { columns: string[]; values: Value[][] };
+  }
+
   tx<T>(fn: () => T): T {
     this.db.run("SAVEPOINT s");
     try {
@@ -163,7 +215,7 @@ export class ScratchDb implements Backend {
   }
 
   /**
-   * 文が開く表と、文が表定義そのものを読むかどうか (metadata)。
+   * 文が開く表と、文が表定義そのものを読むかどうか (metadata)、結果の列名。
    *
    * 表定義を読む文は、`sqlite_master` (どの名前で呼んでも、開くのはルートページ 1 である) を読む文と、`pragma_table_info(...)` の
    * ような PRAGMA の関数を FROM に置く文である。ここには利用者の表しかないので、ここで実行すれば利用者の表定義について答える。
@@ -190,29 +242,36 @@ export class ScratchDb implements Backend {
         }
       } else if (op.opcode === "VOpen") virtual = true;
     }
-    return { tables: [...out], read: [...read], metadata: schema || (virtual && /\bpragma_/i.test(identifierText(sql))) };
+    const { columns } = this.run(sql, [], null, () => null);
+    return { tables: [...out], read: [...read], metadata: schema || (virtual && /\bpragma_/i.test(identifierText(sql))), columns };
   }
 
-  /** 行をまとめて投入する。1 回の取引で流すと 10 万行で 100 ms 前後である。 */
+  /**
+   * 行をまとめて投入する。1 回の取引で流すと 10 万行で 100 ms 前後である。
+   * 値は型ごと束縛する。sql.js の束縛で型が変わる値 (32 ビットを超える INTEGER と、整数の値の REAL) は包むので、包む引数の並び
+   * (bindTyped の書き換え) ごとに、用意した文を覚えて使い回す。
+   */
   load(table: string, columns: string[], rows: Value[][]): void {
     if (rows.length === 0) return;
     const list = columns.map((c) => `"${c.replaceAll('"', '""')}"`).join(", ");
     const insert = `INSERT INTO "${table}" (${list}) VALUES (${columns.map(() => "?").join(", ")})`;
-    const st = this.db.prepare(insert);
-    this.db.run("BEGIN");
+    const prepared = new Map<string, Statement>();
+    this.db.run("SAVEPOINT load");
     try {
-      // sql.js の束縛で型が変わる値 (整数の値の REAL と、32 ビットを超える整数) を含む行は、型を保つ束縛 (bindTyped) を通す。
-      // ほかは用意した文で速く入れる。
       for (const r of rows) {
-        if (r.some((v) => isReal(v) || (isIntegerValue(v) && (v | 0) !== v))) this.raw(insert, ...r);
-        else st.run(r as never);
+        const b = bindTyped(insert, r, "integer");
+        let st = prepared.get(b.sql);
+        if (!st) prepared.set(b.sql, (st = this.db.prepare(b.sql)));
+        st.run(b.params as never);
       }
-      this.db.run("COMMIT");
+      this.db.run("RELEASE load");
     } catch (e) {
+      this.db.run("ROLLBACK TO load");
+      this.db.run("RELEASE load");
       // 集めた行が表の制約に反した (同じ UNIQUE の値の行が 2 つあるなど)。文のエラーと同じ型で返す。
       throw e instanceof SqlError ? e : new SqlError(e instanceof Error ? e.message : String(e));
     } finally {
-      st.free();
+      for (const st of prepared.values()) st.free();
     }
   }
   close(): void {

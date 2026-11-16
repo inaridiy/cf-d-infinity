@@ -35,12 +35,46 @@ describe("analytics path", () => {
       SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY "table", pk ORDER BY commit_ts DESC) rn
                      FROM read_json('${file}', format='newline_delimited', columns={commit_ts:'BIGINT', "table":'VARCHAR', pk:'VARCHAR', deleted:'BOOLEAN', row:'VARCHAR'}))
       WHERE rn = 1 AND NOT deleted`);
-    await duck.run(`CREATE VIEW orders AS SELECT (row->>'tenant_id')::INT tenant_id, row->>'status' status, (row->>'total')::INT total FROM latest WHERE "table" = 'orders'`);
-    await duck.run(`CREATE VIEW tenants AS SELECT (row->>'tenant_id')::INT tenant_id, row->>'plan' plan FROM latest WHERE "table" = 'tenants'`);
+    // 行の値は要素 (INTEGER は "i" と 10 進の数字、TEXT は "t" と文字列。src/value.ts) である。印を外して読む。
+    await duck.run(`CREATE VIEW orders AS SELECT substr(row->>'tenant_id', 2)::INT tenant_id, substr(row->>'status', 2) status, substr(row->>'total', 2)::INT total FROM latest WHERE "table" = 'orders'`);
+    await duck.run(`CREATE VIEW tenants AS SELECT substr(row->>'tenant_id', 2)::INT tenant_id, substr(row->>'plan', 2) plan FROM latest WHERE "table" = 'tenants'`);
     const r = await duck.runAndReadAll(`SELECT t.plan, sum(o.total)::INT s, count(*)::INT c FROM orders o JOIN tenants t USING (tenant_id) GROUP BY t.plan ORDER BY t.plan`);
     expect(r.getRowObjects()).toEqual([{ plan: "free", s: 280, c: 4 }, { plan: "pro", s: 250, c: 5 }]);
     // OLTP 層の同じ集計と一致する。
     expect(oltp.rows).toEqual([{ plan: "free", s: 280 }, { plan: "pro", s: 250 }]);
+  });
+
+  it("emits each row with its column names and its values as elements, so JSON keeps 64-bit integers, NUL, REAL and BLOB", async () => {
+    const c = new SimCluster({ shards: 2 });
+    const db = c.client();
+    await db.ddl("CREATE TABLE w(id INTEGER PRIMARY KEY, n INTEGER, s TEXT, r REAL, v)");
+    const rows: unknown[][] = [
+      [1n, 2n ** 63n - 1n, "a\u0000b", 5, 5],
+      [2n, -(2n ** 63n), "\u0000", Infinity, 2n ** 53n + 1n],
+      [3n, 2n ** 53n + 1n, "", -1.5, new Uint8Array([0, 255])],
+    ];
+    for (const r of rows) await db.query("INSERT INTO w VALUES (?, ?, ?, ?, ?)", r as never);
+    await db.query("UPDATE w SET v = 'x' WHERE id = 3");
+    await c.settle();
+    c.time += 1000;
+    const snap = await collect(c);
+    // NDJSON に書く経路と同じく、JSON を 1 度通す。
+    const changes = (JSON.parse(JSON.stringify(snap.changes)) as typeof snap.changes).filter((x) => x.table === "w");
+    const latest = new Map<string, unknown>();
+    for (const x of [...changes].sort((a, b) => a.commit_ts - b.commit_ts)) latest.set(x.pk, x.row);
+    expect([...latest.values()].sort((a, b) => ((a as { id: string }).id < (b as { id: string }).id ? -1 : 1))).toEqual([
+      { id: "i1", n: "i9223372036854775807", s: "ta\u0000b", r: "r5.0", v: "r5.0" },
+      { id: "i2", n: "i-9223372036854775808", s: "t\u0000", r: "r9.0e+999", v: "i9007199254740993" },
+      { id: "i3", n: "i9007199254740993", s: "t", r: "r-1.5", v: "tx" },
+    ]);
+
+    // DuckDB は、印を外した数字を 64 ビットの整数として正確に読む。
+    const dir = mkdtempSync(join(tmpdir(), "newsql-"));
+    const file = join(dir, "w.ndjson");
+    writeFileSync(file, changes.filter((x) => !x.deleted).map((x) => JSON.stringify({ row: JSON.stringify(x.row) })).join("\n"));
+    const duck = await (await DuckDBInstance.create(":memory:")).connect();
+    const r = await duck.runAndReadAll(`SELECT DISTINCT substr(row->>'n', 2)::BIGINT n FROM read_json('${file}', format='newline_delimited', columns={row:'VARCHAR'}) ORDER BY n`);
+    expect(r.getRowObjects()).toEqual([{ n: -(2n ** 63n) }, { n: 2n ** 53n + 1n }, { n: 2n ** 63n - 1n }]);
   });
 });
 

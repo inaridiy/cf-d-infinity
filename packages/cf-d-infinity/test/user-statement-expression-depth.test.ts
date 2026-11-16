@@ -1,20 +1,20 @@
-// 未解決: 式の木が深い利用者の文は、DO でだけ失敗し、シミュレータでは通る。
+// 式の木が深い利用者の文が、SQLite と同じ答えになること (計画書の未解決の問題 39。値の作り直しの段 3 で直り、test/open/ から移した)。
 //
-// DO の SQLite は、式の木の深さを 100 までに制限している (test/workerd-limits.test.ts)。シャードは、届いた文の深さを測らない
-// (src/shard-limits.ts の shardLimitOf は、文の長さ、束縛の変数の数、複合 SELECT の項の数、値の大きさだけを見る)。D∞ が作る文は、
-// 表を作るときに深さを確かめる (builtLimitOf) が、利用者の文は確かめない。さらに、整数の引数を `(CAST(? AS INTEGER)+0)` で包む
-// 書き換え (src/value.ts の bindTyped) は、1 項あたり深さを 2 足すので、SQLite に直に送れば通る文が、D∞ では深さ 100 を超える。
-// node:sqlite は深さ 1,000 まで受け付けるので、シミュレータの試験では見えない。
+// DO の SQLite は、式の木の深さを 100 までに制限している (test/workerd-limits.test.ts)。段 2 までは、シャードが届いた文の深さを
+// 測らなかった (src/shard-limits.ts の shardLimitOf は、文の長さ、束縛の変数の数、複合 SELECT の項の数、値の大きさだけを見た)。
+// 整数の引数を `(CAST(? AS INTEGER)+0)` で包む書き換え (src/value.ts の bindTyped) は 1 項あたり深さを 2 足すので、SQLite に直に
+// 送れば通る文が、D∞ では DO でだけ失敗した。node:sqlite は深さ 1,000 まで受け付けるので、シミュレータの試験では見えなかった。
 // 値の作り直しの段 2 で、99 列の主キーの表を workerd で確かめていて見つけた (2026-11-14)。
 //
-// 正しい振る舞いは 2 つのどちらかである。シミュレータと同じく答えるか (シャードが深すぎる文を ShardLimit で断り、Worker が
-// 基準経路で実行し直す。Worker の SQLite の上限は 1,000 である)、文の形で決まる理由で、どこでも同じように断るか。
+// 段 3 で、シャードは、届いた文の深さを見積もり (src/sql/depth.ts) で測り、上限を超える文を ShardLimit で断るようになった。Worker は、
+// その文を基準経路で実行し直す (Worker の SQLite の上限は 1,000 である)。シミュレータも同じ上限を模す (test/sim.ts の checkDoDepth。
+// 同じ場面のシミュレータの試験は test/expression-depth.test.ts にある)。
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-const BUNDLE = "dist/worker.open-user-depth.js";
+const BUNDLE = "dist/worker.user-depth.js";
 let mf: Miniflare;
 const post = async (path: string, body: unknown) => {
   const r = await mf.dispatchFetch(`http://x${path}`, { method: "POST", body: JSON.stringify(body), headers: { authorization: "Bearer test" } });

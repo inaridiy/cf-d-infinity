@@ -1,15 +1,20 @@
 // Service Binding の入口。binding を持つ Worker だけが呼べるので、トークンは要らない。
 import { RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
-import type { RemoteResult, RemoteStatement, TransactionMode } from "./binding";
+import type { IntMode, RemoteResult, RemoteStatement, TransactionMode } from "./binding";
 import type { Db, QueryResult } from "./client/db";
+import { toValue } from "./client/d1";
+import { intModeOf, rowidOut, rowsOut, valuesOut } from "./client/results";
 import type { Value } from "./types";
 import { clusterStatus, dbFor, exportRows, handle, importRows, schemaSql, slowQueries, type Env, type ExportCursor, type SlowQuery } from "./worker";
 
-const toValue = (v: unknown): Value =>
-  v === undefined || v === null ? null : typeof v === "boolean" ? Number(v) : (v as Value);
 const values = (params: unknown[] = []): Value[] => params.map(toValue);
-const pack = (r: QueryResult, db: Db): RemoteResult => ({
-  columns: r.columns, rows: r.rows, values: r.values, changes: r.changes, lastInsertRowid: r.lastInsertRowid, token: db.token,
+/**
+ * 結果は D1 と同じ形で返す。INTEGER の形は、呼び出し元が選んだ intMode である (src/client/results.ts。既定は JS の数で、JS の数で
+ * 正確に表せない INTEGER は誤りにする)。structured clone は bigint を運ぶので、"bigint" の結果もそのまま RPC で返る。
+ */
+const pack = (r: QueryResult, db: Db, mode: IntMode): RemoteResult => ({
+  columns: r.columns, rows: rowsOut(r.columns, r.values, mode), values: valuesOut(r.values, mode), changes: r.changes,
+  lastInsertRowid: rowidOut(r.lastInsertRowid, mode), token: db.token,
 });
 
 /**
@@ -18,11 +23,11 @@ const pack = (r: QueryResult, db: Db): RemoteResult => ({
  * workerd は放置された stub の dispose をすぐには呼ばないので、ここでは dispose に頼らない。
  */
 class RemoteTx extends RpcTarget {
-  constructor(private db: Db) {
+  constructor(private db: Db, private mode: IntMode) {
     super();
   }
   async execute(sql: string, params?: unknown[]): Promise<RemoteResult> {
-    return pack(await this.db.query(sql, values(params)), this.db);
+    return pack(await this.db.query(sql, values(params)), this.db, this.mode);
   }
   async commit(): Promise<{ token: number }> {
     await this.db.query("COMMIT");
@@ -40,20 +45,24 @@ class RemoteTx extends RpcTarget {
  */
 export class DinfDatabase extends WorkerEntrypoint<Env> {
   private background = (p: Promise<unknown>) => this.ctx.waitUntil(p);
-  async query(sql: string, params?: unknown[], token = 0): Promise<RemoteResult> {
+  /** intMode は結果の INTEGER の形である (src/binding.ts の IntMode)。知らない値は、文を実行する前に断る。 */
+  async query(sql: string, params?: unknown[], token = 0, intMode?: IntMode): Promise<RemoteResult> {
+    const mode = intModeOf(intMode);
     const db = await dbFor(this.env, token, this.background);
-    return pack(await db.query(sql, values(params)), db);
+    return pack(await db.query(sql, values(params)), db, mode);
   }
   /** 全文を 1 取引で実行する。競合は内部でやり直す。表定義を変える文を含むと、その位置で区切る (Db.batch)。 */
-  async batch(statements: RemoteStatement[], token = 0): Promise<RemoteResult[]> {
+  async batch(statements: RemoteStatement[], token = 0, intMode?: IntMode): Promise<RemoteResult[]> {
+    const mode = intModeOf(intMode);
     const db = await dbFor(this.env, token, this.background);
     const out = await db.batch(statements.map((s) => ({ sql: s.sql, params: values(s.params) })));
-    return out.map((r) => pack(r, db));
+    return out.map((r) => pack(r, db, mode));
   }
-  async begin(mode: TransactionMode = "write", token = 0): Promise<RemoteTx> {
+  async begin(mode: TransactionMode = "write", token = 0, intMode?: IntMode): Promise<RemoteTx> {
+    const ints = intModeOf(intMode);
     const db = await dbFor(this.env, token, this.background);
     await db.query(mode === "write" ? "BEGIN IMMEDIATE" : "BEGIN");
-    return new RemoteTx(db);
+    return new RemoteTx(db, ints);
   }
   /** 遅い文の記録を新しい順に返す。下限は DINF_SLOW_QUERY_MS で決まる。 */
   slowQueries(limit = 50): Promise<SlowQuery[]> {
@@ -75,16 +84,14 @@ export class DinfDatabase extends WorkerEntrypoint<Env> {
   /**
    * 表の行を少しずつ返す。論理エクスポートに使う。cursor が null になったら終わりである。
    * 時点はそろえないので、書き込みを止めていなければ、取引の途中の状態が混じり得る。
-   * BLOB は JSON で運べないので、{ $blob: 16 進 } に変える。
+   * 行は要素のタプルで返し、頁は形式の版を運ぶ (src/transfer.ts の exportPage)。JSON をそのまま通せる。
    */
   async exportRows(table: string, cursor: ExportCursor | null, limit = 1000) {
-    const page = await exportRows(this.env, table, cursor, limit);
-    const hex = (v: Uint8Array) => Array.from(v, (b) => b.toString(16).padStart(2, "0")).join("");
-    return { ...page, rows: page.rows.map((r) => r.map((v) => (v instanceof Uint8Array ? { $blob: hex(v) } : v))) };
+    return exportRows(this.env, table, cursor, limit);
   }
-  /** export が書き出した行を入れる。BLOB は { $blob: 16 進 } で受ける。 */
-  async importRows(table: string, columns: string[], rows: unknown[][]): Promise<number> {
-    return importRows(await dbFor(this.env, 0, this.background), table, columns, rows);
+  /** export が書き出した行を入れる。行は要素のタプルで、format は書き出しの形式の版である (src/transfer.ts の importRows)。 */
+  async importRows(table: string, columns: string[], rows: unknown[][], format?: number): Promise<number> {
+    return importRows(await dbFor(this.env, 0, this.background), table, columns, rows, format);
   }
   /** `env.DB.fetch()` は HTTP の入口 (Hrana、/sql、/admin) と同じで、トークンを検査する。 */
   override fetch(request: Request): Promise<Response> {

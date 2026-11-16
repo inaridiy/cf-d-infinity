@@ -63,7 +63,7 @@ describe("the size of a result", () => {
       return { columns: r.columns, rows: (function* () { for (const row of r.rows) { logRows++; yield row; } })() };
     };
     await expect(c.shard("s0").exec({
-      sql: "SELECT count(*) FROM docs", params: [], spans: [{ kind: "table", table: "docs" }], T: old, minTs: 0, schema: cat.version,
+      sql: "SELECT count(*) FROM docs", columns: ["count(*)"], params: [], spans: [{ kind: "table", table: "docs" }], T: old, minTs: 0, schema: cat.version,
     })).rejects.toThrow(/delta exceeds K/);
     // 300 件の変更のうち、上限 (50 行) を超えたと分かるところまでしか読まない。
     expect(logRows).toBeLessThan(80);

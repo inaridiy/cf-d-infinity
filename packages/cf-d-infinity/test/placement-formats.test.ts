@@ -7,7 +7,9 @@
 //   - まだ扱えない形 (ブロックを途中で切る移動、グループの一部の piece) を、黙って受けずに断ること。
 import { describe, expect, it } from "vitest";
 import { split } from "../src/autoscaler";
+import { fold } from "../src/catalog";
 import { Db } from "../src/client/db";
+import { readEpochs } from "../src/meta";
 import { REGION_TOKENS, SUBSLOTS, TOKENS, blockOf, ownerOf, planSplit, slotAligned, slotOf } from "../src/routing";
 import type { PiecePayload } from "../src/types";
 import { quiescentProblems } from "./invariants";
@@ -30,7 +32,9 @@ describe("Meta", () => {
     const { c, range } = await seeded();
     expect(range).toEqual({ start: REGION_TOKENS / 4, end: REGION_TOKENS / 2 });
     await split(c, "s0", "s2");
-    const bodies = c.metaBackend.exec("SELECT body FROM __routing ORDER BY version").map((r) => JSON.parse(r.body as string));
+    // 範囲表の版ごとの中身。Meta の epoch の列の、最初の範囲表と切り替えの記録の位置で畳む。
+    const log = readEpochs(c.metaBackend);
+    const bodies = log.filter((x) => x.rec.kind === "genesis" || x.rec.kind === "move-start").map((x) => fold(log, x.epoch).routing);
     expect(bodies).toEqual([
       { version: 1, ranges: [{ start: 0, end: REGION_TOKENS / 2, shard: "s0" }, { start: REGION_TOKENS / 2, end: REGION_TOKENS, shard: "s1" }] },
       {
@@ -41,7 +45,7 @@ describe("Meta", () => {
         ],
       },
     ]);
-    expect(bodies[1].ranges.every(slotAligned)).toBe(true);
+    expect(bodies[1]!.ranges.every(slotAligned)).toBe(true);
   });
 
   it("switches any token range, and checks the owner by the ranges it overlaps", async () => {

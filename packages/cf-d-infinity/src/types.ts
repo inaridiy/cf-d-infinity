@@ -1,11 +1,21 @@
 // 分散プロトコルの共有型。docs/design.md の用語に対応する。
 export type Ts = number;
 import type { Interval } from "./routing";
-import type { Real, Tuple } from "./value";
+import type { Tuple } from "./value";
 
-/** SQLite の値。整数の JS の数は INTEGER、整数でない JS の数は REAL、整数の値の REAL は Real (src/value.ts)。 */
-export type Value = string | number | null | Uint8Array | Real;
+/**
+ * SQLite の値。JS の型が SQLite の格納の型である (docs/design-values.md の「値の型と符号」)。bigint は INTEGER (-2^63 から 2^63 - 1)、
+ * number は REAL (整数の値でも REAL)、string は TEXT、Uint8Array は BLOB、null は NULL。
+ */
+export type Value = null | bigint | number | string | Uint8Array;
+/**
+ * ドライバが返す値と、内部の表の値。数は number である。DO の SQLite のドライバは INTEGER と REAL を区別せずに JS の数で返す
+ * (2^53 を超える INTEGER は丸める)。内部の表 (`__meta`、`__intents` など) の整数は 2^53 に収まるので、number で持つ。
+ */
+export type Plain = null | number | string | Uint8Array;
 export type Row = Record<string, Value>;
+/** 内部の表の 1 行。 */
+export type PlainRow = Record<string, Plain>;
 
 /** シャードをまたぐ UNIQUE を守る index。一意でない index は、各シャードのローカル index になるので、ここには入らない。 */
 export interface GlobalIndexDef {
@@ -137,6 +147,12 @@ export interface ExecReq {
   minTs?: Ts;
   sql: string;
   params: Value[];
+  /**
+   * 結果の列名。Worker が、文を自分の SQLite でコンパイルして取る (Db.compiled)。シャードは、読みの文を、この数の列の型つきの読みに
+   * 包み (src/value.ts の typedReadSql)、応答の列名にもこれを使う。書き込みの文では、利用者の RETURNING の列名である (Worker が
+   * RETURNING の項を要素の式に書き換えて送るので、書き換える前の文から取る)。RETURNING のない書き込みは空である。
+   */
+  columns: string[];
   spans: Span[];
   /** Txn が buffer している、このシャード宛の未 commit 変更。 */
   overlay?: Change[];
@@ -326,7 +342,7 @@ export interface PiecePayload extends Piece {
   m: Ts;
   /** 行は、変更と同じくタプルで運ぶ。 */
   rows: { table: string; row: Tuple }[];
-  intents: Row[];
+  intents: PlainRow[];
   /** 送り出した親の表定義の版。行はこの版の形をしている。 */
   schema: number;
 }
@@ -386,16 +402,27 @@ export interface Clock {
   now(): number;
 }
 
-/** SQLite への同期アクセス。DO の ctx.storage と node:sqlite の両方で実装する。 */
+/**
+ * SQLite への同期アクセス。DO の ctx.storage と node:sqlite と sql.js で実装する。
+ * 入口は 2 つある (docs/design-values.md の「JS の型」)。exec、raw、iterate は内部の表のためのもので、整数の値の number を INTEGER
+ * として束縛し、ドライバの値をそのまま返す。query は利用者の表に触る文のためのもので、Value を型ごと束縛する (bigint は INTEGER、
+ * number は REAL)。query の結果もドライバの値のままなので、query には、型を印で運ぶ形の文 (型つきの読み、タプル、RETURNING の要素)
+ * だけを渡す。
+ */
 export interface Backend {
-  exec(sql: string, ...params: Value[]): Row[];
+  exec(sql: string, ...params: Plain[]): PlainRow[];
   /** 同名の列を潰さないよう、列名と値の配列で返す。 */
-  raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] };
+  raw(sql: string, ...params: Plain[]): { columns: string[]; values: Plain[][] };
   /**
    * 結果を 1 行ずつ返す。全行を配列にしないので、途中でやめれば残りは読まない。
    * 読み終えるか break するまで、同じ Backend への他の文を挟まないこと。
    */
-  iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> };
+  iterate(sql: string, ...params: Plain[]): { columns: string[]; rows: Iterable<Plain[]> };
+  /**
+   * 利用者の表に触る文。値を型ごと束縛し、結果を 1 行ずつ返す (iterate と同じく、読み終えるまで他の文を挟まない)。
+   * label は、文の種類ごとの読み書きの行数の集計 (src/worker.ts の rowStats) に使う文面である。包んだ読みは、包む前の文面を渡す。
+   */
+  query(sql: string, params: readonly Value[], label?: string): { columns: string[]; rows: Iterable<Plain[]> };
   /** fn が throw したら ROLLBACK し、その値を再送出する。 */
   tx<T>(fn: () => T): T;
   /** 保留中の write の永続化を待つ。 */
@@ -491,6 +518,18 @@ export interface Faults {
   woundPrepared?: boolean;
   /** prepare が、書く行の他の取引のロックを待つ (モデル m9_red_prepare_waits)。 */
   prepareWaits?: boolean;
+  /**
+   * シャードの書き込みの守り (kernel.ts の claimed) を外す。シャードは、文が捕捉した変更の行を、持ち主かどうかも、文が宣言した
+   * 範囲に入るかどうかも確かめずに受け入れる (2026-11-14 までの挙動)。古い範囲表で計画した複数行の INSERT が、分割で生まれた
+   * 2 つのシャードの両方に全部の行を入れる (未解決の問題 35)。
+   */
+  ignoreWriteClaim?: boolean;
+  /**
+   * 結果を返す文を型つきの読みに包むとき、`LIMIT -1 OFFSET 0` の囲いを外す (docs/design-values.md の「シャードからの読み」)。
+   * SQLite は包んだ文を外の文へ展開し、要素の式が列を参照するたびに、`random()` やサブクエリを評価し直す。typeof と値が別の評価から
+   * 来るので、型と値が食い違う (`i` の印に文字列が続いて読めないか、整数が TEXT になる)。
+   */
+  unfencedRead?: boolean;
 }
 
 export class ConflictError extends Error {
@@ -523,8 +562,11 @@ export class ReadTooOld extends Error {
 // 版 2 の要求は、範囲の数の意味も、移動の要求の形も違うので、受け付けない。
 // 版 4 (2026-11-14): 行イメージを、列名つきの object から、表定義の列の順のタプルにした (docs/design-values.md の段 2)。
 // Change の before と after、PiecePayload の rows、取引が溜める変更の形が変わる。版 3 の要求の行イメージは読めないので、受け付けない。
-export const PROTOCOL_VERSION = 4;
-export const MIN_PROTOCOL_VERSION = 4;
+// 版 5 (2026-11-14): 値を、JS の型が格納の型である形にした (docs/design-values.md の段 3)。INTEGER は bigint、REAL は number で、
+// 整数の値の REAL の印 `{ real }` はなくなった。ExecReq に結果の列名 (columns) を足し、シャードは読みを型つきの読みに包んで、
+// 型のある値を返す。利用者の RETURNING は Worker が要素の式に書き換えて送る。版 4 の要求の数は意味が違うので、受け付けない。
+export const PROTOCOL_VERSION = 5;
+export const MIN_PROTOCOL_VERSION = 5;
 
 export class VersionSkew extends Error {
   readonly retryable = true;
@@ -560,6 +602,24 @@ export class TableLocked extends ConflictError {
 }
 /** TableLocked の誤りか。DO の間ではクラスが落ちるので、メッセージで見分ける。 */
 export const isTableLocked = (e: unknown): boolean => /(^|: )locked: table /.test((e as Error)?.message ?? "");
+/**
+ * シャードの書き込みの守りが、書き込みを断った (src/shard/kernel.ts の claimed)。文が捕捉した変更の行か、取引が確定のときに渡した
+ * 変更の行が、このシャードの持ち物でないか、文が宣言した範囲の外にある。何も書かずに断る。
+ *
+ * 範囲表が古いのではなく、要求の作り方 (Worker の計画か振り分け) の誤りである。範囲表を取り直して同じ計画を送り直しても、
+ * 同じ行を書くので、また断られる。だから、やり直してよい誤り (retryable の印、`conflict:`、`not owner:` などの接頭辞) にはしない。
+ * 経路の拒否 (NotOwner) と同じに扱うと、Worker は範囲表を取り直して同じ計画を送り直し、送り直した先で同じ行を書く
+ * (未解決の問題 35 は、その送り直しで行を 2 つのシャードに入れた)。
+ * DO の間ではクラスが落ちるので、Worker はメッセージの接頭辞 `write outside claim: ` で見分ける (isWriteOutsideClaim)。
+ */
+export class WriteOutsideClaim extends Error {
+  constructor(detail: string) {
+    super(`write outside claim: ${detail}`);
+    this.name = "WriteOutsideClaim";
+  }
+}
+/** WriteOutsideClaim の誤りか。Worker が包み直した誤り (`conflict: write outside claim: ...`) も見分ける。 */
+export const isWriteOutsideClaim = (e: unknown): boolean => /(^|: )write outside claim: /.test((e as Error)?.message ?? "");
 export class Migrating extends Error {
   readonly retryable = true;
   constructor() {
@@ -598,8 +658,12 @@ export function utf8Length(s: string): number {
  * 版 2 (2026-11-14): 行イメージをタプルにし、捕捉を共有の __cap(seq, tbl, old, new) にした (docs/design-values.md の段 2)。
  * __intents.change と __log_g*.blob の行イメージ、Meta の __ddl が記録する捕捉の trigger の文、__cap の形が変わる。
  * 最初の公開の前なので、版 1 からの移行は書かない (持ち主の決定、2026-11-14)。版 1 のデータは、移行がないと言って起動を拒否する。
+ *
+ * 版 3 (2026-11-15): Meta の __ddl と __routing を、epoch の列 __epoch(epoch, rec) の 1 表にした (docs/design-catalog-epoch.md の段 1)。
+ * __meta の shadow は、版ではなく epoch を持つ。シャードの形式は変わらない。版 2 からの移行は書かない。版 2 の Meta を開くと、
+ * 新しいコードは空の列を読み、表定義をなくしたように見えるので、移行がないと言って起動を拒否する。
  */
-export const STORAGE_FORMAT = 2;
+export const STORAGE_FORMAT = 3;
 
 /** 版 n の保存データを版 n + 1 にする移行。鍵は n である。最初の公開の前の形式は持たない (公開前は後方互換を持たない)。 */
 const STORAGE_MIGRATIONS: Record<number, (b: Backend) => void> = {};

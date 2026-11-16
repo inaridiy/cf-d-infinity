@@ -71,18 +71,19 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number) {
   let unknown = 0;
 
   const readKey = async (tx: Txn, x: { t: number; i: number }, reads: Read[]) => {
-    const r = await tx.query("SELECT n FROM users WHERE tenant_id = ? AND id = ?", [x.t, x.i]);
+    // 整数の引数は INTEGER (bigint) で渡す。JS の数は REAL として束縛される (列の型の親和性が整数に戻すので、答えは同じである)。
+    const r = await tx.query("SELECT n FROM users WHERE tenant_id = ? AND id = ?", [BigInt(x.t), BigInt(x.i)]);
     const value = (r.rows[0]?.n as number | undefined) ?? null;
     reads.push({ key: k(x), value });
     return value;
   };
   const readTenant = async (tx: Txn, t: number, reads: Read[]) => {
-    const r = await tx.query("SELECT count(*) c, coalesce(sum(n), 0) s FROM users WHERE tenant_id = ?", [t]);
+    const r = await tx.query("SELECT count(*) c, coalesce(sum(n), 0) s FROM users WHERE tenant_id = ?", [BigInt(t)]);
     reads.push({ tenant: t, value: { count: r.rows[0]!.c, sum: r.rows[0]!.s } });
   };
   const put = async (tx: Txn, x: { t: number; i: number }, v: number, writes: TxRecord["writes"]) => {
-    await tx.query("DELETE FROM users WHERE tenant_id = ? AND id = ?", [x.t, x.i]);
-    await tx.query("INSERT INTO users(tenant_id, id, n) VALUES (?, ?, ?)", [x.t, x.i, v]);
+    await tx.query("DELETE FROM users WHERE tenant_id = ? AND id = ?", [BigInt(x.t), BigInt(x.i)]);
+    await tx.query("INSERT INTO users(tenant_id, id, n) VALUES (?, ?, ?)", [BigInt(x.t), BigInt(x.i), BigInt(v)]);
     writes.push({ key: k(x), value: v });
   };
 

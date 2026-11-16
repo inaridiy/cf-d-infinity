@@ -65,7 +65,7 @@ import { ownerOf, shardsOf, SUBSLOTS } from "../src/routing";
 import type { Value } from "../src/types";
 import { rawRows } from "./ddl-harness";
 import { quiescentProblems } from "./invariants";
-import { prng, REFERENCE_ONLY, SimCluster } from "./sim";
+import { asNumbers, prng, REFERENCE_ONLY, SimCluster } from "./sim";
 
 export const SCHEMA = [
   "CREATE TABLE a(id INTEGER PRIMARY KEY, g INTEGER NOT NULL, v INTEGER NOT NULL)",
@@ -345,7 +345,7 @@ function txDriver(c: SimCluster, s: Script) {
   const asRows = async (p: Promise<{ values: Value[][]; changes: number }>): Promise<Outcome> => {
     try {
       const r = await p;
-      return { kind: "rows", rows: r.values, changes: r.changes };
+      return { kind: "rows", rows: asNumbers(r.values), changes: r.changes };
     } catch (e) {
       return errorOf(e);
     }
@@ -411,7 +411,7 @@ async function misplaced(c: SimCluster): Promise<string[]> {
 
 async function dump(db: Db): Promise<Record<string, Value[][]>> {
   const out: Record<string, Value[][]> = {};
-  for (const [t, d] of Object.entries(TABLES)) out[t] = (await db.query(`SELECT ${d.cols.join(", ")} FROM ${t} ORDER BY ${d.order}`)).values;
+  for (const [t, d] of Object.entries(TABLES)) out[t] = asNumbers((await db.query(`SELECT ${d.cols.join(", ")} FROM ${t} ORDER BY ${d.order}`)).values);
   return out;
 }
 
@@ -448,7 +448,7 @@ export async function runPlacement(s: Script, p: Placement, o: { mask: boolean }
     };
     const writerStep = async (step: Step) => {
       const promise = writers[step.conn as "w1" | "w2"].query(step.sql!, step.params!).then(
-        (r): Outcome => ({ kind: "rows", rows: r.values, changes: r.changes }),
+        (r): Outcome => ({ kind: "rows", rows: asNumbers(r.values), changes: r.changes }),
         errorOf,
       );
       const flag = { i: step.i, promise, done: false };

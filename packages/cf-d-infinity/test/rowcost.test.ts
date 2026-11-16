@@ -32,7 +32,10 @@ async function measure(name: string, op: (i: number) => Promise<unknown>) {
   const w = (Object.values(s).reduce((a, v) => a + v.rowsWritten, 0) - clock) / N;
   const parts = Object.entries(s).filter(([, v]) => v.rowsWritten > 0).sort((a, b) => b[1].rowsWritten - a[1].rowsWritten)
     .map(([k, v]) => `${k}=${(v.rowsWritten / N).toFixed(2)}`);
-  console.log(`ROWCOST ${name}: ${w.toFixed(2)} rows/op + ${clock} clock rows in ${seconds.toFixed(2)} s  [${parts.join(", ")}]`);
+  // 読んだ行の数 (課金の対象)。利用者の表を読む文だけを数える (内部の表は名前が `__` で始まる)。
+  const userReads = Object.entries(s).filter(([k]) => !/ __/.test(k)).reduce((a, [, v]) => a + v.rowsRead, 0) / N;
+  const readParts = Object.entries(s).filter(([k, v]) => v.rowsRead > 0 && !/ __/.test(k)).map(([k, v]) => `${k}=${(v.rowsRead / N).toFixed(2)}`);
+  console.log(`ROWCOST ${name}: ${w.toFixed(2)} rows/op + ${clock} clock rows in ${seconds.toFixed(2)} s  [${parts.join(", ")}]  read ${userReads.toFixed(2)} rows/op [${readParts.join(", ")}]`);
   expect(clock, `${name}: clock rows`).toBeLessThanOrEqual(SHARDS * (Math.ceil(seconds) + 1));
   return w;
 }
@@ -66,6 +69,12 @@ describe.skipIf(!process.env.ROWCOST)("billed rows per operation", () => {
     expect(await measure("insert (autocommit)", (i) => sql("INSERT INTO b(tenant_id,id,n) VALUES (?,2,0)", [i + 1]))).toBeLessThanOrEqual(3);
     expect(await measure("update by pk (autocommit)", (i) => sql("UPDATE b SET n = n + 1 WHERE tenant_id = ? AND id = 1", [(i % 200) + 1]))).toBeLessThanOrEqual(2);
     expect(await measure("read by pk", (i) => sql("SELECT n FROM b WHERE tenant_id = ? AND id = 1", [(i % 200) + 1]))).toBe(0);
+    // 読みの課金 (読んだ行の数) は、型つきの読みに包んでも変わらない見込みである (docs/design-values.md の「費用」)。シャードの読みを
+    // 包む前と後で同じになることを、ROWCOST の行の read で比べる。
+    await measure("read one shard key, ordered", (i) => sql("SELECT id, n FROM b WHERE tenant_id = ? ORDER BY id", [(i % 200) + 1]));
+    await measure("read every row (gathered)", () => sql("SELECT tenant_id, id, n FROM b ORDER BY tenant_id, id", []));
+    await measure("aggregate over every shard (partial)", () => sql("SELECT count(*) AS c, sum(n) AS s FROM b", []));
+    await measure("read by a non-key condition over every shard", () => sql("SELECT tenant_id, id FROM b WHERE n > 0 ORDER BY tenant_id", []));
     expect(await measure("batch: read + update same shard", (i) => post("/batch", { statements: [
       { sql: "SELECT n FROM b WHERE tenant_id = ? AND id = 1", params: [(i % 200) + 1] },
       { sql: "UPDATE b SET n = n + 1 WHERE tenant_id = ? AND id = 1", params: [(i % 200) + 1] }] }))).toBeLessThanOrEqual(3.2);

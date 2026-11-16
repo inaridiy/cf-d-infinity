@@ -50,6 +50,8 @@ const withSelect = (sel: Many, ...xs: H[]): H => ({ h: 1 + Math.max(sel.h, ...xs
 export function expressionDepth(sql: string): number {
   const t: Token[] = tokenize(sql);
   let i = 0;
+  /** FROM の後の表の並びを読んでいる (`, (SELECT ...)` は FROM の副問い合わせである)。 */
+  let fromList = false;
   const peek = (k = 0): Token => t[Math.min(i + k, t.length - 1)]!;
   const isOp = (x: Token, text: string) => x.kind === "op" && x.text === text;
   const isWord = (x: Token, w: string) => x.kind === "word" && x.upper === w;
@@ -64,10 +66,63 @@ export function expressionDepth(sql: string): number {
   };
 
   // stop に当たるまでの文を読み、中の式を集める。stop の字句は読まない。
+  //
+  // FROM と JOIN の後の副問い合わせと、CTE の本体 (`AS (`) は、式ではなく、別の SELECT である。SQLite は、それを名前の解決のときに
+  // その場の深さで確かめる (式の副問い合わせのように、外の式の高さを足すことはない)。式の副問い合わせとして数えると、深さを
+  // およそ 2 倍に見積もる (型つきの読みに包んだ文は、中の文の 2 倍になった。段 3)。
+  //   - FROM と JOIN の副問い合わせは、その深さ (d) を、そのまま文の深さの候補にする。外の式の中にある文なら、外の式の高さは、
+  //     その文を副問い合わせの式として数えるところ (withSelect) で足される。
+  //   - CTE の本体は、参照した場所で解決されるので、参照した式の高さが足される。どこで参照されるかは追わずに、本体の深さに、
+  //     文のほかの部分の深さを足す。小さくはならない。
+  // SQLite は、結合の条件を WHERE に AND でつなぐ (select.c の sqlite3ProcessJoin)。ON は 1 つの項、USING は列ごとに 1 つの項、
+  // NATURAL は同じ名前の列ごとに 1 つの項である。FROM の副問い合わせを外の文に展開するときも、その WHERE を AND でつなぐ。
+  // つなぐたびに、WHERE の高さが 1 増える。項の数だけ、文の深さに足す。NATURAL は、同じ名前の列の数を文からは知れないので、
+  // 表の列の上限 (100) を足す (その文は、シャードでは実行せず、基準経路で実行することになる)。
+  // どれも sqlite3 3.45.1 の CLI (`.limit expr_depth`) で確かめた (test/expression-depth.test.ts)。
   const scan = (stop: (x: Token) => boolean): Many => {
     let all = NONE;
+    let ctes = 0;
+    let joins = 0;
     while (!eof() && !stop(peek())) {
       const at = i;
+      if (isOp(peek(), "(") && isSelect(peek(1)) && i > 0) {
+        const before = t[i - 1]!;
+        const from = isWord(before, "FROM") || isWord(before, "JOIN") || isOp(before, ",") && fromList;
+        const cte = isWord(before, "AS") || isWord(before, "MATERIALIZED");
+        if (from || cte) {
+          i++;
+          const m = subquery();
+          if (cte) ctes += m.d;
+          else {
+            all = { h: all.h, s: all.s, d: Math.max(all.d, m.d) };
+            joins++;
+          }
+          continue;
+        }
+      }
+      if (isWord(peek(), "FROM")) fromList = true;
+      else if (isWord(peek(), "WHERE") || isWord(peek(), "GROUP") || isWord(peek(), "ORDER") || isWord(peek(), "SELECT")) fromList = false;
+      if (isWord(peek(), "ON") && !isWord(peek(1), "CONFLICT")) {
+        joins++;
+        i++;
+        continue;
+      }
+      if (isWord(peek(), "NATURAL")) {
+        joins += 100;
+        i++;
+        continue;
+      }
+      if (isWord(peek(), "USING") && isOp(peek(1), "(")) {
+        i += 2;
+        let n = 1;
+        while (!eof() && !isOp(peek(), ")")) {
+          if (isOp(peek(), ",")) n++;
+          i++;
+        }
+        if (isOp(peek(), ")")) i++;
+        joins += n;
+        continue;
+      }
       if (isWord(peek(), "LIMIT")) {
         // LIMIT と OFFSET の式は、TK_LIMIT の節の下にある (parse.y)。
         i++;
@@ -84,17 +139,23 @@ export function expressionDepth(sql: string): number {
         else i++;
       }
     }
-    return all;
+    return ctes + joins > 0 ? { h: all.h, s: all.s, d: all.d + ctes + joins } : all;
   };
   const closing = (x: Token) => isOp(x, ")");
   const itemEnd = (x: Token) => isOp(x, ")") || isOp(x, ",");
   /** 開き括弧の後から、閉じ括弧までの項目を読む。閉じ括弧を読む。 */
   const list = (): H[] => {
     const items: H[] = [];
+    const outer = fromList;
+    fromList = false;
     for (;;) {
-      if (eof()) return items;
+      if (eof()) {
+        fromList = outer;
+        return items;
+      }
       if (isOp(peek(), ")")) {
         i++;
+        fromList = outer;
         return items;
       }
       if (isOp(peek(), ",")) {
@@ -107,8 +168,12 @@ export function expressionDepth(sql: string): number {
   };
   /** 開き括弧の後の副問い合わせを、閉じ括弧まで読む。 */
   const subquery = (): Many => {
+    // 中の文の FROM の並びと、外の FROM の並びを混ぜない。
+    const outer = fromList;
+    fromList = false;
     const m = scan(closing);
     if (isOp(peek(), ")")) i++;
+    fromList = outer;
     return m;
   };
   const isSelect = (x: Token) => isWord(x, "SELECT") || isWord(x, "WITH") || isWord(x, "VALUES");

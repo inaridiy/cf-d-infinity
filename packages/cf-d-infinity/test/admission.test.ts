@@ -115,22 +115,23 @@ describe("the schema read inside a statement that touches a table (invariant 5: 
 });
 
 describe("an integer that JavaScript cannot hold exactly, arriving over Hrana", () => {
-  // Hrana は整数を 10 進の文字列で運ぶ。2^53 を超える値を数値にすると、黙って隣の値になる。
+  // Hrana は整数を 10 進の文字列で運ぶ。2^53 を超える値を数値にすると、黙って隣の値になる。段 2 までは断っていた。値の作り直しの
+  // 段 3 から、INTEGER (bigint) として正確に受け取る。64 ビットに収まらない値だけを断る。
   const run = async (c: SimCluster, sql: string, args: { type: "integer"; value: string }[]) => {
     const req = { baton: null, requests: [{ type: "execute", stmt: { sql, args } }] } as unknown as PipelineReq;
     const [r] = (await handlePipeline(req, async () => c.client())).results as { type: string; error?: { message: string } }[];
     return r!.type === "ok" ? "ok" : r!.error!.message;
   };
 
-  it("is refused instead of being rounded to a neighbouring value", async () => {
+  it("is stored exactly instead of being rounded to a neighbouring value; only a value beyond 64 bits is refused", async () => {
     const c = new SimCluster({ shards: 2 });
     await c.client().query("CREATE TABLE big(id INTEGER PRIMARY KEY, v INTEGER)");
-    expect(await run(c, "INSERT INTO big VALUES (?, ?)", [{ type: "integer", value: "9007199254740993" }, { type: "integer", value: "1" }]))
-      .toMatch(/^unsupported: the integer 9007199254740993 cannot be stored exactly/);
-    expect(await run(c, "INSERT INTO big VALUES (?, ?)", [{ type: "integer", value: "1" }, { type: "integer", value: "-9007199254740993" }]))
-      .toMatch(/^unsupported: the integer -9007199254740993 cannot be stored exactly/);
-    // 範囲の端は通る。
-    expect(await run(c, "INSERT INTO big VALUES (?, ?)", [{ type: "integer", value: "9007199254740991" }, { type: "integer", value: "-9007199254740991" }])).toBe("ok");
-    expect((await c.client().query("SELECT id, v FROM big")).rows).toEqual([{ id: 9007199254740991, v: -9007199254740991 }]);
+    expect(await run(c, "INSERT INTO big VALUES (?, ?)", [{ type: "integer", value: "9007199254740993" }, { type: "integer", value: "1" }])).toBe("ok");
+    expect(await run(c, "INSERT INTO big VALUES (?, ?)", [{ type: "integer", value: "1" }, { type: "integer", value: "-9007199254740993" }])).toBe("ok");
+    expect(await run(c, "INSERT INTO big VALUES (?, ?)", [{ type: "integer", value: "9223372036854775807" }, { type: "integer", value: "-9223372036854775808" }])).toBe("ok");
+    expect((await c.client().query("SELECT id, v FROM big ORDER BY id")).values)
+      .toEqual([[1n, -9007199254740993n], [9007199254740993n, 1n], [9223372036854775807n, -9223372036854775808n]]);
+    expect(await run(c, "INSERT INTO big VALUES (?, ?)", [{ type: "integer", value: "9223372036854775808" }, { type: "integer", value: "1" }]))
+      .toMatch(/^the integer 9223372036854775808 does not fit in 64 bits/);
   });
 });

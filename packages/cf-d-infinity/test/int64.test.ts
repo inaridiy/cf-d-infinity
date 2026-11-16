@@ -1,28 +1,30 @@
-// 未解決 (値の作り直しの段 3 で通る): 64 ビットの整数を、どの経路でも SQLite と同じに扱う。docs/design-values.md の「足す検査」の 1。
+// 64 ビットの整数を、どの経路でも SQLite と同じに扱う。docs/design-values.md の「足す検査」の 1。
 //
-// SQLite の INTEGER は 64 ビットである。いまの D∞ は、2^53 を超える整数の保存を `unsupported:` で断り (計画書の K1、
-// test/wide-integers.test.ts)、Hrana の引数で渡されたものも断り、SQL の中で計算しただけの値は丸めて `float` で返す
-// (docs/sql-language.md の「値」)。作り直しの後は、どれも SQLite と同じ答えになる。段 3 で、この試験を test/ へ移す。
+// SQLite の INTEGER は 64 ビットである。段 2 までの D∞ は、2^53 を超える整数の保存を `unsupported:` で断り (計画書の K1)、Hrana の
+// 引数で渡されたものも断り、SQL の中で計算しただけの値は丸めて `float` で返した。値の作り直しの段 3 で、値の JS の型が格納の型に
+// なり (bigint は INTEGER)、シャードの結果を型つきで読むようになって、どれも SQLite と同じ答えになった。段 0 に test/open/ に置き、
+// 段 3 で test/ へ移した。
 //
 // 場面ごとに、新しいクラスタと新しい基準の SQLite を使う。文を 1 つずつ両方で実行し、最初に食い違ったところで止めて、
 // 食い違い方を分類する。1 つ断られた後は 2 つの状態が分かれるので、その後の食い違いには意味がないからである。
 // シャードは 1、2、4。実行は 3 通り (普通と、基準経路だけの 2 通り。vitest.config.ts の一覧に頼らず、Db の指定で切り替える)。
 // 基準は node:sqlite を BigInt で読み、結果の INTEGER (BigInt) と REAL (数) を区別して比べる。
 //
-// 同じ場面を、±(2^53 - 1) に収まる値でも流す。こちらはいま通る。場面の台本そのものが SQLite と合っていること、つまり
-// 64 ビットの値での失敗が、値の大きさだけから来ていることを示す。
+// 同じ場面を、±(2^53 - 1) に収まる値でも流す。場面の台本そのものが SQLite と合っていることを示す (段 2 までは、64 ビットの値での
+// 失敗が、値の大きさだけから来ていることを示していた)。
 import type { Client } from "@libsql/client";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 // @ts-expect-error 型定義のない JS のモジュール
-import { importBatches, insertLines, parseInsert } from "../../bin/dump.js";
-import { split } from "../../src/autoscaler";
-import { D1Compatible } from "../../src/client/d1";
-import { Db } from "../../src/client/db";
-import type { Reference } from "../../src/sql/plan";
-import { exportPage, importRows, type ExportCursor } from "../../src/transfer";
-import { clientOf } from "../libsql";
-import { SimCluster } from "../sim";
+import { importBatches, insertLines, parseInsert } from "../bin/dump.js";
+import { split } from "../src/autoscaler";
+import { D1Compatible } from "../src/client/d1";
+import { imageFaults } from "../src/shard/rows";
+import { Db } from "../src/client/db";
+import type { Reference } from "../src/sql/plan";
+import { EXPORT_FORMAT, exportPage, importRows, type ExportCursor } from "../src/transfer";
+import { clientOf } from "./libsql";
+import { SimCluster } from "./sim";
 
 type Arg = null | bigint | number | string;
 
@@ -357,7 +359,8 @@ const SCENARIOS: Record<string, (r: Run) => Promise<void>> = {
         const again = await read(id);
         // 基準経路だけの実行は、主キーの読みでも全シャードから行を集める。2 つ以上のシャードで行が変わっているので、いまは
         // 競合で失敗する (上の未解決の欠陥)。競合は取引の正しい結末の 1 つなので、ここでは認める。答えたなら、古い行でなければならない。
-        if (r.reference !== undefined && /"error":"read too old/.test(again)) break;
+        // 環境変数 REFERENCE で流すと、「普通」の実行もクラスタの指定で基準経路になる (SimCluster.reference)。
+        if ((r.reference !== undefined || r.c.reference !== undefined) && /"error":"read too old/.test(again)) break;
         expect(again, `the transaction reads id ${id} as it was at its read time`).toBe(before[i]);
       }
     } finally {
@@ -379,11 +382,11 @@ const SCENARIOS: Record<string, (r: Run) => Promise<void>> = {
   "export, then import into another cluster": async (r) => {
     await r.h(T);
     await fill(r);
-    // 書き出しの文面 (bin/dump.js) を取り込み、別の数のシャードのクラスタへ入れる。
+    // 書き出しの文面 (bin/dump.js) を取り込み、別の数のシャードのクラスタへ入れる。頁と続きの位置は、CLI と同じく JSON を通す。
     const lines: string[] = [];
     try {
       for (let cursor: ExportCursor | null = null, pages = 0; ; ) {
-        const page = await exportPage(r.c, "t", cursor, 3);
+        const page: Awaited<ReturnType<typeof exportPage>> = JSON.parse(JSON.stringify(await exportPage(r.c, "t", JSON.parse(JSON.stringify(cursor)), 3)));
         if (page.rows.length) lines.push(...(insertLines("t", page.columns, page.rows) as string[]));
         cursor = page.cursor;
         if (cursor === null) break;
@@ -399,7 +402,7 @@ const SCENARIOS: Record<string, (r: Run) => Promise<void>> = {
     for (const line of lines) {
       const insert = parseInsert(line) as { table: string; columns: string[]; rows: unknown[][] } | null;
       if (!insert) throw new Error(`not an exported INSERT: ${line.slice(0, 80)}`);
-      for (const batch of importBatches(insert.rows) as unknown[][][]) await importRows(new Db(other.c, { reference: r.reference }), insert.table, insert.columns, batch);
+      for (const batch of importBatches(insert.rows) as unknown[][][]) await importRows(new Db(other.c, { reference: r.reference }), insert.table, insert.columns, JSON.parse(JSON.stringify(batch)), EXPORT_FORMAT);
     }
     // 取り込んだ先を、元の表を持つ基準の SQLite と比べる。
     const want = JSON.stringify((() => {
@@ -440,10 +443,9 @@ const show = (f: Found) => `${f.scenario} [${f.shards} shards, ${f.mode}] ${f.st
 describe("the scenarios, with integers within ±(2^53 - 1)", () => {
   it("answer as SQLite does on 1, 2 and 4 shards, on the normal path and on both reference paths", async () => {
     const found = await runAll(SAFE);
-    // D1 互換の API は、いまは BigInt の引数を受け取れない (値が小さくても、内部の誤り「Do not know how to serialize a BigInt」で
-    // 失敗する)。段 3 で BigInt を INTEGER として受け取るようになったら、この例外を外す。
-    const d1 = "INSERT with BigInt arguments through the D1-compatible API";
-    expect(found.filter((f) => !(f.kind === "bigint argument" && f.scenario === d1)).map(show)).toEqual([]);
+    // D1 互換の API は、段 2 まで BigInt の引数を受け取れなかった (内部の誤り「Do not know how to serialize a BigInt」)。段 3 で
+    // BigInt を INTEGER として受け取るようになった (src/client/d1.ts の toValue)。
+    expect(found.map(show)).toEqual([]);
   }, 300_000);
 });
 
@@ -451,8 +453,8 @@ describe("64-bit integers", () => {
   let memo: Promise<Found[]> | undefined;
   const all = () => (memo ??= runAll(WIDE));
 
-  // いまの決まりで説明できる食い違いは、3 種類である。断る (`unsupported:`)、保存していない値を丸めて返す、D1 互換の API が
-  // BigInt を受け取れない。それ以外の食い違いは、作り直しを待たずに直すべき欠陥である。
+  // 段 2 までの決まりで説明できた食い違いは、3 種類だった。断る (`unsupported:`)、保存していない値を丸めて返す、D1 互換の API が
+  // BigInt を受け取れない。段 3 からは、どれも起きない (3 つ目の試験)。それ以外の食い違いは、いつでも欠陥である。
   it("never answer differently from SQLite in a way that today's documented limits do not explain", async () => {
     expect((await all()).filter((f) => f.kind === "other").map(show)).toEqual([]);
   }, 300_000);
@@ -474,4 +476,37 @@ describe("64-bit integers", () => {
     const found = (await all()).filter((f) => f.kind !== "other" && f.shards === 1 && f.mode === "normal");
     expect(found.map((f) => `${f.kind} | ${f.scenario} | ${f.step} | ${f.ours}`)).toEqual([]);
   }, 300_000);
+});
+
+// 欠陥を戻して、この試験が気付くことを確かめる。行イメージのタプルの INTEGER を JS の数で値に戻すと (src/shard/rows.ts の
+// imageFaults.roundedImages)、確定した取引の適用と、分割で運んだ行で、2^53 を超える整数が丸まる。どちらも、文の答えは
+// シャードの本体から読むので、丸まった値が後の読みに現れる。値は主キーでない列に置く (主キーが丸まると、行が重なって適用が止まる)。
+describe("a check that row images keep 64-bit integers", () => {
+  const scenes: Record<string, (r: Run) => Promise<void>> = {
+    "a transaction across shards": async (r) => {
+      await r.h(T);
+      await r.tx([1n, 2n, 3n, 4n].map((id): [string, Arg[]] => ["INSERT INTO t(id, v, n) VALUES (?, 'x', ?)", [id, r.v.ABOVE + id]]));
+      await r.h(READ);
+    },
+    "rows moved by a shard split": async (r) => {
+      await r.h(T);
+      for (let i = 1n; i <= 30n; i++) await r.h("INSERT INTO t(id, v, n) VALUES (?, 'x', ?)", [i, r.v.MAX - i]);
+      await split(r.c, "s0", `s${r.shards}`);
+      await r.h(READ);
+    },
+  };
+  for (const [name, scene] of Object.entries(scenes)) {
+    it(`finds the rounding in ${name} (roundedImages), and passes the same scene without it`, async () => {
+      await scene(new Run(WIDE, 2, undefined));
+      imageFaults.roundedImages = true;
+      try {
+        // 丸まった値は、隣の整数か (rounded)、64 ビットの外へ丸まって REAL として入る (other。typeof が real になる)。どちらでも、
+        // 上の試験が落ちる。
+        const kind = await scene(new Run(WIDE, 2, undefined)).then(() => "same as SQLite", (e: unknown) => (e instanceof Divergence ? e.kind : `failed: ${(e as Error).message}`));
+        expect(["rounded", "other"]).toContain(kind);
+      } finally {
+        imageFaults.roundedImages = false;
+      }
+    }, 120_000);
+  }
 });

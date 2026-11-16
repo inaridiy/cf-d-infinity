@@ -1,6 +1,6 @@
 import { DurableObject, RpcTarget } from "cloudflare:workers";
 import { Db, type Cluster, type StatementStat } from "./client/db";
-import { exportPage, importRows, type ExportCursor } from "./transfer";
+import { exportPage, importRows, type ExportCursor, type ExportPage } from "./transfer";
 
 export { importRows, type ExportCursor };
 import { collectMetrics, decide, DEFAULTS, healthProblems, needsFollowUp, nextShardNumber, split, splitsToResume, type AutoscalerState, type Thresholds } from "./autoscaler";
@@ -8,10 +8,12 @@ import { MetaCore, type Catalog, type SplitMove } from "./meta";
 import { planSplit, shardsOf, type Interval } from "./routing";
 import { ShardCore } from "./shard/core";
 import { batonSealer, handlePipeline, serveHranaSocket, type BatonSeal, type PipelineReq } from "./client/hrana";
+import { toValue } from "./client/d1";
+import { intModeOf, rowidOut, rowsOut } from "./client/results";
 import { setSqlWasm } from "./sql/scratch";
-import { bindTyped, restoreColumns } from "./value";
-import { BadRequest, checkCount, checkSql, clusterName, ENTRY_LIMITS, readJson, sameToken, shardCount, shardName } from "./entry";
-import { checkProtocol, PROTOCOL_VERSION, type Backend, type Row, type ShardApi, type ShardHealth, type Value } from "./types";
+import { bindPlain, bindTyped, restoreColumns } from "./value";
+import { BadRequest, checkCount, checkSql, clusterName, ENTRY_LIMITS, exactIntegers, readJson, sameToken, shardCount, shardName } from "./entry";
+import { checkProtocol, PROTOCOL_VERSION, type Backend, type Plain, type PlainRow, type ShardApi, type ShardHealth, type Value } from "./types";
 // @ts-expect-error wrangler と esbuild がバンドル時に解決する
 import sqlWasm from "./sql-wasm.wasm";
 
@@ -59,31 +61,27 @@ const statKey = (sql: string) => {
 
 class DoBackend implements Backend {
   constructor(private storage: DurableObjectStorage) {}
-  exec(sql: string, ...params: Value[]): Row[] {
+  exec(sql: string, ...params: Plain[]): PlainRow[] {
     const { columns, values } = this.raw(sql, ...params);
     return values.map((v) => Object.fromEntries(columns.map((c, i) => [c, v[i] ?? null])));
   }
-  raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] } {
-    // DO の SQLite は JS の数をすべて REAL として束縛する。INTEGER の引数は包む (src/value.ts)。
-    const b = bindTyped(sql, params, "real");
-    const cur = this.storage.sql.exec(b.sql, ...(b.params as never[]));
-    const values = [...cur.raw()].map((r) => r.map((v) => (v instanceof ArrayBuffer ? new Uint8Array(v) : v)) as Value[]);
-    if (cur.rowsWritten > 0 || cur.rowsRead > 0) {
-      const k = statKey(sql);
-      const e = rowStats.get(k) ?? { calls: 0, rowsWritten: 0, rowsRead: 0 };
-      e.calls++;
-      e.rowsWritten += cur.rowsWritten;
-      e.rowsRead += cur.rowsRead;
-      rowStats.set(k, e);
-    }
-    return { columns: restoreColumns(cur.columnNames, b.columns), values };
+  raw(sql: string, ...params: Plain[]): { columns: string[]; values: Plain[][] } {
+    const { columns, rows } = this.iterate(sql, ...params);
+    return { columns, values: [...rows] };
   }
-  iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
-    const b = bindTyped(sql, params, "real");
+  iterate(sql: string, ...params: Plain[]): { columns: string[]; rows: Iterable<Plain[]> } {
+    // DO の SQLite は JS の数をすべて REAL として束縛する。内部の表の整数は包む (src/value.ts)。
+    return this.run(bindPlain(sql, params, "real"), sql);
+  }
+  query(sql: string, params: readonly Value[], label?: string): { columns: string[]; rows: Iterable<Plain[]> } {
+    // INTEGER (bigint) は包む。2^53 を超える INTEGER は 10 進の文字列を束縛して包む。DO の SQLite は BigInt を束縛できない。
+    return this.run(bindTyped(sql, params, "real"), label ?? sql);
+  }
+  private run(b: { sql: string; params: Plain[]; columns: Map<string, string> | null }, label: string): { columns: string[]; rows: Iterable<Plain[]> } {
     const cur = this.storage.sql.exec(b.sql, ...(b.params as never[]));
     const record = () => {
       if (cur.rowsWritten === 0 && cur.rowsRead === 0) return;
-      const k = statKey(sql);
+      const k = statKey(label);
       const e = rowStats.get(k) ?? { calls: 0, rowsWritten: 0, rowsRead: 0 };
       e.calls++;
       e.rowsWritten += cur.rowsWritten;
@@ -92,7 +90,7 @@ class DoBackend implements Backend {
     };
     const rows = (function* () {
       try {
-        for (const r of cur.raw()) yield r.map((v) => (v instanceof ArrayBuffer ? new Uint8Array(v) : v)) as Value[];
+        for (const r of cur.raw()) yield r.map((v) => (v instanceof ArrayBuffer ? new Uint8Array(v) : v)) as Plain[];
       } finally {
         record();
       }
@@ -610,7 +608,7 @@ export async function schemaSql(env: Env, name = "shard"): Promise<string[]> {
 /** 表の行を、シャードの順、主キーの順に少しずつ返す。cursor が null になったら終わりである。 */
 export async function exportRows(
   env: Env, table: string, cursor: ExportCursor | null, limit = 1000, name = "shard",
-): Promise<{ columns: string[]; rows: Value[][]; cursor: ExportCursor | null }> {
+): Promise<ExportPage> {
   return exportPage(clusterOf(env, undefined, name), table, cursor, limit);
 }
 
@@ -698,7 +696,8 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
       checkCount(req?.requests?.length ?? 0, "pipeline requests");
       return Response.json(await handlePipeline(req, (token) => dbFor(env, token, background), await batonSeal(env)));
     }
-    const body = (await readJson(request)) as Statement & { token?: number; statements?: Statement[] };
+    // 引数の数字だけの literal は、64 ビットに収まれば正確に読む (exactIntegers)。
+    const body = (await readJson(request, exactIntegers)) as Statement & { token?: number; statements?: Statement[]; intMode?: unknown };
     if (body.sql !== undefined) checkSql(body.sql);
     if (body.statements !== undefined) {
       checkCount(body.statements.length, "statements");
@@ -714,12 +713,19 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
     }
     const db = await dbFor(env, token, background);
     if (path === "/sql") {
-      const r = await db.query(body.sql, body.params ?? []);
-      return Response.json({ columns: r.columns, rows: r.rows, changes: r.changes, lastInsertRowid: r.lastInsertRowid, token: db.token });
+      // 引数は D1 互換の API と同じ toValue で値にする (数字だけの literal で 64 ビットに収まるものは、上で bigint になっている)。
+      // 結果は D1 と同じ形で、INTEGER は本文の intMode の形である。JSON は bigint を書けないので、"number" か "string" だけを受ける
+      // (src/client/results.ts)。intMode は文を実行する前に確かめる。
+      const mode = intModeOf(body.intMode, true);
+      const r = await db.query(body.sql, (body.params ?? []).map(toValue));
+      return Response.json({
+        columns: r.columns, rows: rowsOut(r.columns, r.values, mode), changes: r.changes, lastInsertRowid: rowidOut(r.lastInsertRowid, mode), token: db.token,
+      });
     }
     if (path === "/batch") {
-      const out = await db.batch((body.statements ?? []).map((s) => ({ sql: s.sql, params: s.params ?? [] })));
-      const results = out.map((r) => ({ rows: r.rows, changes: r.changes }));
+      const mode = intModeOf(body.intMode, true);
+      const out = await db.batch((body.statements ?? []).map((s) => ({ sql: s.sql, params: (s.params ?? []).map(toValue) })));
+      const results = out.map((r) => ({ rows: rowsOut(r.columns, r.values, mode), changes: r.changes }));
       return Response.json({ results, token: db.token });
     }
     return new Response("not found", { status: 404 });

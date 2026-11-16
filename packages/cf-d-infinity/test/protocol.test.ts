@@ -5,20 +5,24 @@ import { keyString } from "../src/keys";
 import { SUBSLOTS, type Interval } from "../src/routing";
 import { encode } from "../src/shard/rows";
 import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type Piece, type PiecePayload, type PieceWant, type Span } from "../src/types";
-import { encodeTuple, realOf, typedOf } from "../src/value";
+import { encodeTuple } from "../src/value";
 
 /**
  * 値の表現の見本。Worker と DO の間を、要求の引数、行イメージ、キー文字列として行き来する。どれかの表現が変わったら、
  * 新旧のコードが同じ値を別の意味に読むので、PROTOCOL_VERSION を上げ、下の表に新しい版の指紋を足す。
  */
 function wireSample(): string {
-  const values = [5, realOf(5), 0.5, realOf(-0), "5", "", null, new Uint8Array([0, 255]), Number.POSITIVE_INFINITY, 2 ** 53 - 1];
+  // 値は、JS の型が格納の型である (版 5 から)。bigint は INTEGER、number は REAL。
+  const values = [5n, 5, 0.5, -0, "5", "", null, new Uint8Array([0, 255]), Number.POSITIVE_INFINITY, 2n ** 53n - 1n, 2n ** 63n - 1n, -(2n ** 63n)];
   // 行イメージは、表定義の列の順のタプルである (版 4 から)。
-  const change = { table: "t", pk: keyString([1]), sk: keyString(["a"]), before: null, after: encodeTuple(values.map(typedOf)) };
+  const change = { table: "t", pk: keyString([1n]), sk: keyString(["a"]), before: null, after: encodeTuple(values) };
+  // 読みの要求は、結果の列名を運ぶ (版 5 から)。条件の範囲の引数には bigint が入る。
+  const read = { sql: "SELECT a, b FROM t WHERE a = ?", params: [5n], columns: ["a", "b"], spans: [{ kind: "pred", table: "t", alias: "t", where: "a = ?", params: [5n, 2.5] }] };
   return [
-    JSON.stringify(values, (_k, x) => (x instanceof Uint8Array ? { u8: [...x] } : typeof x === "number" && !Number.isFinite(x) ? String(x) : x)),
+    JSON.stringify(values, (_k, x) => (x instanceof Uint8Array ? { u8: [...x] } : typeof x === "bigint" ? { int: String(x) } : typeof x === "number" && !Number.isFinite(x) ? String(x) : x)),
     encode(change),
     keyString(values),
+    encode(read),
     moveSample(),
   ].join("\n");
 }
@@ -46,6 +50,7 @@ const WIRE: Record<number, string> = {
   2: "51cd756d252c0541",
   3: "9dadba1e69298e9c",
   4: "dfb952441f2824e0",
+  5: "9f3b7b3e9eaa9b09",
 };
 
 describe("protocol version", () => {

@@ -1,14 +1,19 @@
-import { compoundTerms } from "../src/shard-limits";
+import { compoundTerms, depthOf, SHARD_LIMITS } from "../src/shard-limits";
 import { createHash } from "node:crypto";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { Db, type ClientFaults, type Cluster } from "../src/client/db";
+import { keyString } from "../src/keys";
+import { fold, type EpochRecord } from "../src/catalog";
 import { MetaCore, type SplitMove, type SplitSlot } from "../src/meta";
-import { shardsOf, type Interval } from "../src/routing";
+import { MetaCore as OldMeta } from "./meta-old";
+import { initialRouting, shardsOf, tokenOf, type Interval, type Routing } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
-import { ShardCore, type SpanEscape } from "../src/shard/core";
-import type { Backend, Faults, Row, ShardApi, Ts, Value } from "../src/types";
-import { bindTyped, restoreColumns } from "../src/value";
+import { ShardCore, type SpanEscape, type WriteCheck } from "../src/shard/core";
+import { imageColumns } from "../src/shard/rows";
+import type { Backend, Change, Faults, Plain, PlainRow, ShardApi, Span, TableDef, Ts, Value } from "../src/types";
+import { bindPlain, bindTyped, decodeElem, restoreColumns, type Tuple } from "../src/value";
 
 /**
  * DO の SQLite の実測の制限 (公式の表にないもの)。node:sqlite は上限を変えられないので、文を見て模す。
@@ -28,6 +33,16 @@ export const DO_MAX_RESULT_COLUMNS = 100;
 function checkDoColumns(count: number): void {
   if (count > DO_MAX_RESULT_COLUMNS) throw new Error("too many columns in result set: SQLITE_ERROR");
 }
+/**
+ * DO の SQLite は、式の木の深さを 100 までに制限している (test/workerd-limits.test.ts)。node:sqlite は 1,000 まで受け付けるので、
+ * ここで模す (段 3 で足した。計画書の未解決の問題 39)。深さは、シャードが文を測るのと同じ見積もり (src/sql/depth.ts) で数える。
+ * 見積もりは SQLite の数え方より小さくならないので、ここで断る文は、DO でも断られ得る。シャードの入口 (src/shard-limits.ts) と
+ * プランナは同じ見積もりで文を上限に収めるので、ここに当たるのは、確かめを通らずにシャードが実行した文だけである。
+ */
+function checkDoDepth(sql: string): void {
+  const depth = depthOf(sql);
+  if (depth > SHARD_LIMITS.exprDepth) throw new Error(`Expression tree is too large (maximum depth ${SHARD_LIMITS.exprDepth}; this statement is estimated at ${depth}): SQLITE_ERROR`);
+}
 function checkDoLimits(sql: string, params: Value[] = []): void {
   // 本物の DO は複合 SELECT の項を数える。シャードの側の確かめ (src/shard-limits.ts) と同じ数え方にする。引用符の中の識別子まで
   // 数えると、本物では通る文をここだけが断る (検査の誤り。2026-11-13)。
@@ -40,6 +55,12 @@ function checkDoLimits(sql: string, params: Value[] = []): void {
     if (bytes > DO_MAX_VALUE_BYTES) throw new Error("string or blob too big: SQLITE_TOOBIG");
   }
 }
+
+/**
+ * 値の型を区別しない比べ方のために、INTEGER (bigint) を JS の数にする。node:sqlite の既定の読み (数) と比べる検査が使う。
+ * 2^53 を超える整数は丸まるので、その値を使う検査 (test/int64.test.ts、test/typed-diff.test.ts) は、これを使わずに型ごと比べる。
+ */
+export const asNumbers = <T>(rows: T[][]): T[][] => rows.map((r) => r.map((v) => (typeof v === "bigint" ? Number(v) : v)) as T[]);
 
 /** seed から決まる乱数 (mulberry32)。 */
 export function prng(seed: number): () => number {
@@ -156,7 +177,43 @@ export class VirtualRuntime implements Runtime {
  * DO の SQLite は、2^53 を超える INTEGER を、精度を落とした JS の数で返す。node:sqlite は既定では例外を投げるので、BigInt で読んで、
  * DO と同じように数にする。
  */
-const lossy = (v: unknown): Value => (typeof v === "bigint" ? Number(v) : (v as Value));
+const lossy = (v: unknown): Plain => (typeof v === "bigint" ? Number(v) : (v as Plain));
+
+/**
+ * DO のドライバは、結果の TEXT を NUL (U+0000) を含めて全部返す。node:sqlite のドライバは、最初の NUL で切って返す
+ * (docs/design-values.md の「確かめた事実」)。シミュレータがそのまま返すと、NUL を含む TEXT を、シャードの側も基準の側も
+ * 同じように切って、食い違いが見えない (test/open/nul-in-text.test.ts が見つけた検査の欠け)。
+ *
+ * そこで、利用者の表に触る文 (Backend.query) のうち、結果を返す文 (SELECT、VALUES、WITH で始まる文) は、DO のドライバと同じ値に
+ * なるように包み直して読む。TEXT は BLOB にして運び (CAST(... AS BLOB) は全部のバイトを返す)、UTF-8 として戻す。BLOB は 16 進の
+ * 文字列で運ぶ。結果の列を 2 回以上参照するので、`LIMIT -1 OFFSET 0` で、包む前の文を 1 行につき 1 回だけ評価させる。
+ * DML の RETURNING は包めないが、D∞ は RETURNING の項を、TEXT を BLOB で運ぶ要素の式に書き換えて送る (src/value.ts の
+ * returningElemSql) ので、そのまま読んでも切れない。内部の表の文 (exec、raw、iterate) は包まない。内部の表の TEXT は、JSON か
+ * キー文字列で、NUL をそのまま持たない (JSON は `\u0000` と書く)。
+ */
+const READS_ROWS = /^\s*(?:(?:--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)\s*)*(SELECT|VALUES|WITH)\b/i;
+const wholeTextCache = new Map<string, string>();
+function wholeTextSql(sql: string, n: number): string {
+  const key = `${n}\0${sql}`;
+  let hit = wholeTextCache.get(key);
+  if (hit === undefined) {
+    const cols = Array.from({ length: n }, (_v, i) => `"c${i}"`);
+    const read = cols.map((c) => `CASE typeof(${c}) WHEN 'text' THEN CAST(${c} AS BLOB) WHEN 'blob' THEN hex(${c}) ELSE ${c} END`);
+    hit = `WITH "__dinf_sim"(${cols.join(", ")}) AS (\n${sql}\n) SELECT ${read.join(", ")} FROM (SELECT * FROM "__dinf_sim" LIMIT -1 OFFSET 0)`;
+    if (wholeTextCache.size >= 4096) wholeTextCache.delete(wholeTextCache.keys().next().value!);
+    wholeTextCache.set(key, hit);
+  }
+  return hit;
+}
+const utf8Text = new TextDecoder();
+const fromHex = (s: string) => Uint8Array.from(s.match(/../g) ?? [], (h) => parseInt(h, 16));
+
+/**
+ * query の文が、ドライバから INTEGER を読んだ (docs/design-values.md の「シミュレータ」の 3 つ目)。型つきの読みの形の文は、INTEGER を
+ * 印つきの文字列で返すので、INTEGER がドライバから数として出てくるのは、包み忘れた文だけである。DO のドライバは、その INTEGER を
+ * 丸めた数で返し、D∞ はそれを REAL として読む。範囲の検査と同じく、test/setup.ts が試験ごとに確かめて空にする。
+ */
+export const allDriverIntegers: string[] = [];
 
 /** node:sqlite の Backend。fence() 後の操作は失敗する (DO 基盤が旧 instance を止めるのと同じ)。 */
 export class SqliteBackend implements Backend {
@@ -165,56 +222,101 @@ export class SqliteBackend implements Backend {
   /** quorum の確定の待ちに使う。SimCluster が自分のものに差し替える。 */
   rt: Runtime = systemRuntime;
   constructor(readonly db = new DatabaseSync(":memory:")) {}
-  exec(sql: string, ...params: Value[]): Row[] {
-    if (this.fenced) throw new Error("fenced instance");
-    // node:sqlite も DO の SQLite と同じく、JS の数を REAL として束縛する。束縛の仕方は DO と同じにする (src/value.ts)。
-    // DO の上限は、束縛のために書き換えた後の文に掛かる (書き換えで文が長くなる)。
-    const b = bindTyped(sql, params, "real");
-    checkDoLimits(b.sql, b.params);
-    const st = this.db.prepare(b.sql);
-    const p = b.params as never[];
-    checkDoColumns(st.columns().length);
-    if (st.columns().length === 0) return (st.run(...p), []);
-    const names = restoreColumns(st.columns().map((c) => c.name), b.columns);
-    st.setReturnArrays(true);
-    st.setReadBigInts(true);
-    return (st.all(...p) as unknown as Value[][]).map((r) => Object.fromEntries(names.map((c, i) => [c, lossy(r[i] ?? null)])));
+  /**
+   * 用意した文を、文面ごとに覚えて使い回す。シミュレータの時間の大半は文を用意することで、利用者の表の読みは、元の文 (結果の
+   * 列名を知るため) と包み直した文の 2 つを用意する。文を読み終えるまで同じ Backend に別の文を挟まない約束 (Backend.iterate) が
+   * あるので、同じ文を 2 か所で同時に読むことはない。
+   * 表定義を変える文が来たら、覚えた文を全部捨てる。SQLite は古い文を実行するときに用意し直すが、実行の前に読む結果の列名
+   * (columns()) は古い表定義のままで、`SELECT *` の列が足りなくなる。表定義を変えた後の巻き戻しも、表定義を戻すので、捨てる。
+   */
+  private statements = new Map<string, ReturnType<DatabaseSync["prepare"]>>();
+  /** 表定義を変える文を用意した回数。巻き戻しが表定義も戻したかを知るのに使う。 */
+  private schemaChanges = 0;
+  private statement(sql: string): ReturnType<DatabaseSync["prepare"]> {
+    if (/^\s*(CREATE|ALTER|DROP)\b/i.test(sql)) {
+      this.statements.clear();
+      this.schemaChanges++;
+      return this.db.prepare(sql);
+    }
+    let st = this.statements.get(sql);
+    if (st === undefined) {
+      st = this.db.prepare(sql);
+      if (this.statements.size >= 512) this.statements.delete(this.statements.keys().next().value!);
+      this.statements.set(sql, st);
+    }
+    return st;
   }
-  iterate(sql: string, ...params: Value[]): { columns: string[]; rows: Iterable<Value[]> } {
+  /**
+   * 文を用意して、結果の列名と、行を読む関数を返す。結果のない文は、ここで実行する。
+   * node:sqlite も DO の SQLite と同じく、JS の数を REAL として束縛する。束縛の仕方は DO と同じにする (src/value.ts)。
+   * DO の上限は、束縛のために書き換えた後の文に掛かる (書き換えで文が長くなる)。
+   */
+  private prepare(
+    sql: string, b: { sql: string; params: Plain[]; columns: Map<string, string> | null }, user: boolean,
+  ): { columns: string[]; read: ((all: boolean) => Iterable<Plain[]>) | null } {
     if (this.fenced) throw new Error("fenced instance");
-    const b = bindTyped(sql, params, "real");
+    // DO の SQLite は BigInt を束縛できない。束縛の書き換え (bindTyped) が、いつも数か文字列にする。
+    for (const p of b.params) if (typeof p === "bigint") throw new TypeError("a BigInt reached the driver; the DO SQLite cannot bind it");
     checkDoLimits(b.sql, b.params);
-    const st = this.db.prepare(b.sql);
+    checkDoDepth(b.sql);
+    const st = this.statement(b.sql);
     const p = b.params as never[];
     const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
     checkDoColumns(columns.length);
     if (columns.length === 0) {
       st.run(...p);
-      return { columns, rows: [] };
+      return { columns, read: null };
     }
-    st.setReturnArrays(true);
-    st.setReadBigInts(true);
-    const it = st.iterate(...p) as unknown as Iterable<Value[]>;
-    return { columns, rows: (function* () { for (const r of it) yield r.map(lossy); })() };
+    let reader = st;
+    let convert: (v: unknown) => Plain = lossy;
+    if (user) {
+      const integer = (v: bigint): Plain => {
+        allDriverIntegers.push(`${sql.slice(0, 160)} returned the INTEGER ${v} as a driver number`);
+        return Number(v);
+      };
+      convert = (v) => (typeof v === "bigint" ? integer(v) : (v as Plain));
+      if (READS_ROWS.test(b.sql)) {
+        try {
+          reader = this.statement(wholeTextSql(b.sql, columns.length));
+          convert = (v) => (v instanceof Uint8Array ? utf8Text.decode(v) : typeof v === "string" ? fromHex(v) : typeof v === "bigint" ? integer(v) : (v as Plain));
+        } catch (e) {
+          // WITH で始まる DML (RETURNING のある書き込み) は包めない。そのまま読む。ほかの文が包めないのは、包み方の誤りなので投げる
+          // (黙って素の列で読むと、NUL を含む TEXT が切れても誰も気付かない)。
+          if (!(/^\s*WITH\b/i.test(b.sql) && /\b(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(b.sql))) throw e;
+        }
+      }
+    }
+    reader.setReturnArrays(true);
+    reader.setReadBigInts(true);
+    return {
+      columns,
+      read: (all) => {
+        if (all) return (reader.all(...p) as unknown as unknown[][]).map((r) => r.map(convert));
+        const it = reader.iterate(...p) as unknown as Iterable<unknown[]>;
+        return (function* () { for (const r of it) yield r.map(convert); })();
+      },
+    };
   }
-  raw(sql: string, ...params: Value[]): { columns: string[]; values: Value[][] } {
-    if (this.fenced) throw new Error("fenced instance");
-    const b = bindTyped(sql, params, "real");
-    checkDoLimits(b.sql, b.params);
-    const st = this.db.prepare(b.sql);
-    const p = b.params as never[];
-    const columns = restoreColumns(st.columns().map((c) => c.name), b.columns);
-    checkDoColumns(columns.length);
-    if (columns.length === 0) {
-      st.run(...p);
-      return { columns, values: [] };
-    }
-    st.setReturnArrays(true);
-    st.setReadBigInts(true);
-    return { columns, values: (st.all(...p) as unknown as Value[][]).map((r) => r.map(lossy)) };
+  exec(sql: string, ...params: Plain[]): PlainRow[] {
+    const { columns, read } = this.prepare(sql, bindPlain(sql, params, "real"), false);
+    if (!read) return [];
+    return [...read(true)].map((r) => Object.fromEntries(columns.map((c, i) => [c, r[i] ?? null])));
+  }
+  iterate(sql: string, ...params: Plain[]): { columns: string[]; rows: Iterable<Plain[]> } {
+    const { columns, read } = this.prepare(sql, bindPlain(sql, params, "real"), false);
+    return { columns, rows: read ? read(false) : [] };
+  }
+  raw(sql: string, ...params: Plain[]): { columns: string[]; values: Plain[][] } {
+    const { columns, read } = this.prepare(sql, bindPlain(sql, params, "real"), false);
+    return { columns, values: read ? [...read(true)] : [] };
+  }
+  query(sql: string, params: readonly Value[]): { columns: string[]; rows: Iterable<Plain[]> } {
+    const { columns, read } = this.prepare(sql, bindTyped(sql, params, "real"), true);
+    return { columns, rows: read ? read(false) : [] };
   }
   tx<T>(fn: () => T): T {
     const name = `sp${this.depth++}`;
+    const schema = this.schemaChanges;
     this.db.exec(`SAVEPOINT ${name}`);
     try {
       const out = fn();
@@ -223,6 +325,7 @@ export class SqliteBackend implements Backend {
     } catch (e) {
       this.db.exec(`ROLLBACK TO ${name}`);
       this.db.exec(`RELEASE ${name}`);
+      if (this.schemaChanges !== schema) this.statements.clear();
       throw e;
     } finally {
       this.depth--;
@@ -244,6 +347,7 @@ export class SqliteBackend implements Backend {
   dropUnsynced(): void {
     if (this.holding !== "open") return;
     this.db.exec("ROLLBACK");
+    this.statements.clear();
     this.holding = "lost";
   }
   /** quorum の確定には本番で約 10 ms かかる。ここで処理が譲られないと、待ちの間のレースを再現できない。 */
@@ -292,15 +396,17 @@ const CLIENT_FAULTS = new Set([
 ]);
 /** 範囲の作り方の欠陥のスイッチの名前 (src/client/spans.ts の spanFaults)。test/setup.ts が入れる。 */
 export const SPAN_FAULTS = new Set(["rowSpanDespiteUnique"]);
+/** 行イメージを値に戻すところの欠陥のスイッチの名前 (src/shard/rows.ts の imageFaults)。test/setup.ts が入れる。 */
+export const IMAGE_FAULTS = new Set(["roundedImages"]);
 
 /**
  * 環境変数 FAULT で、欠陥のスイッチを 1 つ、全部のシミュレータに入れる。乱択の検査が、その欠陥を見つけるかを測るためにある
  * (scripts/fault-table.mjs)。試験が自分で入れるスイッチには、上書きせずに足す。
  */
-export function injectedFault(): { name: string; side: "shard" | "client" | "span" } | null {
+export function injectedFault(): { name: string; side: "shard" | "client" | "span" | "image" } | null {
   const name = process.env.FAULT;
   if (!name) return null;
-  return { name, side: CLIENT_FAULTS.has(name) ? "client" : SPAN_FAULTS.has(name) ? "span" : "shard" };
+  return { name, side: CLIENT_FAULTS.has(name) ? "client" : SPAN_FAULTS.has(name) ? "span" : IMAGE_FAULTS.has(name) ? "image" : "shard" };
 }
 
 export interface SimOptions {
@@ -322,7 +428,7 @@ export interface SimOptions {
   logGenMs?: number;
   txnRetainMs?: number;
   recentMax?: number;
-  /** 範囲の検査 (ShardDeps.spanEscape) を切る。既定では掛ける。 */
+  /** 範囲の検査 (ShardDeps.spanEscape) と、書き込みの側の範囲の検査 (ShardDeps.writeCheck) を切る。既定では掛ける。 */
   noSpanCheck?: boolean;
   /**
    * 行イメージの検査 (src/shard/rows.ts の imageChecks。捕捉の変更後の行と本体の行、タプルの長さと表定義) を、このクラスタを作った
@@ -341,16 +447,111 @@ export interface SimOptions {
   realTime?: boolean;
 }
 
+/**
+ * 書き込みの側の範囲の検査 (SimCluster の checkWrites) が見つけた書き込み。シャードが受け入れようとした変更の行が、宣言の外にあるか、
+ * そのシャードが持たない行として残るものである。
+ */
+export interface WriteEscape {
+  shard: string;
+  /** 文の実行なら、その文。取引が溜めた変更を確定のときに受け取る経路 (commitLocal、prepare) なら null。 */
+  sql: string | null;
+  /** `表 主キー` */
+  row: string;
+  problem: string;
+}
+
+/** 行イメージから、行の主キーと shard key のキー文字列を読む。シャードの読み方 (rows.ts の tupleKey) を使わずに、ここで読む。 */
+function keyOfImage(def: TableDef, t: Tuple): { pk: string; sk: string } {
+  const cols = imageColumns(def);
+  const at = (c: string): Value => {
+    const i = cols.indexOf(c);
+    return i >= 0 && i < t.length ? decodeElem(t[i] ?? null) : null;
+  };
+  return { pk: keyString(def.pk.map(at)), sk: keyString(def.shardKey.map(at)) };
+}
+
+/** 宣言した範囲 s が、行 (表 table、キー key、token) を覆うか。全表の範囲は、claim があれば、その token の区間の行だけを覆う。 */
+function declaresRow(s: Span, table: string, key: { pk: string; sk: string }, token: number): boolean {
+  if (s.table !== "*" && s.table !== table) return false;
+  if (s.kind === "pk") return s.pk === key.pk;
+  if (s.kind === "sk") return s.sk === key.sk;
+  if (s.kind === "pred" && s.sk !== undefined) return s.sk === key.sk;
+  return s.claim === undefined || s.claim.some((x) => token >= x.start && token < x.end);
+}
+
 /** Worker と DO の間の RPC だけをシミュレートしたクラスタ。ShardCore は本物を動かす。 */
 /** このプロセスの全クラスタで見つかった、範囲の外の行に依存する文。test/setup.ts が試験ごとに確かめて空にする。 */
 export const allSpanEscapes: SpanEscape[] = [];
+/** このプロセスの全クラスタで見つかった、宣言の外か持ち主でないシャードへの書き込み。test/setup.ts が試験ごとに確かめて空にする。 */
+export const allWriteEscapes: WriteEscape[] = [];
 /**
  * RPC_TRACE=<ディレクトリ> のとき、このプロセスで作ったクラスタの網。test/setup.ts が試験ごとに、RPC の送り元、宛先、種類の列を
  * 書き出して空にする。中身は書かない。変更の前後で、同じ seed の実行の RPC の列が同じかを比べるのに使う。
  */
 export const tracedNets: SimNet[] = [];
+/**
+ * いまの試験が、実時間で動くクラスタ (realTime か now) を作ったか。test/setup.ts が試験ごとに戻す。作っていない試験が本物の
+ * 時計と乱数 (systemRuntime) を使ったら、setup.ts が試験を落とす (同じ seed で同じ実行にならないので)。
+ */
+export const realTimeCluster = { now: false };
+
+/**
+ * クラスタの呼び出しの一部だけを差し替えた包み。差し替えない性質 (仮想の実行環境 runtime、基準経路だけで流す印 reference、
+ * ほかの呼び出し) は、そのまま引き継ぐ。Cluster を手で並べ直すと、それらを落とす (test/setup.ts の決定性の検査が見つける)。
+ */
+export function withOverrides(c: SimCluster, over: Partial<Cluster>): Cluster {
+  return new Proxy(c as unknown as Cluster, { get: (t, p, r) => (p in over ? (over as Record<string | symbol, unknown>)[p] : Reflect.get(t, p, r)) });
+}
 /** 行イメージの検査を、いまの試験の間だけ止めているか (SimOptions の noImageCheck)。test/setup.ts が試験ごとに戻す。 */
 export const imageCheckOff = { now: false };
+
+/**
+ * META_SHADOW=<ディレクトリ> のとき、Meta の呼び出しを、段 1 より前の Meta (test/meta-old.ts) にも同じ順で流し、答えを比べる
+ * (docs/design-catalog-epoch.md の段 1 の検査 (b))。違えば、呼び出しと 2 つの答えを、そのディレクトリのプロセスごとのファイルに書く。
+ * 返すのは新しい Meta の答えなので、実行は変わらない。古い Meta には時計だけを渡し、乱数を渡さない。baton の鍵の乱数を取り合うと、
+ * 実行が変わるからである。そのため baton の鍵は比べない。保存データから起動するクラスタ (stored) には掛けない。
+ */
+function shadowMeta(next: MetaCore, old: OldMeta, dir: string): MetaCore {
+  const show = (x: unknown) => JSON.stringify(x, (_k, v) => (typeof v === "bigint" ? `${v}n` : v)) ?? "undefined";
+  const outcome = (r: PromiseSettledResult<unknown>): string => {
+    if (r.status === "fulfilled") return show(r.value);
+    const e = r.reason as Error;
+    return `throws ${e?.constructor?.name}: ${e?.message} ${show({ ...e })}`;
+  };
+  const settle = (f: () => unknown): Promise<unknown> => {
+    try {
+      return Promise.resolve(f());
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  };
+  mkdirSync(dir, { recursive: true });
+  return new Proxy(next, {
+    get(target, k, receiver) {
+      const f = Reflect.get(target, k, receiver) as unknown;
+      if (typeof f !== "function" || k === "batonSecret") return f;
+      const g = Reflect.get(old, k) as (...a: unknown[]) => unknown;
+      return (...args: unknown[]) => {
+        const copy = structuredClone(args);
+        let out: unknown;
+        let thrown: { e: unknown } | null = null;
+        try {
+          out = (f as (...a: unknown[]) => unknown).apply(target, args);
+        } catch (e) {
+          thrown = { e };
+        }
+        const mine = thrown ? Promise.reject(thrown.e) : Promise.resolve(out);
+        void Promise.allSettled([mine, settle(() => g.apply(old, copy))]).then(([a, b]) => {
+          const x = outcome(a!);
+          const y = outcome(b!);
+          if (x !== y) appendFileSync(`${dir}/${process.pid}.txt`, `${String(k)} ${show(copy)}\n  new: ${x}\n  old: ${y}\n`);
+        });
+        if (thrown) throw thrown.e;
+        return out;
+      };
+    },
+  });
+}
 
 export class SimCluster implements Cluster {
   /** 起動時のシャード。増設後の一覧は catalog の routing を見る。 */
@@ -372,6 +573,8 @@ export class SimCluster implements Cluster {
   cores = new Map<string, ShardCore>();
   /** 宣言した範囲の外の行に依存していた文。空でなければ、取引の検証が成り立っていない。 */
   spanEscapes: SpanEscape[] = [];
+  /** 宣言の外の行か、持ち主でないシャードに残る行を書こうとした書き込み (checkWrites)。空でなければ、行の置き場所が壊れ得る。 */
+  writeEscapes: WriteEscape[] = [];
   backends = new Map<string, SqliteBackend>();
   /** Meta の SQLite。 */
   metaBackend: SqliteBackend;
@@ -389,10 +592,17 @@ export class SimCluster implements Cluster {
     if (process.env.RPC_TRACE) tracedNets.push(this.net);
     if (o.noImageCheck) imageCheckOff.now = true;
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
+    if (!this.virtual) realTimeCluster.now = true;
     this.runtime = this.virtual ?? systemRuntime;
     this.shardIds = o.stored ? [...o.stored.shards.keys()] : Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
     this.metaBackend = new SqliteBackend(o.stored?.meta);
     this.meta = new MetaCore(this.metaBackend, this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs, faults: o.faults });
+    if (process.env.META_SHADOW && !o.stored) {
+      const rt = this.runtime;
+      const clock: Runtime = { now: () => rt.now(), after: (ms, fn) => rt.after(ms, fn), cancel: (h) => rt.cancel(h), random: () => 0, uuid: () => "shadow" };
+      const old = new OldMeta(new SqliteBackend(), this.shardIds, { runtime: clock, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs, faults: o.faults });
+      this.meta = shadowMeta(this.meta, old, process.env.META_SHADOW);
+    }
     for (const id of this.shardIds) this.core(id);
   }
 
@@ -411,7 +621,7 @@ export class SimCluster implements Cluster {
    */
   fingerprint(): string {
     const h = createHash("sha256");
-    for (const m of this.net.log) h.update(JSON.stringify([m.from, m.to, m.method, m.req], (_k, x) => (x instanceof Uint8Array ? [...x] : x)));
+    for (const m of this.net.log) h.update(JSON.stringify([m.from, m.to, m.method, m.req], (_k, x) => (x instanceof Uint8Array ? [...x] : typeof x === "bigint" ? `${x}n` : x)));
     return `${this.net.log.length} rpcs ${h.digest("hex").slice(0, 16)}`;
   }
 
@@ -433,7 +643,7 @@ export class SimCluster implements Cluster {
         }
         const top = [...count].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${k} x${n}`).join(", ");
         const waiting = [...this.unanswered].sort((a, b) => a.at - b.at).slice(0, 6).map(({ m, at }) =>
-          `${m.from}->${m.to} ${String(m.method)} sent at ${at}: ${JSON.stringify(m.req, (_k, x) => (x instanceof Uint8Array ? "<blob>" : x)).slice(0, 300)}`);
+          `${m.from}->${m.to} ${String(m.method)} sent at ${at}: ${JSON.stringify(m.req, (_k, x) => (x instanceof Uint8Array ? "<blob>" : typeof x === "bigint" ? `${x}n` : x)).slice(0, 300)}`);
         reject(new Error(
           `the run did not finish: ${why} (${this.net.log.length} RPCs, simulated time ${this.time}).\n` +
           `RPCs that never returned (${this.unanswered.size}):\n  ${waiting.join("\n  ") || "none"}\n` +
@@ -486,7 +696,70 @@ export class SimCluster implements Cluster {
         this.spanEscapes.push(e);
         allSpanEscapes.push(e);
       },
+      writeCheck: this.o.noSpanCheck ? undefined : (e) => this.checkWrites(e),
     }));
+  }
+
+  /**
+   * 書き込みの側の範囲の検査。シャードが書き込みを受け入れる前に呼ばれる (KernelDeps.writeCheck)。シャードの守り (kernel.ts の
+   * claimed) とは別に、ここで確かめ直す。守りを欠陥のスイッチ (ignoreWriteClaim) で外しても、同じに確かめる。変更の行ごとに:
+   *   1. 変更が名乗る行 (pk と sk) が、行イメージから読んだ行と同じである。
+   *   2. 文の実行なら、文が宣言した範囲のどれかが、その行を覆う。
+   *   3. 変更後の行が残るなら、そのシャードが、その行の token を持っている。持ち主は、Meta の範囲表と、シャードが保存した範囲の
+   *      移動の記録 (__fenced と __incoming) から決める。シャードのメモリと、シャードの所有の規則は使わない。手放した token は
+   *      持たない。受け取った token と、範囲表がそのシャードに割り当てる token は持つ。
+   * 確かめるだけで、処理は変えない (RPC の列も変わらない)。見つけたものは test/setup.ts が試験ごとに確かめる。
+   */
+  private checkWrites(e: WriteCheck): void {
+    for (const c of e.changes) {
+      let problem: string | null;
+      try {
+        problem = this.writeProblem(e, c);
+      } catch (err) {
+        problem = `the check could not read the change: ${(err as Error)?.message ?? String(err)}`;
+      }
+      if (problem === null) continue;
+      const w: WriteEscape = { shard: e.shard, sql: e.sql, row: `${c.table} ${c.pk}`, problem };
+      this.writeEscapes.push(w);
+      allWriteEscapes.push(w);
+    }
+  }
+
+  private writeProblem(e: WriteCheck, c: Change): string | null {
+    const image = c.after ?? c.before;
+    // 取引の中で入れて消した行は、変更前も変更後もない変更として確定に届く (Txn.buffer)。何も書かず、何も残さない。
+    if (!image) return null;
+    const key = keyOfImage(e.def(c.table), image);
+    if (key.pk !== c.pk || key.sk !== c.sk) return `the change names row ${c.pk} (shard key ${c.sk}), but its image is row ${key.pk} (shard key ${key.sk})`;
+    const token = tokenOf(key.sk, key.pk);
+    if (e.spans && !e.spans.some((s) => declaresRow(s, c.table, key, token))) {
+      return `the statement wrote a row outside its declared spans ${JSON.stringify(e.spans).slice(0, 200)}`;
+    }
+    if (c.after && !this.ownsToken(e.shard, token)) {
+      return `the row would stay on ${e.shard}, which does not own token ${token} (the range table gives it to ${this.routingOwner(token)})`;
+    }
+    return null;
+  }
+
+  /** シャードが token を持っているか。Meta の範囲表と、シャードが保存した範囲の移動の記録から決める (checkWrites の 3)。 */
+  private ownsToken(shard: string, token: number): boolean {
+    const db = this.backends.get(shard)!.db;
+    const inside = (table: string) =>
+      (db.prepare(`SELECT lo, hi FROM ${table}`).all() as { lo: number; hi: number }[]).some((r) => token >= r.lo && token < r.hi);
+    if (inside("__fenced")) return false;
+    if (inside("__incoming")) return true;
+    return this.routingOwner(token) === shard;
+  }
+
+  /**
+   * Meta の今の範囲表で、token を持つシャード。範囲表がまだなければ、最初の範囲表で決める。
+   * 範囲表は、Meta の epoch の列を SQLite から直に読んで畳む。MetaCore の入口は、期限切れの取り消しを記録し得るので使わない。
+   */
+  private routingOwner(token: number): string | undefined {
+    const rows = this.metaBackend.db.prepare(`SELECT epoch, rec FROM __epoch ORDER BY epoch`).all() as { epoch: number; rec: string }[];
+    const log = fold(rows.map((r) => ({ epoch: r.epoch, rec: JSON.parse(r.rec) as EpochRecord })));
+    const routing: Routing = rows.some((r) => r.epoch === 0) ? log.routing : initialRouting(this.shardIds);
+    return routing.ranges.find((x) => token >= x.start && token < x.end)?.shard;
   }
 
   /** 予約された alarm を発火させる。redrive が仕事を残したら、DO と同じく次の alarm を予約する。 */
@@ -606,7 +879,7 @@ export class SimCluster implements Cluster {
 }
 
 /** シャードの変更ログを commit_ts の昇順で全部読む (テスト用)。 */
-export function logRows(b: SqliteBackend): Row[] {
+export function logRows(b: SqliteBackend): PlainRow[] {
   const gens = JSON.parse((b.exec(`SELECT v FROM __meta WHERE k = 'log_gens'`)[0]?.v as string | undefined) ?? "[]") as number[];
   return gens.flatMap((g) => b.exec(`SELECT commit_ts, txn, blob FROM __log_g${g} ORDER BY commit_ts`));
 }

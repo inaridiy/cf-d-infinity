@@ -123,6 +123,68 @@ describe("the binding's fetch", () => {
   });
 });
 
+// docs/design-values.md の「D1 互換の API、Service Binding、HTTP の JSON」と、決めたことの 1 と 2。fixtures/app.ts が、bigint を
+// `<数字>n` の文字列にして返す。
+describe("64-bit integers and NUL through the binding and HTTP", () => {
+  const NUL = "a\u0000b";
+  const MAX = "9223372036854775807";
+  const MIN = "-9223372036854775808";
+  const ABOVE = "9007199254740993";
+
+  it("refuses a wide INTEGER in the result by default, and returns every INTEGER as bigint or string with intMode", async () => {
+    const r = await call("wide");
+    for (const k of ["plainScan", "plainKey", "plainRaw"]) expect(r[k], k).toMatch(/cannot hold exactly/);
+    expect(r.returningPlain).toMatch(/cannot hold exactly/);
+    expect(r.tooWide).toMatch(/does not fit in 64 bits/);
+    expect(r.badMode).toMatch(/intMode/);
+    const { plainScan: _a, plainKey: _b, plainRaw: _c, returningPlain: _d, tooWide: _e, badMode: _f, ...exact } = r;
+    expect(exact).toEqual({
+      safe: { id: 1, s: NUL },
+      bigScan: [
+        { id: "1n", n: `${MAX}n`, v: `${MAX}n`, s: NUL },
+        { id: "2n", n: `${MIN}n`, v: `${MIN}n`, s: NUL },
+        { id: "3n", n: `${ABOVE}n`, v: "4611686018427387905n", s: NUL },
+      ],
+      bigRaw: [["1n", `${MAX}n`, `${MAX}n`, NUL], ["2n", `${MIN}n`, `${MIN}n`, NUL], ["3n", `${ABOVE}n`, "4611686018427387905n", NUL]],
+      strScan: [
+        { id: "1", n: MAX, v: MAX, s: NUL },
+        { id: "2", n: MIN, v: MIN, s: NUL },
+        { id: "3", n: ABOVE, v: "4611686018427387905", s: NUL },
+      ],
+      session: `${MAX}n`,
+      batch: [{ n: `${MIN}n` }],
+      inTx: [{ n: `${MIN}n` }],
+      afterTx: "4611686018427387905n",
+      // RETURNING のない INSERT は成功し、既定の last_row_id は丸めずに 0 (返す rowid がない) になる。
+      lastRowPlain: 0,
+      lastRowBig: "1152921504606846977n",
+      lastRowStr: "1152921504606846978",
+      // 安全な範囲の外の整数の値の JS の数は REAL である (決めたことの 2)。INTEGER の列は、型の親和性で整数にする。
+      unsafe: { t: "real", x: 2 ** 60 },
+      unsafeStored: { tn: "integer", n: "1152921504606846976n", tv: "real", v: 2 ** 60 },
+    });
+  });
+
+  it("answers HTTP /sql and /batch in the intMode the body names; integer literals in the JSON are read exactly", async () => {
+    const r = await call("httpWide");
+    expect(r.plain).toMatchObject({ status: 400, error: expect.stringMatching(/cannot hold exactly/) });
+    expect(r.batchPlain).toMatchObject({ status: 400, error: expect.stringMatching(/cannot hold exactly/) });
+    expect(r.lastRowPlain).toMatchObject({ status: 200, changes: 1, lastInsertRowid: null });
+    expect(r.bigint).toMatchObject({ status: 400, error: expect.stringMatching(/JSON cannot carry a bigint/) });
+    expect(r.bad).toMatchObject({ status: 400, error: expect.stringMatching(/intMode/) });
+    expect(r.str).toMatchObject({
+      status: 200, columns: ["id", "n", "s"], changes: 0, lastInsertRowid: null,
+      rows: [{ id: "1", n: MAX, s: NUL }, { id: "2", n: MIN, s: NUL }, { id: "3", n: ABOVE, s: NUL }],
+    });
+    expect(r.num).toMatchObject({ status: 200, rows: [{ id: 1, s: NUL }] });
+    // 数字だけの literal で 64 ビットに収まるものは INTEGER、小数点か指数のあるものと、64 ビットに収まらないものは REAL。
+    expect(r.literals).toMatchObject({ status: 200, rows: [{ a: "integer", b: MIN, c: "real", d: "real", e: ABOVE, f: "integer" }] });
+    expect(r.lastRow).toMatchObject({ status: 200, changes: 1, lastInsertRowid: "1152921504606846981" });
+    expect(r.batch).toMatchObject({ status: 200, results: [{ rows: [{ n: MIN }], changes: 0 }, { rows: [{ s: NUL }], changes: 0 }] });
+    expect(r.nul).toMatchObject({ status: 200, rows: [{ s: NUL, h: "610062" }] });
+  });
+});
+
 describe("the Database binding from another Worker", () => {
   it("works with only the client in the consumer's bundle", async () => {
     const consumer = await mf.getWorker("consumer");

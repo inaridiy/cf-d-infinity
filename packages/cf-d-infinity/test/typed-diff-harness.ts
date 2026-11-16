@@ -1,5 +1,5 @@
 // 値の型を保った突き合わせと、そのための 2 つ目の生成器 (docs/design-values.md の「足す検査」の 2)。
-// test/typed-diff.test.ts と test/open/typed-diff-wide.test.ts が使う。
+// test/typed-diff.test.ts が使う。
 //
 // test/typed-diff.test.ts の元の比較は、結果の BigInt を数にしてから比べるので、結果の INTEGER と REAL の違いを見ない。
 // ここでは @libsql/client を intMode: "bigint" で使う。INTEGER は BigInt、REAL は JS の数で返るので、型ごと比べられる。
@@ -9,6 +9,9 @@
 // これまでの seed が別の台本になる。足す値と文は、ここの 2 つ目の生成器 (script2) に置く。
 import type { Client } from "@libsql/client";
 import { DatabaseSync } from "node:sqlite";
+import { bindParams, ident, parseStatements, render, type Node } from "../src/sql/cst";
+import { returningClause, rewriteReturning } from "../src/sql/returning";
+import type { Faults } from "../src/types";
 import { clientOf } from "./libsql";
 import { prng, SimCluster } from "./sim";
 
@@ -33,73 +36,110 @@ export const cell = (x: unknown): Cell =>
         : typeof x === "string" ? `t${x}`
           : `b${hex(x instanceof ArrayBuffer ? new Uint8Array(x) : (x as Uint8Array))}`;
 
-// ---- 段 3 まで緩める比較 ----
+// ---- 比較 ----
 //
-// いまの D∞ の結果の型は、次の 2 点で SQLite (と sqld) と違う。どちらも docs/sql-language.md の「値」に書いてある違いで、
-// 値の作り直しの段 3 でなくなる。そのとき、この 2 つの関数と RELAXED_UNTIL_STAGE_3 を消す。
-// ここに当てはまらない食い違いは、いまの欠陥である。緩める条件を広げて通さないこと。
-export const RELAXED_UNTIL_STAGE_3 = true;
+// 結果を型ごと比べる。段 0 から段 2 までは、文書にある 2 点 (整数の値の REAL を Hrana の `integer` で返す、SQL の中で計算した 2^53 を
+// 超える整数を丸めて `float` で返す) を緩めていた。値の作り直しの段 3 で、どちらの違いもなくなったので、緩めるのをやめた。
 
-/** 「結果の数の型」: 整数の値の REAL (5.0) を、Hrana の `integer` で返す。DO の SQLite が読み出しで INTEGER と REAL を区別しないからである。 */
-export function integralRealAsInteger(want: Cell, got: Cell): boolean {
-  if (want === null || got === null || want[0] !== "r" || got[0] !== "i") return false;
-  const x = Number(want.slice(1));
-  return Number.isSafeInteger(x) && got === `i${x}`;
+/** 2 つの結果が同じか。 */
+function sameRows(want: Cell[][], got: Cell[][]): boolean {
+  return JSON.stringify(want) === JSON.stringify(got);
 }
 
-/** 「2^53 を超える整数」: SQL の中で計算して 2^53 を超えた INTEGER は、精度を落として `float` で返す。 */
-export function wideIntegerAsRoundedFloat(want: Cell, got: Cell): boolean {
-  if (want === null || got === null || want[0] !== "i" || got[0] !== "r") return false;
-  const big = BigInt(want.slice(1));
-  return (big > 2n ** 53n - 1n || big < -(2n ** 53n) + 1n) && Number(got.slice(1)) === Number(big);
+// ---- 基準の読み方 ----
+//
+// node:sqlite のドライバは、結果の TEXT を最初の NUL で切って返す (docs/design-values.md の「確かめた事実」)。そのまま読むと、
+// NUL を含む TEXT は、基準の側でも切れて、D∞ が切っても食い違いが見えない (test/open/nul-in-text.test.ts が見つけた検査の欠け)。
+// 基準は、TEXT を BLOB にして読み、UTF-8 として戻す (CAST(... AS BLOB) は全部のバイトを返す)。
+// - 結果を返す文 (SELECT、VALUES、WITH) は、文を包み直して、結果の列ごとに TEXT を BLOB、BLOB を 16 進にする。
+// - DML の RETURNING は包めないので、項ごとに書き換える。項の切り分けは D∞ と同じ関数 (src/sql/returning.ts) を使うが、要素の式と
+//   読み方はここに独立に置く。台本の typeof() と hex() の項が、書き換えに頼らない確かめである。
+
+const READS_ROWS = /^\s*(SELECT|VALUES|WITH)\b/i;
+const utf8 = new TextDecoder();
+const unhex = (s: string) => Uint8Array.from(s.match(/../g) ?? [], (h) => parseInt(h, 16));
+
+/** 結果を返す文を包み直して、TEXT を全部読む。 */
+function wholeSelect(sql: string, n: number): string {
+  const cols = Array.from({ length: n }, (_v, i) => `"c${i}"`);
+  const read = cols.map((c) => `CASE typeof(${c}) WHEN 'text' THEN CAST(${c} AS BLOB) WHEN 'blob' THEN hex(${c}) ELSE ${c} END`);
+  return `WITH "__ref"(${cols.join(", ")}) AS (\n${sql}\n) SELECT ${read.join(", ")} FROM (SELECT * FROM "__ref" LIMIT -1 OFFSET 0)`;
+}
+const fromWhole = (v: unknown): unknown => (v instanceof Uint8Array ? utf8.decode(v) : typeof v === "string" ? unhex(v) : v);
+
+/** RETURNING の項の要素の式。どの格納の型にも印を付け、TEXT は BLOB で運ぶ。 */
+const returnedElem = (c: string) =>
+  `CASE typeof(${c}) WHEN 'integer' THEN 'i'||${c} WHEN 'text' THEN CAST(${c} AS BLOB) WHEN 'real' THEN 'r'||quote(${c}) WHEN 'blob' THEN 'b'||hex(${c}) END`;
+function fromReturned(v: unknown): unknown {
+  if (v === null || v === undefined) return null;
+  if (v instanceof Uint8Array) return utf8.decode(v);
+  const s = v as string;
+  return s[0] === "i" ? BigInt(s.slice(1)) : s[0] === "r" ? Number(s.slice(1)) : unhex(s.slice(1));
 }
 
-export interface Relaxed { integralRealAsInteger: number; wideIntegerAsRoundedFloat: number }
+/** 文が書く表の名前。 */
+function writtenTable(stmt: Node): string {
+  const head = (stmt.clauses as Node[]).find((c) => /^(insert|update|delete)_clause$/.test(c.type));
+  let t: Node = head.type === "insert_clause" ? head.table : head.tables.items[0];
+  while (t.type === "alias" || t.expr) t = t.expr;
+  return ident(t.type === "member_expr" ? t.property : t);
+}
 
-/** 2 つの結果が、緩める 2 点を除いて同じか。緩めた回数を数える。 */
-function sameRows(want: Cell[][], got: Cell[][], relaxed: Relaxed): boolean {
-  if (want.length !== got.length) return false;
-  const counted: Relaxed = { integralRealAsInteger: 0, wideIntegerAsRoundedFloat: 0 };
-  for (let i = 0; i < want.length; i++) {
-    if (want[i]!.length !== got[i]!.length) return false;
-    for (let j = 0; j < want[i]!.length; j++) {
-      const [w, g] = [want[i]![j]!, got[i]![j]!];
-      if (w === g) continue;
-      if (RELAXED_UNTIL_STAGE_3 && integralRealAsInteger(w, g)) counted.integralRealAsInteger++;
-      else if (RELAXED_UNTIL_STAGE_3 && wideIntegerAsRoundedFloat(w, g)) counted.wideIntegerAsRoundedFloat++;
-      else return false;
+/** 基準の node:sqlite で文を実行する。結果を返さない文は "ok"。 */
+export function referenceRows(lite: DatabaseSync, sql: string, args: Arg[]): Cell[][] | "ok" {
+  const st = lite.prepare(sql);
+  const n = st.columns().length;
+  if (n === 0) return (st.run(...(args as never[])), "ok");
+  let read = st;
+  let args2: unknown[] = args;
+  let convert: (v: unknown) => unknown = (v) => v;
+  if (READS_ROWS.test(sql)) {
+    read = lite.prepare(wholeSelect(sql, n));
+    convert = fromWhole;
+  } else {
+    const stmt = parseStatements(sql)[0];
+    const values = bindParams(stmt, args as never);
+    const clause = returningClause(stmt);
+    if (clause) {
+      const table = writtenTable(stmt);
+      const columns = (lite.prepare(`SELECT name FROM pragma_table_info(?)`).all(table) as { name: string }[]).map((r) => r.name);
+      rewriteReturning(clause, columns, returnedElem);
+      const r = render(stmt, values);
+      read = lite.prepare(r.sql);
+      args2 = r.params;
+      convert = fromReturned;
     }
   }
-  relaxed.integralRealAsInteger += counted.integralRealAsInteger;
-  relaxed.wideIntegerAsRoundedFloat += counted.wideIntegerAsRoundedFloat;
-  return true;
+  read.setReadBigInts(true);
+  read.setReturnArrays(true);
+  return (read.all(...(args2 as never[])) as unknown as unknown[][]).map((r) => r.map((v) => cell(convert(v))));
 }
 
-export interface TypedRun { problems: string[]; relaxed: Relaxed; statements: number }
+export interface TypedRun { problems: string[]; statements: number }
 
 /**
  * 台本を、D∞ (Hrana 経由) と node:sqlite に流して、結果を型ごと比べる。
  * stopAtFirst: 最初の食い違いで止める。断られた文の後は 2 つの状態が分かれるので、その後の食い違いには意味がない。
  */
-export async function runTyped(schema: string[], steps: Step[], shards: number, o: { stopAtFirst?: boolean } = {}): Promise<TypedRun> {
+export async function runTyped(
+  schema: string[], steps: Step[], shards: number, o: { stopAtFirst?: boolean; faults?: Faults; noSpanCheck?: boolean } = {},
+): Promise<TypedRun> {
   const lite = new DatabaseSync(":memory:");
-  const c = new SimCluster({ shards });
+  const c = new SimCluster({ shards, faults: o.faults, noSpanCheck: o.noSpanCheck });
   const client: Client = clientOf(c, { intMode: "bigint" });
   for (const s of schema) {
     lite.exec(s);
     await client.execute(s);
   }
-  const out: TypedRun = { problems: [], relaxed: { integralRealAsInteger: 0, wideIntegerAsRoundedFloat: 0 }, statements: 0 };
+  const out: TypedRun = { problems: [], statements: 0 };
   const shown = (x: unknown) => JSON.stringify(x);
   for (const step of steps) {
     out.statements++;
     const norm = step.normalize ?? ((rows: Cell[][]) => rows);
     let want: Cell[][] | "ok" | "error";
     try {
-      const st = lite.prepare(step.sql);
-      st.setReadBigInts(true);
-      st.setReturnArrays(true);
-      want = st.columns().length ? norm((st.all(...(step.args as never[])) as unknown as unknown[][]).map((r) => r.map(cell))) : (st.run(...(step.args as never[])), "ok");
+      const rows = referenceRows(lite, step.sql, step.args);
+      want = rows === "ok" ? "ok" : norm(rows);
     } catch {
       want = "error";
     }
@@ -113,7 +153,7 @@ export async function runTyped(schema: string[], steps: Step[], shards: number, 
     }
     // Hrana は値を JSON で運ぶので、REAL の無限大を運べない (sqld も同じ)。クライアントの誤りになるのを、正しいとする。
     if (typeof got === "string" && /HRANA_PROTO_ERROR/.test(got) && /"r-?Infinity"/.test(shown(want))) continue;
-    const same = Array.isArray(want) && Array.isArray(got) ? sameRows(want, got, out.relaxed) : want === got;
+    const same = Array.isArray(want) && Array.isArray(got) ? sameRows(want, got) : want === got;
     if (!same) {
       out.problems.push(`${step.sql} ${shown(step.args.map(cell))}\n  sqlite: ${shown(want).slice(0, 300)}\n  ours:   ${shown(got).slice(0, 300)}`);
       if (o.stopAtFirst) break;
@@ -133,9 +173,9 @@ export const SCHEMA2 = [
 ];
 
 export interface Script2Options {
-  /** 2^53 を超える整数を値に混ぜる。いまは保存を断るので (計画書の K1)、段 3 までは test/open/ でだけ使う。 */
+  /** 2^53 を超える整数を値に混ぜる。 */
   wideIntegers?: boolean;
-  /** NUL を含む文字列を値に混ぜる。いまは Worker の SQLite を通ると切れるので (test/open/nul-in-text.test.ts)、test/open/ でだけ使う。 */
+  /** NUL を含む文字列を値に混ぜる。 */
   nul?: boolean;
 }
 
@@ -162,7 +202,7 @@ function valueOf2(r: () => number, o: Script2Options): Arg {
 }
 
 /** 行ごとに値の違う列 (`random()`) の結果。値そのものではなく、値が許した集まりに入っているかだけを残す。 */
-const oneOf = (allowed: Cell[]) => (rows: Cell[][]) => rows.map((row) => row.map((v) => (allowed.includes(v) ? "valid" : `unexpected ${v}`)));
+export const oneOf = (allowed: Cell[]) => (rows: Cell[][]) => rows.map((row) => row.map((v) => (allowed.includes(v) ? "valid" : `unexpected ${v}`)));
 
 /**
  * 元の生成器が作らない文。RETURNING (整数を入れた REAL の列を含む)、`random()` の列、WITH で始まる文、重なった列名、

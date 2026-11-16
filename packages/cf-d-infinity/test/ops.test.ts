@@ -183,22 +183,48 @@ describe("the cf-d-infinity command", () => {
     expect(json.health[0]).toMatchObject({ format: STORAGE_FORMAT, intents: 0, unapplied: 0, redriveErrors: [] });
   });
 
+  it("passes 64-bit integers and NUL exactly through --param, the table and --json", async () => {
+    await sql(logged, "CREATE TABLE wide_cli(id INTEGER PRIMARY KEY, n INTEGER, s TEXT)");
+    await sql(logged, "INSERT INTO wide_cli VALUES (1, 9223372036854775807, 'a' || char(0) || 'b'), (2, -9223372036854775808, ''), (3, 9007199254740993, 'x')");
+    const table = await cli(["sql", "SELECT id, n FROM wide_cli WHERE n = ? OR n = ? ORDER BY id", "--param", "9223372036854775807", "--param", "9007199254740993", ...to]);
+    expect([table.code, table.stderr]).toEqual([0, ""]);
+    expect(table.stdout).toBe("id  n\n--  -------------------\n1   9223372036854775807\n3   9007199254740993\n(2 rows)\n");
+    const json = await cli(["sql", "SELECT id, n, s FROM wide_cli ORDER BY id", "--json", ...to]);
+    expect([json.code, json.stderr]).toEqual([0, ""]);
+    // INTEGER は、JS の数で表せない値も、数字を全部書いた JSON の数である。
+    expect(json.stdout).toContain('"n": 9223372036854775807');
+    expect(json.stdout).toContain('"n": -9223372036854775808');
+    const exact = JSON.parse(json.stdout, ((_k: string, v: unknown, ctx: { source?: string }) =>
+      (typeof v === "number" && /^-?\d+$/.test(ctx?.source ?? "") ? BigInt(ctx.source!) : v)) as never);
+    expect(exact.rows).toEqual([{ id: 1n, n: 2n ** 63n - 1n, s: "a\u0000b" }, { id: 2n, n: -(2n ** 63n), s: "" }, { id: 3n, n: 2n ** 53n + 1n, s: "x" }]);
+    const w = await cli(["sql", "INSERT INTO wide_cli(id, n) VALUES (?, ?)", "--param", "4", "--param", "-9223372036854775807", "--json", ...to]);
+    expect(JSON.parse(w.stdout)).toMatchObject({ changes: 1, lastInsertRowid: 4 });
+    expect((await sql(logged, "SELECT CAST(n AS TEXT) AS n, typeof(n) AS t FROM wide_cli WHERE id = 4")).json.rows).toEqual([{ n: "-9223372036854775807", t: "integer" }]);
+  });
+
   it("exports schema and rows as SQL, and imports them into an empty database with the same contents", async () => {
     await cli(["sql", "CREATE TABLE things(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, label TEXT, data BLOB, score REAL, PRIMARY KEY (tenant_id, id))", ...to]);
     await cli(["sql", "CREATE TABLE people(id INTEGER PRIMARY KEY, email TEXT UNIQUE)", ...to]);
+    await cli(["sql", "CREATE TABLE wide(id INTEGER PRIMARY KEY, n INTEGER, s TEXT NOT NULL, r REAL, v)", ...to]);
     await sql(logged, "INSERT INTO things VALUES (1, 1, ?, x'00ff10', 1.5), (1, 2, NULL, NULL, -2), (2, 1, ?, x'', 0)", ["it's a 'quoted'\nline\r\nwith breaks", "日本語; -- not a comment"]);
     for (let i = 1; i <= 30; i++) await sql(logged, "INSERT INTO people(id, email) VALUES (?, ?)", [i, `p${i}@example.test`]);
+    // 64 ビットの端、2^53 + 1、NUL を含む TEXT、無限大と整数の値の REAL を、主キーにも置く。
+    await sql(logged, `INSERT INTO wide VALUES (9223372036854775807, -9223372036854775808, 'a' || char(0) || 'b', 9e999, 9007199254740993),
+      (-9223372036854775808, 9007199254740993, char(0), -9e999, 5.0), (9007199254740993, 0, '', 0.5, x'00')`);
     const dir = mkdtempSync(join(tmpdir(), "dinf-cli-"));
     const file = join(dir, "dump.sql");
     const exported = await cli(["export", "--out", file, ...to]);
     expect([exported.code, exported.stderr]).toEqual([0, ""]);
     const dump = readFileSync(file, "utf8");
+    // 先頭の行が形式の版である。取り込みはこれを確かめる。
+    expect(dump.split("\n")[0]).toBe("-- cf-d-infinity export format 1");
     // 1 文が 1 行。文字列の中の改行は char() の連結になっている。
     expect(dump.split("\n").filter((l) => l && !l.startsWith("--")).every((l) => l.endsWith(";"))).toBe(true);
     // 表定義は利用者の文面のまま書き出す (shard key は主キーの先頭の列で決まるので、書き足すものはない)。
     expect(dump).toContain("PRIMARY KEY (tenant_id, id));");
     expect(dump).toContain("|| char(10) ||");
-    expect(dump).toContain("X'00ff10'");
+    expect(dump).toContain("X'00FF10'");
+    expect(dump).toContain("(9223372036854775807, -9223372036854775808, 'a' || char(0) || 'b', 9.0e+999, 9007199254740993)");
 
     const imported = await cli(["import", file, "--worker", "ops-empty"]);
     expect([imported.code, imported.stderr]).toEqual([0, ""]);
@@ -206,6 +232,8 @@ describe("the cf-d-infinity command", () => {
       "SELECT tenant_id, id, label, hex(data) AS data, score FROM things ORDER BY tenant_id, id",
       "SELECT id, email FROM people ORDER BY id",
       "SELECT id, n, note FROM t ORDER BY id",
+      "SELECT CAST(id AS TEXT) AS id, CAST(n AS TEXT) AS n, hex(s) AS s, quote(r) AS r, typeof(r) AS tr, quote(v) AS v, typeof(v) AS tv FROM wide ORDER BY id",
+      "SELECT id, CAST(n AS TEXT) AS n, hex(s) AS s FROM wide_cli ORDER BY id",
     ]) {
       expect((await sql(empty, q)).json.rows, q).toEqual((await sql(logged, q)).json.rows);
     }
@@ -227,6 +255,13 @@ describe("the cf-d-infinity command", () => {
     writeFileSync(join(bare, "package.json"), "{}");
     expect((await cli(["sql", "SELECT 1", "--remote", ...to], { cwd: bare })).stderr).toMatch(/--remote needs Wrangler in this project/);
     expect((await cli(["frobnicate"])).stderr).toMatch(/unknown command/);
+    // 形式の版の行がない file と、知らない版の file は、何も実行せずに断る。
+    const unmarked = join(bare, "old.sql");
+    writeFileSync(unmarked, "CREATE TABLE never(a);\n");
+    expect((await cli(["import", unmarked, "--worker", "ops-empty"])).stderr).toMatch(/no export format line/);
+    writeFileSync(unmarked, "-- cf-d-infinity export format 999\nCREATE TABLE never(a);\n");
+    expect((await cli(["import", unmarked, "--worker", "ops-empty"])).stderr).toMatch(/export format 999/);
+    expect((await sql(empty, "SELECT count(*) AS n FROM never")).json.error).toMatch(/no such table/);
   });
 });
 

@@ -1,22 +1,32 @@
-// Worker が SQLite の値の変換を写す関数 (src/keys.ts) を、本物の SQLite と大量の値で突き合わせる (計画書の不変条件 6)。
+// Worker が SQLite の値の変換を決める関数 (src/sql/stored.ts の storedValue) とキー文字列 (src/keys.ts) を、本物の SQLite と大量の値で
+// 突き合わせる (計画書の不変条件 6)。
 //
 // Worker は行の置き場所を、文の中の値を列の型に揃えたキーで決める。揃え方が SQLite と 1 つでも違えば、その値の行は
 // Worker が思うのと別のシャードにあり、読みは空を返し、書き込みはシャードのキーの確認で断られる。答えが置き場所で変わる。
 // 手で選んだ値の試験 (test/key-affinity.test.ts) は、1e14 の REAL を "1" と書く誤りも、文の中の `5.0` を整数にする誤りも
 // 踏まなかった (2026-11-13 の Codex の見直し、指摘 C7 と C8)。ここでは、値を生成して、次の 2 段で比べる。
-//   1. storedAs と、各親和性の列に入れた値 (typeof と quote で読む)。storedAs が揃えないと答えた値 (undefined) は飛ばす。
+//   1. storedValue と、各親和性の列に入れた値 (typeof と quote で読む)。storedValue が揃えないと答えた値 (undefined) は飛ばす。
 //   2. 文の中の literal と引数の値を、シャード 4 つの D∞ と SQLite に入れて、同じ literal で引く。
-// 1 段目は、REAL を TEXT にする変換を JS で写した関数を、CAST(REAL AS TEXT) と 2 万個の double で比べていた。1e14 を "1" と書く
-// 誤りを直しても、15 桁目の丸めが SQLite 3.51 と違う値が残ったので、その変換は写すのをやめた (src/keys.ts の storedAs)。
+// 1 段目は、段 2 まで、REAL を TEXT にする変換を JS で写した関数 (storedAs) を、CAST(REAL AS TEXT) と 2 万個の double で比べていた。
+// 1e14 を "1" と書く誤りを直しても、15 桁目の丸めが SQLite 3.51 と違う値が残ったので、その変換は写すのをやめた。段 3 で storedAs を
+// 消し、storedValue に替えた。値は型のある値である (bigint は INTEGER、number は REAL)。
 import { DatabaseSync } from "node:sqlite";
 import initSqlJs from "sql.js";
 import { beforeAll, describe, expect, it } from "vitest";
 import { Db } from "../src/client/db";
-import { keyString, keyValues, storedAs } from "../src/keys";
+import { keyString, keyValues } from "../src/keys";
 import { oldKeyString } from "./key-string-old";
 import { initStoredValue, storedValue } from "../src/sql/stored";
 import type { Affinity, Value } from "../src/types";
-import { decodeTuple, isReal, parseTuple, realOf, tupleSql, typedOf, type TypedValue } from "../src/value";
+import { decodeTuple, parseTuple, tupleSql } from "../src/value";
+
+/** 段 2 までの値の形 (整数の JS の数は INTEGER、`{ real }` は整数の値の REAL)。形式 1 のキー文字列 (oldKeyString) が受ける。 */
+type OldValue = Parameters<typeof oldKeyString>[0][number];
+const oldReal = (n: number): OldValue => (Number.isInteger(n) ? { real: n } : n);
+/** 段 2 までの値を、型のある値にする。 */
+const typedOfOld = (v: OldValue): Value =>
+  v !== null && typeof v === "object" && !(v instanceof Uint8Array) ? v.real
+    : typeof v === "number" && Number.isInteger(v) && Math.abs(v) < 2 ** 63 ? BigInt(v) : (v as Value);
 import { prng, SimCluster } from "./sim";
 import { bitsOf, doubles, EDGE_DOUBLES, INT64, int64s, numericStrings, sqljsBinding, TRICKY_STRINGS } from "./value-corpus";
 
@@ -26,28 +36,25 @@ describe("the Worker's value conversions agree with SQLite", () => {
     lite.exec("CREATE TABLE a(t TEXT, n NUMERIC, i INTEGER, r REAL, b BLOB)");
     const cols: [string, Affinity][] = [["t", "TEXT"], ["n", "NUMERIC"], ["i", "INTEGER"], ["r", "REAL"], ["b", "BLOB"]];
     const values: Value[] = [];
-    for (const x of doubles(2000, 2)) values.push(realOf(x), String(x), ` ${x} `, x.toExponential(), x.toPrecision(15));
-    for (let i = -5; i < 5; i++) values.push(i, String(i), `${i}.0`, `${i}e2`, `0x${Math.abs(i)}`, `+${Math.abs(i)}`, `${i}.`, `.${Math.abs(i)}`);
+    for (const x of doubles(2000, 2)) values.push(x, String(x), ` ${x} `, x.toExponential(), x.toPrecision(15));
+    for (let i = -5; i < 5; i++) values.push(BigInt(i), String(i), `${i}.0`, `${i}e2`, `0x${Math.abs(i)}`, `+${Math.abs(i)}`, `${i}.`, `.${Math.abs(i)}`);
     values.push("9223372036854775807", "9223372036854775808", "-9223372036854775808", "1e400", "-1e400", "abc", "", " ");
     const bad: string[] = [];
     const ins = lite.prepare(`INSERT INTO a VALUES (${cols.map(() => "?").join(", ")})`);
     const read = lite.prepare(`SELECT ${cols.map(([c]) => `typeof(${c}) AS ${c}_t, quote(${c}) AS ${c}_q`).join(", ")} FROM a`);
     for (const v of values) {
       lite.exec("DELETE FROM a");
-      // 印の REAL は REAL のまま、整数は INTEGER で束縛する (node:sqlite は数を REAL で束縛するので、整数は BigInt で渡す)。
-      const bound = isReal(v) ? v.real : typeof v === "number" && Number.isInteger(v) ? BigInt(v) : v;
-      ins.run(...cols.map(() => bound as never));
+      // node:sqlite は、BigInt を INTEGER、数を REAL として束縛する。Value と同じ決まりである。
+      ins.run(...cols.map(() => v as never));
       const row = read.get() as Record<string, string>;
       for (const [c, a] of cols) {
         const want = `${row[`${c}_t`]} ${row[`${c}_q`]}`;
-        const s = storedAs(v, a);
+        const s = storedValue(v, a);
         // undefined は「Worker では揃えない。SQLite に揃えさせる」の意味で、食い違いではない。
         if (s === undefined) continue;
-        // 2^53 を超える整数は JS の数で正確に持てない。別の問題として扱う (計画書の K1、test/open/wide-integers.test.ts)。
-        if (row[`${c}_t`] === "integer" && BigInt(row[`${c}_q`]!) ** 2n > 2n ** 106n) continue;
         const got = s === null ? "null NULL"
-          : isReal(s) ? `real ${(lite.prepare("SELECT quote(?) AS q").get(s.real) as { q: string }).q}`
-            : typeof s === "number" ? (Number.isInteger(s) && Math.abs(s) < 2 ** 63 ? `integer ${BigInt(s)}` : `real ${(lite.prepare("SELECT quote(?) AS q").get(s) as { q: string }).q}`)
+          : typeof s === "bigint" ? `integer ${s}`
+            : typeof s === "number" ? `real ${(lite.prepare("SELECT quote(?) AS q").get(s) as { q: string }).q}`
               : typeof s === "string" ? `text ${(lite.prepare("SELECT quote(?) AS q").get(s) as { q: string }).q}` : "blob";
         if (got !== want) bad.push(`${JSON.stringify(v)} into ${a}: ${got} (SQLite ${want})`);
       }
@@ -60,7 +67,7 @@ describe("the Worker's value conversions agree with SQLite", () => {
     const literals = ["5.0", "5", "1e14", "100000000000000.0", "1.5", "-0.0", "0.1", "1e15", "1e16", "123.0", "'5.0'", "'5'", "' 5 '", "'1e2'", "x'05'"];
     const r = prng(3);
     for (let i = 0; i < 40; i++) literals.push(`${(r() * 10).toFixed(Math.floor(r() * 4))}e${Math.floor(r() * 40) - 20}`);
-    const args: Value[] = [realOf(5), 5, realOf(1e14), realOf(1e15), realOf(0.5), "5.0", "5"];
+    const args: Value[] = [5, 5n, 1e14, 1e15, 0.5, "5.0", "5", 2n ** 60n + 1n, 2 ** 60];
     for (const aff of affinities) {
       const lite = new DatabaseSync(":memory:");
       const ddl = `CREATE TABLE t(k ${aff} PRIMARY KEY, v INTEGER)`;
@@ -71,8 +78,9 @@ describe("the Worker's value conversions agree with SQLite", () => {
         const want = (() => {
           try {
             const st = lite.prepare(sql);
-            const bound = params.map((p) => (isReal(p) ? p.real : typeof p === "number" && Number.isInteger(p) ? BigInt(p) : p)) as never[];
-            return st.columns().length ? JSON.stringify(st.all(...bound)) : (st.run(...bound), "ok");
+            st.setReadBigInts(true);
+            const bound = params as never[];
+            return st.columns().length ? JSON.stringify(st.all(...bound), (_k, x) => (typeof x === "bigint" ? Number(x) : x)) : (st.run(...bound), "ok");
           } catch (e) {
             return `error ${(e as Error).message}`;
           }
@@ -85,18 +93,13 @@ describe("the Worker's value conversions agree with SQLite", () => {
       for (const l of literals) {
         id++;
         const w = await run(`INSERT OR IGNORE INTO t(k, v) VALUES (${l}, ${id})`);
-        // 列が整数に揃えた値が 2^53 を超えると、保存を断る (計画書の K1、test/wide-integers.test.ts)。SQLite からも消して先へ進む。
-        if (w.got.startsWith("error unsupported: an INTEGER beyond") && w.want === "ok") {
-          lite.exec(`DELETE FROM t WHERE v = ${id}`);
-          continue;
-        }
         const s = await run(`SELECT v FROM t WHERE k = ${l} ORDER BY v`);
         if (w.got !== w.want) bad.push(`${aff} INSERT ${l}: ${w.got} (SQLite ${w.want})`);
         if (s.got !== s.want) bad.push(`${aff} SELECT ${l}: ${s.got} (SQLite ${s.want})`);
       }
       for (const a of args) {
         id++;
-        const w = await run("INSERT OR IGNORE INTO t(k, v) VALUES (?, ?)", [a, id]);
+        const w = await run("INSERT OR IGNORE INTO t(k, v) VALUES (?, ?)", [a, BigInt(id)]);
         const s = await run("SELECT v FROM t WHERE k = ? ORDER BY v", [a]);
         if (w.got !== w.want) bad.push(`${aff} INSERT ? = ${JSON.stringify(a)}: ${w.got} (SQLite ${w.want})`);
         if (s.got !== s.want) bad.push(`${aff} SELECT ? = ${JSON.stringify(a)}: ${s.got} (SQLite ${s.want})`);
@@ -156,9 +159,9 @@ function keyDisagreements(values: Typed[], key: (v: Typed) => string | undefined
 
 describe("a key string is equal exactly when SQLite takes two values for the same key", () => {
   it("the format-1 keyString (test/key-string-old.ts), over the values that can be stored today", () => {
-    // いま保存できるのは、絶対値が 2^53 未満の INTEGER と、REAL である (2^53 以上の INTEGER は断る。計画書の K1)。
-    const today = (v: Typed): Value | undefined =>
-      typeof v === "number" ? realOf(v) : v > -(2n ** 53n) && v < 2n ** 53n ? Number(v) : undefined;
+    // 段 2 まで保存できたのは、絶対値が 2^53 未満の INTEGER と、REAL である (2^53 以上の INTEGER は断った。計画書の K1)。
+    const today = (v: Typed): OldValue | undefined =>
+      typeof v === "number" ? oldReal(v) : v > -(2n ** 53n) && v < 2n ** 53n ? Number(v) : undefined;
     const r = keyDisagreements(EDGE_VALUES, (v) => {
       const x = today(v);
       return x === undefined ? undefined : oldKeyString([x]);
@@ -178,14 +181,14 @@ describe("a key string is equal exactly when SQLite takes two values for the sam
     expect(keyString([2n ** 60n + 1n])).not.toBe(keyString([2 ** 60]));
     expect(keyString([-(2n ** 63n)])).toBe(keyString([-(2 ** 63)]));
     // 形式 1 の keyString は、JS の表記で書く。2^53 以上では、表記が同じでも値が違う INTEGER がある。
-    expect(oldKeyString([realOf(2 ** 60)])).toBe("[1152921504606847000]");
-    expect(keyString([realOf(2 ** 60)])).toBe("[1152921504606846976]");
+    expect(oldKeyString([oldReal(2 ** 60)])).toBe("[1152921504606847000]");
+    expect(keyString([2 ** 60])).toBe("[1152921504606846976]");
   });
 });
 
 // ---- 新しいキー文字列と、その読み戻し (値の作り直しの段 1 で足し、段 2 から使う) ----
 
-const shownTyped = (v: TypedValue): string =>
+const shownTyped = (v: Value): string =>
   v === null ? "NULL"
     : typeof v === "bigint" ? `INTEGER ${v}`
       : typeof v === "number" ? `REAL ${bitsOf(Object.is(v, -0) ? 0 : v)} (${v})`
@@ -193,12 +196,12 @@ const shownTyped = (v: TypedValue): string =>
           : `BLOB ${[...v].join(",")}`;
 
 describe("the new key string against the format-1 one", () => {
-  it("is the same string for every value that can be stored today, except integral REALs beyond 2^53 that JS does not write exactly", () => {
-    // いま保存できる値。絶対値が 2^53 未満の INTEGER、REAL、TEXT、BLOB、NULL。行の token はキー文字列から決まるので、
-    // 文字列が 1 バイトでも変わると、その行の置き場所が変わる。
-    const today: Value[] = [
+  it("is the same string for every value that could be stored before stage 3, except integral REALs beyond 2^53 that JS does not write exactly", () => {
+    // 段 2 まで保存できた値。絶対値が 2^53 未満の INTEGER、REAL、TEXT、BLOB、NULL。行の token はキー文字列から決まるので、
+    // 文字列が 1 バイトでも変わると、その行の置き場所が変わる。値は段 2 までの形で持ち、新しい keyString には型のある値で渡す。
+    const today: OldValue[] = [
       ...[...INT64, ...int64s(2000, 5)].filter((v) => v > -(2n ** 53n) && v < 2n ** 53n).map(Number),
-      ...[...doubles(20000, 2), ...EDGE_DOUBLES, 0, -0, Infinity, -Infinity].map(realOf),
+      ...[...doubles(20000, 2), ...EDGE_DOUBLES, 0, -0, Infinity, -Infinity].map(oldReal),
       // 印のない、64 ビットに収まらない整数の値の数も、今の決まりでは REAL である。
       1e20, 2 ** 64, -(2 ** 70),
       null, ...numericStrings(doubles(300, 3)), ...TRICKY_STRINGS, "a\u0000b", "é", 'q"r', "back\\slash",
@@ -207,12 +210,10 @@ describe("the new key string against the format-1 one", () => {
     const bad: string[] = [];
     let changed = 0;
     for (const v of today) {
-      const [was, now] = [oldKeyString([v]), keyString([v])];
-      // 今の決まりの値 (整数の JS の数は INTEGER) で渡しても、型のある値 (BigInt は INTEGER) で渡しても、同じ文字列になる。
-      if (keyString([typedOf(v)]) !== now) bad.push(`${JSON.stringify(v)}: ${now} with today's value, ${keyString([typedOf(v)])} with the typed value`);
+      const [was, now] = [oldKeyString([v]), keyString([typedOfOld(v)])];
       if (was === now) continue;
       // 変わってよいのは、設計書の「変わるキーと変わらないキー」の 2 行目だけである。
-      const x = isReal(v) ? v.real : null;
+      const x = v !== null && typeof v === "object" && !(v instanceof Uint8Array) ? v.real : null;
       if (x === null || Math.abs(x) < 2 ** 53 || x < -(2 ** 63) || x >= 2 ** 63) bad.push(`${JSON.stringify(v)}: ${was} became ${now}`);
       else if (now !== `[${BigInt(x)}]`) bad.push(`${JSON.stringify(v)}: ${now} is not the exact value ${BigInt(x)}`);
       else changed++;
@@ -224,15 +225,16 @@ describe("the new key string against the format-1 one", () => {
     const r = prng(9);
     for (let i = 0; i < 2000; i++) {
       const key = Array.from({ length: 1 + Math.floor(r() * 3) }, () => today[Math.floor(r() * today.length)]!);
-      const changes = key.some((v) => oldKeyString([v]) !== keyString([v]));
-      if ((oldKeyString(key) === keyString(key)) === changes) bad.push(`${JSON.stringify(key)}: ${oldKeyString(key)} and ${keyString(key)}`);
+      const typed = key.map(typedOfOld);
+      const changes = key.some((v, j) => oldKeyString([v]) !== keyString([typed[j]!]));
+      if ((oldKeyString(key) === keyString(typed)) === changes) bad.push(`${JSON.stringify(key)}: ${oldKeyString(key)} and ${keyString(typed)}`);
     }
     expect(bad.slice(0, 10)).toEqual([]);
   });
 });
 
 describe("a key string read back with keyValues", () => {
-  const KEYS: TypedValue[] = [
+  const KEYS: Value[] = [
     ...INT64, ...int64s(200, 7), ...EDGE_DOUBLES, ...doubles(300, 8), 5, 0.5, -0.25, 1e19, 1e21, Infinity, -Infinity,
     "", "abc", "5", "5.0", "a\u0000b", "é", 'q"r', "9223372036854775807", new Uint8Array([]), new Uint8Array([0, 255]), new Uint8Array([53]),
   ];
@@ -257,7 +259,7 @@ describe("a key string read back with keyValues", () => {
     const lite = new DatabaseSync(":memory:");
     lite.exec("CREATE TABLE u(k PRIMARY KEY, v INTEGER)");
     lite.exec("CREATE TABLE c(a, b, v INTEGER, PRIMARY KEY (a, b))");
-    const stored: [TypedValue, number][] = [];
+    const stored: [Value, number][] = [];
     const seen = new Set<string>();
     KEYS.forEach((v, i) => {
       // 同じキーの値 (INTEGER の 5 と REAL の 5.0 など) は、先に入れたものだけが行になる。
@@ -283,15 +285,12 @@ describe("a key string read back with keyValues", () => {
   });
 });
 
-// ---- storedValue (値の作り直しの段 1。まだどこからも呼ばれていない) ----
+// ---- storedValue (値の作り直しの段 1 で足し、段 3 からプランナが使う) ----
+//
+// 初期化の前に呼ぶと投げることは、ここでは確かめられない。Worker の SQLite (sql.js) を初期化すると、storedValue の SQLite も一緒に
+// 開く (src/sql/scratch.ts の sqlJs)。試験の準備 (test/setup.ts) が、どの試験よりも先に Worker の SQLite を開く。
 
 describe("storedValue", () => {
-  it("refuses to answer before its SQLite is open", () => {
-    // JS で決まる変換でも投げる。初期化を忘れた呼び出しが、値によって通ったり落ちたりしない。
-    expect(() => storedValue("5", "INTEGER")).toThrow(/before initStoredValue/);
-    expect(() => storedValue(5n, "INTEGER")).toThrow(/before initStoredValue/);
-  });
-
   describe("once its SQLite is open", () => {
     const AFFINITIES: [string, Affinity][] = [["t", "TEXT"], ["n", "NUMERIC"], ["i", "INTEGER"], ["r", "REAL"], ["b", "BLOB"]];
     const DDL = "CREATE TABLE a(id INTEGER PRIMARY KEY, t TEXT, n NUMERIC, i INTEGER, r REAL, b BLOB)";
@@ -305,7 +304,7 @@ describe("storedValue", () => {
 
     it("gives the value that node:sqlite and sql.js store in a column of each affinity", () => {
       const reals = [...doubles(2000, 2), ...EDGE_DOUBLES, 0, -0, Infinity, -Infinity, NaN];
-      const values: TypedValue[] = [
+      const values: Value[] = [
         ...reals, ...INT64, ...int64s(300, 4), ...new Set(numericStrings([...doubles(300, 3), ...EDGE_DOUBLES])),
         "a\u0000b", "5\u0000", "é", null, new Uint8Array([]), new Uint8Array([0, 255]), new Uint8Array([53]),
       ];
@@ -337,7 +336,7 @@ describe("storedValue", () => {
     });
 
     it("leaves the conversion of a string to SQLite: forms that JS reads differently, and a string that keeps a NUL", () => {
-      const cases: [TypedValue, Affinity, TypedValue][] = [
+      const cases: [Value, Affinity, Value][] = [
         ["0x10", "INTEGER", "0x10"], [" 12 ", "INTEGER", 12n], ["1e3", "INTEGER", 1000n], ["1e3", "REAL", 1000], ["abc", "NUMERIC", "abc"], ["", "INTEGER", ""],
         ["9223372036854775807", "INTEGER", 2n ** 63n - 1n], ["9223372036854775808", "INTEGER", 2 ** 63], ["-9223372036854775808", "NUMERIC", -(2n ** 63n)],
         ["9007199254740993", "REAL", 2 ** 53], ["1e400", "REAL", Infinity], ["5.0", "TEXT", "5.0"], ["5\u0000", "INTEGER", "5\u0000"], ["a\u0000b", "NUMERIC", "a\u0000b"],
@@ -345,7 +344,7 @@ describe("storedValue", () => {
         [5, "INTEGER", 5n], [5n, "REAL", 5], [5n, "TEXT", "5"], [0.5, "INTEGER", 0.5], [2 ** 60, "INTEGER", 2n ** 60n], [1e19, "INTEGER", 1e19],
         [2n ** 53n + 1n, "REAL", 2 ** 53], [2n ** 63n - 1n, "REAL", 2 ** 63], [2n ** 63n - 1n, "TEXT", "9223372036854775807"], [-0, "INTEGER", 0n],
       ];
-      for (const [v, a, want] of cases) expect(`${shownTyped(v)} into ${a}: ${shownTyped(storedValue(v, a) as TypedValue)}`).toBe(`${shownTyped(v)} into ${a}: ${shownTyped(want)}`);
+      for (const [v, a, want] of cases) expect(`${shownTyped(v)} into ${a}: ${shownTyped(storedValue(v, a) as Value)}`).toBe(`${shownTyped(v)} into ${a}: ${shownTyped(want)}`);
       expect(storedValue(0.5, "TEXT")).toBeUndefined();
     });
   });

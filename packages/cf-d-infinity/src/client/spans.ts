@@ -7,7 +7,7 @@
 // 既定は広く取る。狭めてよいのは、下に書いた規則に当てはまる形だけである。規則を足すときは、その形の文を
 // 範囲の検査 (ShardDeps.spanEscape、試験では常に掛かる) に通してから足す。
 import type { Scan, UniqueRead } from "../sql/plan";
-import { q } from "../shard/rows";
+import { uniqueWhere } from "../shard/rows";
 import type { Span, TableDef } from "../types";
 
 /** 1 行だけを名指しする範囲。 */
@@ -62,9 +62,11 @@ export function statementSpans(shape: StatementShape): Span[] {
     if (shape.uniqueReads) {
       // 値に NULL があれば、どの行とも衝突しない (UNIQUE は NULL を互いに別の値として扱う)。`=` は列の照合順序で比べる。
       const reads = shape.uniqueReads.filter((u) => u.values.every((v) => v !== null));
+      // 列が多い UNIQUE は、つないだ条件が深くなる。釣り合った木に組む (uniqueWhere)。シャードはこの条件で行イメージを判定する
+      // (ShardKernel.rowMatches)。表を作るときに、その文が DO の SQLite の上限に収まることを確かめている (imageStatements)。
       return [row, ...reads.map((u): Span => ({
         kind: "pred", table: only.name, alias: only.name, sk: sks[0]!,
-        where: u.cols.map((c) => `${q(only.name)}.${q(c)} = ?`).join(" AND "), params: u.values,
+        where: uniqueWhere(only.name, u.cols), params: u.values,
       }))];
     }
   }

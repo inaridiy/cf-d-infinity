@@ -3,7 +3,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Db } from "../src/client/db";
 import { spanFaults } from "../src/client/spans";
-import { allSpanEscapes, SimCluster } from "./sim";
+import type { Faults } from "../src/types";
+import { allSpanEscapes, allWriteEscapes, SimCluster } from "./sim";
 
 const P = `CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id))`;
 
@@ -11,10 +12,11 @@ describe("the span check", () => {
   afterEach(() => {
     spanFaults.rowSpanDespiteUnique = false;
     allSpanEscapes.length = 0; // ここで見つけたものは、この試験が確かめた。全体の検査には渡さない
+    allWriteEscapes.length = 0;
   });
 
-  const unique = async () => {
-    const c = new SimCluster({ shards: 1 });
+  const unique = async (faults: Faults = {}) => {
+    const c = new SimCluster({ shards: 1, faults });
     const db = c.client();
     await db.ddl(P);
     await db.ddl(`CREATE UNIQUE INDEX p_code ON p(tenant_id, code)`);
@@ -24,9 +26,19 @@ describe("the span check", () => {
 
   it("reports a write that reads a row outside its span: REPLACE that removes the row holding the same UNIQUE value", async () => {
     spanFaults.rowSpanDespiteUnique = true;
-    const { c, db } = await unique();
+    // 文は、宣言した 1 行の外の行 (同じ値を持つ行 1) を消すので、シャードの書き込みの守りが断る。範囲の検査だけで見つかることを
+    // 確かめるために、守りを外す。書き込みの側の範囲の検査も、同じ行を報告する。
+    const { c, db } = await unique({ ignoreWriteClaim: true });
     await db.query("INSERT OR REPLACE INTO p VALUES (1, 2, 'a')");
     expect(c.spanEscapes.map((e) => e.sql)).toEqual([expect.stringMatching(/^INSERT OR REPLACE INTO "p"/)]);
+    expect(c.writeEscapes.map((e) => e.row)).toEqual(["p [1,1]"]);
+  });
+
+  it("with the write guard on, the shard refuses that REPLACE and writes nothing", async () => {
+    spanFaults.rowSpanDespiteUnique = true;
+    const { c, db } = await unique();
+    await expect(db.query("INSERT OR REPLACE INTO p VALUES (1, 2, 'a')")).rejects.toThrow(/^write outside claim: the statement wrote p row \[1,1\]/);
+    expect((await db.query("SELECT tenant_id, id, code FROM p")).values).toEqual([[1n, 1n, "a"]]);
   });
 
   it("reports an insert whose UNIQUE check read another row", async () => {
@@ -65,7 +77,7 @@ describe("the span check", () => {
     const { version } = await c.catalog();
     // 文は q も読むのに、範囲には p の 1 行しか入れていない。
     await c.shard("s0").exec({
-      sql: "SELECT code, (SELECT count(*) FROM q WHERE tenant_id = 1) AS n FROM p WHERE tenant_id = 1 AND id = 1", params: [],
+      sql: "SELECT code, (SELECT count(*) FROM q WHERE tenant_id = 1) AS n FROM p WHERE tenant_id = 1 AND id = 1", params: [], columns: ["code", "n"],
       spans: [{ kind: "pk", table: "p", pk: "[1,1]", sk: "[1]" }], schema: version,
     });
     expect(c.spanEscapes.length).toBe(1);

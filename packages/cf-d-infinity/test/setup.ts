@@ -6,10 +6,11 @@ import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { afterEach, beforeAll, beforeEach, expect } from "vitest";
 import { spanFaults } from "../src/client/spans";
-import { imageChecks } from "../src/shard/rows";
+import { imageChecks, imageFaults } from "../src/shard/rows";
 import { parseObserver } from "../src/sql/cst";
 import { openScratch } from "../src/sql/scratch";
-import { allSpanEscapes, imageCheckOff, injectedFault, tracedNets } from "./sim";
+import { systemRuntime } from "../src/runtime";
+import { allDriverIntegers, allSpanEscapes, allWriteEscapes, imageCheckOff, injectedFault, realTimeCluster, tracedNets } from "./sim";
 
 // PARSER_CORPUS=<ディレクトリ> を付けて流すと、試験が解析に渡した文を、プロセスごとの 1 行 1 文の JSON のファイルに書き出す。
 // パーサの突き合わせ (test/parser-oracle.test.ts) が、これを文の集まりとして読む。同じ文は、プロセスの中で 1 度だけ書く。
@@ -34,6 +35,7 @@ beforeAll(async () => {
 beforeEach(() => {
   const f = injectedFault();
   if (f?.side === "span") (spanFaults as Record<string, boolean>)[f.name] = true;
+  if (f?.side === "image") (imageFaults as Record<string, boolean>)[f.name] = true;
 });
 
 // RPC_TRACE=<ディレクトリ> を付けて流すと、試験ごとに、その試験が作ったクラスタの RPC の送り元、宛先、種類の列を 1 つのファイルに
@@ -71,4 +73,46 @@ afterEach(() => {
     distinct.map((e) => `${e.shard}: ${e.sql.slice(0, 160)} | spans ${JSON.stringify(e.spans).slice(0, 200)} | all rows: ${e.full.slice(0, 120)} | rows in spans only: ${e.narrowed.slice(0, 120)}`),
     "statements that depend on rows outside their declared spans",
   ).toEqual([]);
+});
+
+// 書き込みの側の範囲の検査 (sim.ts の checkWrites)。シミュレータのシャードが受け入れようとした書き込みのうち、宣言した範囲の外の
+// 行を書く文か、行を持ち主でないシャードに残す書き込みがあれば、その試験を失敗にする。シャードの守り (kernel.ts の claimed) が
+// 断った書き込みも数える。守りがあっても、Worker が宣言を誤ったことには変わりないからである。範囲の検査と同じく、
+// SimOptions の noSpanCheck で切る。
+afterEach(() => {
+  const found = allWriteEscapes.splice(0);
+  const seen = new Set<string>();
+  const distinct = found
+    .map((e) => `${e.shard}: ${e.sql === null ? "(a transaction's writes at commit)" : e.sql.slice(0, 160)} | ${e.row} | ${e.problem.slice(0, 240)}`)
+    .filter((s) => !seen.has(s) && seen.add(s));
+  expect(distinct.slice(0, 10), "writes outside their declared spans, or rows left on a shard that does not own them").toEqual([]);
+});
+
+// 型つきの読みの検査 (docs/design-values.md の「足す検査」の 5 の 1 つ目、test/sim.ts の allDriverIntegers)。利用者の表に触る文
+// (Backend.query) が、ドライバから INTEGER を数として読んだら、その試験を失敗にする。DO のドライバは、その INTEGER を丸めて返す。
+afterEach(() => {
+  const found = [...new Set(allDriverIntegers.splice(0))];
+  expect(found.slice(0, 5), "statements through query that read an INTEGER as a driver number (a read that is not typed)").toEqual([]);
+});
+
+// 決定性の検査。シミュレータの試験は、時計、待ち、乱数、取引の ID を、クラスタの仮想の実行環境から取る (AGENTS.md)。本物の
+// systemRuntime を呼んだ試験は、同じ seed でも実行ごとに要求の中身が変わる (2026-11-15、Cluster を手で包んだ試験が runtime を
+// 渡さず、Db が systemRuntime の取引の ID と時刻を使っていた)。実時間のクラスタ (realTime か now) を作った試験だけは許す。
+const systemCalls: string[] = [];
+for (const name of ["now", "after", "random", "uuid"] as const) {
+  const real = systemRuntime[name] as (...a: unknown[]) => unknown;
+  (systemRuntime as unknown as Record<string, unknown>)[name] = (...a: unknown[]) => {
+    systemCalls.push(name);
+    return real(...a);
+  };
+}
+beforeEach(() => {
+  systemCalls.length = 0;
+  realTimeCluster.now = false;
+});
+afterEach(() => {
+  const used = [...new Set(systemCalls)];
+  systemCalls.length = 0;
+  if (used.length === 0 || realTimeCluster.now) return;
+  throw new Error(`this test used the real clock or randomness (systemRuntime.${used.join(", ")}) without a real-time cluster; pass the cluster's runtime (a Cluster wrapper must keep \`runtime\`)`);
 });
