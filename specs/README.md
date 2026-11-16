@@ -1692,7 +1692,7 @@ M24 の本体の場面は、取引 1 件である。取引 2 件の場面 (M21 �
 | `WOUND` | ロックを持つ取引の文が、開いている試みの書き込み禁止に当たったら、Worker が Meta に、その試みを取り消させる (`m24_lock` のまま) | `m24_retry_red_no_wound` | `holderNotDelayed` |
 | `HOLD` | 禁止に当たったシャードは、その書き込みを断る (`TableLocked`) ときに、行のロックを取引に与える (書かずに) | `m24_retry_red_no_hold` | `noReblock`、活性 `ddlTerminates` |
 | `RETRY` | 進める側は、取り消された DDL を、新しい試みでやり直す | `m24_retry_red_no_retry` | `asSqlite` |
-| `KEEP_BUDGET` | やり直しも、DDL を始めたときの期限 (5 秒) の中で行う。期限が来たら、開いている試みを取り消し、DDL は `SQLITE_BUSY` で失敗する | `m24_retry_red_restart` | `asSqlite` |
+| `KEEP_BUDGET` | やり直しも、DDL を始めたときの待ちの期限 (5 秒。遷移ごとの lease とは別で、進める側が持つ) の中で行う。期限が来たら、開いている試みを取り消し、DDL は `SQLITE_BUSY` で失敗する | `m24_retry_red_restart` | `asSqlite` |
 | `FRESH_EPOCH` | やり直しは、新しい epoch の prepare を記録し、全部のシャードの ok を集め直す | `m24_retry_red_same_epoch` | `checkSawRows` |
 
 やり直すだけでは足りない。

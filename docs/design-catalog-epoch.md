@@ -1056,7 +1056,7 @@ SQLite (WAL) では、ほかの接続の DDL は、別の表の取引を失敗�
 | 記録の適用中 | 適用している記録が変えるもの (fence の表を含む) に頼る要求は、適用が終わるまで待つ。断らない。ほかの要求は通す | `schemaChanging` の間、全部の要求を断る |
 | intent の決着 | 記録を適用する前に決着させるのは、その記録が変える表 (fence の表、文が作る、変える、消す表、index の表) の intent だけである | `settleAll` が全部の intent を決着させる |
 | 床 | 床を表ごとに持ち、読みの epoch を進める commit を適用したとき、その表にだけ置く。古い時刻の読み戻しで戻すのは、読む表の行だけで、見る床もその表のものだけである。refresh の窓と述語の検証も、範囲の表の床だけを見る | シャードに 1 つの `ddlFloor` |
-| 行ロック | 表 X の prepare は、X の行のロックがある間は適用しない。待ちの上限は DDL の期限 (DDL を始めてから、busy_timeout と同じ 5 秒。prepare の記録が運ぶ) で、過ぎれば `prepared` に ok でないと答え、DDL が `SQLITE_BUSY` で失敗する。ただし、取ってきた列で、その遷移がもう閉じている (commit か abort が記録されている) prepare は、待たずに適用する (遅れたシャードが prepare と abort を続けて適用するときに、ロックの持ち主が追いつきを止めないため。`m24_lock` の `applyPrepare` と同じ) | prepare は intent を決着させるだけで、ロックを待たない |
+| 行ロック | 表 X の prepare は、X の行のロックがある間は適用しない。待ちの上限は DDL の待ちの期限 (DDL を始めてから、busy_timeout と同じ 5 秒。下の「Worker」。prepare の記録が運ぶ) で、過ぎれば `prepared` に ok でないと答え、DDL が `SQLITE_BUSY` で失敗する。ただし、取ってきた列で、その遷移がもう閉じている (commit か abort が記録されている) prepare は、待たずに適用する (遅れたシャードが prepare と abort を続けて適用するときに、ロックの持ち主が追いつきを止めないため。`m24_lock` の `applyPrepare` と同じ) | prepare は intent を決着させるだけで、ロックを待たない |
 | 禁止に当たったロックを持つ取引 | X の行のロックを別のシャードに持つ取引の書き込みか `COMMIT` が、X の書き込み禁止に当たったら、シャードは、その文を `TableLocked` で断るときに、その行のロックを取引に与える (書かずに。要求は、取引がロックを持つことを運ぶ)。そのロックは、ほかの行ロックと同じく、やり直しの prepare を待たせ、取引の `COMMIT` か `ROLLBACK` で放され、TTL で切れる (`m24_retry` の `HOLD`) | 禁止に当たった文は断られるだけで、何も残さない |
 
 記録の適用中に要求を断っていたのは、受けると intent が増え続けて、適用がいつまでも終わらないからである。
@@ -1072,7 +1072,8 @@ SQLite (WAL) では、ほかの接続の DDL は、別の表の取引を失敗�
 - `Txn.load` は、表定義全体の epoch が変わっていても、取引を失敗させない。取引のスナップショットの epoch で畳んだ表定義 (Meta の列を、その epoch まで畳んだもの) で計画し、範囲表はいまのものを使う。baton は、今と同じく、その epoch を運ぶ。
 - 書き込み禁止で待つ (`TableLocked`) 文は、表定義全体の epoch が進むまでではなく、禁止を掛けた遷移が閉じる (commit か abort が記録される) まで待つ (`Db.schemaMovedPast`)。commit だけで進める形では、abort の後に epoch が進まないからである。
 - 表 X の行のロックを持つ取引の文か `COMMIT` が、X の書き込み禁止で断られたら、Worker は、断ったシャードを、取引がロックを持つシャードに数え (上の「シャード」の、禁止に当たったロックを持つ取引)、Meta に、その遷移を取り消させる (`abort`。開いていれば記録される)。その後、禁止が解けるのを待つ。
-- DDL の文を受けた Worker (DDL を進める側) は、DDL を始めた時刻から 5 秒を、DDL の期限にする。遷移が取り消させる手で abort されたら、期限のうちなら、同じ DDL を新しい遷移でやり直す。新しい遷移は、新しい epoch の prepare を記録し、全部のシャードの ok を集め直す (取り消された遷移の ok は使わない)。期限は数え直さない。期限が来たら、開いている遷移を取り消し、DDL は `SQLITE_BUSY` で失敗する。行の確かめ (CHECK の試し、UNIQUE の重複) や DROP の確かめで abort された遷移は、やり直さない (今と同じく、その理由で失敗する)。
+- 取り消させる手の `abort` は、理由に、ロックを持つ取引が書き込み禁止に当たったことを記録する (ほかの abort の理由と見分けられる形で)。
+- DDL を進める側 (`Db.changeSchema`) は、DDL を始めた時刻から 5 秒を、DDL の待ちの期限にする (busy_timeout と同じ)。遷移ごとの期限 (lease。5 秒ごとに延ばし、prepare から 5 分まで) とは別のもので、進める側が持つ。遷移が abort され、その理由が取り消させる手のもの (`commit` の断りか、`prepared` の ok でない答えで知る) なら、待ちの期限のうちに、同じ DDL を新しい遷移でやり直す。新しい遷移は、新しい epoch の prepare を記録し (新しい lease が付く)、全部のシャードの ok を集め直す (取り消された遷移の ok は使わない)。待ちの期限は数え直さない。待ちの期限が来たとき、まだ prepare を適用していない (ロックを待つ) シャードがあれば、開いている遷移を取り消し、DDL は `SQLITE_BUSY` で失敗する。全部のシャードが prepare を適用した後の仕事 (index の行の走査など) は、今と同じく lease の下で進み、待ちの期限では止めない (その後は、ロックを持つ取引が新しく現れないので、取り消させる手も起きない)。行の確かめ (CHECK の試し、UNIQUE の重複) や DROP の確かめで abort された遷移と、lease の期限切れで abort された遷移は、やり直さない (今と同じく、その理由で失敗する)。
 - 何もしていない取引の最初の文が `stale schema` で断られたら、新しいスナップショットで計画し直す (今の `Txn.rebase` と同じ)。
 
 ### 触った表の DDL と SQLite
@@ -1104,7 +1105,7 @@ TTL がなくても、取引の文が DDL の期限まで待ち、その間 DDL 
 禁止に当たったシャードが取引にロックを与えないと、そのシャードが、取引の書き込みより先に、やり直しの prepare を適用し得る。
 取引はまた禁止に当たり、取り消しとやり直しが繰り返す (`m24_retry_red_no_hold`。`noReblock` と、活性の `ddlTerminates` を破る)。
 実際の時刻では、繰り返しが期限まで続いて DDL が `SQLITE_BUSY` で失敗し、取引の書き込みはそれまで待つ。行が 1 つのシャードにあれば起きないので、これも置き場所で決まる失敗である。
-やり直すたびに期限を数え直すと、DDL は 5 秒を過ぎても終わらず、SQLite なら `SQLITE_BUSY` になる DDL が確定する (`m24_retry_red_restart`)。
+やり直すたびに待ちの期限を数え直すと、DDL は 5 秒を過ぎても終わらず、SQLite なら `SQLITE_BUSY` になる DDL が確定する (`m24_retry_red_restart`)。
 取り消された遷移の prepare の epoch と ok を使ってやり直すと、取引の書き込みより前のシャードの ok が、やり直しの commit に数えられ、シャードの確かめ (CHECK の試し、index の行の走査) が、DDL の確定する行を全部は見ない (`m24_retry_red_same_epoch`。`checkSawRows` を破る)。
 
 ### 決めたこと 6 を改める
@@ -1201,7 +1202,7 @@ witness は、競りのない時刻で、置き場所 (同じシャード、別�
 - `m24_retry` のロックの TTL。`m24_retry` にはロックが切れる手がない (`m24_lock` にある)。`asSqlite` は、ロックが切れない取引についての性質である。TTL はシャードごとで、そのシャードで文を実行したときだけ延びるので、ロックが切れるかどうかは、取引のほかの文がどのシャードに行くかで変わる (下の「持ち主の判断が要ること」の 6)。
 - `COMMIT` が書き込み禁止に当たる形。ロックを持つシャードでは、prepare がロックを待つので、TTL がなければ起きない。`m24_retry` の `HOLD` は、x2 の書き込みが当たる形だけを持つ。上の「シャード」の規則は、`COMMIT` も同じに扱う。
 - 取引 2 件以上が、順に DDL を取り消させる形。`m24_retry` の取引は 1 件で、取り消させるのは高々 1 回である。`m24_retry_red_restart` が示すのは、期限を数え直すと、DDL の結果が 5 秒を過ぎてから決まることで、限りなく延びることではない。取引が次々に来る形で限りなく延びることは、期限を数え直さないことから従う、という読みに留まる。
-- 進める側が止まる形。DDL の文を受けた Worker が落ちれば、やり直す者がいない。遷移は期限切れで abort され、DDL の文は答えを返さない (今と同じ)。
+- 進める側が止まる形。`Db.changeSchema` を進める Worker が落ちれば、やり直す者がいない。遷移は、今と同じく、lease の 5 秒のうちに Meta の `expire` が abort する。
 - `m24_retry_red_same_epoch` が持つのは、取り消された試みの ok を使い続けることだけである。シャードが同じ epoch の prepare を重複として読み飛ばす形 (禁止もロックの待ちもない) は、モデルにない。どちらも、やり直しに新しい epoch を使えば起きない。
 - 行の確かめや DROP の確かめで abort された遷移をやり直さないこと。`m24_retry` の DDL は、行で失敗しない。
 
@@ -1220,7 +1221,7 @@ witness は、競りのない時刻で、置き場所 (同じシャード、別�
 | 7 | シャードの床 (`ddlFloor`、`deltaAfter`、`refresh`、`predicateChanged`) | 表ごとの床。読む表の行だけを読み戻す | 別の表の DDL の後で、取引の 2 文目 (古い T の読み戻し)、refresh、述語の検証が通る試験 (今は `read too old` か競合で落ちる) | `globalDdlFloor` (`m24_floor_red_global`)、`restoreAllTables` (`m24_floor_red_restore_all`)、`noFloorOnChange` (`m24_floor_red_no_floor`) |
 | 8 | Worker の取引 (`Txn.reroute`、`Txn.load`、`Db.schemaMovedPast`) | 範囲表だけを取り替える。baton は、取引のスナップショットの epoch で畳んだ表定義で組み立て直す。書き込み禁止の待ちは、遷移が閉じるまで | baton の取引と `Db.begin()` の取引が、関係のない DDL と分割をまたいで確定する試験 (今は `the schema changed while the transaction was open` で落ちる) | `doomOnSchemaChange` (`m24_red_global` の Worker の側。モデルの取引は組み立て直さないので、赤はない) |
 | 9 | シャードの prepare の適用 | fence の表の行のロックがある間は適用しない。DDL の期限 (prepare の記録が運ぶ) で `prepared` に ok でないと答える | 悲観の取引が行を書いた表への `ALTER TABLE` が、取引の `COMMIT` の後で通るか、`SQLITE_BUSY` で失敗する試験 (今は取引の `COMMIT` が落ちる) | `prepareIgnoresLocks` (`m24_lock_red_no_wait`、`m24_retry_red_no_wait`) |
-| 10 | Worker の取引、シャードの書き込み禁止、DDL を進める側 (`src/client/db.ts` の DDL の経路) | 取引の側: ロックを持つ表の書き込み禁止に当たったら、断ったシャードをロックを持つシャードに数え、Meta に遷移を取り消させる。シャードの側: ロックを持つ取引の文を禁止で断るときに、その行のロックを取引に与える。進める側: DDL を始めた時刻から 5 秒を期限にし、取り消された遷移を、期限のうちなら新しい遷移 (新しい epoch の prepare。ok は集め直す) でやり直す。期限は数え直さない。期限が来たら、開いている遷移を取り消して `SQLITE_BUSY` を返す | 2 つのシャードに書く悲観の取引の 2 つ目の書き込みが、DDL の書き込み禁止に当たる試験を、行を 1 つのシャードに置いた同じ試験と並べ、取引が 5 秒のうちに確定すれば、どちらでも DDL が確定し、取引の書き込みが 5 秒を待たないこと。取引が 5 秒を過ぎてもロックを持てば、どちらでも DDL が 5 秒で (それより前でなく) `SQLITE_BUSY` になること | `noWound` (`m24_lock_red_no_wound`、`m24_retry_red_no_wound`)、`noRetryAfterWound` (`m24_retry_red_no_retry`)、`noLockAtFence` (`m24_retry_red_no_hold`)、`retryRestartsBudget` (`m24_retry_red_restart`)、`retrySameEpoch` (`m24_retry_red_same_epoch`) |
+| 10 | Worker の取引、シャードの書き込み禁止、DDL を進める側 (`src/client/db.ts` の DDL の経路) | 取引の側: ロックを持つ表の書き込み禁止に当たったら、断ったシャードをロックを持つシャードに数え、Meta に遷移を取り消させる (abort の理由に、取り消させる手であることを記録する)。シャードの側: ロックを持つ取引の文を禁止で断るときに、その行のロックを取引に与える。進める側 (`Db.changeSchema`): DDL を始めた時刻から 5 秒を待ちの期限にし (遷移の lease とは別)、取り消させる手の理由で abort された遷移を、待ちの期限のうちなら新しい遷移 (新しい epoch の prepare。ok は集め直す) でやり直す。待ちの期限は数え直さない。待ちの期限が来たとき、prepare を適用していないシャードがあれば、開いている遷移を取り消して `SQLITE_BUSY` を返す | 2 つのシャードに書く悲観の取引の 2 つ目の書き込みが、DDL の書き込み禁止に当たる試験を、行を 1 つのシャードに置いた同じ試験と並べ、取引が 5 秒のうちに確定すれば、どちらでも DDL が確定し、取引の書き込みが 5 秒を待たないこと。取引が 5 秒を過ぎてもロックを持てば、どちらでも DDL が 5 秒で (それより前でなく) `SQLITE_BUSY` になること | `noWound` (`m24_lock_red_no_wound`、`m24_retry_red_no_wound`)、`noRetryAfterWound` (`m24_retry_red_no_retry`)、`noLockAtFence` (`m24_retry_red_no_hold`)、`retryRestartsBudget` (`m24_retry_red_restart`)、`retrySameEpoch` (`m24_retry_red_same_epoch`) |
 | 11 | `docs/model-coverage.md`、`specs/README.md` | M24 の赤の行を、項目ごとに P から A に移す | | |
 
 決めたこと 6 の変更 (2 のうち commit だけで進めること) は、3 のうち `atLeast` と、8 のうち `Db.schemaMovedPast` と一緒になら、先に入れてよい。
