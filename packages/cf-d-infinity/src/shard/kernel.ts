@@ -2187,10 +2187,13 @@ export class ShardKernel {
       if (!this.faults.ddlIgnoresIntents) return wait(this.call("settleAll", {}));
     }
     if (!f.got) return wait({ kind: "meta", method: "epochsSince", args: [this.applied] }, "got");
+    // 範囲の記録の後は、畳み直しを後回しにする。表定義の記録の文は、直前までを畳んだスナップショットから決めるので、その前に畳む。
+    let stale = false;
     for (const x of f.got) {
       if (x.epoch <= this.applied) continue;
       if (x.epoch !== this.applied + 1) throw new SqlError(`shard ${this.id} has applied the epoch log up to ${this.applied}, but the next record is epoch ${x.epoch}`);
       const rec = x.rec;
+      if (stale && isDdlRecord(rec)) this.resnap();
       const statements = this.statementsOf(rec);
       try {
         this.b.tx(() => {
@@ -2198,12 +2201,14 @@ export class ShardKernel {
           this.store(x);
         });
       } catch (err) {
+        if (stale) this.resnap();
         if (rec.kind !== "commit") throw err;
         this.schemaStuck = { epoch: x.epoch, message: (err as Error).message };
         throw new SqlError(`schema change of epoch ${x.epoch} cannot be applied on shard ${this.id}: ${(err as Error).message}`);
       }
       this.log.push(x);
-      this.resnap();
+      stale = !isDdlRecord(rec);
+      if (!stale) this.resnap();
       if (rec.kind !== "commit") continue;
       this.schemaStuck = null;
       // index を公開する commit は、時刻を運ぶ。index を使わずに確定した書き込みは、どのシャードのものも、この時刻以下である。
@@ -2213,6 +2218,7 @@ export class ShardKernel {
       this.ddlFloor = this.issue();
       this.metaSet("ddl_floor", this.ddlFloor);
     }
+    if (stale) this.resnap();
     return done(undefined);
   }
 
