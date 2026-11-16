@@ -4,7 +4,8 @@
 // 手は、止めずに 1 回流したときに、進める側が Meta とシャードへ送った呼び出しの列から取る (test/ddl-driver.ts の driver。
 // 表定義と移動の一覧を読む呼び出しは数えない)。手の名前と数は実装で変わるので、列の番号で止める。止めた後で、
 //   1. 移る行と残る行が、最新の範囲表の接続からも、分割の前の範囲表を持ったままの接続からも、読めて書ける。
-//   2. 進める側を再開せずに、子が自分で移動を終える (応答の後の仕事と、子が予約した alarm だけで)。Meta の列に開いた移動が残らず、
+//   2. 進める側を再開せずに、子が自分で移動を終える (応答の後の仕事と、子が予約した alarm だけで。シミュレータの alarm は、仮想の時計で
+//      発火する)。Meta の列に開いた移動が残らず、
 //      親も子も移動の途中でない。
 //   3. 表定義の変更が通る。
 //   4. 全部の行が、全表の読みで数えられる。
@@ -55,11 +56,10 @@ async function check(s: Awaited<ReturnType<typeof seeded>>) {
     movedStale: await rw(stale, moved, 1001),
     staysStale: await rw(stale, stays, 2001),
   };
-  // 進める側なしで、子が移動を終える。応答の後の仕事を待ち、子が予約した alarm を発火させる。
-  for (let i = 0; i < 3; i++) {
-    await c.settle();
-    await c.fireAlarms();
-  }
+  // 進める側なしで、子が移動を終える。応答の後の仕事と、子が予約した alarm (シミュレータでは仮想の時計で 5 秒ごとに発火する) だけで
+  // 進むのを、仮想の時刻で 30 秒まで待つ。試験は alarm を自分で発火させない。
+  const closed = () => fold(readEpochs(c.metaBackend)).moves.length === 0;
+  for (let waited = 0; waited < 30_000 && !closed(); waited += 500) await c.sleep(500);
   await c.settle();
   const open = fold(readEpochs(c.metaBackend)).moves;
   const shards = await Promise.all(["s0", "s1"].map((id) => c.shard(id).moves({})));

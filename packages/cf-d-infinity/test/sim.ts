@@ -485,6 +485,10 @@ function declaresRow(s: Span, table: string, key: { pk: string; sk: string }, to
   return s.claim === undefined || s.claim.some((x) => token >= x.start && token < x.end);
 }
 
+/** 子として移動を進めるシャードの alarm の間隔 (DO の alarm と同じ 5 秒) と、続けて発火させる回数の上限 (SimCluster.armMoveAlarm)。 */
+const MOVE_ALARM_MS = 5_000;
+const MOVE_ALARM_LIMIT = 60;
+
 /** Worker と DO の間の RPC だけをシミュレートしたクラスタ。ShardCore は本物を動かす。 */
 /** このプロセスの全クラスタで見つかった、範囲の外の行に依存する文。test/setup.ts が試験ごとに確かめて空にする。 */
 export const allSpanEscapes: SpanEscape[] = [];
@@ -644,7 +648,10 @@ export class SimCluster implements Cluster {
         this.background.add(p);
         void p.finally(() => this.background.delete(p));
       },
-      scheduleRedrive: () => void this.alarms.add(id),
+      scheduleRedrive: (why) => {
+        this.alarms.add(id);
+        if (why === "move") this.armMoveAlarm(id);
+      },
       faults: this.o.faults,
       K: this.o.K,
       lockTtlMs: this.o.lockTtlMs,
@@ -667,7 +674,8 @@ export class SimCluster implements Cluster {
    *   2. 文の実行なら、文が宣言した範囲のどれかが、その行を覆う。
    *   3. 変更後の行が残るなら、そのシャードが、その行の token を持っている。持ち主は、シャードが保存した記録 (Meta の epoch の列の写し
    *      __epoch と、渡したグループの記録 __moved と __arrived) から決める。シャードのメモリと、シャードの所有の規則は使わない。
-   *      写しを畳んだ範囲表がそのシャードに割り当てる token を持ち、渡して受け取り直していないグループの行は持たない (段 4 から、
+   *      写しを畳んだ範囲表がそのシャードに割り当てる token を持ち、渡して、届き直してもおらず、その範囲を受け取り直してもいないグループの
+   *      行は持たない (段 4 から、
    *      範囲表の切り替えと親の fence と子の受け取りの始まりは、同じ move-start の記録である。親は、その記録を写すまで、移る範囲の行を
    *      持ち、書き込みを受けてよい。その行は、記録を写した後に子へ運ばれる)。
    * 確かめるだけで、処理は変えない (RPC の列も変わらない)。見つけたものは test/setup.ts が試験ごとに確かめる。
@@ -705,7 +713,8 @@ export class SimCluster implements Cluster {
 
   /**
    * シャードが、shard key sk の行の token を持っているか。シャードが保存した記録から決める (checkWrites の 3)。
-   * 写した epoch の列を畳んだ範囲表で、その token がシャードのものであり、そのグループを渡して受け取り直していないこと。
+   * 写した epoch の列を畳んだ範囲表で、その token がシャードのものであり、そのグループを渡した後に、届き直したか、その範囲を受け取り直したこと
+   * (渡していなければ、それでよい)。
    */
   private ownsToken(shard: string, token: number, sk: string): boolean {
     const db = this.backends.get(shard)!.db;
@@ -714,7 +723,10 @@ export class SimCluster implements Cluster {
     if (routing.ranges.find((x) => token >= x.start && token < x.end)?.shard !== shard) return false;
     const last = (table: string) => (db.prepare(`SELECT max(epoch) AS e FROM ${table} WHERE g = ?`).get(sk) as { e: number | null }).e;
     const out = last("__moved");
-    return out === null || (last("__arrived") ?? -1) > out;
+    if (out === null) return true;
+    // 渡した後に、そのグループが届き直したか、そのグループを含む範囲を受け取り直していれば (行のないまま戻ったグループには到着の記録がない)、持つ。
+    const received = (db.prepare(`SELECT max(epoch) AS e FROM __incoming WHERE lo <= ? AND ? < hi`).get(token, token) as { e: number | null }).e;
+    return Math.max(last("__arrived") ?? -1, received ?? -1) > out;
   }
 
   /**
@@ -726,6 +738,35 @@ export class SimCluster implements Cluster {
     const log = fold(rows.map((r) => ({ epoch: r.epoch, rec: JSON.parse(r.rec) as EpochRecord })));
     const routing: Routing = rows.some((r) => r.epoch === 0) ? log.routing : initialRouting(this.shardIds);
     return routing.ranges.find((x) => token >= x.start && token < x.end)?.shard;
+  }
+
+  /**
+   * 子として移動を進めるシャードの alarm (docs/design-catalog-epoch.md の決めたこと 4)。DO の alarm と同じく、予約から MOVE_ALARM_MS の後に
+   * redrive を走らせ、まだ進める移動が残っていれば、もう一度予約する。仮想の時計のクラスタでだけ、仮想の時計で発火させる (実時間の
+   * タイマーは使わない)。移動のない alarm (取り残された intent と phase 2 の再駆動) は、今までどおり試験が fireAlarms で発火させる。
+   * 終わらない移動 (親が答えない) で発火し続けないよう、続けて発火させる回数に上限を置く。発火したときに、進める移動がもうなければ、
+   * redrive を走らせずに終える。
+   */
+  private moveAlarms = new Map<string, number>();
+  private armMoveAlarm(id: string): void {
+    if (!this.virtual || this.moveAlarms.has(id)) return;
+    this.moveAlarms.set(id, 0);
+    const fire = async () => {
+      const core = this.core(id);
+      if (core.movesToDrive === 0) {
+        this.moveAlarms.delete(id);
+        return;
+      }
+      await core.redrive().catch(() => undefined);
+      const fired = (this.moveAlarms.get(id) ?? 0) + 1;
+      if (this.core(id).movesToDrive > 0 && fired < MOVE_ALARM_LIMIT) {
+        this.moveAlarms.set(id, fired);
+        this.runtime.after(MOVE_ALARM_MS, () => void fire());
+      } else {
+        this.moveAlarms.delete(id);
+      }
+    };
+    this.runtime.after(MOVE_ALARM_MS, () => void fire());
   }
 
   /** 予約された alarm を発火させる。redrive が仕事を残したら、DO と同じく次の alarm を予約する。 */

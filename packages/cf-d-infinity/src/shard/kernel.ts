@@ -41,8 +41,11 @@ export interface KernelDeps {
   clock: Clock;
   /** 実時間の出どころ。指定しなければ実物を使う。シミュレータは seed から決まる実装を渡す。 */
   runtime?: Pick<Runtime, "now">;
-  /** phase 2 の再駆動を予約する。DO では storage.setAlarm に渡す。 */
-  scheduleRedrive?(): void;
+  /**
+   * phase 2 の再駆動と、子として受け取っている移動の続きを予約する。DO では storage.setAlarm に渡す (alarm は 1 つで、どちらも redrive が
+   * 進める)。why が "move" なら、子として進める移動のための予約である (シミュレータは、これを仮想の時計の alarm にする)。
+   */
+  scheduleRedrive?(why?: "move"): void;
   K?: number;
   faults?: Faults;
   /** ロックの TTL。既定は LOCK_TTL_MS である。 */
@@ -586,8 +589,6 @@ export interface Phase2Frame {
 /** finalize と abort の frame。 */
 export interface SettleTxnFrame<R> {
   req: R;
-  /** 転送された piece の移動の epoch まで、列を適用した (受け取り始めた)。 */
-  reached?: true;
   arrived?: true;
   /** 運んだ piece の決着を、まだ転送していない先。 */
   queue?: [string, Piece[]][];
@@ -726,9 +727,9 @@ export class ShardKernel {
     this.boot();
   }
 
-  /** 試験が、状態を確かめるのに覗く。 */
-  peek(): { locks: ReadonlyMap<string, RowLock>; recentLowWater: Ts } {
-    return { locks: this.locks, recentLowWater: this.recentLowWater };
+  /** 試験が、状態を確かめるのに覗く。moves は、子として進める移動の数 (childMoves) である。 */
+  peek(): { locks: ReadonlyMap<string, RowLock>; recentLowWater: Ts; moves: number } {
+    return { locks: this.locks, recentLowWater: this.recentLowWater, moves: this.childMoves().length };
   }
 
   // ---- 起動と永続メタデータ ----
@@ -808,7 +809,8 @@ export class ShardKernel {
     // 再起動の前に予約した alarm がなくても、残った intent と phase 2 を片付け、子として受け取っている移動を進める
     // (docs/design-catalog-epoch.md の決めたこと 4)。
     const pendingWork = b.exec(`SELECT (SELECT count(*) FROM __intents) + (SELECT count(*) FROM __txn WHERE status = 'committed' AND done = 0) n`)[0]?.n as number;
-    if (pendingWork > 0 || this.childMoves().length > 0) this.deps.scheduleRedrive?.();
+    if (this.childMoves().length > 0) this.deps.scheduleRedrive?.("move");
+    else if (pendingWork > 0) this.deps.scheduleRedrive?.();
     const resume = Math.max(this.faults.hlcNoCeiling ? 0 : this.ceiling, this.maxCommit, maxPrepare, maxMoved, this.maxArrived, this.maxFloor);
     this.hlc = new Hlc(resume);
   }
@@ -2349,7 +2351,7 @@ export class ShardKernel {
     if (rec.to !== this.id) return [];
     this.incoming.push({ ...range, from_id: rec.from, epoch: x.epoch });
     for (const g of [...this.moved.keys()]) if (overlaps(blockOf(g), range)) this.moved.delete(g);
-    this.deps.scheduleRedrive?.();
+    this.deps.scheduleRedrive?.("move");
     return [{ kind: "background", effect: { kind: "move", epoch: x.epoch } }];
   }
 
@@ -3389,8 +3391,6 @@ export class ShardKernel {
 
   private finalizeStep(f: SettleTxnFrame<{ txn: string; c: Ts; pieces?: Piece[] }>): Step<void, SettleTxnFrame<{ txn: string; c: Ts; pieces?: Piece[] }>> {
     const req = f.req;
-    const reach = this.reachPieces(f);
-    if (reach) return reach;
     if (!f.arrived) {
       f.arrived = true;
       // いまは、どの piece もグループの全体なので、到着はグループの名前で確かめる。
@@ -3416,8 +3416,6 @@ export class ShardKernel {
 
   private abortStep(f: SettleTxnFrame<{ txn: string; pieces?: Piece[] }>): Step<void, SettleTxnFrame<{ txn: string; pieces?: Piece[] }>> {
     const req = f.req;
-    const reach = this.reachPieces(f);
-    if (reach) return reach;
     if (!f.arrived) {
       f.arrived = true;
       if (req.pieces) return wait(this.call("arrive", { groups: req.pieces.map((p) => p.g) }));
@@ -3433,17 +3431,6 @@ export class ShardKernel {
     const next = f.queue.shift();
     if (!next) return done(undefined);
     return wait({ kind: "peer", call: this.peer(next[0], "abort", { txn: req.txn, pieces: next[1] }) });
-  }
-
-  /**
-   * 転送された決着が運ぶ piece の移動を、まだ適用していなければ、その epoch まで列を適用する (受け取り始める)。転送の後で、未着の
-   * piece を引き取るからである (arrive)。piece を転送する親は、子が引き取った後でだけ転送するので、子は、ふつうはもう適用している。
-   */
-  private reachPieces<R extends { pieces?: Piece[] }>(f: SettleTxnFrame<R>): Step<void, SettleTxnFrame<R>> | null {
-    if (f.reached) return null;
-    f.reached = true;
-    const epoch = Math.max(-1, ...(f.req.pieces ?? []).map((p) => p.epoch));
-    return epoch > this.applied ? wait(this.call("toEpoch", { epoch })) : null;
   }
 
   // ---- 手続き: anchor への照会 ----

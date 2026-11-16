@@ -58,6 +58,10 @@ export class ShardCore implements ShardApi {
   get lastRedriveErrors(): string[] {
     return this.k.lastRedriveErrors;
   }
+  /** 子として進める移動の数。受け取り中か、受け取り終えたが move-end を記録させていない移動である。シミュレータの alarm が見る。 */
+  get movesToDrive(): number {
+    return this.k.peek().moves;
+  }
   // 試験が、状態を確かめるときに覗く。
   private get locks(): ReadonlyMap<string, unknown> {
     return this.k.peek().locks;
