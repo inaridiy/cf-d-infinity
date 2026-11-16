@@ -928,6 +928,42 @@ module m23c_live_end_w {
                    HAS_W = true, HAS_Y = true, TICKS = 0, T_MAX = 5, GCS = 0, R = 1).*
 }
 
+// 活性 (txnEnds) を、空にされたグループで。子は到着ではなく finish で受け持つ
+module m23c_live_end_empty {
+  import m23c_core(OLD_READS = true, FWD = true, MERGE = true, SPLIT_FLOOR = false, EMPTY_FLOOR = true, PREV_ANSWERS = false,
+                   WORKER_ROUTES = false, RETAIN = true,
+                   MOVES_N = 2, BACK = false, EMPTY = true, SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = false,
+                   HAS_W = true, HAS_Y = false, TICKS = 0, T_MAX = 5, GCS = 0, R = 1).*
+}
+// 活性 (txnEnds) を、範囲が S0 へ戻る形で
+module m23c_live_end_back {
+  import m23c_core(OLD_READS = true, FWD = true, MERGE = true, SPLIT_FLOOR = false, EMPTY_FLOOR = true, PREV_ANSWERS = false,
+                   WORKER_ROUTES = false, RETAIN = true,
+                   MOVES_N = 2, BACK = true, EMPTY = false, SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = false,
+                   HAS_W = true, HAS_Y = true, TICKS = 0, T_MAX = 5, GCS = 0, R = 1).*
+}
+// 活性 (txnEnds) を、変更ログを 2 回まで切り詰める形で (書き手 W)
+module m23c_live_end_retain {
+  import m23c_core(OLD_READS = true, FWD = true, MERGE = true, SPLIT_FLOOR = false, EMPTY_FLOOR = true, PREV_ANSWERS = false,
+                   WORKER_ROUTES = false, RETAIN = true,
+                   MOVES_N = 2, BACK = false, EMPTY = false, SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = false,
+                   HAS_W = true, HAS_Y = false, TICKS = 0, T_MAX = 5, GCS = 2, R = 1).*
+}
+// 保持と重ねること: 変更ログを 2 回まで切り詰め、書き手 Y (受け取る前の c で適用した intent と、受け取りの記録を消すこと)。移動 1 回 (HEAVY)
+module m23c_green_retain_y {
+  import m23c_core(OLD_READS = true, FWD = true, MERGE = true, SPLIT_FLOOR = false, EMPTY_FLOOR = true, PREV_ANSWERS = false,
+                   WORKER_ROUTES = false, RETAIN = true,
+                   MOVES_N = 1, BACK = false, EMPTY = false, SCAN2 = true, WRITE = false, PESSIMISTIC = false, OTHER = true,
+                   HAS_W = false, HAS_Y = true, TICKS = 0, T_MAX = 5, GCS = 2, R = 1).*
+}
+// 空にされたグループで、書く取引 (確定の検証が、範囲の床を窓の上端にして前の持ち主に尋ねる)
+module m23c_green_empty_w {
+  import m23c_core(OLD_READS = true, FWD = true, MERGE = true, SPLIT_FLOOR = false, EMPTY_FLOOR = true, PREV_ANSWERS = false,
+                   WORKER_ROUTES = false, RETAIN = true,
+                   MOVES_N = 2, BACK = false, EMPTY = true, SCAN2 = true, WRITE = true, PESSIMISTIC = false, OTHER = true,
+                   HAS_W = true, HAS_Y = false, TICKS = 0, T_MAX = 5, GCS = 0, R = 1).*
+}
+
 // ---- 赤: 条件を 1 つずつ外す ------------------------------------------------------------------------------------------
 
 // M23b のまま (古い読みなし)。案 A' の形で、読むだけの取引が、移動のために失敗する

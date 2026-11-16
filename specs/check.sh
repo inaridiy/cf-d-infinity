@@ -635,6 +635,7 @@ green   $f m23c_green_back_y m23cSafeRO                 # 範囲が S0 へ戻る
 green   $f m23c_green_split_floor m23cSafeRO            # 閾値を範囲の床にしても、持ち主が自分の版を重ねれば安全 (全表の span の形)
 green   $f m23c_green_retain m23cSafeRO                 # 変更ログを切り詰める (移動 1 回)。渡した行は logLowWater が手放した時刻を越えるまで残す
 green   $f m23c_green_empty m23cSafeRO                  # 空にされたグループは運ばれず、子は範囲の床より前の T を前の持ち主に尋ねる
+green   $f m23c_green_empty_w m23cSafe                  # 同上で、書く取引 (確定の検証も、範囲の床を窓の上端にして前の持ち主に尋ねる)
 red     $f m23c_base_ro roNeverFails                    # M23b の規則のまま: 案 A' の形で、読むだけの取引が移動のために失敗する
 red     $f m23c_red_child_below readConsistent          # 持ち主が、到着より前の T に、受け取った行で答える
 red     $f m23c_red_no_merge readConsistent             # 持ち主が、自分の版を重ねない (受け取る前の c で適用した intent を落とす)
@@ -645,6 +646,9 @@ red     $f m23c_red_worker_routes readConsistent        # Worker が古い読み
 red     $f m23c_red_empty_no_floor readConsistent       # 運ばれなかったグループの窓の始まり (範囲の床) を記録しない
 live    $f m23c_live_end txnEnds                        # 活性: 取引はいつか終わる (読みが intent や到着を待ち続けない)。OTHER なし
 live    $f m23c_live_end_w txnEnds                      # 同上、書く取引
+live    $f m23c_live_end_back txnEnds                   # 同上、範囲が S0 へ戻る形
+live    $f m23c_live_end_empty txnEnds                  # 同上、空にされたグループ (子は finish で受け持つ)
+live    $f m23c_live_end_retain txnEnds                 # 同上、変更ログを切り詰める形
 witness $f m23c_green_ro_w witnessAPrime                # 案 A' の形の読むだけの取引が、T を進めずに確定する
 witness $f m23c_green_ro_w witnessForward2              # 2 回の移動をまたいで、前の持ち主 2 つに尋ねた読みで確定する
 witness $f m23c_green_ro_y witnessOverlay               # 持ち主の重ねた版 (受け取る前の c で適用した intent) が答えになる
@@ -657,6 +661,7 @@ if [ "${HEAVY:-0}" = "1" ]; then
   green $f m23c_green_split_floor_y m23cSafeRO
   green $f m23c_green_retain_w m23cSafe                 # 書く取引で、変更ログを切り詰める
   green $f m23c_green_retain2 m23cSafeRO                # 移動 2 回で、変更ログを 1 回切り詰める
+  green $f m23c_green_retain_y m23cSafeRO               # 変更ログを切り詰め、書き手 Y (重ねることと、受け取りの記録を消すこと)
   live  $f m23c_live chainLive                         # OTHER ありで、refresh と尋ねる列が終わる (古い読みはどちらも使わない。M23b の m23b_live と同じ規則)
 fi
 for m in m23c_green_ro_w m23c_green_ro_y m23c_green_w m23c_green_retain m23c_green_empty m23c_base_ro m23c_red_child_below \

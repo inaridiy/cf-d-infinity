@@ -146,7 +146,7 @@ Serializable は保たれ、書き込みがあれば `COMMIT` の検証で競合
 書く取引の `COMMIT` は、移動がないときと同じく、読んだ行が別の接続に変えられていれば `SQLITE_BUSY` になる。
 答えも失敗も、行の置き場所では変わらない。
 `not owner` で失敗することはない。
-読み取り時刻が、変更ログを残す時間 (`LOG_RETAIN_MS`、今は 10 分) より古くなった取引は、移動がなくても、読みか `COMMIT` が `read too old` で失敗することがある (資源の限り)。
+読み取り時刻が、変更ログを残す時間 (`LOG_RETAIN_MS`、今は 10 分) より古くなった取引は、移動がなくても、読みが `read too old` で、`COMMIT` が競合で失敗することがある (資源の限り。Hrana ではどちらも `SQLITE_BUSY`)。
 (2026-11-15 に決めた約束を、2026-11-16 に改めた。前の約束では、移動の時刻より前の読み取り時刻で読む文は、読み取り時刻を進め、それまでに読んだ行が別の接続に書かれていれば競合になった。読むだけの取引が移動のために失敗するので改めた (`specs/m23c_old_reads_across_move.qnt`、`docs/design-refresh-across-move.md` の「古い読み」)。今のコードが守るのは一部である。動いた行への文は、範囲表を取り直して新しい持ち主へ送り、`not owner` では失敗しない。`Db.begin()` の取引は、分割の前に動いた範囲を読んでも書いてもいなければ、確定まで通る。まだ守らないのは 3 つで、どれも読んだ行が変わっていなくても失敗する。分割の前に動いた範囲を読んだ取引は、その範囲を移動の時刻より前の時刻で読む文が `read too old` で失敗する。分割の前に動いた行を書いたか、行ロックを取って読んだ取引は、次の文が `SQLITE_BUSY` (競合) で失敗する (どちらも `test/open/transaction-across-split.test.ts`)。SQL の `BEGIN` の取引は、分割の後に動いた行を書くと、`COMMIT` が `SQLITE_BUSY` (`read too old`) で失敗する (`test/open/locking-transaction-commit-after-split.test.ts`)。)
 
 ### 取引の中の DDL

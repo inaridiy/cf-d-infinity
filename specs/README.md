@@ -1418,6 +1418,7 @@ M23c は、その読みに T のまま答える規則を確かめる。
 
 `m23cSafe` は、M23b の `serializable`、`readConsistent`、`boundedRefusals`、`boundedAsks`、`parentFrozen` に、`boundedHops` (1 回の読みが前の持ち主に尋ねる回数は移動の数以下) を足し、`placementIndependent` に「古すぎる」で断られたときを足したものである。
 `roNeverFails` は、読むだけの X が失敗するのは「古すぎる」で断られたときだけである、という性質で、読むだけのインスタンスは `m23cSafeRO` (`m23cSafe` と `roNeverFails`) を確かめる。
+古い読みを入れると、読むだけの X を失敗させる手は「古すぎる」の断りだけになる (移動による refresh がなくなり、ほかの refresh は通らなくても取引を失敗させない) ので、`roNeverFails` は形の上で成り立つ。「読むだけの取引は移動で失敗しない」の中身は、答えが正しいこと (`readConsistent`、`serializable`) と、読みが待ち続けずに取引が終わること (`txnEnds`) が担う。`txnEnds` は、移動 2 回、範囲が S0 へ戻る形、空にされたグループ、変更ログの切り詰め、書く取引のそれぞれで確かめた。`m23c_base_ro` は、古い読みを外すと `roNeverFails` が破れることを示す。
 `logLowWater` は時計 - `R` より上がらないので、「古すぎる」は、T が、答えに要るシャードの時計で保持の幅より古いときだけに起きる (実装では `LOG_RETAIN_MS`、今は 10 分)。
 時相の性質は 2 つある。
 `txnEnds` は、X がいつか確定するか失敗すること (読みが intent や到着を待ち続けない) で、`chainLive` は、M23b と同じく、始めた refresh と尋ねる列がいつか終わることである。
@@ -1450,13 +1451,18 @@ M23c は、その読みに T のまま答える規則を確かめる。
 | `m23c_green_split_floor` | `m23cSafeRO` | 閾値を範囲の床にする。読むだけ、書き手 W | 1,306,232 | No violation |
 | `m23c_green_retain` | `m23cSafeRO` | 変更ログを 2 回まで切り詰める (保持の幅 1)。移動 1 回、読むだけ、書き手 W | 7,457,625 | No violation |
 | `m23c_green_empty` | `m23cSafeRO` | W が K2 の行を消す。空のグループは運ばれない。読むだけ、移動 2 回 | 771,188 | No violation |
+| `m23c_green_empty_w` | `m23cSafe` | 同上で、書く取引 (楽観) | 1,129,299 | No violation |
 | `m23c_live_end` | `txnEnds` (時相) | 読むだけ、書き手 W と Y、OTHER なし | 88,802 | No violation |
 | `m23c_live_end_w` | `txnEnds` (時相) | 書く取引 (楽観)、書き手 W と Y、OTHER なし | 179,431 | No violation |
+| `m23c_live_end_back` | `txnEnds` (時相) | 範囲が S0 へ戻る。読むだけ、書き手 W と Y、OTHER なし | 91,644 | No violation |
+| `m23c_live_end_empty` | `txnEnds` (時相) | 空にされたグループ (子は finish で受け持つ)。読むだけ、書き手 W、OTHER なし | 1,676 | No violation |
+| `m23c_live_end_retain` | `txnEnds` (時相) | 変更ログを 2 回まで切り詰める。読むだけ、書き手 W、OTHER なし | 95,328 | No violation |
 | `m23c_green_y` | `m23cSafe` | 書く取引 (楽観)、書き手 Y (HEAVY) | 11,502,165 | No violation |
 | `m23c_green_split_floor_y` | `m23cSafeRO` | 閾値を範囲の床にする。読むだけ、書き手 Y (HEAVY) | 8,420,809 | No violation |
 | `m23c_green_pess` | `m23cSafe` | 全表を 1 回読み、K2 を悲観で書く。書き手 W と Y (HEAVY) | 24,056,593 (5 分) | No violation |
 | `m23c_green_retain_w` | `m23cSafe` | `m23c_green_retain` で、書く取引 (HEAVY) | 10,255,846 | No violation |
 | `m23c_green_retain2` | `m23cSafeRO` | 変更ログを 1 回切り詰める。移動 2 回、読むだけ、書き手 W (HEAVY) | 26,682,901 (5 分) | No violation |
+| `m23c_green_retain_y` | `m23cSafeRO` | 変更ログを 2 回まで切り詰める。移動 1 回、読むだけ、書き手 Y (重ねることと、受け取りの記録を消すことが同時に起きる) (HEAVY) | 47,652,651 (10 分) | No violation |
 | `m23c_live` | `chainLive` (時相) | 読むだけ、書き手 Y、OTHER あり (to は 4 まで) (HEAVY) | 3,442,150 (9 分) | No violation |
 | `m23c_base_ro` | `roNeverFails` | M23b の規則のまま。読むだけ、書き手 W | 19,450 で反例 | 反例 |
 | `m23c_red_child_below` | `readConsistent` | 条件を 1 つ外す (`m23c_green_ro_w` の定数) | 4,637 で反例 | 反例 |
@@ -1469,7 +1475,7 @@ M23c は、その読みに T のまま答える規則を確かめる。
 
 状態数は、4 workers、heap 2.5 GB で、ほかの TLC の検査と同時に流さずに測った。
 赤の状態数は、TLC が反例を見つけるまでに数えた数で、流すたびに少し変わる。
-2026-11-16 に、`check.sh` の M23c の節を `HEAVY` なしで流し、36 件 (TLC の検査 23 件と run の試験 13 件) がすべて期待どおりで、13 分 (763 秒) かかった。HEAVY の 6 件は 1 本ずつ流して期待どおりだった (`m23c_live` が 9 分、`m23c_green_pess` と `m23c_green_retain2` が 5 分ずつ)。
+2026-11-16 に、`check.sh` の M23c の節を `HEAVY` なしで流し、40 件 (TLC の検査 27 件と run の試験 13 件) がすべて期待どおりで、15 分 (880 秒。初めの数分は、ほかの TLC の検査と同時だった) かかった。HEAVY の 7 件は 1 本ずつ流して期待どおりだった (`m23c_green_retain_y` が 10 分、`m23c_live` が 9 分、`m23c_green_pess` と `m23c_green_retain2` が 5 分ずつ)。
 `txnEnds` を OTHER ありで確かめると、ほかのシャードの `ReadTooOld` による refresh が、通らないまま何度でも始まる経路で破れる (25,693 状態で反例。モデルの OTHER は回数を数えないが、実装は 1 つの文につき 4 回までである)。これは検査の側の誤りなので、OTHER なしのインスタンスで確かめた。
 移動 2 回で変更ログを 2 回切り詰める形は、4 分で 2,045 万状態を数えても終わらなかったので、移動 1 回の形を既定にし、移動 2 回は切り詰め 1 回の形 (`m23c_green_retain2`) を HEAVY にした。
 
