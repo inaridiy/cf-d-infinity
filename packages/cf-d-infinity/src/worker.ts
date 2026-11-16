@@ -699,7 +699,7 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
       checkCount(req?.requests?.length ?? 0, "pipeline requests");
       return Response.json(await handlePipeline(req, (token) => dbFor(env, token, background), await batonSeal(env)));
     }
-    // 引数の数字だけの literal は、64 ビットに収まれば正確に読む (exactIntegers)。
+    // 引数の数の literal は、文面で INTEGER か REAL かを決める (numberLiterals。数字だけなら INTEGER で、64 ビットまで正確に読む)。
     const body = (await readJson(request, numberLiterals)) as Statement & { token?: number; statements?: Statement[]; intMode?: unknown };
     if (body.sql !== undefined) checkSql(body.sql);
     if (body.statements !== undefined) {
@@ -716,7 +716,7 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
     }
     const db = await dbFor(env, token, background);
     if (path === "/sql") {
-      // 引数は D1 互換の API と同じ toValue で値にする (数字だけの literal で 64 ビットに収まるものは、上で bigint になっている)。
+      // 引数は jsonParams で値にする。値でない引数 (JSON の配列と object) は、文を実行する前に断る。
       // 結果は D1 と同じ形で、INTEGER は本文の intMode の形である。JSON は bigint を書けないので、"number" か "string" だけを受ける
       // (src/client/results.ts)。intMode は文を実行する前に確かめる。
       const mode = intModeOf(body.intMode, true);

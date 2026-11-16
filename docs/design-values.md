@@ -196,7 +196,7 @@ SQL では `json_array(要素, ...)` で作る。
 | 境界 | 入る向き | 出る向き |
 |---|---|---|
 | Hrana | `integer` は `BigInt(文字列)` で INTEGER。`float` は REAL | INTEGER は `integer` (10 進の文字列)、REAL は `float` |
-| D1 互換の API、Service Binding、HTTP の `/sql` と `/batch` | `bigint` は INTEGER。`number` は、安全な整数なら INTEGER、ほかは REAL。真偽値は INTEGER。HTTP の JSON の、数字だけで書いた literal は、64 ビットに収まれば INTEGER (段 4) | 既定は、安全な範囲の INTEGER を `number` で返し、範囲の外は誤りにする。`intMode` で `bigint` か文字列を選べる。範囲の外の `last_row_id` は、既定では「返す rowid がない」(`null`、D1 の `meta` では 0。段 4)。HTTP は `bigint` を選べない |
+| D1 互換の API、Service Binding、HTTP の `/sql` と `/batch` | `bigint` は INTEGER。`number` は、安全な整数なら INTEGER、ほかは REAL。真偽値は INTEGER。HTTP の JSON の数の literal は文面で決め、数字だけなら INTEGER (64 ビットに収まれば正確。段 4)、小数点か指数があれば REAL (2026-11-16)。値でない引数は断る (2026-11-16) | 既定は、安全な範囲の INTEGER を `number` で返し、範囲の外は誤りにする。`intMode` で `bigint` か文字列を選べる。範囲の外の `last_row_id` は、既定では「返す rowid がない」(`null`、D1 の `meta` では 0。段 4)。HTTP は `bigint` を選べない |
 | Worker の SQLite (sql.js) | 下の「束縛」の表 | `useBigInt` で読む。INTEGER は `bigint`、REAL は `number` |
 | DO の SQL の API | 下の「束縛」の表 | 行イメージはタプル (文字列)、結果は型つきの読み |
 | シミュレータの node:sqlite | DO と同じ | DO と同じ (丸めて読む模倣を残す) |
@@ -308,6 +308,7 @@ Worker の SQLite で計算した値を引数に戻す場所 (`insertSelect`、V
 ### D1 互換の API、Service Binding、HTTP の JSON
 
 入る向きは、`toValue` (`src/client/d1.ts:24`、`src/entrypoint.ts:8`) の 1 か所で決める。
+`toValue` は型と 64 ビットの範囲を閉じ、値でない引数を、文を実行する前に断る (2026-11-16 の追記。この節の末尾)。
 `number` は、`Number.isSafeInteger` なら INTEGER、そうでなければ REAL とする。
 2^60 のような安全な範囲の外の整数の値は REAL になる。
 D∞ が丸めるのではなく、渡された double をそのまま入れる (INTEGER の列なら、SQLite がその値の整数にする)。
@@ -315,8 +316,10 @@ D∞ が丸めるのではなく、渡された double をそのまま入れる 
 断るなら、2^53 以上 2^63 未満の整数の値だけになるが、その範囲の REAL (1e17 など) を渡す文も断ることになる。
 2^53 以上の INTEGER を正確に渡すには、`bigint` を渡すか、Hrana を使う。
 
-HTTP の本文は JSON で、`JSON.parse` は数を JS の数に丸める。数字だけで書いた literal のうち、安全な整数の外にあって 64 ビットに収まるものは、reviver が受け取る元の文面 (`context.source`) から `bigint` にする (`src/entry.ts` の `exactIntegers`。段 4)。
-ほかの literal (安全な整数、小数点か指数のあるもの、64 ビットに収まらないもの) は、JS の数のまま `toValue` を通る。
+HTTP の本文は JSON で、`JSON.parse` は数を JS の数に丸める。数の literal の型は、reviver が受け取る元の文面 (`context.source`) で決める (`src/entry.ts` の `numberLiterals` と `jsonParams`)。
+数字だけで書いた literal は INTEGER である。安全な整数の外にあって 64 ビットに収まるものは、文面から `bigint` にする (段 4)。
+小数点か指数のある literal は REAL である。値が安全な整数のもの (`5.0`、`1e5`) は、reviver が印を付け、`toValue` の D1 の規則で INTEGER にならないようにする (2026-11-16 の追記)。
+64 ビットに収まらない数字だけの literal は、SQLite がその literal を読むのと同じく REAL である。
 JS の `JSON.stringify` は 1e21 未満の整数の値を数字だけで書くので、JS のクライアントが HTTP で 2^60 の double を送ると、Service Binding では REAL、HTTP では同じ値の INTEGER になる。値は等しく、違うのは格納の型だけである。
 HTTP の JSON では文面が値であり、数字だけの literal を整数として読むのは、JSON を読む多くの言語の決まりと同じである。
 Hrana の本文には reviver を掛けない (`float` の数は REAL である)。
@@ -330,6 +333,32 @@ HTTP の `/sql` は JSON なので、`"bigint"` は選べない (誤りにする
 `last_row_id` (`lastInsertRowid`) は、`"bigint"` と `"string"` では正確な値で返す。`"number"` で JS の数にできない `last_row_id` は、丸めずに「返す rowid がない」として扱う (`lastInsertRowid` は `null`、D1 の `meta.last_row_id` は行を入れなかった文と同じ 0)。誤りにはしない。RETURNING のない INSERT は結果の行を持たず、SQLite では成功するからである (段 4 の結果の「設計書から変えた点」の 2)。
 Service Binding は、呼び出し元の `intMode` を RPC の引数で運び (`query`、`batch`、`begin`)、`DinfDatabase` の側で変える。structured clone は `bigint` を運ぶので、`"bigint"` の結果もそのまま返る。
 誤りにするかどうかは値で決まり、行の置き場所には依らない。
+
+#### 2026-11-16 の追記: 入口で値を閉じる (計画書の未解決の問題 47)
+
+外部の確認で、入る向きに 2 つの穴が見つかった。
+1 つ目に、`toValue` の最後の枝が `v as Value` の素通しで、値でない引数が中へ入った。
+JSON の配列 `[[65, 66]]` は、要素の符号 (`encodeElem`) とキー文字列 (`keyString`) に `Uint8Array` として読まれ、BLOB の `x'4142'` になった。
+object `[{"a": 1}]` は、キー文字列を作る `lowerHex` の中で TypeError になった。
+`ArrayBuffer` も同じ TypeError になり、`Uint16Array` は workerd で要素ごとに 1 バイトへ切られ、キー文字列は要素から作られた。
+64 ビットの外の `bigint` は、入口では断らず、束縛のときに RangeError で落ちた。
+2 つ目に、HTTP の数を、文面ではなく値で読んでいた。`exactIntegers` は安全な整数を先に返し、`toValue` が安全な整数の JS の数を全部 INTEGER にしたので、文面に小数点や指数のある `5.0` と `1e5` が INTEGER になった。上の段落は、その前は「ほかの literal (安全な整数、小数点か指数のあるもの、64 ビットに収まらないもの) は、JS の数のまま `toValue` を通る」と書いていた。
+
+今の規則は次のとおりである。
+
+| 入口 | 規則 |
+|---|---|
+| HTTP の `/sql` と `/batch` (`src/entry.ts` の `numberLiterals` と `jsonParams`) | 数の literal は文面で決める。数字だけなら INTEGER (64 ビットに収まれば正確に読む。収まらなければ、SQLite の literal と同じく REAL)。小数点か指数があれば REAL。`true` と `false` は INTEGER の 1 と 0。JSON の配列と object は断る (JSON には BLOB を書く形がない)。`params` が配列でなければ 400 で断る。元の文面を読めない実行環境では、D1 互換の API と同じ規則で読む |
+| D1 互換の API と Service Binding (`src/client/d1.ts` の `toValue`、`src/entrypoint.ts`) | 変えていない数の規則 (安全な整数は INTEGER、ほかは REAL。`5.0` と `5` は JS の数として同じなので、どちらも INTEGER)。`bigint` は INTEGER で、64 ビットの外は断る。`Uint8Array`、`ArrayBuffer`、型つき配列と `DataView` は、そのバイトの BLOB (D1 と同じ)。配列、object、symbol、関数は断る。D1 互換の API は、D1 と同じく `bind` が同期で断る |
+
+断る誤りは `SqlError` で、何番目の引数か (1 から) と、受け付ける型を書く (`parameter 2 is an array; ...`、`parameter 1: the integer 9223372036854775808 does not fit in 64 bits`)。
+文を実行する前に断るので、取引の中でも何も書かない。どちらも引数の型で決まり、行の置き場所には依らない。
+HTTP の印 (小数点か指数のある安全な整数) は、reviver だけが作るクラスである。JSON の本文にも structured clone にも作れないので、利用者は偽れない。
+reviver は配列の要素の数だけを読み替え、本文の `token` などは JS の数のまま残す。
+
+検査は、規則を先に書き、前のコードで落ちることを確かめてからコミットした (`test/entry-values.ts`、規則 2)。
+シミュレータでは `test/entry-values.test.ts` が、HTTP の本文の読み方と D1 互換の API を、1 と 2 のシャードで、表を読まない文と主キーで読み書きする文に流す。
+workerd では `test/binding.test.ts` が、HTTP の `/sql` と `/batch`、Service Binding の `query`、`batch`、取引の `execute`、Worker の中の D1 互換の API に、同じ場面を流す。
 
 ### シミュレータ
 
@@ -1042,7 +1071,7 @@ DO の SQLite と Workers の CPU では測っていない。
 
 ### 設計書から変えた点
 
-1. **HTTP の JSON の整数の literal。** 「境界」の表は、HTTP の引数を D1 互換の API と同じ JS の数の規則で書いていた (2^53 以上の INTEGER を正確に渡すには `bigint` か Hrana)。HTTP では、本文の文面を JS の数に丸めるのは D∞ 自身なので、数字だけの literal で 64 ビットに収まるものを INTEGER として読むことにした (`src/entry.ts` の `exactIntegers`。reviver の `context.source` を使う)。決めたことの 2 (JS の数の引数) からは外れる。JS のクライアントが `JSON.stringify` で 2^60 の double を送ると、Service Binding では REAL、HTTP では同じ値の INTEGER になる。値は等しく、違うのは格納の型だけである。戻すなら、`src/worker.ts` の `readJson(request, exactIntegers)` の 2 つ目の引数を外す 1 行である。
+1. **HTTP の JSON の整数の literal。** 「境界」の表は、HTTP の引数を D1 互換の API と同じ JS の数の規則で書いていた (2^53 以上の INTEGER を正確に渡すには `bigint` か Hrana)。HTTP では、本文の文面を JS の数に丸めるのは D∞ 自身なので、数字だけの literal で 64 ビットに収まるものを INTEGER として読むことにした (`src/entry.ts` の `exactIntegers`。reviver の `context.source` を使う)。決めたことの 2 (JS の数の引数) からは外れる。JS のクライアントが `JSON.stringify` で 2^60 の double を送ると、Service Binding では REAL、HTTP では同じ値の INTEGER になる。値は等しく、違うのは格納の型だけである。戻すなら、`src/worker.ts` の `readJson(request, exactIntegers)` の 2 つ目の引数を外す 1 行である。2026-11-16 に、小数点か指数のある literal も文面で REAL と読むことにし、`exactIntegers` は `numberLiterals` になった (「D1 互換の API、Service Binding、HTTP の JSON」の 2026-11-16 の追記)。
 2. **`last_row_id`。** 設計書は決めていなかった。初めは結果の値と同じく、`"number"` で JS の数にできなければ誤りにした。`test/int64.test.ts` の、D1 互換の API で `bigint` の id を入れる場面が落ちた。RETURNING のない INSERT は結果の行を持たず、SQLite では成功する。誤りにすると、確定した書き込みが失敗に見え、呼び出し元がやり直すかもしれない。`"number"` では、「返す rowid がない」として扱うことにした。Service Binding と HTTP の `lastInsertRowid` は `null`、D1 の `meta.last_row_id` は行を入れなかった文と同じ 0 である。丸めない、書き込みを失敗に見せない、JSON に書ける、の 3 つを満たす。D1 の `meta` を `null` にしなかったのは、D1 の型が数で、Service Binding のクライアントは `lastInsertRowid` の `null` から「行を入れなかった」と「JS の数にできない」を見分けられないからである (見分けるには、RPC の形にもう 1 つ項目が要る)。`"bigint"` と `"string"` は正確な値を返す。行の中の INTEGER (RETURNING を含む) は、今までどおり誤りにする。
 3. **Service Binding の変換の場所。** 変換は `DinfDatabase` の側 (`pack`) で行い、クライアントは intMode を運ぶだけにした。アプリの Worker に入るクライアントにプランナーや変換のコードを入れないためである (`test/binding.test.ts` が 10 KB 未満を確かめる。今は約 4.8 KB)。
 4. **エクスポートの形式の版。** 設計書は file の形式を変えないと書いていた。CLI と Worker のあいだの JSON と file が、どちらも公開の後に版の違う相手と出会うので (古い CLI と新しい Worker、古い file と新しい CLI)、両方に版 (`EXPORT_FORMAT` = 1) を持たせた。版の行のない file (段 3 までの CLI が書いたもの) は断る (公開の前なので後方互換を持たない)。無限大の literal は `9e999` から `9.0e+999` (`realText`) になった。取り込みはどちらも読む。

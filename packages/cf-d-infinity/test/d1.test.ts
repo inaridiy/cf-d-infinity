@@ -137,9 +137,10 @@ describe("64-bit integers and NUL through the D1 compatible API", () => {
     const c = new SimCluster({ shards: 2 });
     const d1 = new D1Compatible(new Db(c));
     await d1.prepare(T).run();
+    // D1 と同じく bind が同期で断る (src/client/d1.ts の toValue。2026-11-16 から。前は実行のときに RangeError で落ちた)。
     for (const x of [2n ** 63n, -(2n ** 63n) - 1n]) {
-      await expect(d1.prepare("SELECT ? AS x").bind(x).all()).rejects.toThrow(/does not fit in 64 bits/);
-      await expect(d1.prepare("INSERT INTO w(id, n) VALUES (1, ?)").bind(x).run()).rejects.toThrow(/does not fit in 64 bits/);
+      expect(() => d1.prepare("SELECT ? AS x").bind(x)).toThrow(/parameter 1: the integer -?\d+ does not fit in 64 bits/);
+      expect(() => d1.prepare("INSERT INTO w(id, n) VALUES (1, ?)").bind(x)).toThrow(/does not fit in 64 bits/);
     }
     expect((await d1.prepare("SELECT count(*) AS c FROM w").first("c"))).toBe(0);
   });

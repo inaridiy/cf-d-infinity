@@ -4,10 +4,14 @@ import type { IntMode, RemoteResult, RemoteStatement, TransactionMode } from "./
 import type { Db, QueryResult } from "./client/db";
 import { toValue } from "./client/d1";
 import { intModeOf, rowidOut, rowsOut, valuesOut } from "./client/results";
-import type { Value } from "./types";
+import { SqlError, type Value } from "./types";
 import { clusterStatus, dbFor, exportRows, handle, importRows, schemaSql, slowQueries, type Env, type ExportCursor, type SlowQuery } from "./worker";
 
-const values = (params: unknown[] = []): Value[] => params.map(toValue);
+/** 引数を値にする (src/client/d1.ts の toValue)。値でない引数は、文を実行する前に断る。 */
+const values = (params: unknown = []): Value[] => {
+  if (!Array.isArray(params)) throw new SqlError("params must be an array");
+  return params.map((v, i) => toValue(v, i));
+};
 /**
  * 結果は D1 と同じ形で返す。INTEGER の形は、呼び出し元が選んだ intMode である (src/client/results.ts。既定は JS の数で、JS の数で
  * 正確に表せない INTEGER は誤りにする)。structured clone は bigint を運ぶので、"bigint" の結果もそのまま RPC で返る。
