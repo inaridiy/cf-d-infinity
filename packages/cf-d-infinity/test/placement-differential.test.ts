@@ -9,7 +9,8 @@
 //
 // 作った日 (2026-11-14) に見つけたもの: 未解決の問題 34 (伏せずに流すと、最初に見つかるのは seed 4。seed 1 から 100 のうち
 // sim で 36、reference-scans で 35、reference-full で 45 の seed で見つかる)。分割の前の範囲表で計画した複数行の INSERT が、行を
-// 2 つのシャードに入れる欠陥 (test/open/multi-row-insert-after-split.test.ts。分割で切る置き場所の seed 45)。
+// 2 つのシャードに入れる欠陥 (未解決の問題 35。分割で切る置き場所の seed 45。Epoch の段 2 で直し、再現は
+// test/multi-row-insert-after-split.test.ts へ移った)。
 //
 // 既知の未解決の欠陥 (placement-oracle.ts の KNOWN_OPEN) は、既定の実行では伏せる。伏せた数は最後の試験が確かめる
 // (伏せた欠陥がもう起きないなら、その試験が落ちる)。OPEN=1 を付けると伏せない。そのときは、欠陥に当たる seed が落ちる。

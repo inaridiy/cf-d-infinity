@@ -49,10 +49,8 @@ describe("live split", () => {
     const c = await setup();
     const { t, range } = await movingTenant(c);
     await insert(c, t, 7);
-    const slot = await c.reserveSplit("s0", "s2", range);
-    await c.shard("s2").beginIncoming({ ...range, from: "s0", slot: slot.id });
-    await c.shard("s0").fence({ ...range, to: "s2", slot: slot.id });
-    await c.switchRange({ ...range, to: "s2" });
+    // 移動を開き、親にだけ適用させる (fence)。子は、要求が届いたときに記録を適用して受け取り始める。
+    await c.moveAt("s0", "s2", range, ["s0"]);
     const db = new Db(c);
     expect(await getN(db, t)).toBe(7); // 所有権の切替だけで読める
     await db.query("UPDATE users SET n = 8 WHERE tenant_id = ? AND id = 1", row(t));
@@ -77,15 +75,11 @@ describe("live split", () => {
     const c = await setup();
     const { t, range } = await movingTenant(c);
     await insert(c, t, 5);
-    const slot = await c.reserveSplit("s0", "s2", range);
-    await c.shard("s2").beginIncoming({ ...range, from: "s0", slot: slot.id });
-    await c.shard("s0").fence({ ...range, to: "s2", slot: slot.id });
-    await c.switchRange({ ...range, to: "s2" });
+    const { epoch } = await c.moveAt("s0", "s2", range, ["s0"]);
     // 親は m を確定したが、応答が子に届かなかった。
-    await c.shard("s0").pull({ ...range, want: [{ g: JSON.stringify([t]), from: null }], to: "s2", maxBytes: 1_000_000 });
-    await c.shard("s2").drain(range);
-    const { m } = await c.shard("s0").finishMove(range);
-    await c.shard("s2").finishIncoming({ ...range, m });
+    await c.shard("s0").pull({ ...range, want: [{ g: JSON.stringify([t]), from: null }], to: "s2", maxBytes: 1_000_000, epoch });
+    // 子が移動を終えるまで進める (drain、親の finishMove、finishIncoming、move-end)。
+    await c.shard("s2").drain({ ...range, epoch });
     expect(await getN(new Db(c), t)).toBe(5);
     expect(c.backends.get("s0")!.exec("SELECT count(*) c FROM users WHERE tenant_id = ?", t)[0]!.c).toBe(0);
   });
@@ -94,10 +88,7 @@ describe("live split", () => {
     const c = await setup();
     const { t, range } = await movingTenant(c);
     await insert(c, t, 5);
-    const slot = await c.reserveSplit("s0", "s2", range);
-    await c.shard("s2").beginIncoming({ ...range, from: "s0", slot: slot.id });
-    await c.shard("s0").fence({ ...range, to: "s2", slot: slot.id });
-    await c.switchRange({ ...range, to: "s2" });
+    await c.moveAt("s0", "s2", range, ["s0", "s2"]);
     c.restart("s0");
     c.restart("s2");
     expect(await getN(new Db(c), t)).toBe(5);
@@ -111,12 +102,9 @@ describe("live split", () => {
     const c = await setup();
     const { t, range } = await movingTenant(c);
     await insert(c, t, 5);
-    const slot = await c.reserveSplit("s0", "s2", range);
-    await c.shard("s2").beginIncoming({ ...range, from: "s0", slot: slot.id });
-    await c.shard("s0").fence({ ...range, to: "s2", slot: slot.id });
-    await c.switchRange({ ...range, to: "s2" });
+    const { epoch } = await c.moveAt("s0", "s2", range, ["s0"]);
     const db = new Db(c);
-    const [n] = await Promise.all([getN(db, t), c.shard("s2").drain(range), getN(new Db(c), t)]);
+    const [n] = await Promise.all([getN(db, t), c.shard("s2").drain({ ...range, epoch }), getN(new Db(c), t)]);
     expect(n).toBe(5);
     await c.settle();
     expect(c.backends.get("s2")!.exec("SELECT count(*) c FROM users WHERE tenant_id = ?", t)).toEqual([{ c: 1 }]);
@@ -156,12 +144,11 @@ describe("counterexamples from m5b_live_migration", () => {
     // 移す前に時点を取る読み手。時点は w の確定の後、移す時刻 m の前にある。範囲表は移す前のものを持ち続ける。
     reader = await new Db(c).begin();
     await getN(reader, other);
-    const slot = await c.reserveSplit("s0", "s2", range);
-    await c.shard("s2").beginIncoming({ ...range, from: "s0", slot: slot.id });
-    await c.shard("s0").fence({ ...range, to: "s2", slot: slot.id });
-    await c.switchRange({ ...range, to: "s2" });
+    // 移動を開き、親にだけ適用させる (fence)。子は、記録を、届いた piece か、転送された phase 2 から知る。子の SQLite は、ここで作る。
+    const { epoch } = await c.moveAt("s0", "s2", range, ["s0"]);
+    await c.shard("s2").moves({});
     // 親は応答を返したが子の処理はまだで、グループは飛行中である。
-    const inFlight = await c.shard("s0").pull({ ...range, want: [{ g: JSON.stringify([t]), from: null }], to: "s2", maxBytes: 1_000_000 });
+    const inFlight = await c.shard("s0").pull({ ...range, want: [{ g: JSON.stringify([t]), from: null }], to: "s2", maxBytes: 1_000_000, epoch });
     const receive = () => (c.cores.get("s2") as unknown as { receive(p: unknown): Promise<void> }).receive(inFlight);
     // arrivedFirst: グループが子に着き終わってから、親に phase 2 が届く (m5b_red_p2)。そうでなければ、飛行中に届く (m5b_red_p2_window)。
     if (arrivedFirst) await receive();
@@ -171,7 +158,7 @@ describe("counterexamples from m5b_live_migration", () => {
     await c.sleep(5);
     // 飛行中だった応答がここで子へ届く。
     if (!arrivedFirst) await receive();
-    return { c, t, range, reader: reader! };
+    return { c, t, range: { ...range, epoch }, reader: reader! };
   };
 
   it("m5b_red_p2_window: applying at the parent loses the write in the flying snapshot", async () => {
@@ -238,11 +225,15 @@ describe("counterexamples from m5b_live_migration", () => {
     await c.settle();
     expect(await getN(reader, t).catch((e: Error) => e.message)).not.toBe(1); // T の時点の真の値は w が書いた 1 である
   });
-  it("a fenced parent refuses the read of a moved group", async () => {
+  // 段 2 (docs/design-catalog-epoch.md) から、断られた取引は範囲表を取り替えて、文を子で計画し直す。読み手は移動の前の時点で
+  // ほかのグループ (s1) を読んだだけなので、その読みは移す時刻 m まで変わっておらず、時点を m へ進めて、子が w の書き込みを答える。
+  it("a fenced parent refuses the read of a moved group, and the reader reads it at the child", async () => {
     const { c, t, range, reader } = await pendingIntent({}, true);
     await c.shard("s2").drain(range);
     await c.settle();
-    await expect(getN(reader, t)).rejects.toThrow(/not owner|moved at/);
+    const from = c.net.failed.length;
+    expect(await getN(reader, t)).toBe(1);
+    expect(c.net.failed.slice(from).filter((x) => x.m.to === "s0").map((x) => x.message)).toEqual(["not owner: s2"]);
   });
 
   const fencedWrite = async (faults: Faults) => {

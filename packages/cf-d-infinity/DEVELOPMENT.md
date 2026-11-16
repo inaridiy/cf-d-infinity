@@ -199,7 +199,8 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `src/sql/scratch.ts` | Worker の中の SQLite (sql.js) |
 | `src/sql/lexer.ts`、`parser.ts`、`printer.ts` | SQLite の方言の字句解析、構文解析、文面への出し直し |
 | `src/sql/cst.ts` | 構文木の入口。解析の前の書き換え、引数の束縛、定数の読み取り |
-| `src/meta.ts` | 表定義、DDL 履歴、範囲表、index の作成と書き込み禁止の期限、保守の操作の枠 |
+| `src/meta.ts` | 表定義と範囲表を記録する epoch の列 (表定義の遷移の prepare、commit、abort と、その期限。範囲の移動の move-start と move-end) |
+| `src/catalog.ts` | epoch の列の記録の型と畳み込み (`fold`)、記録を足せる条件 (`refusal`、M21 の Meta の手) |
 | `src/value.ts` | 値の格納の型 (INTEGER と REAL)。束縛の関数 `bindTyped` (DO、シミュレータ、Worker の SQLite の 3 つの Backend が通す)。行イメージの要素とタプル (`tupleSql`、`decodeElem`) と、要素を今の値に戻す橋 `fromTypedValue` |
 | `src/keys.ts` | キー文字列を作る関数 (`keyString`) と読み戻す関数 (`keyValues`、`keyParams`)。SQLite の型の親和性を写す `storedAs` |
 | `src/sql/depth.ts` | 式の木の深さの見積もり (DO の SQLite の上限は 100)。表を作るときに、D∞ が作る文を確かめる |
@@ -232,7 +233,7 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `test/rollback-read.test.ts` | どの過去時点も正確に再構成できること |
 | `test/migration.test.ts` | ライブ移動、`m5b` の反例、Autoscaler の判断 |
 | `test/routing.test.ts` | 範囲表。前の 4,096 個の slot の境目で動かすかぎり、token にする前の範囲表と同じ持ち主になること。区間の移動を乱択で重ねても、どの token にも持ち主がちょうど 1 つあること。行の置き場所の値 |
-| `test/placement-formats.test.ts` | token の区間にした後の形式。Meta の範囲表と分割の枠、シャードの移動の記録、piece を運ぶ要求の形と、まだ扱えない形 (ブロックを途中で切る移動、グループの一部の piece) を断ること |
+| `test/placement-formats.test.ts` | token の区間にした後の形式。Meta の範囲表と移動の記録、シャードの移動の記録、piece を運ぶ要求の形と、まだ扱えない形 (ブロックを途中で切る移動、グループの一部の piece) を断ること |
 | `test/workerd.test.ts` | 本物の workerd と DO の SQLite での結合テスト |
 | `test/ddl-concurrent.test.ts`、`test/ddl-harness.ts` | 取引と並行する DDL。index の作成、UNIQUE、DROP、列の追加、分割との競合を乱数の作業負荷で回し、index と表の一致、確定した書き込みの残存、表定義の収束を見る。見つかった欠陥の再現も含む |
 | `test/limits.test.ts` | シャード側の上限。結果の行数とバイト数、取引の大きさ、グループの列挙と大きさ |
@@ -253,7 +254,8 @@ Cloudflare は、デプロイ後も active な DO で旧コードを最大 300 �
 | `test/replay.test.ts` | 並行に流した文を、確定の時刻の順に 1 つの SQLite で再生し、1 文ずつ結果が同じこと (取引の中の DDL を含む) |
 | `test/typed-diff.test.ts` | 型のある引数を @libsql/client から流し、値と `typeof` を node:sqlite と比べる。`test/storage-class.test.ts`、`test/key-affinity.test.ts` も値の型とキー |
 | `test/upgrade.test.ts` | 保存形式の版ごとの材料 (`test/fixtures/storage/`) から起動して、答え、書き込み、分割、表定義の変更が通ること |
-| `test/unique-index-build.test.ts`、`test/rebuild-guard.test.ts`、`test/txn-across-schema-change.test.ts`、`test/migration-tools.test.ts`、`test/split-slot.test.ts` | 表定義の変更の安全 (モデル M12 から M15) と、本物の Drizzle の移行 |
+| `test/unique-index-build.test.ts`、`test/rebuild-guard.test.ts`、`test/m21-two-phase.test.ts`、`test/ddl-driver-stops.test.ts`、`test/txn-across-schema-change.test.ts`、`test/migration-tools.test.ts` | 表定義の変更の安全 (モデル M21、M13) と、本物の Drizzle の移行 |
+| `test/split-slot.test.ts`、`test/m21-moves.test.ts`、`test/fenced-before-switch.test.ts`、`test/range-returns.test.ts` | 範囲の移動 (モデル M21)。分割を進める側がどの手の前で止まっても子が移動を終えること、表定義の遷移と移動の排他、前の持ち主へ戻る範囲 |
 | `test/drizzle-kit.test.ts` | 本物の drizzle-kit が作った移行を、Drizzle の移行で流す |
 | `test/closed-stream-locks.test.ts`、`test/unique-pending-cost.test.ts`、`test/add-column-mixed-scan.test.ts` | 2026-11-12 に直した欠陥の再現 |
 | `test/determinism.test.ts` | ソースが時計、タイマー、乱数を直に呼ばないこと。同じ seed が同じ実行になること |

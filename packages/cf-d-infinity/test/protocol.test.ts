@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { keyString } from "../src/keys";
 import { SUBSLOTS, type Interval } from "../src/routing";
 import { encode } from "../src/shard/rows";
-import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type Piece, type PiecePayload, type PieceWant, type Span } from "../src/types";
+import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type ExecReq, type ExecRes, type Piece, type PiecePayload, type PieceWant, type ShardApi, type Span } from "../src/types";
 import { encodeTuple } from "../src/value";
 
 /**
@@ -17,13 +17,23 @@ function wireSample(): string {
   // 行イメージは、表定義の列の順のタプルである (版 4 から)。
   const change = { table: "t", pk: keyString([1n]), sk: keyString(["a"]), before: null, after: encodeTuple(values) };
   // 読みの要求は、結果の列名を運ぶ (版 5 から)。条件の範囲の引数には bigint が入る。
-  const read = { sql: "SELECT a, b FROM t WHERE a = ?", params: [5n], columns: ["a", "b"], spans: [{ kind: "pred", table: "t", alias: "t", where: "a = ?", params: [5n, 2.5] }] };
+  // 要求は、Worker のスナップショットの epoch と、表定義の epoch を運ぶ (版 6 から。schema の数は DdlEntry.version ではない)。
+  const read = {
+    sql: "SELECT a, b FROM t WHERE a = ?", params: [5n], columns: ["a", "b"], spans: [{ kind: "pred", table: "t", alias: "t", where: "a = ?", params: [5n, 2.5] }],
+    schema: 4, epoch: 7,
+  } satisfies Partial<ExecReq>;
+  // 書き込みの応答は、文が入れた行を、入れた順に運ぶ (版 7 から。lastInsertRowid はこれだけから決める)。
+  const written = { changes: [change], inserted: [{ table: "t", pk: keyString([1n]) }], count: 1 } satisfies Partial<ExecRes>;
+  // 表定義の遷移の prepare を適用したかを尋ねる要求と、その答え (版 8 から。docs/design-catalog-epoch.md の段 3)。
+  const prepared: [Parameters<ShardApi["prepared"]>[0], Awaited<ReturnType<ShardApi["prepared"]>>] = [{ epoch: 9 }, { ok: false, reason: "CHECK constraint failed" }];
   return [
     JSON.stringify(values, (_k, x) => (x instanceof Uint8Array ? { u8: [...x] } : typeof x === "bigint" ? { int: String(x) } : typeof x === "number" && !Number.isFinite(x) ? String(x) : x)),
     encode(change),
     keyString(values),
     encode(read),
     moveSample(),
+    encode(written),
+    encode(prepared),
   ].join("\n");
 }
 
@@ -39,10 +49,14 @@ function moveSample(): string {
   const range = { start: 32768 * SUBSLOTS, end: 65536 * SUBSLOTS } satisfies Interval;
   const part = { start: 7 * SUBSLOTS + 32768, end: 8 * SUBSLOTS } satisfies Interval;
   const span = { kind: "table", table: "t", claim: [range, part] } satisfies Span;
-  const piece = { g, range, after: null } satisfies Piece;
+  // piece は、運ぶ移動の move-start の epoch を持つ (版 9 から。docs/design-catalog-epoch.md の段 4)。
+  const piece = { g, range, after: null, epoch: 11 } satisfies Piece;
   const want = [{ g, from: null }, { g, at }] satisfies PieceWant[];
-  const payload = { g, range: part, after: null, upTo: at, m: 1024, rows: [{ table: "t", row: ["i1", null, "tx"] }], intents: [], schema: 3 } satisfies PiecePayload;
-  return JSON.stringify([span, range, part, piece, want, payload]);
+  const payload = { g, range: part, after: null, epoch: 11, upTo: at, m: 1024, rows: [{ table: "t", row: ["i1", null, "tx"] }], intents: [], schema: 3 } satisfies PiecePayload;
+  // 子から親への移動の要求は move-start の epoch を運び、進める側の drain も、その epoch を名指しする (版 9 から)。
+  const pull = { ...range, want, to: "s1", maxBytes: 1_000_000, epoch: 11 } satisfies Parameters<ShardApi["pull"]>[0];
+  const drain = { ...range, epoch: 11 } satisfies Parameters<ShardApi["drain"]>[0];
+  return JSON.stringify([span, range, part, piece, want, payload, pull, drain]);
 }
 
 /** 版ごとの、見本の指紋。古い版の値は、その版のときの見本のもので、いまの見本からは作れない。 */
@@ -51,6 +65,10 @@ const WIRE: Record<number, string> = {
   3: "9dadba1e69298e9c",
   4: "dfb952441f2824e0",
   5: "9f3b7b3e9eaa9b09",
+  6: "3ef766de45822d5c",
+  7: "ada064f16f3fde8e",
+  8: "edeccd61efb19a77",
+  9: "4e20b5834a72831a",
 };
 
 describe("protocol version", () => {

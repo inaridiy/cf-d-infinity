@@ -350,14 +350,21 @@ export const CAPTURE_TABLES = [
  * 主キーを書き換える UPDATE は、古いキーの削除と新しいキーの挿入になる。REPLACE が消す行は、recursive_triggers で DELETE の
  * trigger が先に走るので、同じ規則に載る。利用者の trigger は作れず (sql/ddl.ts)、外部キーは強制しないので、行を書き換えるのは
  * 文そのものと、それが発火する捕捉の trigger だけである。最後の new が、文の後の本体の行である。
+ *
+ * inserted は、文が入れた行を、SQLite が入れた順に並べたものである。INSERT の trigger の記録 (old がなく new がある) だけを数える。
+ * REPLACE が消してから入れた行は入り、UPSERT の DO UPDATE (UPDATE の trigger)、OR IGNORE が入れなかった行 (記録がない) は入らない。
+ * 正味の変更からは、これを作れない (REPLACE で入れ直した行も、DO UPDATE で更新した行も、before と after のある変更になる)。
+ * 文の結果の lastInsertRowid は、これだけから決める (ExecRes.inserted、src/client/db.ts の lastInsertRowid)。
  */
-export function capturedChanges(b: Backend, catalog: (t: string) => TableDef): Change[] {
+export function capturedChanges(b: Backend, catalog: (t: string) => TableDef): { changes: Change[]; inserted: Pick<Change, "table" | "pk">[] } {
   const net = new Map<string, { table: string; before: Tuple | null; after: Tuple | null }>();
+  const inserted: Pick<Change, "table" | "pk">[] = [];
   for (const r of b.raw(`SELECT tbl, old, new FROM __cap ORDER BY seq`).values) {
     const table = r[0] as string;
     const def = catalog(table);
     const old = r[1] === null ? null : tupleIn(r[1]);
     const fresh = r[2] === null ? null : tupleIn(r[2]);
+    if (fresh && !old) inserted.push({ table, pk: tupleKey(def, fresh).pk });
     if (old) {
       const at = `${table}\0${tupleKey(def, old).pk}`;
       const e = net.get(at);
@@ -380,7 +387,7 @@ export function capturedChanges(b: Backend, catalog: (t: string) => TableDef): C
     out.push({ table: n.table, ...tupleKey(def, image), before: n.before, after: n.after });
   }
   if (imageChecks.report) for (const c of out) checkAfter(b, catalog(c.table), c.pk, c.after, "the trigger capture");
-  return out;
+  return { changes: out, inserted };
 }
 
 /** 試験の検査。捕捉でまとめた変更後の行が、本体の行と同じであること。 */

@@ -1,6 +1,6 @@
 # CatalogEpoch による Meta の一本化の設計
 
-状態：設計。段 1 (列と畳み込み) を実装した (2026-11-15、末尾の「段 1 の結果」)。段 2 から段 4 の実装はまだない。モデルは M21 (`specs/m21_catalog_epoch.qnt`) にあり、結果は [specs/README.md](../specs/README.md) の M21 の節に書いた。持ち主の判断が要ることと決めたことは、「段 1 の結果」の前にまとめた。
+状態：設計。段 1 (列と畳み込み)、段 2 (要求が epoch を運ぶ)、段 3 (DDL の 2 相化)、段 4 (移動) を実装した (2026-11-15 と 16、末尾の「段 1 の結果」から「段 4 の結果」)。モデルは M21 (`specs/m21_catalog_epoch.qnt`) にあり、結果は [specs/README.md](../specs/README.md) の M21 の節に書いた。持ち主の判断が要ることと決めたことは、「段 1 の結果」の前にまとめた。
 作成日：2026-11-14
 前提：[overview.md](./overview.md)、[design-subslots.md](./design-subslots.md)、[specs/README.md](../specs/README.md) の M11 から M15、M18、M19、M5b
 
@@ -299,7 +299,7 @@ Worker のキャッシュは、今の `Db.cached` (`src/client/db.ts:1239`) が�
 取引は、最初に読むか書くかしたときのスナップショットを確定まで使う (`Txn.catalog`、`src/client/db.ts:630`)。今と同じである。
 範囲表だけが進んだ後も、取引は古いスナップショットのまま進む。
 動いていない行への文は、そのシャードが移動の記録を適用していても通る (M21 の `witnessPinnedSurvives`)。
-動いた区間に触った文は、今と同じく `not owner:` で失敗し、利用者が取引をやり直す。
+動いた区間に触った文は、`not owner:` で断られた後、`schema` が同じスナップショットを取り直して、新しい持ち主へ送り直す ([design-refresh-across-move.md](./design-refresh-across-move.md)。2026-11-15 に改めた。末尾の「移動をまたぐ取引 (2026-11-15)」)。
 
 ## 今の仕組みとの対応
 
@@ -493,7 +493,7 @@ M21 は、進める側がどこで止まっても、次の 2 つが成り立つ�
 
 1. 書き込みが止まる DDL が増えることを認める。進め方を 1 通りにするためである。止まるのは `prepare` から `commit` か `abort` までで、行を確かめる DDL では、その確かめの時間を含む。`docs/sql-language.md` に書く。
 2. 新しい表を作るだけの DDL でも、`prepare` の往復を挟む。
-3. 試適用で index を 2 度作るかどうかは、段 3 で、行の多い表で測ってから決める。
+3. 試適用で index を 2 度作るかどうかは、段 3 で、行の多い表で測ってから決める。段 3 で測り、2 度作る形のままにした (「段 3 の結果」の測り)。
 4. 移動は、`move-start` の後は子が自分の alarm で進める。止まった分割の間、全表の読みが `migrating:` で断られる時間を短くするためである。
 5. 順序は計画書の順番のとおりにする。値の作り直しの段 3 の後、token の区間の段 2 の前に、段 1 から段 4 を入れる。
 6. 表定義の epoch は、`prepare`、`commit`、`abort` のどれでも進める (M21 が全部の赤を確かめた形)。`commit` だけで進める案は、取引を古くする回数が減るので、実装の後で、赤をその案の上でも確かめ直してから採るかを決める。
@@ -598,3 +598,843 @@ model にしかない条件 (操作は 1 度だけ、進める側が止まった
 - 表定義の版を比べる値を、`DdlEntry.version` から `schema` に替える。段 1 の `commit` の記録が運ぶ `DdlEntry.version` は、段 3 で記録の形を変えるときに消す。
 - 畳み込みの費用。段 1 の Meta は、呼ばれるたびに列の全部を読んで畳む (今も `__ddl` の全部を読んでいた)。シャードも畳むようになるので、最後の epoch で覚えておく形を考える。
 - 古い Meta の写し (`test/meta-old.ts`) と `META_SHADOW` は、段 3 で表定義の遷移を 2 相にするまで残す。答えが変わる段 2 の変更 (`Catalog` に足すもの) は、比べる前に古い答えに合わせて落とす。
+
+## 段 2 の結果 (2026-11-15)
+
+段 2 で、要求が Worker のスナップショットの epoch と表定義の epoch を運び、シャードが Meta の列の写しを持つようになった。
+断られた試みは、古い計画を送り直さず、新しいスナップショットで計画し直す。
+Meta の記録と入口は段 1 のままで、DDL と分割の手順も変えていない。
+通信の版は 6、保存の形式は版 4 で、どちらも移行は書かない。
+
+### 要求が運ぶものと、シャードが確かめること
+
+| 要求 | 運ぶもの |
+|---|---|
+| `ExecReq`、`PrepareReq`、`CommitReq` (anchor から参加者への `prepare` も) | `schema` (表定義が最後に変わった epoch。`Catalog.schema`) と `epoch` (スナップショットの epoch。`Catalog.epoch`) |
+| `syncSchema` | `{ schema }`。DDL を全シャードへ適用させる手と、分割の枠を取る前の適用が使う |
+| `beginIncoming` の答え、`fence`、`PiecePayload` | `schema` は表定義の epoch である。`MetaCore.startSplit` は、枠の版と一緒に、その版の表定義の epoch を返す |
+| `unchanged` | `schema` は表定義の epoch。`epoch` は運ばない (下の「ずれたところ」) |
+
+`Catalog` に `epoch` と `schema` を足した。
+Meta の入口 (`applyDdl` の `basedOn`、取り消し、公開、枠) は、段 3 まで `DdlEntry.version` で話す。
+`SchemaMoved` は、版と一緒に表定義の epoch を運ぶ。
+
+シャードは、要求の入口 (`schemaStep`) で、M21 の `gate` と同じ順に確かめる。
+
+1. 要求の `schema` が自分の表定義の epoch より小さければ、`not owner: stale schema` で断る。大きければ、Meta の列を適用してから確かめ直す (intent を決着させる今の手順のまま)。
+2. 要求の `epoch` が自分の写しの最後の epoch より大きく、要求の行か claim が自分のスナップショットで自分のものでなければ、範囲の記録だけを適用する (`catchUpStep`)。表定義の記録の手前で止まる。要求の `epoch` が小さいことでは断らない。
+3. 同期区間の入口 (`enter` の `assertOwned`) と書き込みの守り (`claimed`) が、所有を引く。手放した範囲 (`__fenced`) か、自分のスナップショットの範囲表で自分のものでない範囲なら `not owner`。全表の読みの claim も同じ規則で引く。`__fenced` の拒否は段 4 まで残す。分割の手順は、範囲表を切り替える前に親を fence するので、親のスナップショットが切り替えを知る前から断れるのは、こちらだけである。
+
+欠陥のスイッチ `ignoreFence` は、意味を広げて、`__fenced` とスナップショットの両方の所有の確かめを外す (M21 の `m21_red_owner_unchecked`)。
+
+### シャードの写し
+
+シャードの `__ddl(version, entry)` を `__epoch(epoch, rec)` にした。Meta の列のうち、適用した分を、epoch 0 から隙間なく、Meta と同じ記録の形で持つ。
+表定義 (`defs`)、表定義の epoch、所有を引く範囲表は、写しを `src/catalog.ts` の `fold` で畳んで作る。
+畳んだ結果はメモリに持ち、記録を足したときだけ畳み直す (段 1 の申し送りの「畳み込みの費用」)。
+Meta は、段 1 と同じく、呼ばれるたびに畳む。シミュレータでは Meta の答えの object が Worker にそのまま渡り、持ち続けられるので、控えを共有しないためである。
+続きは `MetaCore.epochsSince(after)` (新しい入口) で取る。
+
+| 記録 | 写しに足す手 |
+|---|---|
+| `genesis`、`move-start`、`move-end` | 文を持たない。表定義の記録と一緒に適用するとき (`applyStep`) と、範囲の記録だけを適用するとき (`catchUpStep`)。後者は intent を決着させない |
+| `commit` (段 1 の形。`DdlEntry` を運ぶ) | 文を実行し、同じ取引で写しに足す (`applyStep`)。取り消された版と、それを取り消す版の組は、今と同じく、両方とも実行しない。比べるのは `DdlEntry.version` である。畳むと取り消す前の表定義に戻るので、表定義は飛ばしても飛ばさなくても同じになる |
+| `prepare`、`abort`、`of` のある `commit` (段 3) | まだ書かれない。届いたら、シャードは適用せずに断る |
+
+### 断られた試みを計画し直す
+
+Worker が断られた要求を送り直す場所を全部見た。計画を捨てて計画し直すようにしたのは 2 か所で、残りは、もとから試みごとに計画し直しているか、計画を送り直さない。
+
+| 場所 | 段 2 より前 | 段 2 |
+|---|---|---|
+| 複数のシャードに書く autocommit の文 (`Db.dispatch` から `Db.transaction`) | 断られると (古い表定義、`not owner`、`migrating`、競合)、新しい取引で、最初の計画をそのまま送り直した。未解決の問題 35 と 38 はこれである | やり直す試みのスナップショットの epoch か表定義の epoch が、最初の計画のものと違えば、計画を捨てて、その試みの取引で計画し直す。一度違えば、後の試みでも最初の計画には戻らない (計画し直した試みが競合で断られた後に戻ると、古い計画を送り直す。`test/reference-write-after-add-column.test.ts` の 2 つ目)。最初の計画の採番は戻す。スナップショットが最初の計画と同じ (競合、`migrating`) なら、同じ計画を送る (計画は待ちと採番を含むので、競合のたびに計画し直すと、分割も DDL もない実行の RPC の列まで変わる) |
+| 取引の中の文 (`Db.begin()`、`Db.transaction(fn)`、D1 の batch の `Txn.statement`。SQL の `BEGIN` と Hrana の取引の `Db.attemptStatement`) | `not owner` を利用者へ返した。取引は自分の範囲表を持ち続けたので、動いた範囲に触る文は、取引の終わりまで断られた | `not owner` (表定義が古いという `not owner: stale schema` は除く) なら、表定義の epoch が同じで範囲表が新しいスナップショットを取り、取引の範囲表だけを取り替えて、文を計画し直す (`Txn.reroute`、3 回まで)。捨てた試みの採番は戻す。取引が名乗る表定義の epoch は変わらない。取引が溜めた書き込みの行か、行ロックを取って読んだ範囲が、新しい範囲表で別のシャードのものなら、取り替えずに競合で断る (下の 37)。`COMMIT` は計画し直す文ではないので、取り替えない |
+| 計画の途中で表を読む autocommit の文 (`inTxn`) | 試みごとに、取引の表定義で計画し直していた | 変えない |
+| 利用者の関数の取引 (`Db.transaction(fn)`、`batch` の区切り)、Hrana の `BEGIN` から始まる batch | 試みごとに関数か batch を頭から流し、文ごとに計画し直していた | 変えない |
+| 1 つの autocommit の文 (`Db.attemptStatement`) | 試みごとに計画し直し、採番を戻していた | 変えない |
+| 取引の要求の読み直し (`Txn.call`) | 応答を待つ間に読み取り時刻が進んだときと、`moved at` で時刻を進めたときに、同じ要求を同じシャードへ、新しい時刻で送り直す | 変えない。表定義と範囲表は変わっていないので、計画は古くない |
+| index の項目を書く取引 (`Db.writeIndex`) | 範囲表を取り直し、項目を新しい範囲表で振り分け直して書く | 変えない |
+| 分割の枠 (`reserveSplit`)、DDL の記録 (`Db.record`) | 版が進んでいたら取り直してやり直す | 適用させる数を表定義の epoch にした。データの文の計画ではない |
+
+`src/client/d1.ts`、`src/binding.ts`、`src/worker.ts`、`src/entry.ts` には、送り直す繰り返しがない。
+段 2 で足した採番の戻し (`Db.dispatch`、`Txn.statement`) は、捨てた試みが計画を終えた後に、同じブロックから誰も取っていないときだけ戻す (`Db.idsUndo`)。worker.ts は、同じ isolate の接続でブロックを共有する (`sharedIds`) ので、確かめずに戻すと、ほかの接続が取った番号をもう一度配ることがある。SQL の `BEGIN` の取引の文を計画し直すときは、`Db.attemptStatement` の今の戻し方を通り、これは、この確かめをしていない (下の「見つけて直していないもの」)。
+
+### 未解決の問題 35、37、38
+
+| 問題 | 段 2 より前 | 段 2 |
+|---|---|---|
+| 35 (分割の前の計画の複数行 INSERT) | シャードの書き込みの守りが `write outside claim:` で断り、INSERT が失敗した | 計画し直して、行を持ち主ごとの文に分ける。`test/multi-row-insert-after-split.test.ts` へ移した。置き場所の差分の検査は、伏せていた形 (表定義を作った Db で初めの行を入れる) を伏せずに流す |
+| 38 (ADD COLUMN の前の計画の基準経路の書き込み) | 足した列を既定値で上書きした | 新しい表定義で計画し直す。`test/reference-write-after-add-column.test.ts` へ移した |
+| 37 (取引が分割をまたげない) | 動いた範囲に触る文と `COMMIT` が `not owner` で失敗した | 動いた行への文は新しい持ち主へ行き、`not owner` で失敗しない。`Db.begin()` の取引は、分割の前に動いた範囲を読んでも書いてもいなければ、確定まで通る。まだ通らない形は 3 つで、`test/open/` に残した (下) |
+
+37 のうち、まだ通らないのは次の 3 つである。どれも、読んだ行が変わっていなくても失敗するので、成否が置き場所で変わる。
+
+- 分割の前に動いた範囲を読んだ取引 (`test/open/transaction-across-split.test.ts`)。その範囲を移動の時刻 m より前の時刻で読むと、子は `read too old: moved at m` で断る。取引は読み取り時刻を m へ進めようとして、それまでの読みを確かめ直す (`Txn.advance`) が、その読みは、親が移動の前の範囲表の claim で答えたものである。親は、手放した範囲を含む claim を `not owner` で断り、子は、床 m より前の時刻の確かめに答えない。誰も読みが今も成り立つとは言えないので、取引は時点を進められない。同じ取引の `COMMIT` も、溜めた読みと書き込みが親のものとして残るので、親に `not owner` で断られる。
+- SQL の `BEGIN` の取引が、分割の後に動いた行を書く (`test/open/locking-transaction-commit-after-split.test.ts`)。書き込みは最新の状態で実行され、子が受ける。`COMMIT` では、子の prepare が取引の T で所有を確かめ、T は子の床より前なので、`read too old` で断る。子が持つ書き込みと読みは、どれも子が受け取った後の時刻 F から検証されるのに、所有は T で引く。
+
+- 分割の前に動いた行を書いたか、行ロックを取って読んだ取引 (`test/open/transaction-across-split.test.ts` の 3 つ目)。次の文が競合で断られる。範囲表を取り替えると、溜めた書き込みは書いたときのシャードのものとして残り、新しい持ち主へ送る文の overlay に入らない。行ロックを取る文 (SQL の `BEGIN` の書き込み、`BEGIN IMMEDIATE` の主キーの読み) は最新の状態で実行されるので、子の床にも止められず、取引自身の書き込みを見ないまま答えた。行ロックは読んだシャードのメモリにだけあるので、ロックを取って読んだ行も、新しい持ち主では別の接続が書けて、読み直すと食い違った (段 2 の作業の確かめで見つけた。`test/transaction-own-writes-across-split.test.ts`)。いまは、範囲表を取り替えずに競合で断る (`Txn.reroute`)。
+
+直すには、親が移動の前の時刻を、子が受け取った後の時刻を受け持って、移動をまたぐ読みを確かめ直す規則と、溜めた読みと書き込みを新しい持ち主へ移す規則が要る。
+親は自分の変更ログで、子は受け取った後の自分の変更ログで答える。片方だけでは足りない。子は、グループを受け取った時刻 (piece の m) から書き込みを受けるが、範囲の床 m は `finishMove` が後で発行するので、その間の子の書き込みを親は知らない。
+要求の epoch が移動の記録より新しいとき (読み手が移動を知っていて、両方に尋ねるとき) だけ答えさせる必要もある。
+この規則は M21 にない (M21 の取引は動いた行で断られ、M18 は移動をまたぐ取引の検証を扱っていない)。
+規則 3 により、モデル (M5b を広げる) を先に書く。持ち主の判断で、別の作業がモデルを書いている。
+「Worker」の節の、動いた区間に触った文についての文は、そのモデルの作業が直す。
+
+### 検査
+
+先に書いた試験の 2 つ (`test/transaction-on-unmoved-rows-across-split.test.ts`、`test/lagging-child-catches-up.test.ts`) は、段 2 より前のコード (`44306cf`) で通り、段 2 の後も通る。
+1 つ目は、動いていない行の取引が、分割を知った親でも通ること (M21 の `m21_red_strict_epoch`) を、Worker を通して確かめる。2 つ目は、子が範囲の記録を適用する前に、最新の範囲表と表定義の要求を受けて追いつくことを確かめる。
+
+M21 の赤のうち段 2 が届く 4 つに、再生を足した (`docs/model-coverage.md`)。
+`m21_red_stale` と `m21_red_owner_unchecked` と `m21_red_strict_epoch` は `test/epoch-requests.test.ts` に、シャードへ直に要求を送る形で置いた。
+`m21_red_owner_unchecked` の形は、段 2 より前のシャードが黙って受けたもの (範囲表で別のシャードのもので、一度も手放していない行の書き込み) で、`ignoreFence` で受けるように戻すと、シミュレータの書き込みの検査が、持ち主でないシャードに残る行として見つける。
+`m21_red_no_recheck` は、今までの再生 (`test/stale-plan-after-wait.test.ts`) が、表定義の epoch で比べるようになった。
+
+RPC の列。`test/history.test.ts` と `test/replay.test.ts` の既定の seed (61 件) を、`44306cf` と段 2 で `RPC_TRACE` を付けて流し、送り元、宛先、種類の列を比べた。
+49 件は同じで、12 件が違った。どれも分割か古い表定義が関わる。
+
+| 違った試験 | 原因 |
+|---|---|
+| `history` の「while shards are added」の seed 21 から 26、「with splits and restarts together」の 32 から 34、「with pessimistic transactions ... with splits and restarts」の 51 と 54 (11 件) | 分割の後、取引の文が `not owner` で終わらず、範囲表を取り替えて新しい持ち主へ行く (`Txn.reroute`)。子が範囲の記録を適用する (`catchUpStep`)。取引の成否が変わるので、作業負荷の続きも変わる。数を出す印を一時的に入れて `SEEDS=21`、`31`、`51` で `history` を流し (`SEEDS` はどの場面の seed も置き換える)、取り替えと追いつきが起きることを確かめた |
+| `replay` の「with a UNIQUE index that spans shards built during the run」の seed 5 (1 件) | 実行の途中で index を作る DDL が入り、複数のシャードに書く autocommit の文が古い表定義で断られた。やり直す試みは、計画し直す (`Db.dispatch`)。数を出す印を一時的に入れて流し、この seed で 6 つの文が計画し直されることを確かめた |
+
+meta の呼び出しは RPC の列に出ないので、`ddlSince` から `epochsSince` への置き換えは列を変えない。
+
+段 1 の Meta との比べ合い (`META_SHADOW`) を、Meta を多く呼ぶ試験 (`ddl-concurrent`、`split-slot`、`rebuild-guard`、`unique-index-build`、`schema-failure`、`ddl-vs-split-race` の 153 件) で流し、違いは 0 件だった。
+段 2 で足したもの (`Catalog` の `epoch` と `schema`、`startSplit` の `schema`、`SchemaMoved` の表定義の epoch) は、比べる前に新しい Meta の答えから落とす (`test/meta-old.ts` の `stage1Answer`、`stage1Error`)。`epochsSince` は古い Meta にないので比べない。`test/catalog.test.ts` の乱択の比べ合いも同じ落とし方をする。
+
+欠陥の表 (`scripts/fault-table.mjs --from 1 --to 40 --procs 3`、コミットした作業ツリーで)。見つけた数は、どの行も減らなかった。
+各欄は、落ちた試験の数 / 流した seed ごとの試験の数である。
+
+| 欠陥 | 段 | replay | history | ddl-concurrent |
+|---|---|---|---|---|
+| (なし) | 前 (`44306cf`) | 0/120 | 0/240 | 0/520 |
+| (なし) | 後 (`04a0c9e`) | 0/120 | 0/240 | 0/520 |
+| `noSchemaRecheck` | 前 | 0/120 | 0/240 | 37/520 |
+| `noSchemaRecheck` | 後 | 0/120 | 0/240 | 39/520 |
+| `ignoreFence` | 前 | 0/120 | 82/240 | 80/520 |
+| `ignoreFence` | 後 | 0/120 | 82/240 | 80/520 |
+| `staleWideRead` | 前 | 0/120 | 0/240 | 16/520 |
+| `staleWideRead` | 後 | 0/120 | 0/240 | 16/520 |
+| `childKeepsOldSchema` | 前 | 0/120 | 0/240 | 0/520 |
+| `childKeepsOldSchema` | 後 | 0/120 | 0/240 | 0/520 |
+
+`noSchemaRecheck` と `staleWideRead` の ddl-concurrent は、落ちる seed の顔ぶれが少し変わった (同じ seed でも、計画し直しと追いつきで実行が変わる)。
+`childKeepsOldSchema` は、前も後も、乱択の検査では見つからない (`docs/model-coverage.md` の「Switches that match no red module」のとおり)。
+表は `04a0c9e` で取った。その後の `f055c56` は、行ロックを取って読んだ範囲が動いた取引の範囲表を取り替えないことだけを足した (分割の後の取引の文だけが変わる)。RPC の列と、下の数は `f055c56` で取り直した。
+
+置き場所の差分の検査の「台本の途中で 1 回分割する」置き場所で、分割の後の取引の文と `COMMIT` の結果を、seed 1 から 300 で数えた (3 つの実行の形)。
+取引の出し方は、`Db.begin()` (表の object)、SQL の `BEGIN` (sql)、Hrana の baton (baton) である。
+
+| 実行 | 段 | 文: 通った | 文: `not owner` | 文: `read too old` | 文: ほかの競合 | `COMMIT`: 通った | `COMMIT`: `not owner` | `COMMIT`: ほかの競合 |
+|---|---|---|---|---|---|---|---|---|
+| sim | 前 | 329 | 406 | 110 | 0 | 82 | 92 | 45 |
+| sim | 後 | 437 | 0 | 355 | 52 | 74 | 90 | 55 |
+| reference-scans | 前 | 318 | 406 | 118 | 0 | 99 | 85 | 35 |
+| reference-scans | 後 | 418 | 0 | 374 | 50 | 92 | 82 | 45 |
+| reference-full | 前 | 161 | 509 | 181 | 0 | 110 | 75 | 29 |
+| reference-full | 後 | 266 | 0 | 520 | 62 | 101 | 70 | 43 |
+
+制約の違反で失敗した文は数えていない。
+
+文の `not owner` は、どの形でも 0 になった。前は、object と sql の取引の文が、分割の後に動いた範囲に触ると、取引の終わりまで断られた (baton は要求ごとに範囲表を取り直すので、前から 0 だった)。
+そのうち、分割の前に動いた範囲を読んでいなかった取引の文は通るようになり、読んでいた取引の文は `read too old` に、書いていた取引の文は競合になった (37 の形)。台本の半分は、取引を表の丸ごとの読みで始めるので、`read too old` が多い。
+`COMMIT` の `not owner` は残る (37 の 1 つ目の形の `COMMIT`)。
+検査は、分割の後の文の `not owner` を違いとして報告するように締めた。`COMMIT` は、もとから競合を許しているので、緩いままである。締めた検査は、段 2 で seed 1 から 300 が通り、段 2 より前のコードでは、既定の 30 seed のうち 12 が落ちる。
+
+### 設計の本文からずれたところ
+
+- `refresh` と `unchanged` は `epoch` を運ばない。どちらも、取引がそのシャードで読んだ範囲を送る要求で、そのシャードは、そのときもう自分のスナップショットで範囲を持っていた。範囲の記録を適用する必要が起きない。
+- 範囲の記録だけを適用する手 (`catchUpStep`) は、表定義の記録の手前で止まる。表定義の記録は intent を決着させてから適用するもので、要求の表定義の epoch が自分より新しければ、入口が先にそちらへ回すからである。
+- 所有の確かめは、`__fenced` の拒否の隣に足した。置き換えてはいない (段 4 まで、親は範囲表の切り替えより前に fence する)。
+- シャードは移動の記録 (`Snapshot.moves`) を所有に使わない。移動の途中の規則 (到着、時刻 m、`Migrating`、`ReadTooOld`) は、今と同じく `__incoming`、`__fenced`、`__arrived` が持つ。
+- Meta は畳んだ結果を覚えない (上の「シャードの写し」)。
+
+### 見つけて直していないもの
+
+- 37 の 3 つの形 (上)。
+- Hrana の baton の取引は、要求ごとに、その要求の接続の範囲表で組み立て直す (`Txn.load`) ので、分割の前に書いた行が動くと、上と同じく、行ロックを取る文が取引自身の書き込みを見ないまま答える (`test/open/baton-own-write-across-split.test.ts`)。段 2 より前のコードでも同じである。不変条件の候補: 取引の文は、取引自身の書き込みを必ず見る (見られないなら答えない)。持ち主は Worker の取引の層。
+- `Db.attemptStatement` は、失敗した文の採番を、同じブロックなら無条件に戻す。worker.ts は同じ isolate の接続でブロックを共有するので、その間にほかの接続が同じブロックから取っていれば、その番号をもう一度配り、後の INSERT が主キーの UNIQUE で失敗する (`test/shared-rowid-block-rollback.test.ts`)。不変条件の候補: 採番した rowid は、どの接続にも 1 度しか配らない。
+
+### 段 3 に要るもの
+
+- Meta が `prepare`、`abort`、`of` のある `commit` を書き、シャードが `prepare` の禁止 (`open.fence`) で書き込みを断る。いまのシャードは、これらの記録を断る (`applyStep`)。`TableDef.building` と `locked` の印を、スナップショットの `open` に替える。
+- `schema` を、どの記録で進めるかの持ち主の判断 6 (いまは、段 1 の `commit` の記録だけが進める)。
+- `test/meta-old.ts` と `META_SHADOW` は、段 3 で消せる。比べる前に段 2 の欄を落とす関数 (`stage1Answer`、`stage1Error`) も一緒に消す。
+- 移動をまたぐ読みの確かめ直しの規則と、取引が溜めた読みと書き込みを新しい持ち主へ移す規則 (上) は、段 3 ではなく、37 の作業である。モデルが入ってから、`Txn.advance`、`Txn.reroute`、子の prepare の所有の時刻に入れる。
+
+## 移動をまたぐ取引 (2026-11-15)
+
+「Worker」の節は、動いた区間に触った文が `not owner:` で失敗し、利用者が取引をやり直す、としていた。
+2026-11-15 に、取引は途中の移動をまたいで続く、と約束した (`docs/sql-language.md` の「取引」)。
+設計は [design-refresh-across-move.md](./design-refresh-across-move.md)、モデルは M23 (`specs/m23_refresh_across_move.qnt`) にある。
+この文書で変わるのは、取引が確定まで使うスナップショットの意味だけである。
+取引が確定まで名乗るのは `schema` で、範囲表は `NotOwner` のたびに取り直す。
+取り直したスナップショットの `schema` が違えば、今と同じく、表定義の変更で古くなった取引として失敗する。
+「取引は、最初に読むか書くかしたときのスナップショットを確定まで使う」と「範囲表だけが進んだ後も、取引は古いスナップショットのまま進む」は、表定義の部分について読む。
+要求が `epoch` と `schema` を運ぶこと、シャードが所有を自分のスナップショットで引くことは変わらない。
+範囲表の取り直しだけを先に入れても安全である。確かめは今と同じく読んだシャードへ行き、親は `NotOwner`、子は床で断るので、取引は競合で失敗する (M23 の `m23_impl`。答えは誤らないが、規則 4 はまだ破れている)。
+
+## 段 3 の結果 (2026-11-16)
+
+段 3 で、どの DDL も、Meta の列の `prepare` から `commit` か `abort` へ進むようになった。
+取り消し (逆操作の文を持つ次の版)、`TableDef.building` と `locked`、DROP の前の書き込み禁止の版 (`lockTables`、`finishLock`)、記録の前に重複を調べる `Db.checkUnique` はなくなった。
+分割の枠 (`SplitSlot`) と、範囲の移動の手順は段 2 のままである (段 4)。
+通信の版は 8、保存の形式は版 5 で、どちらも移行は書かない。
+
+### 記録と期限
+
+| 記録 | Meta が書くとき | シャードがすること (記録を写しに足すのと同じ 1 つの同期の取引で) |
+|---|---|---|
+| `{ kind: "prepare", mode, ddl, fence, staging? }` | `MetaCore.prepare(sql, { guard }, basedOn)`。`basedOn` が最新の表定義の epoch でなければ `SchemaMoved`。遷移が開いているか分割の枠があれば `SchemaBusy`。文 (`staging.sql` と `ddl.sql`) を Meta の SQLite の空の表で試して巻き戻し、通れば記録して、期限を付ける | 先に intent を全部決着させる (今までどおり、表定義の記録の前に `settleAll`)。`staging.sql` (index の表) を作る。以後、`fence` の表への書き込みを `TableLocked` で断る (`assertUnlocked` が、スナップショットの開いている遷移を見る) |
+| `{ kind: "commit", of, at? }` | `MetaCore.commit(epoch, acks, at)`。遷移が開いていること (ONE_EXIT)、`acks` が範囲表の全シャードを覆うこと (ALL_ACKS) を確かめ (`refusal` の `one-exit` と `all-acks`)、文を Meta の SQLite でも実行して残す。期限を消す | prepare の `ddl.sql` を実行する。`at` があれば時計を進め、`ddlFloor` を取り直す。失敗すれば、取り消さずに止まる (`schemaStuck`、health の `schemaError`) |
+| `{ kind: "abort", of, reason }` | `MetaCore.abort(epoch, reason)`。進める側が失敗したとき。期限切れなら `expire` が書く。もう abort された遷移には記録せず、記録した理由を返す。commit された遷移は断る | `staging` の表を名前で消す。禁止が解ける |
+
+期限は `__meta` の `lease` (`[{ epoch, started, until }]`) で、prepare が付け、commit と abort が消す。
+進める側は期限の半分ごとに `MetaCore.renew(epoch)` で延ばし、止まれば 5 秒 (`LEASE_MS`) のうちに、延ばし続けても prepare から 5 分 (`TRANSITION_MAX_MS`) で、Meta の入口の `expire` が abort を書く。
+abort の理由は「(遷移の名前) stopped before it finished and was withdrawn; the table is unchanged」か「... did not finish within 300 seconds ...」で、遷移の名前は、index の作成なら `CREATE INDEX <名前>`、取引が読んだ表の DROP なら `the lock on <表> before DROP TABLE`、ほかは文そのものである (`src/catalog.ts` の `describeOpen`)。
+
+シャードの新しい入口 `prepared({ epoch })` は、prepare の epoch まで列を適用し、その遷移が自分のスナップショットで開いていれば ok を返す。
+mode が `trial` なら、書き込みを止めた表に `ddl.sql` を試して巻き戻し (`ShardKernel.trial`、rollback-read と同じ形)、SQLite が通したかを返す。
+もう開いていなければ (先に abort を適用した) ok: false を返す。
+
+### 進め方
+
+`Db.changeSchema` は、どの DDL も同じ手で進める。新しい表を作るだけの DDL も同じである (決めたこと 2)。
+
+1. 表定義を取り、文を Worker の SQLite で再生できることを確かめ (`assertReplays`)、Meta に prepare を記録させる (`prepareDdl`)。`SchemaMoved` なら取り直し、`SchemaBusy` なら待つ (60 秒)。何もしない DDL (IF NOT EXISTS で表がある、など) は、何も記録されずに終わる。
+2. 期限を延ばし始め、範囲表の全シャードに `prepared` を尋ねる (`preparedAll`)。どれかが ok でなければ、その理由で失敗する。移動の途中で適用を待つシャードには、待って尋ね直す。
+3. mode ごとの仕事をする (`work`)。`build` は止まった行を読んで index の表へ項目を書き、読んだ時刻の最大を `at` にする。`guard` は、取引が読んだ範囲を持つシャードに `unchanged` を尋ねる。
+4. Meta に commit を記録させる。どこかで失敗すれば abort を記録させ、Meta が先に abort していれば、その理由を返す。
+5. commit を全シャードに適用させる (`syncAll`)。書き込みの禁止を早く解くためで、失敗は捨てる。
+
+進める側の手を、進める側の止まる検査 (`test/ddl-driver-stops.test.ts`) が止めずに流したときの列は次のとおりである (2 シャード。`catalog` は数えない)。
+
+| 場面 | 手の列 |
+|---|---|
+| 片方のシャードの行が CHECK に反する ADD COLUMN | `prepare` `renew` `s0.prepared` `s1.prepared` `abort` `s0.syncSchema` `s1.syncSchema` |
+| 行のある表への、シャードをまたぐ UNIQUE の index | `prepare` `renew` `s0.prepared` `s1.prepared` `s0.exec` `s1.exec` `s1.exec` `s1.commitLocal` `s0.exec` `s0.commitLocal` `commit` `s0.syncSchema` `s1.syncSchema` |
+| 同じ batch が読んだ表の DROP | (読む取引の手の後で) `prepare` `renew` `s0.prepared` `s1.prepared` `s0.unchanged` `s1.unchanged` `commit` `s0.syncSchema` `s1.syncSchema` |
+
+段 3 より前の、行で失敗する DDL の列は `s0.syncSchema` `s1.syncSchema` `applyDdl` `s0.syncSchema` `s1.syncSchema` `s0.syncSchema` `s1.syncSchema` だった (記録の前の適用、記録、記録の後の適用、取り消しの後の適用)。
+
+### mode と fence
+
+| DDL | mode | fence |
+|---|---|---|
+| CREATE TABLE、CREATE VIEW、DROP VIEW、DROP INDEX、列だけの一意でない CREATE INDEX | `plain` | なし |
+| DROP TABLE、ALTER TABLE ... RENAME TO | `plain` | 対象の表 |
+| シャード内の UNIQUE index、式か WHERE のある index | `trial` | 対象の表 |
+| ALTER TABLE ... ADD COLUMN | `trial` | 対象の表 |
+| 行のある表への、シャードをまたぐ UNIQUE の index | `build` | 対象の表 (staging は `__gidx_<index>`) |
+| 取引が読んだ表の DROP TABLE | `guard` | 消す表 |
+
+### 消したもの
+
+| 場所 | 消したもの |
+|---|---|
+| `src/meta.ts` | `applyDdl`、`revokeDdl` と `revoke`、`publishIndex`、`lockTables`、`finishLock`、`renewLock`、`building`、`holders`、`ddlSince`、`entries`、`append`、`schemaOf`、`build_lease`。`Catalog.version` と `Catalog.revoked`、`SchemaMoved.version`、`SplitSlot.version` (枠は表定義の epoch `schema` で持つ) |
+| `src/catalog.ts` | 段 1 の、`DdlEntry` を運ぶ `commit` の記録と `DdlEntry` (`version`、`reverts`、`reason`、`guard`)、`Snapshot.version` と `revoked` |
+| `src/sql/ddl.ts`、`src/types.ts` | `ParsedDdl.undo` と `build`、`publishBuild`、`TableDef.building` と `locked`、使われていなかった `MetaApi` |
+| `src/shard/kernel.ts`、`core.ts`、`step.ts` | `schemaFailed` の手続き、Meta への `revokeDdl`、取り消しの組を飛ばす処理 (`applyStep` の `skip`) |
+| `src/client/db.ts` | `record` (記録の前の全シャードへの適用)、`syncRecorded`、`guardedDrop`、`checkUnique`、`buildIndex`、`stillBuilding`、Cluster の 6 つの入口 |
+| `src/worker.ts` | Meta の DO の 6 つの入口と `ddlSince`。`schemaSql` (論理エクスポートの表定義) は `catalog().ddl` から作る。`/admin/ddl` は表定義の epoch を返す |
+| 欠陥のスイッチ | `dropAfterExpiry` (`commitAfterAbort` に広げた)、`scanBeforeLock` (`checkBeforePrepare` に広げた) |
+| 試験 | `test/meta-old.ts`、`META_SHADOW` (`test/sim.ts` の `shadowMeta`)、`stage1Answer` と `stage1Error`、`test/catalog.test.ts` の段 1 の比べ合い |
+
+古い Meta との比べ合いを消す前に、残る使い道がないことを確かめた。
+比べ合いは、新旧の Meta の同じ名前の入口を同じ順で呼んで答えを比べるもので、段 3 の Meta には、比べていた入口のうち表定義の 6 つ (`applyDdl`、`revokeDdl`、`publishIndex`、`lockTables`、`finishLock`、`renewLock`) がない。
+残る入口 (`catalog`、分割の枠の 5 つ、`switchRange`、`allocate`) の答えも、表定義の版の数と取り消しの印がなくなり、表定義の epoch が prepare と abort でも進むので、同じにならない。
+乱択の比べ合い (`test/catalog.test.ts` の 60 seed) の並びは、どれも表定義の 6 つの入口を呼ぶ。
+表定義の遷移の条件は、M21 と突き合わせる `test/catalog-m21.test.ts` (段 3 でも変えずに通る) と、`test/catalog.test.ts` の書き直した試験、下の再生が確かめる。
+
+### 決めたこと 3 (試しで index を 2 度作るか) の測り
+
+シャード内の UNIQUE index (`CREATE UNIQUE INDEX ux ON p(tenant_id, code)`、主キー 2 列、`code` は 30 字ほどの TEXT) を、行の数を変えて node:sqlite (Node 24) で作った。
+3 回流した中央値である。
+
+| 行 | 1 度だけ作る | 試して巻き戻す | 試した後に作る |
+|---|---|---|---|
+| 100,000 | 35 ms | 34 ms | 30 ms |
+| 1,000,000 | 399 ms | 402 ms | 399 ms |
+
+試しの費用は、index を 1 度作るのと同じで、書き込みが止まる時間は、その分だけ長くなる (100 万行のシャードで約 0.4 秒)。
+試しで index を 2 度作る形のままにした。
+`prepare` で本物の index を作り、`abort` で名前で消す形にすると、作るのは 1 度で済むが、`prepare` が利用者の表に触ることになり、遅れて `prepare` と `abort` を続けて見るシャードと、分割で生まれたシャードが、作って消すことになる。
+節約できるのは 100 万行で 0.4 秒ほどで、書き込みが止まる時間の上限 (5 分) と比べて小さい。
+DO の SQLite が取引 (`transactionSync`) の中の DDL を巻き戻し、確定のときに同じ文がもう一度通ることは、手元の workerd で確かめた。Meta は DDL ごとに、文を自分の SQLite の取引の中で試して巻き戻す (`tryShadow`) ので、workerd の試験の全部の DDL がこの経路を通る。シャードの試しが通る場合と通らない場合は、`test/workerd.test.ts` の「tries a change that can fail on rows on the fenced table ...」が通す。
+巻き戻した書き込みが課金されるかは、Cloudflare で測っていない (`docs/platform-facts.md` にない)。持ち主の許可を得た計測の項目に足す。
+
+### 設計の本文からずれたところ
+
+- `prepare` の `staging` の表定義は、prepare を畳んだときから `Snapshot.tables` に載り、abort で消える。進める側が、commit の前に、その表へ項目を書くからである。利用者の文からは見えない (内部の名前で、Worker の SQLite の履歴にもない)。
+- `build` の prepare の `ddl` は、出来上がった形 (表定義の `globalIndexes` に index を足したもの、index の表の表定義、`indexes`、利用者の文) を持ち、行の側の index (`__gidx_<index>__rows`、一意でない) を作る文だけを `ddl.sql` に置く。
+- どの `ADD COLUMN` も `trial` にした。`CHECK` と `NOT NULL` だけでなく、STRICT の表の既定値の型も既存の行で確かめられ、SQLite の `ADD COLUMN` は表の形を書き換えるだけなので、試すのは安い。`NOT NULL` で既定値のない `ADD COLUMN` は、新しい SQLite では空の表では通るので、Meta では断られず、行のあるシャードの試しで断られる。
+- DDL の遷移と分割の排他は、段 4 まで分割の枠が守る。`refusal` の `ddl-waits-move` と `move-waits-ddl` は使わない。試験が `switchRange` を直に呼んで `endSplit` を呼ばないと、列に開いた移動が残り、`ddl-waits-move` で全部の DDL が止まるからである。Meta が `refusal` で決めるのは、`one-open`、`one-exit`、`all-acks` の 3 つである。
+- スナップショットは、開いている遷移を一覧 (`Snapshot.opens`) でも持つ。欠陥のスイッチ `overlappingTransitions` を入れた Meta の列も畳むためで、Meta の条件が守られていれば、1 つか空である。期限も遷移ごとに持つ。
+- `commitAfterAbort` は、閉じた遷移の遅れた commit を受けて、同じ prepare をもう一度記録し、それを確定する。列は壊れず、abort から開き直すまでの書き込みは止まっていない。
+- `commitWithoutAcks` は、Worker の側で最後のシャードに `prepared` も、commit の後の適用も送らない。Meta の側では ok の集合を確かめない。`FAULT=` は両方に入れる (`test/sim.ts` の `BOTH_FAULTS`)。
+- `prepared` の要求の `early` は、欠陥のスイッチ `checkBeforePrepare` だけが付ける。シャードは列を適用せずに、記録を読んで、いまの表で試す。
+- 重複のある列への `CREATE UNIQUE INDEX` (行が同じシャードにある) の誤りの文が、D∞ の文 (`UNIQUE constraint failed: p has duplicate values`) から SQLite の文 (`UNIQUE constraint failed: p.tenant_id, p.code`) になった。記録の前に調べていた `Db.checkUnique` がなくなり、各シャードの試しが SQLite の文を返すからである。`test/schema-failure.test.ts` のほかの場面 (行の片方が反する部分 UNIQUE、CHECK に反する ADD COLUMN) の文は変わらない。
+- 分割の途中に出した DDL の誤りの文が「a shard split is in progress」から「a shard split of s0 is in progress」になった。記録の前に全シャードへ移動の途中かを尋ねる手がなくなり、Meta の枠の `SchemaBusy` で待つからである。
+- 分割の枠を取る前の全シャードへの適用 (`reserveSplit`) は残した。段 3 からは安全のためには要らない (取り消しがないので、枠の後に表定義の記録が入らない)。欠陥のスイッチ `splitWithoutSync` は、段 3 から何も戻さない。枠と一緒に段 4 で消す。
+
+### 検査
+
+先に今のコードで用意した検査 (規則 2)。
+
+- 進める側を各手の前で止める検査 (`test/ddl-driver-stops.test.ts`、`test/ddl-driver.ts`)。手の列を止めずに流して取り、手ごとに最初から流し直して、その手の前で止める。止めた後で、文は効いたか効かなかったかのどちらかであること、表へ書けること、別の DDL が通ること、全シャードが最新の表定義を適用でき、適用の失敗を報告していないことを確かめる。段 3 より前のコードで、index の作成と、読んだ表の DROP の場面は通り、行で失敗する ADD COLUMN の場面は落ちた。Meta が版を記録した後、シャードへ適用させる前に進める側が止まると、取り消しは、どれかの要求が行の反するシャードに版を適用させるまで起きず、その間、ほかの接続は列を足した表定義で計画した (4 つの値の INSERT が「table p has 5 columns but 4 values were supplied」で失敗した)。どこでも効かない文が、効いたように見えた。この場面は `test/open/` に置いてから段 3 に入り、段 3 で 3 つとも通ったので、戻した。
+- `test/schema-failure.test.ts` は、重複のある UNIQUE と CHECK に反する行の場面の誤りの文を、完全に一致で確かめるようにした。段 3 で変わったのは、上に書いた 1 つだけである。どの場面でも、表は書けるままである。
+- `test/open/split-reserve-revoked.test.ts` を、段 3 の形に写して `test/split-reserve-revoked.test.ts` へ移した。行で失敗する DDL を進める側が、s1 の試しが通らないのを見て abort を記録し、全シャードに適用させる前に止まる。分割の枠を取る前の適用は、prepare と abort を順に適用するだけで断られず、split() は 1 回で通る。
+
+M21 の段 3 の赤の再生は `docs/model-coverage.md` の M21 の行にある。
+新しく書いたのは `test/m21-two-phase.test.ts` の 9 つの場面で、どれも、直したコードで正しく終わることと、欠陥のスイッチを入れると、モデルの反例と同じ不変条件が破れることを確かめる。
+スイッチは、表を作った後で入れる (場面の前提の表を作る DDL にスイッチが掛からないように)。
+
+| M21 の赤 | スイッチ | スイッチを入れたときの姿 |
+|---|---|---|
+| `m21_red_trial_no_fence` | `ignoreTableLock` | 試しの後に CHECK に反する行が入り、s0 が commit を適用できずに止まる |
+| `m21_red_trial_no_drain` | `ddlIgnoresIntents` | 試しが決着していない intent の行を見落とし、s0 が commit を適用できずに止まる |
+| `m21_red_trial_early` | `checkBeforePrepare` | prepare を適用する前に試し、その後の書き込みを受けて、s0 が止まる |
+| `m21_red_drop_check_early` | `checkBeforePrepare` | prepare の前に「変更なし」と答え、その後に書かれた行が DROP で消える |
+| `m21_red_drop_no_fence` | `ignoreTableLock` | 確かめた後に書かれた行が DROP で消える |
+| `m21_red_trial_missing_ack` | `commitWithoutAcks` | 答えなかったシャードが commit を適用できずに止まる。Meta の確かめだけを残すと、Meta が commit を断る |
+| `m21_red_drop_missing_ack` | `commitWithoutAcks` | prepare を適用しなかったシャードが、DROP が完了を返した後の書き込みを受け、その行が消える |
+| `m21_red_two_exits` | `commitAfterAbort` | 期限で abort された index の遅れた commit が通り、項目のない index が公開される (abort の適用が index の表を消すので、abort の後の行だけでなく、全部の行が index から引けない) |
+| `m21_red_two_open` | `overlappingTransitions` | モデルの順 (index を作っている間に同じ表の DROP が確定する) では、Meta が commit のときに自分の SQLite で文を実行するので、消えた表への index の commit が記録されずに断られる (2 つ目の守り)。同じ欠陥は ADD COLUMN の順で表に出る: index の commit が、列を足す前の表定義で、足した列を表定義から消す |
+
+`m21_red_early_commit` は、`commitWithoutAcks` だけでは届かない。index の作成の行の走査は prepare の epoch を名乗るので、飛ばされたシャードも、行を読まれる前に prepare を適用するからである。モデルの順 (項目を書く前に commit する) は、`publishBeforeBackfill` が `test/unique-index-build.test.ts` で再生する。
+`test/ddl-concurrent.test.ts` の「DDL が全シャードに適用される前に完了を返す」欠陥の検査の検査 (lost-write check) は、確定の後の `syncSchema` を空にする形から、どのシャードも prepare を適用せずに ok と答え、確定の後にも適用しない形にした。`commitWithoutAcks` (3 つのうち 1 つのシャードを飛ばす) では、この作業負荷は seed 201 から 260 で 1 度も当たらなかった。
+
+M12 と M14 の行は、M21 の行に置き換えた (決めたこと 7)。M15 の行は、段 4 で分割の枠がなくなるまで残す。`m15_red_no_based_on` は、段 3 から形がない (取り消しがないので、枠の後に表定義の記録が入らない) ので D にした。M11 と M13 の行は残す。
+
+### 比べたもの
+
+RPC の列。`test/history.test.ts` と `test/replay.test.ts` の既定の seed (61 件) を、段 3 の前 (`6c24560`) と後 (`3b6d6d7`) で `RPC_TRACE` を付けて流し、送り元、宛先、種類の列を比べた。
+3 件は同じ (クラスタを作らない集計の試験で、列が空) で、58 件が違った。
+
+| 違った試験 | 原因 |
+|---|---|
+| `history` の 33 件と、`replay` の DDL を作業負荷の前にだけ流す場面の 9 件 (42 件) | シャードに表定義を適用させる要求 (`syncSchema` と、新しい `prepared`) を除くと、列は同じである。どの試験も表を作る DDL で始まり、DDL 1 つの要求が、記録の前の `syncSchema` と記録の後の `syncSchema` から、`prepared` と commit の後の `syncSchema` に替わった。42 件とも、シャードごとに、前の `syncSchema` の数と、後の `prepared` と `syncSchema` の数の和が等しい |
+| `replay` の「実行の途中で index を作る」の seed 1 から 8 (8 件) | 作業負荷の途中で DDL を流す場面である。DDL の要求の種類が替わり (上と同じ)、取り消しの後の全シャードへの適用がなくなったので、最初の DDL から後の列の交わり方が変わる。数を出す印を一時的に入れて seed 1 を流した (前後とも試験は通る): DDL は前後とも 11 回で、成否も同じ (7 回通り、4 回は重複で失敗)。シャードごとの表定義の要求は、前が `syncSchema` 27 回 (記録の前の適用 11、記録の後の適用 11、index の作成の終わり (公開か取り消し) の後の適用 5)、後が `prepared` 11 回と `syncSchema` 11 回 (commit か abort の後の適用) だった。書き込みが `TableLocked` で待ったのは、前後とも 0 回、古い表定義で断られて計画し直したのは、前後とも 2 回だった |
+| `replay` の「SQL の BEGIN と Hrana の batch で表定義を変える取引」の seed 1 から 8 (8 件) | 同じく作業負荷の途中の DDL である。seed 1 の数: 前は DDL を 117 回出し、99 回が記録され、16 回は何もしない DDL (IF NOT EXISTS など。記録されない) で、2 回は失敗した。記録の前に全シャードへ適用させる手は 161 回あった (`schema moved` と `schema busy` のやり直しを含み、何もしない DDL も送る)。後は DDL を 99 回出し、91 回が prepare から commit まで進み、8 回は何もしない DDL で、シャードに要求を送らなかった。古い表定義で断られて計画し直した文は、前が 124 回、後が 75 回だった。取引と batch のやり直しの回数が変わり、出した DDL の数も変わる。`TableLocked` の待ちは、前後とも 0 回だった |
+
+数を出す印は、`Db.changeSchema` の出口と、`Db.onRetry`、`Db.schemaMovedPast` に一時的に入れ、比べた後で戻した。
+
+欠陥の表 (`scripts/fault-table.mjs --from 1 --to 40 --procs 3`、コミットした作業ツリーで。前は `6c24560`、後は `3b6d6d7`)。
+各欄は、落ちた試験の数 / 流した seed ごとの試験の数である。
+
+| 欠陥 (前 / 後) | 段 | replay | history | ddl-concurrent |
+|---|---|---|---|---|
+| (なし) | 前 | 0/120 | 0/240 | 0/520 |
+| (なし) | 後 | 0/120 | 0/240 | 0/520 |
+| `ddlIgnoresIntents` | 前 | 30/120 | 0/240 | 142/520 |
+| `ddlIgnoresIntents` | 後 | 31/120 | 0/240 | 104/520 |
+| `unchangedIgnoresIntents` | 前 | 0/120 | 0/240 | 0/520 |
+| `unchangedIgnoresIntents` | 後 | 0/120 | 0/240 | 0/520 |
+| `ignoreTableLock` | 前 | 8/120 | 0/240 | 85/520 |
+| `ignoreTableLock` | 後 | 7/120 | 0/240 | 80/520 |
+| `noSchemaRecheck` | 前 | 0/120 | 0/240 | 39/520 |
+| `noSchemaRecheck` | 後 | 0/120 | 0/240 | 1/520 |
+| `publishBeforeBackfill` | 前 | 40/120 | 0/240 | 120/520 |
+| `publishBeforeBackfill` | 後 | 39/120 | 0/240 | 120/520 |
+| `publishWithoutClock` | 前 | 0/120 | 0/240 | 0/520 |
+| `publishWithoutClock` | 後 | 1/120 | 0/240 | 0/520 |
+| `scanSkipsEmpty` | 前 | 0/120 | 0/240 | 0/520 |
+| `scanSkipsEmpty` | 後 | 0/120 | 0/240 | 0/520 |
+| `guardFromCommitTs` | 前 | 0/120 | 0/240 | 0/520 |
+| `guardFromCommitTs` | 後 | 0/120 | 0/240 | 0/520 |
+| `repinOnRestore` | 前 | 0/120 | 0/240 | 0/520 |
+| `repinOnRestore` | 後 | 0/120 | 0/240 | 0/520 |
+| `dropAfterExpiry` / `commitAfterAbort` | 前 | 0/120 | 0/240 | 0/520 |
+| `dropAfterExpiry` / `commitAfterAbort` | 後 | 0/120 | 0/240 | 0/520 |
+| `scanBeforeLock` / `checkBeforePrepare` | 前 | 2/120 | 0/240 | 64/520 |
+| `scanBeforeLock` / `checkBeforePrepare` | 後 | 2/120 | 0/240 | 61/520 |
+| `commitWithoutAcks` (新) | 後 | 0/120 | 0/240 | 0/520 |
+| `overlappingTransitions` (新) | 後 | 0/120 | 0/240 | 0/520 |
+
+見つけた数が減った行と、その理由。
+
+- `noSchemaRecheck` の ddl-concurrent (39 から 1)。場面ごとに数えた (同じ seed の範囲を `scripts/sweep.mjs` で流した): 前は「分割と CREATE INDEX と ADD COLUMN」が 17、「分割と CREATE UNIQUE INDEX と ADD COLUMN」が 19、「ADD COLUMN」が 2、「複数の表の取引と DROP TABLE」が 1 で、ほとんどが、行イメージの形の検査 (`test/setup.ts`) が見つけた、列を足す前の形の書き込みだった。後は「分割と CREATE UNIQUE INDEX と ADD COLUMN」の seed 31 の 1 つである。M21 では、待ちの後の版の確かめ直し (`m21_red_no_recheck` が外すもの、`noServeBelowAck` を守る) と、prepare の書き込み禁止 (`noWriteWhileFenced` を守る) は別の守りで、どちらも、待っている間に表の形が変わった古い計画の書き込みを止める。減った理由は 2 つある。1 つ目は、段 3 の ADD COLUMN の書き込み禁止で、これは測った: 作業ツリーの写しで ADD COLUMN の fence を空にして同じ seed を流すと、5 (分割と CREATE INDEX と ADD COLUMN が 3、分割と CREATE UNIQUE INDEX と ADD COLUMN が 2) に戻る。禁止があると、古い計画の書き込みは、待ちの後で書き込み禁止に断られる (`assertUnlocked` は要求の表定義の epoch に依らない)。2 つ目 (39 から 5) は、表の形が変わるのが、最初の記録ではなく commit になったことである。これは推し量ったもので、測っていない。段 3 より前の ADD COLUMN は 1 つの版で、待っている書き込みがその版の適用をまたげば足りた。段 3 では、prepare は形を変えず、形を変える commit は、全シャードの prepared の往復の後に記録され、その後で適用される。古い計画の書き込みが形の変わる前に入って、形が変わった後に出るには、待ちが prepare の適用から commit の適用までをまたがなければならず、乱択の作業負荷の待ちは、ほとんどそこまで長くない (残った 5 つは、分割で群の到着を待つ、長い待ちのある場面である)。待ちが 2 つの記録をまたぐ形は、`test/stale-plan-after-wait.test.ts` と ddl-concurrent の BUG-3 の再生が決まった順で流し、スイッチを入れると落ちる (`m21_red_no_recheck` の行)。乱択の検査は、このスイッチを、ほとんど見つけなくなった。
+- `ddlIgnoresIntents` の ddl-concurrent (142 から 104)。場面ごとの数は、前、後の順に、複数の表の取引と DROP TABLE が 25、21、DROP と同じ名前の CREATE が 18、18、ADD COLUMN が 21、16、分割と CREATE INDEX と ADD COLUMN が 10、1、分割と CREATE UNIQUE INDEX と ADD COLUMN が 16、12、列の順を変えた作り直しが 24、19、移行の道具の作り直しが 28、17 である。どの場面も見つける。M21 で intent の決着が守るのは、prepare を適用したシャードで、書き込みを止めた表に、決着していない書き込みが後から入らないこと (`m21_red_no_drain` の `noWriteWhileFenced`) である。乱択の検査が見るのは、その後の commit が表の形を変えるか表を消したときに、まだ決着していない intent が、新しい形の表に当てはめられるか、消えた表に残る姿だけである。段 3 では、prepare と commit の間に全シャードへの往復 (と試し) があり、prepare のときに飛んでいた intent の多くは、commit を適用する前に決着する。intent が commit の適用まで残る実行だけが見つかるので、数が減る (場面ごとの数は測ったもので、この理由は推し量ったものである)。決まった順の再生 (`m21_red_no_drain`、`_trial_no_drain`、`_drop_no_drain` の行) は、スイッチを入れると落ちる。
+- `ignoreTableLock` (replay 8 から 7、ddl-concurrent 85 から 80)、`publishBeforeBackfill` の replay (40 から 39)、`scanBeforeLock` / `checkBeforePrepare` の ddl-concurrent (64 から 61)。どれも、index の作成の守りを外すスイッチで、守りの位置 (prepare を適用したシャードが書き込みを断る、項目を書いてから commit する、prepare を適用してから行を読む) は段 3 の前後で同じである (M21 の `m21_red_no_fence`、`_early_commit`、`_scan_early`)。どれも seed 1 から見つかり、違いは数 seed である。RPC の列の比べ合いのとおり、最初の DDL の後の交わり方が変わったことによると考えているが、場面ごとには数えていない。決まった順の再生は、スイッチを入れると落ちる。`checkBeforePrepare` は、試しと DROP の前の確かめも早めるが、ddl-concurrent の ADD COLUMN は CHECK を持たず、行で失敗し得ないので、試しを早めても答えは変わらない。その 2 つの形は `test/m21-two-phase.test.ts` が流す。
+
+新しい 2 つのスイッチは、乱択の検査では見つからない。`commitWithoutAcks` は 3 つのうち 1 つのシャードを飛ばすだけで、飛ばしたシャードは、次の要求で prepare と commit を続けて適用する。古い表定義で計画した書き込みが、そのシャードに、その前に届く実行が要る (ddl-concurrent の lost-write の検査の検査で、seed 201 から 260 に 1 度もなかった)。`overlappingTransitions` は、2 つ目の DDL が 1 つ目の遷移の間に記録される実行が要るが、作業負荷の DDL は 1 つの接続から順に出る。どちらも `test/m21-two-phase.test.ts` が決まった順で再生する。
+
+### 乱択の検査
+
+段 3 の後のコード (`c2ac670`) で流した。
+
+| 検査 | seed | 結果 |
+|---|---|---|
+| `test/ddl-concurrent.test.ts` (sim) | 1 から 500 | 6,500 件が通り、落ちたものはない (3 プロセスで 2,053 秒) |
+| `test/ddl-concurrent.test.ts` (`REFERENCE=scans`) | 1 から 100 | 1,300 件が通り、落ちたものはない (807 秒) |
+| `test/ddl-concurrent.test.ts` (`REFERENCE=full`) | 1 から 100 | 1,300 件が通り、落ちたものはない (2,273 秒) |
+| `test/replay.test.ts` の「実行の途中で index を作る」(sim、reference-scans、reference-full) | 1 から 200 | 600 件が通り、落ちたものはない (80 秒) |
+
+`ddl-concurrent` は基準経路の 2 つの組 (`vitest.config.ts` の oracles) に入っていないので、`REFERENCE` を環境変数で渡して sim の組で流した。渡した値が効いていることは、seed 1 の 1 つの場面で RPC を数えて確かめた (通常の経路は 1,616 回で `execAuto` が 53 回、`REFERENCE=scans` は 1,847 回で `execAuto` が 0 回、`REFERENCE=full` は 7,845 回)。
+「実行の途中で index を作る」は、段 3 の直後のコード (`3b6d6d7`) でも seed 1 から 200 を流し、600 件が通った。
+全部の試験 (`npx vitest run --maxWorkers=3`、4 つの組) も `c2ac670` で流し、182 ファイルのうち 175 が通り 7 が飛ばされ、1,946 件のうち 1,908 件が通り、38 件が飛ばされ、落ちたものはなかった。
+欠陥の表と RPC の列は `3b6d6d7` で取った。その後の `5189ca9` は、シャードが写しを畳み直す回数を減らすだけで (範囲の記録の後の畳み直しを、次の表定義の記録の前まで遅らせる)、畳んだ結果を変えない。`c2ac670` は試験と文書だけである。`history` と `replay` の既定の seed の RPC の列は、`3b6d6d7` と `c2ac670` で 61 件とも同じだった。
+
+### 見つけて直していないもの
+
+段 3 の作業の中で新しく見つけた欠陥は、進める側を止める検査が段 3 より前のコードで見つけた 1 つ (行で失敗する DDL が、取り消されるまでの間、ほかの接続に見える) で、段 3 で直った。
+`test/open/` の再現 (13 ファイル) は、段 3 の前後で流し、どれも落ち、最初の誤りの文も前後で同じだった (段 3 で直って移した `split-reserve-revoked` を除く)。
+
+### 段 4 に要るもの
+
+- `startMove` と `endMove`。分割の枠 (`SplitSlot`、`beginSplit`、`startSplit`、`checkSplit`、`endSplit`、`splits`)、`fence` と `beginIncoming` の RPC、`switchRange`、`reserveSplit` を消す。DDL と移動の排他を、`refusal` の `ddl-waits-move` と `move-waits-ddl` で、列から決める (段 3 では、枠の `assertFreeForDdl` と `beginSplit` の `open` の確かめが守っている)。消す欠陥のスイッチは `startWithoutSlot`、`fenceWithoutSlot`、`splitWithoutSync` (段 3 から何も戻さない) で、足すのは `ddlDuringMove`、`moveDuringDdl`、`endBeforeDrained`、`pullWithoutEpoch`。
+- `docs/model-coverage.md` の M15 の行を、M21 の段 4 の赤 (`m21_red_ddl_during_move`、`_move_during_ddl`、`_end_early`、`_pull_unfenced`、`_fence_first`) に置き換える。`test/open/fenced-before-switch.test.ts` を本試験へ移す。
+- `test/split-slot.test.ts` を、`test/ddl-driver.ts` と同じ形 (手の列の番号で止める) の、分割を進める側の検査に書き直す。止まる位置は、`startMove` の前後、`drain` の途中、`endMove` の前である。
+- `Db.preparedAll` の、移動の途中のシャードを待って尋ね直す手は、Meta が移動の間に prepare を記録しなくなれば (DDL_WAITS_MOVE が列で決まれば)、起きなくなる。残すか消すかを決める。
+- 決めたこと 6 の、表定義の epoch を commit だけで進める案は、段 3 の実装の上で、赤を確かめ直してから採るかを決める (段 3 は、どの記録でも進める)。
+- `specs/README.md` の M21 の節は、段 3 に合わせて直す必要がある (この作業は `specs/` を書かないので、直していない)。「Meta が条件として使うのは段 3 と段 4 から」は、段 3 で `one-open`、`one-exit`、`all-acks` を使い始めたことに、「実装が入った時点で、M12、M14、M15 は M21 が置き換える」は、M12 と M14 を段 3 で、M15 を段 4 で置き換えることにする。
+
+## 表ごとの epoch (2026-11-16)
+
+状態：設計とモデル。実装はまだない。
+未解決の問題 53 を閉じる変更である。
+モデルは M24 (`specs/m24_table_epochs.qnt`) で、結果は [specs/README.md](../specs/README.md) の M24 の節に書いた。
+関数と行の番号は `9e53efa` のものである。
+
+### 問題
+
+段 3 の取引は、表定義全体の epoch (`schema`) を 1 つ名乗る。
+この epoch は prepare、commit、abort のどれでも進む (決めたこと 6)。
+そのため、どの DDL も、開いている取引を全部、2 度古くする。関係のない表の `CREATE TABLE` でも、失敗した DDL でも同じである。
+古くなった取引の以後の文と `COMMIT` は、`SQLITE_BUSY` で断られる。
+
+表を見ずに取引を断る所は、ほかに 4 つある。
+
+| 場所 | 何をするか |
+|---|---|
+| シャードの `schemaStep` (`src/shard/kernel.ts:2141`) | 表定義の記録を適用している間 (`schemaChanging`)、古い表定義の要求を全部断る |
+| シャードの `ddlFloor` (`:1489`、`:1522`、`:2032`) | DDL の commit を適用するたびに、シャードに 1 つの床を置く。どの表についても、床より古い時刻の読み戻し (`deltaAfter`)、refresh、述語の検証を断る。読み戻すのも、T より後に確定した全部の表の行である |
+| Worker の `Txn.load` (`src/client/db.ts:874`) | Hrana の baton の取引を組み立て直すとき、表定義全体の epoch が変わっていれば、取引を失敗させる。`@libsql/client` の https は、この経路である |
+| Worker の `Txn.reroute` (`:807`) | 表定義全体の epoch が同じスナップショットでなければ、範囲表を取り替えず、範囲の移動で断られた文が失敗する |
+
+持ち主の基準 (2026-11-16) は、Drizzle のような ORM から使ったときに SQLite と同じに振る舞うことである。
+D∞ の仕組みだけが起こし、SQLite では起きない失敗は、認めない。
+SQLite (WAL) では、ほかの接続の DDL は、別の表の取引を失敗させない。
+
+### 規則
+
+| 要素 | 決定 |
+|---|---|
+| 表定義のもの | 表と view。名前 (大文字小文字を区別しない) で引く。消した名前も、消した epoch を持ち続ける。作り直した表は、より新しい epoch になる |
+| ものの epoch | 表は 2 つ持つ。読みの epoch と、書き込みの epoch である。view は 1 つ持つ |
+| 読みの epoch が進む記録 | その表の読みが返すもの (列、行の形、表があるか) か、シャードが古い時刻の行をその表に読み戻せるかを変える DDL の commit。`CREATE TABLE`、`DROP TABLE`、`RENAME TO` (古い名前と新しい名前の両方)、`ADD COLUMN`、シャード内の UNIQUE index と、式か WHERE のある index の作成 (前の行を戻すと、新しい制約や式で失敗し得る) |
+| 書き込みの epoch が進む記録 | 読みの epoch が進む記録と、index の DDL の commit (`CREATE INDEX`、`DROP INDEX`。シャードをまたぐ UNIQUE を含む)。index の DDL は、index の名前ではなく、その表の epoch を進める |
+| view の epoch が進む記録 | `CREATE VIEW` と `DROP VIEW` の commit |
+| epoch を進める記録の種類 | commit だけ (決めたこと 6 を改める。下の「決めたこと 6 を改める」)。prepare と abort は、どの epoch も進めない。prepare が作る内部の表 (`__gidx_<index>`) だけは、prepare の epoch で生まれる |
+| 計画が頼るもの | 文が開く表 (view を通るなら、その元の表。`Db.tablesOf` が Worker の SQLite のコンパイルで確かめる表)、文が名指す view、文が書く表 |
+| 要求が運ぶもの | 頼るものごとに、名前と epoch と、書き込みとして頼るか。書く表と、文が `INDEXED BY` で index を名指す表 (パーサが受け付ける。`indexed_table`) は書き込みの epoch、ほかは読みの epoch である。index を名指す読みは、`DROP INDEX` の後に古い計画のまま届くと、シャードの SQLite が `no such index` で断るからである |
+| シャードが比べるもの | 運ばれたものだけを、自分のスナップショットと比べる。要求のほうが新しければ、列をその epoch まで適用してから比べ直す。古ければ `stale schema` で断る。等しければ通す |
+| 取引のスナップショット | 最初に読むか書くかしたときの表定義の全体を、確定まで使う (今と同じ。M13)。初めて触る表も、その表定義で計画する |
+
+読みの epoch と書き込みの epoch を分けたのは、index の DDL の後も、読むだけの取引が続けられるようにするためである (下の「触った表の DDL と SQLite」)。
+読みの経路は、index と UNIQUE の情報を使わない。
+計画 (`src/sql/plan.ts`) が `uniques` と `globalIndexes` を見るのは INSERT と UPDATE で、範囲 (`src/client/spans.ts` の `statementSpans`) が `uniques` で範囲を広げるのは書き込みだけである。
+`src/client/db.ts` で `uniques` と `globalIndexes` を見る所も、書き込みが衝突し得る行を集める所と、グローバル index を保守する所 (`indexChanges`) である。
+グローバル index は読みの経路に使わない (`docs/sql-language.md`)。
+シャード内の index は、シャードの SQLite が自分で使い、答えを変えない。変わり得るのは、`ORDER BY` のない読みの行の順だけで、SQL はそれを決めていない。
+読みの epoch が index の作成で進むのは、古い時刻の読み戻しが、新しい UNIQUE や式で失敗し得る index (上の表) だけである。
+
+要求が運ぶものの数は、その要求の範囲と書き込みが名指す表と、文が名指す view の数である。
+要求はもともと範囲と書き込みで表を名指していて、その大きさは文と取引の上限 (1 MB の書き込みなど) で決まるので、新しい上限は置かない。
+数が多いときに表定義全体の epoch へ戻す、という逃げ道も置かない。置くと、成否が文の形ではなく、頼る表の数で決まるからである。
+
+### シャード
+
+| 確かめ | 規則 | 今の何を置き換えるか |
+|---|---|---|
+| 表定義 | 要求が運ぶ、頼るものごとに比べる (上の表) | `schemaStep` の `schema` の比べ |
+| 待ちの後の確かめ直し | 同じく、頼るものごとに比べ直す | `enter` の `schema` の確かめ直し (M21 の `m21_red_no_recheck`) |
+| 遷移の仕事の要求 | `prepared`、index の作成の行の走査、DROP の前の `unchanged` は、prepare の epoch を `atLeast` として運び、シャードはそこまで列を適用してから答える | 要求の `schema` に prepare の epoch を名乗らせて、適用させていた。commit だけで進める形では、prepare はどの epoch も進めないので、別に運ぶ (M21 の `CHECK_AT_EPOCH`) |
+| 記録の適用中 | 適用している記録が変えるもの (fence の表を含む) に頼る要求は、適用が終わるまで待つ。断らない。ほかの要求は通す | `schemaChanging` の間、全部の要求を断る |
+| intent の決着 | 記録を適用する前に決着させるのは、その記録が変える表 (fence の表、文が作る、変える、消す表、index の表) の intent だけである | `settleAll` が全部の intent を決着させる |
+| 床 | 床を表ごとに持ち、読みの epoch を進める commit を適用したとき、その表にだけ置く。古い時刻の読み戻しで戻すのは、読む表の行だけで、見る床もその表のものだけである。refresh の窓と述語の検証も、範囲の表の床だけを見る | シャードに 1 つの `ddlFloor` |
+| 行ロック | 表 X の prepare は、X の行のロックがある間は適用しない。待ちの上限は busy_timeout と同じ 5 秒で、過ぎれば `prepared` に ok でないと答え、DDL が `SQLITE_BUSY` で失敗する。ただし、取ってきた列で、その遷移がもう閉じている (commit か abort が記録されている) prepare は、待たずに適用する (遅れたシャードが prepare と abort を続けて適用するときに、ロックの持ち主が追いつきを止めないため。`m24_lock` の `applyPrepare` と同じ) | prepare は intent を決着させるだけで、ロックを待たない |
+
+記録の適用中に要求を断っていたのは、受けると intent が増え続けて、適用がいつまでも終わらないからである。
+決着させるのを、記録が変える表の intent だけにすれば、ほかの表への要求を受けても、待つ intent は増えない。
+記録が変える表への要求は、受け付けずに待たせるので、これも増えない。
+決着を全部の表にしたまま、ほかの表の要求を通すと、適用が飢える。2 つは一緒に入れる。
+
+### Worker
+
+- 計画は、文ごとに、頼るものとその epoch を、取引のスナップショットから集める。取引の COMMIT は、シャードごとに、そのシャードの書き込みと確かめる範囲が頼るものを運ぶ。
+- 取引は、最初に読むか書くかしたときのスナップショットの epoch を、確定まで名乗る (今の `Txn.planned`)。
+- `Txn.reroute` は、表定義全体の epoch を比べずに、新しい範囲表を取る。表定義は取引のスナップショットのまま計画する。範囲表と表定義は独立で、表定義の遷移と移動は Meta が並べない。
+- `Txn.load` は、表定義全体の epoch が変わっていても、取引を失敗させない。取引のスナップショットの epoch で畳んだ表定義 (Meta の列を、その epoch まで畳んだもの) で計画し、範囲表はいまのものを使う。baton は、今と同じく、その epoch を運ぶ。
+- 書き込み禁止で待つ (`TableLocked`) 文は、表定義全体の epoch が進むまでではなく、禁止を掛けた遷移が閉じる (commit か abort が記録される) まで待つ (`Db.schemaMovedPast`)。commit だけで進める形では、abort の後に epoch が進まないからである。
+- 表 X の行のロックを持つ取引の文か `COMMIT` が、X の書き込み禁止で断られたら、Worker は Meta に、その遷移を取り消させる (`abort`。開いていれば記録され、DDL は `SQLITE_BUSY` で失敗する)。その後、禁止が解けるのを待つ。
+- 何もしていない取引の最初の文が `stale schema` で断られたら、新しいスナップショットで計画し直す (今の `Txn.rebase` と同じ)。
+
+### 触った表の DDL と SQLite
+
+取引が頼る表 X を、ほかの接続の DDL が変えるときの扱いを、SQLite (WAL、busy_timeout 5 秒) と比べた。
+
+| 取引の状態 | SQLite | D∞ にできること |
+|---|---|---|
+| X に書いた (行ロックを持つ) | DDL が、取引の書き込みのロックを待つ。busy_timeout を過ぎれば、DDL が `SQLITE_BUSY` で失敗する。取引は失敗しない | (a) prepare が、X の行のロックを持つ取引を待つ。できる。シャードは、自分の行のロックと intent を、表ごとに知っている |
+| X を読んだだけで、後で X を読む | 古い表定義と古い行のまま読み続ける。`COMMIT` も通る | (b) 古い表定義のまま答える。できるのは、シャードが今の表で古い計画に同じ答えを返せる DDL だけである。index の DDL (読みの epoch を進めないもの) がそれに当たる。列を足す、名前を変える、表を消す DDL の後は、古い時刻の行を新しい形の表に読み戻せず、古い名前の表もない。シャードは、開いている読むだけの取引を知らないので、そのために古い表を残しておくこともできない |
+| X を読んだだけで、後で X に書く | 書くときに `SQLITE_BUSY` (スナップショットが古い。ほかの接続の確定があれば、DDL でなくても) | (c) 再試行できる競合 (`SQLITE_BUSY`)。いつでもできる。今の扱いを、表ごとにしたもの |
+| X にまだ触っていない | 初めて X を読む文は、取引のスナップショットの古い表定義で答える | (b) と同じ。index の DDL の後は答え、ほかは (c) |
+
+推奨は、(a) をロックを持つ取引に、(b) を index の DDL に、残りに (c) を使う組み合わせである。
+SQLite とまだ違うのは、次の 4 つだけである。
+
+1. 読むだけの取引が、触った表か初めて触る表を、ほかの接続の DDL (列を足す、名前を変える、表を消す、シャード内の UNIQUE index か、式か WHERE のある index を作る) の確定の後で読むと、その文が `SQLITE_BUSY` になる。SQLite は古いスナップショットで答える。
+2. 行ロックは、そのシャードで文を実行しないまま 5 秒経つと切れる (TTL。Worker が落ちたときのため)。その後は DDL が待たずに進み、取引のその表への次の文か `COMMIT` が `SQLITE_BUSY` になる。SQLite の書き込みのロックは、`COMMIT` まで切れない。
+3. 楽観の取引は、`COMMIT` まで行ロックを持たないので、DDL を待たせない。`COMMIT` が `SQLITE_BUSY` になる。楽観なのは、Worker の中から使う `Db.begin()` と `Db.transaction(fn)`、それを使う D1 互換の `batch` (`Db.batch`) である。`transaction(fn)` と `batch` は、自分でやり直すので、利用者には見えない。悲観なのは、SQL の `BEGIN` (`Db.control` が `pessimistic` にする)、それを使う Hrana の取引と baton、Service Binding の `begin()` (`BEGIN IMMEDIATE` か `BEGIN` を送る。`src/entrypoint.ts`) で、これらには当たらない。
+4. 書いた取引が、別のシャードで X の書き込み禁止に当たったときは、DDL を取り消させる (上の「Worker」の、遷移を取り消させる手)。DDL は `SQLITE_BUSY` で失敗する。SQLite では、取引が書き込みのロックを持つ間、DDL はそもそも始まらない。結果 (DDL が `SQLITE_BUSY` で失敗し、取引は続く) は同じだが、DDL の側は、待たずに失敗することがある。
+   これは、規則 4 (成否が行の置き場所で決まらない) に触れる。取引の行が 1 つのシャードにあれば、DDL は 5 秒まで待ち、その間に取引が確定すれば通る。行が 2 つのシャードにあり、2 つ目の書き込みが書き込み禁止に当たると、DDL はすぐに取り消される。置き場所に依らない形にするには、取り消された DDL を、進める側が同じ 5 秒の中でやり直す (取引が確定すれば通り、5 秒を過ぎれば `SQLITE_BUSY`)。このやり直しは、モデルにない (下の「持ち主の判断が要ること」の 4)。
+
+(a) の待ちを入れないと、書いた取引の `COMMIT` が、DDL の後で古い計画として断られる (`m24_lock_red_no_wait`)。
+取り消させる手を入れないと、取引が P に行ロックを持ったまま Q の書き込み禁止で待つ間に、P のロックが切れて DDL が確定し、取引が断られる (`m24_lock_red_no_wound`)。
+P のロックの TTL は、Q で待っている間は延びないからである。
+
+### 決めたこと 6 を改める
+
+表ごとの epoch は、commit だけで進める。
+理由は 3 つある。
+
+1. 失敗した DDL は、触った表の取引も古くしない。SQLite では、失敗した DDL は何も変えない。prepare でも進めると、失敗した B の DDL が、B を読んだ取引を断る (`m24_red_prepare_advances`。`noRefusalWithoutChange` を破る)。
+2. 書き込みは、prepare から終わりまで、書き込み禁止が止める。prepare より前に計画した書き込みは、禁止の間は待ち、abort の後はそのまま通り、commit の後は古い計画として断られる (`m24_green_check` の `witnessAcrossFailedTouched`)。
+3. M21 の不変条件 (`noServeBelowAck` を除く) は、M21 の全部の場面で、commit だけで進める形でも成り立つ (`specs/m24b_m21_commit_only.qnt` の緑)。M21 の赤 28 個 (35 本) は、2 本を除いて、同じ不変条件を破る。除いた 2 本は、下の「移動の途中の prepare」である。`noServeBelowAck` は、この形では定義から成り立たない。
+
+この形で要るものは 2 つで、上の表に入れた。遷移の仕事の要求が prepare の epoch を別に運ぶこと、書き込み禁止で待つ文が遷移が閉じるまで待つことである。
+
+#### 移動の途中の prepare
+
+commit だけで進める形で M21 の赤を流し直すと、`m21_red_ddl_during_move` (移動の途中に prepare を記録する) と `m21_red_end_early` (子が受け取り終える前に move-end を記録し、その後で prepare を記録する) の `servable` に、反例がなくなった (565,944 と 367,636 状態)。
+段 3 の形では、prepare が表定義の epoch を進めるので、その epoch で計画した要求を、prepare を適用できない移動の途中のシャードが断った。
+commit だけで進める形では、prepare はどの epoch も進めず、要求は prepare の適用を待たない。
+commit は、移動の途中のシャードが prepare を適用して ok と答えるまで記録されないので、DDL は移動が終わるまで待つだけになる。
+逆向き (遷移が開いている間に移動を始める、`m21_red_move_during_ddl`) は、この形でも破れる。移動の前に ok と答えたシャードの分で commit が記録でき、それを移動の途中のシャードが適用できず、最新の要求を断るからである。
+
+それでも、Meta の `ddl-waits-move` (移動の間は prepare を記録しない) と、子が受け取り終えてから move-end を記録することは残す。
+移動の途中に prepare を記録すると、移動していないシャードが prepare を適用して表への書き込みを止め、その禁止が移動の終わりまで (長い移動では、遷移の期限の 5 分まで) 続くからである。
+2 つは、この形では、M21 の場面 (移動は 1 回) では、安全のためではなく、書き込みが止まる時間のための条件になる。
+適用されていない prepare の後ろで 2 つ目の移動が始まる形は、モデルにないので、2 つの条件を外してよい、という結果ではない。
+段 4 で、`m21_red_ddl_during_move` と `m21_red_end_early` の再生を書くときは、`servable` ではなく、この形 (禁止が移動の終わりまで続く) を確かめるか、D の行にする。これは、決めたこと 6 を改めるときに決める。
+
+### 取引の中の DDL (M13)
+
+M13 の規則 (DDL の前に取引を確定する、取引は版を名乗り続ける、断られた区切りだけをやり直す、確定に失敗したら DDL を実行しない) は変えない。
+`m24_boundary_*` は、M13 の本体に、ほかの接続の DDL が区切りの表に触るか、を足したもので、表ごとに比べても `boundarySafe` が成り立ち、M13 の赤 5 つが同じ不変条件を破り、関係のない DDL が区切りの途中に入っても、区切りがやり直されないこと (`witnessUnrelatedNoRetry`) を確かめた。
+表定義全体の版と比べると、関係のない DDL の後で区切りがやり直しになる (`m24_boundary_red_global`)。
+
+### モデル (M24)
+
+M24 は M21 の本体を写し、表定義のものを 4 つ (表 A、A の上の view V、別の表 B、まだない表 N) にして、DDL を 2 つ (`CREATE TABLE N`、B の行で失敗し得る DDL) 足したものである。
+M21 の設計の条件は、設計どおりに固定した。新しい条件を定数にし、赤はそれを 1 つずつ外す。
+床、行ロック、取引の中の DDL は、小さなモデル (`m24_floor_*`、`m24_lock_*`、`m24_boundary_*`) で確かめた。
+決めたこと 6 は、M21 の本体を、M21 のインスタンスと同じ定数で、epoch を commit だけで進める形にして確かめ直した (`specs/m24b_m21_commit_only.qnt` の `m24_m21_*`。M21 を読み込むので、M24 の検査のたびに読まないよう、ファイルを分けた。M21 のファイルは、`test/catalog-m21.test.ts` が sha256 を確かめているので変えない)。
+
+| 条件 | 外したときの赤 | 破れる不変条件 |
+|---|---|---|
+| ものごとに比べる (`PER_TABLE`) | `m24_red_global` (段 3 の形)、`m24_red_global_commit_only` (commit だけで進めても、全体の epoch 1 つのまま) | `noRefusalUnrelated` |
+| commit だけで進める (`SCHEMA_ON_PREPARE`) | `m24_red_prepare_advances` | `noRefusalWithoutChange` |
+| view を通る計画は元の表にも頼る (`EXPAND_VIEW`) | `m24_red_view` | `readConsistent`、`planMatches` |
+| index の DDL は、その表の書き込みの epoch を進める (`INDEX_ON_TABLE`) | `m24_red_index` | `indexMatches`、`planMatches` |
+| 書き込みは書き込みの epoch を比べる (`WRITE_EPOCH`) | `m24_red_write_epoch` | `indexMatches` |
+| 書き込みの計画は、読んだ表にも頼る (`READ_DEPS`) | `m24_red_read_deps` | `planMatches` |
+| 記録の適用中は、変わるものに頼る要求を待たせ、ほかは通す (`APPLY_REFUSES`) | `m24_red_apply_all` (段 3 の形)、`m24_red_apply_touched` (変わるものに頼る要求を断る) | `noRefusalUnrelated`、`noRefusalWithoutChange` |
+| 床を表ごとに持つ | `m24_floor_red_global` | `noRefusalUnrelated` |
+| 読み戻すのは読む表の行だけ | `m24_floor_red_restore_all` | `noRefusalUnrelated` |
+| 形を変えた表には床を置く | `m24_floor_red_no_floor` | `noRestoreAcross` |
+| prepare は行ロックを待つ | `m24_lock_red_no_wait` | `holderSurvives` |
+| 書き込み禁止に当たった、ロックを持つ取引は、遷移を取り消させる | `m24_lock_red_no_wound` | `holderSurvives` |
+| ほかの接続の DDL と比べるのは、区切りの表に触ったものだけ | `m24_boundary_red_global` | `noRefusalUnrelated` |
+
+新しい不変条件は 3 つで、M21 の `noServeBelowAck` と `pinned` と `pinnedSurvives` を、ものごとに言い直したものである。
+
+- `planMatches`: シャードが要求を受け付けるとき、要求が本当に頼るどのものの表定義も、計画のときと同じである。
+- `noRefusalUnrelated`: 頼るものに触る表定義の記録 (prepare、commit、abort のどれでも) が計画の後にないのに、持ち主が版の理由で断ることはない。「表 A の取引は、表 B の DDL で断られない」である。
+- `noRefusalWithoutChange`: 頼るものの表定義が計画の後に変わっていない (確定した DDL がない) のに、持ち主が版の理由で断ることはない。失敗した DDL は、触った表の取引も断らない。
+
+witness は、取引が、計画の後の関係のない `CREATE TABLE` の commit と、関係のない DDL の abort の両方を適用したシャードで受け付けられ、確定すること (`witnessAcrossUnrelated`) を含む。
+同じ witness は、段 3 の形 (`m24_red_global`) と、全体の epoch を commit だけで進める形 (`m24_red_global_commit_only`) では届かない (緑として確かめた)。
+
+確かめていないこと。
+
+- 時刻と、読みの答えの中身。M24 の本体の読みは、確定した最新の値を答えたかだけを見る。index の DDL の後で古い計画の読みに答えてよいことは、読みが index を使わないという、計画と範囲のコードを読んだ結果に依る (上の「規則」)。モデルはそれを前提にしている。
+- 名前の作り直し (DROP の後の CREATE、RENAME)。名前で引き、消した名前も epoch を持ち続ければ、古い計画は古い epoch を運ぶので断られる。モデルの DROP は消すところまでである。
+- 2PC の取引 (anchor から参加者への prepare)。M24 の取引は 1 シャードである。参加者への prepare も、その参加者の書き込みと範囲が頼るものを運ぶ。
+- 取引が 2 つ以上の表に書く形。M24 の取引は A の 1 行を書く。B は読むだけである。
+- 取引 2 件の場面。M24 の場面は取引 1 件である。取引 2 件にすると、この作業の計算機では 5 分で終わらなかった。取引 2 件が index の項目を取り合う形は、M21 の場面を commit だけで進める形 (`m21_alt_commit_only_build`、`m24_m21_green_drop` など) が確かめるが、表ごとの比べ方との組み合わせは確かめていない。
+- 活性。記録の適用が、ほかの表の intent のために飢えないこと (上の「シャード」の最後の段落) は、時相の性質としては確かめていない。
+- 表ごとの intent の決着。モデルの取引は A にしか書かないので、B と N の記録は決着させる intent を持たない。決着を全部の表にした形との違いは、モデルには現れない。
+- `INDEXED BY` で index を名指す読み。モデルの読みは index を名指さない。上の「規則」では、書き込みの epoch で頼るとした。
+- 書き込み禁止の待ちの上限 (30 秒)。本体の書き込みは、禁止が解けるまで待ち続ける。実装では、30 秒を超える遷移 (行の多い表の index の作成) の間に待った書き込みは `SQLITE_BUSY` になる。今と同じで、この設計は変えない。
+
+### 実装の一覧
+
+規則 2 により、各項目の前に、落ちる検査を用意する。
+
+| # | 場所 | すること | 先に落ちる検査 | 欠陥のスイッチ (赤) |
+|---|---|---|---|---|
+| 1 | `src/sql/ddl.ts` | `ParsedDdl` に、その DDL が変えるもの (`changes: { read: string[]; write: string[]; views: string[] }`) を足す。上の「規則」の表のとおりに決める | 表の DDL の一覧ごとに、変えるものを確かめる試験 | |
+| 2 | `src/catalog.ts` | `Snapshot` に、ものごとの epoch (`objects: Record<name, { read, write }>`、view は `views` の epoch) を足し、`fold` が commit で進める。消した名前も残す。`Snapshot.schema` は commit だけで進める (Meta の `basedOn` と Worker のキャッシュに残す) | `fold` の試験 (CREATE、DROP、作り直し、RENAME、index、view、abort では進まない) | `epochOnPrepare` (`m24_red_prepare_advances`) |
+| 3 | 要求の型 (`ExecReq`、`PrepareReq`、`CommitReq`、anchor から参加者への prepare、`refresh`、`unchanged`) | `schema` を `deps: { name; epoch; write? }[]` に替える。遷移の仕事の要求は `atLeast` を運ぶ。`PROTOCOL_VERSION` を上げる | | |
+| 4 | Worker の計画 (`src/client/db.ts`、`src/sql/plan.ts`) | 文ごとに頼るものを集める。開く表は `Db.tablesOf` の表 (view の元の表を含む)、名指す view、書く表は書き込みの epoch | 関係のない表の `CREATE TABLE`、失敗した DDL、確定した DDL の後で、取引の文と `COMMIT` が通る試験 (今は落ちる) | `globalSchemaEpoch` (`m24_red_global`)、`viewDepsOnly` (`m24_red_view`)、`indexAsObject` (`m24_red_index`)、`writeDepsOnlyWritten` (`m24_red_read_deps`) |
+| 5 | シャードの `schemaStep` と `enter` | 頼るものごとに比べ、待ちの後も比べ直す。書き込みは書き込みの epoch と比べる | 同じ表の DDL の後で古い計画が断られる試験 (今の `stale-plan-after-wait`、`epoch-requests` を、ものごとに書き直す) | `writeComparesRead` (`m24_red_write_epoch`)。`noSchemaRecheck` は残す |
+| 6 | シャードの記録の適用 (`applyStep`、`settleAllStep`、`schemaChanging`) | 決着させる intent を、記録が変える表のものに絞る。適用中は、変わるものに頼る要求を待たせ、ほかは通す | 別の表の記録を適用しているシャードへの取引の文が通る試験 (今は `not owner: stale schema` で落ちる) | `applyRefusesAll` (`m24_red_apply_all`)、`applyRefusesTouched` (`m24_red_apply_touched`) |
+| 7 | シャードの床 (`ddlFloor`、`deltaAfter`、`refresh`、`predicateChanged`) | 表ごとの床。読む表の行だけを読み戻す | 別の表の DDL の後で、取引の 2 文目 (古い T の読み戻し)、refresh、述語の検証が通る試験 (今は `read too old` か競合で落ちる) | `globalDdlFloor` (`m24_floor_red_global`)、`restoreAllTables` (`m24_floor_red_restore_all`)、`noFloorOnChange` (`m24_floor_red_no_floor`) |
+| 8 | Worker の取引 (`Txn.reroute`、`Txn.load`、`Db.schemaMovedPast`) | 範囲表だけを取り替える。baton は、取引のスナップショットの epoch で畳んだ表定義で組み立て直す。書き込み禁止の待ちは、遷移が閉じるまで | baton の取引と `Db.begin()` の取引が、関係のない DDL と分割をまたいで確定する試験 (今は `the schema changed while the transaction was open` で落ちる) | `doomOnSchemaChange` (`m24_red_global` の Worker の側。モデルの取引は組み立て直さないので、赤はない) |
+| 9 | シャードの prepare の適用 | fence の表の行のロックがある間は適用しない。5 秒で `prepared` に ok でないと答える | 悲観の取引が行を書いた表への `ALTER TABLE` が、取引の `COMMIT` の後で通るか、`SQLITE_BUSY` で失敗する試験 (今は取引の `COMMIT` が落ちる) | `prepareIgnoresLocks` (`m24_lock_red_no_wait`) |
+| 10 | Worker の取引 | ロックを持つ表の書き込み禁止に当たったら、Meta に遷移を取り消させる | 2 つのシャードに書く悲観の取引の 2 つ目の書き込みが、DDL の書き込み禁止に当たる試験 | `noWound` (`m24_lock_red_no_wound`) |
+| 11 | `docs/model-coverage.md`、`specs/README.md` | M24 の赤の行を、項目ごとに P から A に移す | | |
+
+決めたこと 6 の変更 (2 のうち commit だけで進めること) は、3 のうち `atLeast` と、8 のうち `Db.schemaMovedPast` と一緒になら、先に入れてよい。
+それだけで、失敗した DDL は取引を古くしなくなる。ただし、表定義全体の epoch のままなので、確定した DDL は、関係のない表のものでも、全部の取引を古くし続ける (`m24_red_global_commit_only`)。
+その後に、1、2 の残り、3、4、5 を一緒に入れる (運ぶものと比べるものは、片方だけでは意味がない)。
+6、7、8 の残りは、それぞれ独立に入れられる。9 と 10 は一緒に入れる。
+
+### 実装の後の `docs/sql-language.md`
+
+「取引の中の DDL」の最後の段落と、「DDL」の「DDL は、開いている取引を 2 度古くする」の段落は、実装の後で次のようになる。
+文書は、実装が入るまで今のまま (段 3 の挙動) にしておく。
+
+> 取引が最初に読むか書くかした後で、別の接続が表定義を変えても、取引は最初の表定義のまま続く。
+> 後から作られた表は見えない (`no such table`)。SQLite で、読み始めた取引から、後で作られた表が見えないのと同じである。
+> 別の接続の DDL が取引を古くするのは、その DDL が、取引の文が頼る表 (読む表、書く表、view の元の表) を変えて確定したときだけである。
+> 別の表の DDL、新しい表を作る DDL、失敗した DDL は、取引を古くしない。
+> DDL が書き込みを止めている間 (下の「DDL」)、その表への書き込みは待つ。DDL が失敗すれば、待った書き込みはそのまま通る。
+> 頼る表を変えた DDL が確定した後では、その表を読む文と書く文、その表を読んだか書いた取引の `COMMIT` が、`SQLITE_BUSY` で断られる。取引をやり直す。
+> ただし、index を作るか消すだけの DDL (一意でない列の `CREATE INDEX`、shard key を含まない列への `CREATE UNIQUE INDEX`、`DROP INDEX`) の後は、その表を読む文と、その表を読んだだけの取引の `COMMIT` は通る。書く文 (と `INDEXED BY` でその表の index を名指す文) と、書いた取引の `COMMIT` は断られる。
+> 取引が表の行を書いて行ロックを持っている間は、その表の DDL のほうが待つ (最大 5 秒。待ち切れなければ、DDL が `SQLITE_BUSY` で失敗する)。
+> 取引が別のシャードで、DDL の書き込みの禁止に当たったときも、DDL のほうが `SQLITE_BUSY` で失敗する。
+> SQLite で、書いた取引が書き込みのロックを持つ間、ほかの接続の DDL が待つのと同じである。
+>
+> SQLite と違うのは、次の 3 つである。
+>
+> - 読むだけの取引は、SQLite では、ほかの接続の DDL の後も、古い表定義と古い行のまま読み続けられる。この DB では、列を足す、名前を変える、表を消す、シャード内の UNIQUE index か、式か WHERE のある index を作る DDL が確定した後で、その表を読む文が `SQLITE_BUSY` になる。その取引で初めて読む表でも同じである。
+> - 行ロックは、そのシャードで文を実行しないまま 5 秒経つと切れる。その後は DDL が待たずに進み、取引のその表への次の文か `COMMIT` が `SQLITE_BUSY` になる。
+> - Worker の中から使う `Db` の `begin()` と `transaction(fn)` の取引は、`COMMIT` まで行ロックを持たないので、DDL を待たせない。`COMMIT` が `SQLITE_BUSY` になる (`transaction(fn)` と、それを使う D1 互換の `batch` は、自分でやり直す)。
+
+> DDL が取引を古くするのは、確定したときだけで、古くなるのは、その DDL が変えた表に頼る取引だけである (`docs/design-catalog-epoch.md` の「表ごとの epoch」)。
+> 失敗した DDL と、ほかの表の DDL は、取引を古くしない。
+
+### 持ち主の判断が要ること
+
+1. **触った表の扱い**。推奨は上の組み合わせ ((a) ロックを持つ取引には DDL を待たせる、(b) index の DDL の後も読みは通す、ほかは (c))。(a) を入れず (c) だけにすると、仕組みは小さい (9 と 10 がなくなる) が、ORM の移行 (列を足す) と並行して書いている取引の `COMMIT` が `SQLITE_BUSY` になる。SQLite では DDL のほうが待つ。
+2. **読みの epoch と書き込みの epoch を分けること**。分けなければ (表に epoch 1 つ)、index を足す移行の間、その表を読むだけの取引も `SQLITE_BUSY` になる。分ける費用は、epoch が 2 つになることと、index の種類で読みの epoch を進めるかを決める表 (上の「規則」) を保つことである。推奨は分ける側である。
+3. **行ロックの TTL**。SQLite との違いの 2 つ目 (5 秒文を実行しない取引の行ロックが切れる) は、表ごとの epoch とは別の、今からある違いである。この設計は変えない。
+4. **取り消させた DDL のやり直し**。書いた取引が別のシャードで書き込み禁止に当たったとき DDL を取り消させる手は、DDL の成否を、取引の行の置き場所で変える (上の「触った表の DDL と SQLite」の 4)。推奨は、進める側が、取り消された DDL を同じ 5 秒の中でやり直す形である。DDL の成否が「取引が 5 秒のうちに確定するか」だけで決まり、置き場所に依らなくなる。入れるなら、`m24_lock` に、進める側のやり直しを足してから入れる (規則 3)。
+5. **段 4 の再生**。決めたこと 6 を commit だけで進める形に改めると、`m21_red_ddl_during_move` と `m21_red_end_early` の今の形 (`servable`) は、反例でなくなる (上の「移動の途中の prepare」)。段 4 でこの 2 つの再生を書くなら、その前に、決めたこと 6 をどちらにするかを決める。
+
+## 段 4 の結果 (2026-11-16)
+
+段 4 で、範囲の移動は、Meta の列の `move-start` と `move-end` の 2 つの記録で進むようになった。
+`move-start` は、範囲表の切り替えであり、親の fence であり、子の受け取りの始まりである。
+分割の枠 (`SplitSlot`)、`fence` と `beginIncoming` の RPC、`switchRange`、`reserveSplit` はなくなった。
+`move-start` の後は、子が自分で移動を進める (決めたこと 4)。
+通信の版は 9、保存の形式は版 6 で、どちらも移行は書かない。
+
+### 記録と、誰が進めるか
+
+| 手 | 誰が | 何をするか |
+|---|---|---|
+| `startMove({ from, to, start, end })` | 進める側 (Autoscaler の `split`) | Meta が `move-start` を記録する。同じ移動 (親、子、区間) がもう開いていれば、記録を足さずに、その epoch を返す (再開)。断るのは `refusal` の 4 つの条件 (下の「排他」) と、slot の境目にない区間である |
+| `move-start` を適用する (`moveRows`、`moveStarted`) | 親と子 (列の適用の中で) | 親は `__fenced` に、子は `__incoming` に、移動の epoch の行を、記録を写しに足すのと同じ取引で書く。親にとって、これが fence である (以後、スナップショットの範囲表が区間を子に渡すので、親はその区間の書き込みと prepare を断る)。子は受け取り始め、応答の後の仕事として移動を進め始め、alarm も予約する |
+| `drain({ start, end, epoch })` | 進める側が子に送る | 子が移動を終えるまで進める手順 (`moveStep`) に合流し、運んだ数を返す。子は epoch まで列を適用してから始めるので、まだ `move-start` を知らない子にも、この要求だけで足りる |
+| 全グループを引き取る (`drainStep`) | 子 | 親の `listGroups` と `pull` に移動の epoch を付ける。親は、その epoch まで列を適用してから答える (`toEpochStep`。M21 の PULL_AT_EPOCH)。範囲の記録だけを先に適用し、手前に表定義の記録があれば列の全部を適用する |
+| 親の `finishMove({ start, end, epoch })` | 子が親に送る | 親は epoch まで適用し、fence に終えた印を付け、時刻 m を発行する |
+| `finishIncoming` | 子 (自分で) | 時計を m まで進め、受け取りの記録に終えた印と m を付ける。以後、子は移動の途中ではない |
+| `endMove(epoch)` | 子が Meta に送る | Meta が `move-end` を記録する。もう閉じていれば、閉じた記録の epoch を返す。子は、受け取り終えた後でだけ送る (M21 の END_AFTER_DRAIN。列からは決まらないので、子の手順の順序が守る) |
+| `move-end` まで写しを進める | 子 | 自分の写しで移動が閉じる。alarm は、もうこの移動を進めない |
+
+子が進める手順は、3 つの入口から同じものに合流する (殻の `drive`。移動の epoch ごとに 1 つ)。`move-start` を適用したときの応答の後の仕事、alarm (`redrive` は、受け取り中の移動と、受け取り終えたが自分の写しで閉じていない移動を進める)、進める側の `drain` である。
+子は、起動のときにも、受け取り中か閉じていない移動があれば alarm を予約する。
+Autoscaler の `split` の手は 2 つ (`startMove`、子の `drain`) になった。Autoscaler の判断は、Meta に開いている移動 (`moves()`) を、子に `drain` を送って再開する (`movesToResume`)。子が `move-start` をまだ知らない移動は、最新の範囲表の要求が子に届くか、この再開で始まる。
+
+「止まったときに誰が終えるか」の表の移動の行は、次のようになった。
+
+| 止まる場所 | 残る状態 | 誰が、どう終えるか |
+|---|---|---|
+| `startMove` の前 | 何もない | やり直す |
+| `startMove` の後、子が知る前 | 親はまだ区間を持ち、答える (親も `move-start` を適用していなければ) | 最新の範囲表の要求が子に届くか (子は記録を適用して受け取り始め、そのまま移動を進める)、Autoscaler が開いている移動を再開する |
+| 子が受け取っている途中 (子が再起動して、応答の後の仕事が消えた) | 主キーを名指しする要求は通る。全表の読みは `migrating:` | 子の alarm が続きを進める |
+| `move-end` の記録の前 (子は受け取り終えている) | 表定義の遷移が開けない | 子の alarm が `endMove` を呼び直す |
+
+### 表定義の遷移と移動の排他
+
+Meta は、記録を足す前に、列を畳んだスナップショットで `refusal` に尋ね、次の 2 つで断る。分割の枠はなくなった。
+
+| 足す記録 | 断る条件 (`refusal` の rule) | 誤り |
+|---|---|---|
+| `prepare` | 移動が開いている (`ddl-waits-move`。M21 の DDL_WAITS_MOVE) | `SchemaBusy` (`schema busy: a shard split of <親> is in progress`)。Worker は待ってやり直す (60 秒) |
+| `move-start` | 表定義の遷移が開いている (`move-waits-ddl`。MOVE_WAITS_DDL) | `SchemaBusy`。Autoscaler の `split` は `split busy: schema busy: ...` にして、次の判断でやり直す |
+
+`move-start` は、ほかに、区間の全体を親が持つこと (`owner`)、開いている移動と区間か親か子が重ならないこと (`moves-overlap`。`split busy:`)、子がほかの区間を持たないこと (`child-owns`) を確かめる。
+どれも、段 1 から `refusal` にあり、`test/catalog-m21.test.ts` が M21 と突き合わせている条件である。
+移動が閉じるのは、子が受け取り終え、親が渡し終えた (`finishMove`) 後なので、`prepare` が記録された後に移動の途中のシャードはない。
+`Db.preparedAll` の、移動の途中のシャードを待って尋ね直す手は消した (段 3 の申し送り)。
+
+### 受け取りの記録を受け取りごとに
+
+所有をスナップショットだけで引くようにした (`notOwned` と、全表の読みの claim。手放した記録 `__fenced` とは比べない) ので、範囲が前の持ち主へ戻れるようになった。
+そこで、移動の記録をどれも、その移動の `move-start` の epoch で分けた (`docs/design-refresh-across-move.md` の「実装がすること」の 5、M23b が段 4 に求めること)。
+
+| 記録 | 段 4 より前 | 段 4 |
+|---|---|---|
+| `__incoming` | 区間ごと。`finishIncoming` の 2 つ目の UPDATE が、同じ区間の、ほかの受け取りの終わった行の m を上げた | 受け取りごとに 1 行 (`epoch` が主キー)。書き換えるのは、いま受け取っている移動の行だけで、受け取り終えた移動にもう一度届いても何もしない (時計だけを進める) |
+| `__arrived` | 主キー `(g, lo, after)`。同じグループの 2 度目の到着は `INSERT OR IGNORE` で捨てられ、`receiveStep` は 2 度目の行を入れなかった (行が消えた) | 主キー `(g, epoch, after)`。この移動でまだ届いていない piece は、前の移動で届いたグループでも新しい到着である |
+| `__moved`、`__moved_txn` | 主キー `(g, lo, after)`。同じグループを 2 度渡すと、2 度目を列挙せず (ack 済みの印が残る)、前の m で渡した | 主キー `(g, epoch, after)`。メモリの印は「渡して、まだ受け取り直していない」グループだけで、範囲が戻ると外す。決着の転送は、いまも渡したままの移動の記録だけをたどる (前の移動の記録をたどると、戻した先と戻ってきた先が互いに転送し合う) |
+| `Piece`、`PiecePayload` | グループ、区間、位置 | 移動の epoch も運ぶ。前の移動の遅れた ack は、受け取り直した後の行を消さない |
+
+### 消したもの
+
+| 場所 | 消したもの |
+|---|---|
+| `src/meta.ts` | 分割の枠 (`SplitSlot`、`SplitMove`、`beginSplit`、`startSplit`、`checkSplit`、`endSplit`、`splits`、`__meta` の `splits`、枠の期限)、`switchRange` |
+| `src/catalog.ts` | `splitId`。`Move.from` は省けなくなった |
+| `src/autoscaler.ts` | `reserveSplit` (枠を取る前の全シャードへの `syncSchema`)、`split` の `beginIncoming`、`fence`、`switchRange`、`finishMove`、`finishIncoming`、`endSplit` の手、`splitsToResume` (`movesToResume` に替えた) |
+| `src/shard/kernel.ts`、`core.ts`、`step.ts` | `beginIncomingStep`、`fenceStep` と、その RPC。所有の確かめの `fencedIn` (`__fenced` の終わった行による拒否)。`finishIncoming` の 2 つ目の UPDATE。Meta への `startSplit`、`checkSplit` |
+| `src/client/db.ts` | `Cluster` の `beginSplit`、`endSplit`、`splits`、`switchRange`。`Db.preparedAll` の、移動の途中のシャードを待って尋ね直す手 |
+| `src/worker.ts` | Meta の DO の枠の入口と `switchRange`。`/admin/status` の `splits` は `moves` になった |
+| 欠陥のスイッチ | `startWithoutSlot`、`fenceWithoutSlot` (Meta)、`splitWithoutSync` (Worker) |
+| 試験 | `test/split-slot.test.ts` の、M15 の `m15_red_no_based_on` と `m15_red_late_start` の再生 (枠と一緒に、形がなくなった) |
+
+### 設計の本文からずれたところ
+
+- 進める側の手は、設計の「今と同じ順に呼んでよい」より少ない。`split` は `startMove` と子の `drain` だけを呼び、`drain` が、子の手順 (引き取り、親の `finishMove`、`finishIncoming`、`endMove`) に合流する。進める側が `finishIncoming` と `endMove` を自分で呼ぶと、子が受け取り終えたかを進める側が知らずに呼ぶことになる。
+- Meta の `startMove` は、slot の境目にない区間を、記録の前に断る (`moving a part of a slot is not supported yet`)。段 4 より前は、シャードの `beginIncoming` が、範囲表を切り替える前に断っていた。記録すると、シャードが進められない移動が開き続け、表定義の変更も止まる。
+- `syncSchema` は `{ schema, epoch? }` を受ける。`syncEpoch` への改名はしていない (RPC の列の比べ合いを読みやすくするため)。
+- 子の受け取りの始まりの表定義の epoch を、Meta は返さない。子は列を順に適用するので、`move-start` を適用した時点の表定義は、親が `move-start` を適用した時点と同じである (移動が開いている間は表定義の記録が足されない)。`receiveStep` の、届いた piece の表定義まで追いつく手は残した (通常は何もしない)。
+- 欠陥のスイッチ `pullWithoutEpoch` は、親の側に置いた。子は epoch を運ぶが、親がそこまで適用せずに (fence の前に) 答える。モデルの「要求が epoch を運ばない」と同じ形で、渡した piece を移動ごとに見分けられるようにするためである。
+- 列の適用 (`applyStep`) は、移動の途中になった後の表定義の記録を、記録ごとに断る (M21 の `movingNow`)。同じ続きの中で `move-start` を適用して移動の途中になることがあるからで、Meta の条件が破れたときだけ起きる。`toEpochStep` は、epoch まで適用できていれば、その先の記録で断られても通る。
+- シャードは、子として進める移動のために alarm を予約するとき、そう伝える (`scheduleRedrive("move")`。DO では、ほかの予約と同じ 1 つの alarm である)。シミュレータは、その予約を、クラスタの仮想の時計の alarm にする (`SimCluster.armMoveAlarm`)。DO と同じく 5 秒後に `redrive` を走らせ、まだ進める移動が残っていれば、もう一度予約する (続けて 60 回まで)。発火したときに進める移動がもうなければ、何もしない。移動のない alarm (取り残された intent と phase 2 の再駆動) は、今までどおり試験が発火させる (`fireAlarms`)。自動に発火させると、移動のないほかの試験の RPC の列まで変わるからである。
+- シミュレータの書き込みの検査 (`checkWrites`) の持ち主の決め方を変えた。段 4 より前は、Meta のいまの範囲表と `__fenced`、`__incoming` から決めた。段 4 では、シャードが写した列 (`__epoch`) を畳んだ範囲表でその token がシャードのものであり、そのグループを渡した記録 (`__moved`) があれば、その後に届き直したか (`__arrived`)、その範囲を受け取り直した (`__incoming`) ことを求める。親は `move-start` を写すまで、移る範囲の行を持ち、書き込みを受けてよい (その行は、写した後に子へ運ばれる) ので、Meta のいまの範囲表とは比べられない。この決め方は、シャードの所有の規則 (スナップショット) と同じ記録を読むので、段 4 より前ほど独立ではない。欠陥のスイッチ `ignoreFence` と `pullWithoutEpoch` の書き込みは、この検査が見つける (`test/epoch-requests.test.ts`、`test/m21-moves.test.ts`)。
+- 受け取り終えた移動にもう一度 `finishIncoming` が届いても、m を上げない。段 4 より前は大きい方の m を残した (`test/old-read-of-emptied-group.test.ts` の試験は、その振る舞いを確かめていたので、受け取りの m が変わらないことを確かめるように書き直した)。どちらの m も、渡した側がその範囲について発行したどの時刻よりも大きいので、初めの m で足りる。
+
+### 検査
+
+先に、段 4 より前のコード (`9e53efa`) で用意した検査 (規則 2)。
+
+- 分割を進める側を各手の前で止める検査 (`test/split-slot.test.ts`。段 4 の前は `test/open/split-driver-stops.test.ts`)。手は、止めずに流したときに進める側が送った呼び出しの列から取る (`test/ddl-driver.ts` の `driver`。表定義と移動の一覧を読む呼び出しは数えない)。止めた後で、移る行と残る行が、最新の範囲表の接続からも、分割の前の範囲表を持ったままの接続からも、読めて書けること、進める側を再開せずに (応答の後の仕事と、子が予約した alarm だけで) 移動が終わり、Meta の列に開いた移動が残らず、親も子も移動の途中でないこと、表定義の変更が通ること、全表の読みで全部の行が数えられること、進める側を再開しても通り、移動の記録が 1 組だけであることを確かめる。子が受け取りの途中で再起動する場面も足した。段 4 より前のコードの手は `syncSchema` `beginSplit` `beginIncoming` `fence` `switchRange` `drain` `finishMove` `finishIncoming` `endSplit` の 9 つで、子が受け取り始めた後のどの手 (`fence` から `endSplit` までの 6 つ) で止めても、移動は終わらず、表定義の変更は「a shard split of s0 is in progress」で失敗した。`switchRange` の前で止めると、移る行の読みと書きが「not owner: s1」で失敗した (問題 17)。受け取りの途中で再起動した子は、alarm を予約しなかった。
+- 前の持ち主へ戻る範囲の検査 (`test/range-returns.test.ts`)。1 シャードの全部の範囲を s0 から s1、s1 から s0、s0 から s1 へ動かし、移動のたびに全部の行が読めて書けることと、受け取ったシャードが受け取りごとに記録を残すことを確かめる。段 4 より前のコードでは、2 つ目の移動の後、前の持ち主 s0 は戻った範囲を `__fenced` の終わった行で断り続け (「not owner: s1」)、40 行のどれも読めなかった。記録の検査も、2 つの受け取りの m が同じ値になって落ちた (`finishIncoming` の 2 つ目の UPDATE)。
+
+段 4 で、2 つとも通るようになった。
+受け取りの記録の守りを 1 つずつ外して、検査が見つけることを確かめた。2 度目の到着を捨てる形 (`receiveStep` の `fresh` を `!this.arrived.has(g)` に戻す) では、3 つ目の移動の後に 40 行全部が消え、到着の記録も 1 行ずつになった。`finishIncoming` の 2 つ目の UPDATE を戻すと、行は残るが、2 つの受け取りの m が同じになった。
+
+送り出した側の記録 (M23b が名指しした 2 つの義務の外で、範囲が戻るために要ったもの) にも、`test/range-returns.test.ts` に場面を足した。2 シャードで、s0 の全部の範囲を s2 へ動かして戻す。
+1 つ目は、範囲と一緒に戻らなかった空のグループ (行がないので運ばれない) に、戻った後の 2 シャードの取引が書く場面で、再起動しない形と、戻った後に s0 が再起動する形がある。2 つ目は、確定を返した 2 シャードの取引の phase 2 が s0 に届く前に、その intent が範囲と一緒に s2 へ行って戻り、その後で phase 2 が届く場面である。
+守りを 1 つずつ外して確かめた。範囲を受け取り直したときに「渡した」印を外す手 (`moveStarted`) を外すと、1 つ目の再起動しない形で、取引の書き込みが s0 で適用されずに消えた。起動のときに外す手を外すと、再起動する形で同じになった。決着の転送が、いまも渡したままの移動の記録だけをたどる手を外すと、2 つ目の場面で s0 と s2 が phase 2 を互いに転送し合い、試験が時間切れになった。
+前の移動の piece の遅れた ack を数えない手 (`ack` の `known.epoch !== p.epoch`) は、外しても、どの試験も落ちなかった。遅れた ack が、受け取り直した後の同じグループの、まだ子に届いていない渡しを消す形は、作っていない。
+
+M21 の段 4 の赤の再生は `test/m21-moves.test.ts` (4 つの赤、8 件) と `test/fenced-before-switch.test.ts` にある。どれも、直したコードで正しく終わることと、スイッチを入れると、モデルの反例と同じ不変条件が破れることを確かめる。
+
+| M21 の赤 | スイッチ | スイッチを入れたときの姿 |
+|---|---|---|
+| `m21_red_ddl_during_move` | `ddlDuringMove` (Meta) | 子の受け取りの途中に prepare が記録される。DDL は親で「waiting for a shard split on s0」で失敗して abort され、受け取り中の子は、最新の表定義の epoch の読みを「waiting for a shard split on s1」で断る (`servable`) |
+| `m21_red_move_during_ddl` | `moveDuringDdl` (Meta) | 進める側が prepare の後で止まった遷移の間に移動が開き、期限切れの abort が移動の途中に記録される。受け取り中の子は、それを適用できず、最新の epoch の読みを断る |
+| `m21_red_end_early` | `endBeforeDrained` (子) | 子が受け取り終える前に move-end が記録され、Meta の移動の一覧は空になる。次の DDL の prepare を受け取り中の子が適用できず、DDL は失敗し、子は最新の epoch の読みを断る |
+| `m21_red_pull_unfenced` | `pullWithoutEpoch` (親) | 親が move-start を適用する前に行を渡し、その後に分割の前の範囲表で計画した書き込みを受ける。書いた値は子に届かず、親の行は ack で消える (`moveKeepsWrites`、`readConsistent`)。シミュレータの書き込みの検査も、渡した後の行を親に残す書き込みとして見つける |
+| `m21_red_fence_first` | なし | 段 4 より前の手順そのもの。親だけが move-start を適用し (fence)、子が知らないまま進める側が止まった形で、新しい接続も古い範囲表の接続も、移る行を読み書きできる |
+
+`test/catalog.test.ts` には、表定義の遷移と移動の排他を両方向とも Meta だけで確かめる試験と、スイッチが、それぞれの向きの確かめだけを外すことを確かめる試験を足した。
+
+移動を開いたままにして場面を作る試験のうち、進める側の要求を止めていたものは、段 4 では子が自分で行を運ぶので、止めても移動が開いたままにならない。`test/ddl-vs-split-race.test.ts` (進める側の `drain` を止めていた) と `test/child-behind-parent.test.ts` は、子の最初の手 (親のグループの一覧、`listGroups`) を止めるように直した。`ddl-vs-split-race` は、読みの間、子が受け取り中で、表定義の変更が記録されていないことも確かめる。`test/split-hazards.test.ts` の、進める側の `drain` を落とす 2 つの場面は、子が移動を知らないまま残る形として残し、行の読みが子に届くと、子がそのまま移動を終えることを確かめるように直した。
+
+### 比べたもの
+
+RPC の列。`test/history.test.ts` と `test/replay.test.ts` の既定の seed (61 件) を、段 4 の前 (`9e53efa`) と後 (`ffd3ca2`) で `RPC_TRACE` を付けて流し、送り元、宛先、種類の列を比べた。
+46 件は同じで、15 件が違った。違ったのは、分割のある `history` の試験の全部 (「while shards are added」の seed 21 から 26、「with splits and restarts together」の 31 から 34、「with pessimistic transactions ... with splits and restarts」の 51 から 54、同じ seed が同じ実行になることを確かめる 1 件) で、分割のない `history` と、分割のない `replay` は全部同じだった。
+15 件とも、列は最初の分割の最初の手まで同じで、そこで、前は Autoscaler が親と子の `moves` を尋ね、後は子に `drain` を送る。
+15 件の分割の手を足し合わせると次のようになる。
+
+| 要求 | 前 | 後 |
+|---|---|---|
+| Autoscaler から: `moves` (親と子) | 302 | 0 |
+| Autoscaler から: `syncSchema` (枠を取る前に全シャードへ。最初の CREATE TABLE の後の 64 を含む) | 1,324 | 64 |
+| Autoscaler から: `beginIncoming`、`fence`、`finishMove`、`finishIncoming` | 151 ずつ | 0 |
+| Autoscaler から: `drain` | 151 | 175 |
+| 子から親へ: `finishMove` | 0 | 175 |
+| 子から親へ: `listGroups`、`pull`、`ack` | 235、41、46 | 219、65、65 |
+
+前は 151 回、後は 175 回の分割が終わった。分割 1 回の Autoscaler の要求が、`moves` 2、`syncSchema` がシャードの数だけ、`beginIncoming`、`fence`、`drain`、`finishMove`、`finishIncoming` から、子への `drain` 1 つになり、`finishMove` は子が親に送る。
+分割が速く終わるので、作業負荷が終わる前に、作業負荷の側の上限 (`MAX_SPLITS`、12 回) により近くまで割る。
+分割の時期が変わるので、取引の要求 (`exec`、`prepare`、`commit`、`finalize`、`refresh` など) の数と交わり方も変わる。どの試験も、前後とも通る。
+`syncSchema` と、子から親への `listGroups`、`pull`、`finishMove` が運ぶ epoch による列の適用は、Meta への呼び出し (`epochsSince`) なので、RPC の列には出ない。
+その後の `e0e6233` (シミュレータの、移動のための alarm と、送り出した側の試験) でも同じ 61 件を流し、61 件とも `ffd3ca2` と同じ列だった。alarm を足しても、この作業負荷の RPC の列は変わらなかった。
+
+### 表定義の epoch を commit だけで進める案 (M24) との関係
+
+段 4 は、表定義の epoch を、`prepare`、`commit`、`abort` のどれでも進める今の決め方 (決めたこと 6) の上で実装した。
+M21 の段 4 の赤の再生のうち 3 つは、この決め方に頼っている。`m21_red_ddl_during_move`、`m21_red_end_early`、`m21_red_move_during_ddl` の再生 (`test/m21-moves.test.ts`) は、どれも、受け取り中の子が、移動の途中に記録された表定義の記録 (`prepare` か `abort`) を適用できず、その epoch で計画した読みを断ることを、破れの姿として確かめる。`prepare` と `abort` が表定義の epoch を進めなければ、その読みは断られない。
+M24 (`specs/m24_*`) は、commit だけで進める決め方で、前の 2 つ (`ddl_during_move`、`end_early`) が `servable` の形では反例でなくなると報告している。問題 53 の実装で決め方を変えるときに、この 3 つの再生の破れの姿を見直す。`ddl-waits-move` と、受け取り終えた後でだけ move-end を記録させる規則は、M24 でも残る。`m21_red_pull_unfenced` の再生は、表定義の epoch の決め方に頼らない。
+
+### 未解決の問題 17 と 37
+
+問題 17 (親の fence の後、範囲表の切り替えの前に進める側が止まると、移る範囲を誰も答えない) は閉じた。`test/fenced-before-switch.test.ts` を本試験へ移した。
+親の fence は、親が `move-start` を適用することで、そのとき Meta の列には、子を宛先にした範囲表がある。
+試験は、モデルの反例と同じ形 (親だけが `move-start` を適用し、子は何も知らない) を作り、新しい接続も、分割の前の範囲表を持ったままの接続も、移る行を読み書きできることを確かめる。
+分割を進める側を各手の前で止める検査 (`test/split-slot.test.ts`) も、段 4 より前のコードでは、この形で落ちた。
+
+問題 37 (取引が分割をまたげない) の再現 (`test/open/` の `transaction-across-split`、`locking-transaction-commit-after-split`、`baton-own-write-across-split`) は、段 4 の前後で流し、どれも同じ形で落ちた。
+最初の誤りの文は同じで、違うのは `read too old: moved at <m>` の m の値だけである (段 4 の前 `1024003090`、後 `1024000022`。分割の手が少なくなり、移動が仮想の時刻の早くに起きる)。
+段 4 は、37 の 3 つの形のどれも変えない。37 が要るのは、移動をまたぐ確かめ直しの規則 (`docs/design-refresh-across-move.md`) で、段 4 は、その規則が前提にする受け取りの記録 (受け取りごとの `from_id` と m) と、前の持ち主へ戻った範囲に答えることを入れた。
+`test/open/` のほかの再現 (UNIQUE と大文字小文字の段の 7 ファイル 11 件) も、前後で同じ誤りで落ちた。
+
+### 危険と、確かめていないこと
+
+- 親が、`move-start` より前に確定した DDL をまだ適用していないと、子の最初の `listGroups` か `pull` で、親は列の全部を適用する (intent を決着させる)。その間、その親に intent を持つ取引の決着を待つ。段 4 より前は、同じ待ちが、Autoscaler の `fence` の中にあった (`reachStep`)。段 4 では、利用者の要求 (子の on-demand の引き取り) がこの待ちに入ることがある。親に intent を置いた取引が、子への prepare で、親からの引き取りを待つと、決着の待ちの上限 (`SCHEMA_WAIT_MS`、5 秒) まで待ってから、競合で失敗する。再現は作っていない。乱択の検査で、この形が起きた数も数えていない。DDL を確定した Worker は、確定の後に全シャードへ適用させる (`syncAll`) ので、親が遅れるのは、その適用が届かなかったときだけである。
+- 子が移動を進める手順は、応答の後の仕事 (DO では `ctx.waitUntil`) で始まり、続きは alarm (5 秒ごと) が進める。alarm の handler の上限 (15 分) を越える移動は、alarm が `drain` を続きから進める (到着の記録のあるグループは飛ばす)。本物の DO では確かめていない (`test/workerd.test.ts` は、Autoscaler の `drain` が子の手順に合流する形で、移動の全部を通す)。
+- 2 つ以上の移動が同時に開くこと (区間とシャードが重ならないとき) は、Meta の条件 (`moves-overlap`) と `test/catalog.test.ts` の場面だけで確かめた。乱択の検査 (`history`、`elle-sim`、`ddl-concurrent`) の分割は、1 つずつ進む。
+- 範囲が前の持ち主へ戻る形は、`test/range-returns.test.ts` の決まった並び (1 シャードの全部の範囲を 3 回動かす) だけで確かめた。Autoscaler は、範囲を持たないシャードしか子にしないので (`child-owns`)、ふつうの分割では起きない。
+
+### 見つけて直していないもの
+
+- 範囲が前の持ち主へ戻る途中に届いた phase 2 を、前の持ち主が、intent を適用も転送もせずに受け取ったと答える (`test/open/phase2-during-return.test.ts`)。2 シャードの取引 (z は s0、s1 が anchor) が確定を返し、s0 への phase 2 が届く前に、z の intent が範囲と一緒に s2 へ行き、範囲が s0 へ戻る移動の途中 (s0 は move-start を適用して受け取り始め、z をまだ引き取っていない) で phase 2 が届く。s0 には z の intent がなく、渡した印は move-start の適用で外れているので、何もせずに答え、anchor は届け終えた印を付ける。z の intent は、後で範囲と一緒に s0 に届き、決着しないまま残る。読み手が来れば anchor に尋ねて決着させるが、anchor が届け終えた取引の記録を消した後 (`TXN_RETAIN_MS`) は、presumed abort で捨てられる (M10 の `m10_red_gc_undone` と同じ形の失い方)。不変条件の候補: 参加者は、intent を適用したか、いまの持ち主へ転送した後でだけ、phase 2 を受け取ったと答える。持ち主は、送り出した側の記録 (`moved`、`moveStarted`、`forwards`)。送り出した側の記録で 4 つ目の手直しになるので、規則 1 により直していない。案は 2 つある。渡した印を、範囲を受け取り直したときではなく、そのグループが届いたときか、受け取り終えたとき (`finishIncoming`) に外す (届くまでは、phase 2 を、渡した先へ転送する。渡した先は、まだ渡していなければ自分で適用し、渡していれば転送し返し、受け取る側は未着の piece を引き取ってから適用する)。または、範囲が前の持ち主へ戻る移動を、M23b を書き手に広げて確かめるまで、Meta が断る (Autoscaler の分割は、もともと範囲を持たないシャードしか子にしないので、ふつうは起きない)。
+
+### 段 4 の後に要るもの
+
+- 問題 37 の実装 (`docs/design-refresh-across-move.md` の「実装がすること」)。受け取りの記録は、受け取りごとに `__incoming` (`from_id`、m、`epoch`) と `__arrived` (`epoch`) にある。`history` の RPC は、尋ねたシャードが fence の宛先かを `__fenced` の `to` と `epoch` で確かめられる。範囲が前の持ち主へ戻る形 (`m23b_live_red_cycle`) の再生も、いまは書ける。
+- `specs/README.md` の M21 の節の「M15 は段 4 で置き換える」と、M15 の節は、M21 が置き換えたことに直す必要がある (この作業は `specs/` を書かないので、直していない)。`docs/model-coverage.md` は、M15 の行を M21 の行に置き換えた。
+- 決めたこと 6 の、表定義の epoch を commit だけで進める案は、まだ決めていない (段 3 と同じ)。
+- 分割の途中で止まる進め方と、範囲が戻る移動を、乱択の検査の生成器に入れること。いまは決まった並びの試験だけが確かめる (上の「危険と、確かめていないこと」)。
+
+乱択の検査。
+
+| 検査 | seed | 組 | コード | 結果 |
+|---|---|---|---|---|
+| `test/history.test.ts` | 1 から 300 | sim、reference-scans、reference-full | `ffd3ca2` | 5,400 件が通り、落ちたものはない (`scripts/sweep.mjs`、1 プロセス、3 つの組を並べて 3,674 秒) |
+| `test/elle-sim.test.ts` | 1 から 300 | sim、reference-scans、reference-full | `ffd3ca2` | 900 件が通り、落ちたものはない (1,621 秒) |
+| `test/replay.test.ts` | 1 から 300 | sim | `ffd3ca2` | 900 件が通り、落ちたものはない |
+| `test/history.test.ts` | 1 から 300 | sim | `e0e6233` | 1,800 件が通り、落ちたものはない |
+| `test/elle-sim.test.ts` | 1 から 300 | sim | `e0e6233` | 300 件が通り、落ちたものはない |
+| `test/replay.test.ts` | 1 から 300 | sim | `e0e6233` | 900 件が通り、落ちたものはない |
+
+`replay` は分割を含まない (再起動と DDL はある) ので、sim の組だけで流した。
+
+欠陥の表 (`scripts/fault-table.mjs --from 1 --to 40 --procs 3 --harness history,ddl-concurrent`、コミットした木を `git archive` で取り出して。前は `9e53efa`、後は `e0e6233`)。移動の欠陥の行だけを流し、分割を含まない `replay` は外した (前後とも同じ)。
+各欄は、落ちた試験の数 / 流した seed ごとの試験の数である。
+
+| 欠陥 | 前: history | 前: ddl-concurrent | 後: history | 後: ddl-concurrent |
+|---|---|---|---|---|
+| (なし) | 0/240 | 0/520 | 0/240 | 0/520 |
+| `servePastMove` | 5/240 | 0/520 | 4/240 | 2/520 |
+| `ignoreFence` | 82/240 | 80/520 | 79/240 | 76/520 |
+| `dropIntentsOnMove` | 4/240 | 7/520 | 13/240 | 9/520 |
+| `applyAfterMoved` | 0/240 | 1/520 | 0/240 | 0/520 |
+| `finishWithoutClock` | 0/240 | 0/520 | 0/240 | 0/520 |
+| `noRangeFloor` | 0/240 | 0/520 | 0/240 | 0/520 |
+| `staleWideRead` | 0/240 | 16/520 | 0/240 | 20/520 |
+| `ddlDuringMove` (新) | | | 0/240 | 6/520 |
+| `moveDuringDdl` (新) | | | 0/240 | 22/520 |
+| `endBeforeDrained` (新) | | | 0/240 | 4/520 |
+| `pullWithoutEpoch` (新) | | | 78/240 | 80/520 |
+
+見つけた数が減った行は 2 つで、どちらも、決まった順の再生はスイッチを入れると落ちる。
+- `ignoreFence` (162 から 155)。このスイッチは所有の確かめを外す (M21 の `m21_red_owner_unchecked`、M5b の `m5b_red_s3_parent`)。外したことが答えを変えるのは、親が区間を手放した後に、古い範囲表の要求が親に届いたときだけである。段 4 では、move-start が記録されてから親がそれを適用するまで、親はスナップショットで区間を持ち、古い範囲表の要求に答えるのが正しい (M21 の、親の fence は start を適用したことである)。段 4 より前は、範囲表を切り替える前に親が fence したので、スイッチが効く期間は、それより長かった。どの seed の範囲でも、ほとんどの seed (1 から 6 の全部) で見つかる。減った理由は推し量ったもので、場面ごとには数えていない。
+- `applyAfterMoved` (1 から 0)。前に見つけたのは ddl-concurrent の「CREATE UNIQUE INDEX (global) and ADD COLUMN while shards split」の seed 23 だけで (行が失われた)、後は同じ seed で通る。このスイッチは、渡したグループの phase 2 を親で適用する (M5b の `m5b_red_p2`、`_p2_window`)。答えが変わるのは、2 相の取引の intent が pull に乗り、その phase 2 が pull の後に親に届いたときだけである。段 4 では、親の fence (move-start の適用) と最初の pull が続けて起きる (子の最初の `listGroups` か `pull` が、親に適用させる) ので、fence の前に置かれて pull の後まで決着しない intent が少なくなる。これも推し量ったもので、測っていない。決まった順の再生 (`test/migration.test.ts` の「m5b_red_p2 ...」と「m5b_red_p2_window ...」) は、スイッチを入れると落ちる。
+
+新しい 4 つのスイッチは、どれも ddl-concurrent が見つける。`pullWithoutEpoch` は、history でも見つかる (親が fence の前に行を渡し、その後の書き込みが子に届かない)。`ddlDuringMove`、`moveDuringDdl`、`endBeforeDrained` を history が見つけないのは、history の作業負荷が、最初の CREATE TABLE のほかに DDL を出さないからである。`e0e6233` の 3 つは、seed を 3 つに分けて、1 つの作業プロセスずつ流した。
+`test/ddl-vs-split-race.test.ts` と `test/child-behind-parent.test.ts` は、子の受け取りを止める形に直した後 (上の「検査」) も通る。
+全部の試験 (`npx vitest run --maxWorkers=3`、4 つの組) を `e0e6233` で流し、187 ファイルのうち 180 が通り 7 が飛ばされ、1,954 件のうち 1,916 件が通り、38 件が飛ばされ、落ちたものはなかった (313 秒)。workerd の組の `test/workerd.test.ts` の「a split through /admin/split」は、本物の DO で、子の DO が Meta の DO に `endMove` を送る形を通す。

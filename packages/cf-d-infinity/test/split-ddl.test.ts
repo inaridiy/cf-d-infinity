@@ -53,7 +53,7 @@ describe("split + a schema change + a committed transaction waiting to be applie
 
     // 増設の途中で列を足す。親も子も、増設が終わるまで DDL を適用しないので、DDL は待つ。待ち時間を短くすると、はっきり断る。
     const impatient = await attempt(new Db(c, { splitWaitMs: 100 }).ddl("ALTER TABLE t ADD COLUMN z INTEGER"));
-    expect(impatient).toEqual({ err: "a shard split is in progress; retry the schema change when it finishes" });
+    expect(impatient).toEqual({ err: "a shard split of s0 is in progress; retry the schema change when it finishes" });
     const ddl = attempt(new Db(c).ddl("ALTER TABLE t ADD COLUMN z INTEGER"));
     await c.sleep(50);
     releasePull();

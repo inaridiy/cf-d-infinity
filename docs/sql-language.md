@@ -88,11 +88,12 @@ DO の SQLite には、文の長さ (100 KB)、束縛の変数 (100 個)、複�
 | 項目 | 差分 |
 |---|---|
 | 64 ビットの整数 | 差分はない (2026-11-14 から。`test/int64.test.ts`)。±2^63 の端まで、保存し、引数で渡し、SQL の中で計算し、結果で返し、分割で運び、エクスポートして取り込める (`test/export-import.test.ts`)。Hrana は 10 進の文字列 (`integer`) で運ぶ。D1 互換の API、Service Binding、HTTP の `/sql` と `/batch` の結果の INTEGER は、`intMode` で形を選ぶ (@libsql/client と同じ。2026-11-15 から)。既定の `"number"` は D1 と同じく JS の数で返し、±(2^53 - 1) を超える INTEGER を含む結果は、隣の値に丸めずに誤りにする。`last_row_id` は、`"number"` で JS の数にできなければ (2^53 を超える rowid を明示して入れたとき)、丸めずに「返す rowid がない」として扱う (Service Binding と HTTP の `lastInsertRowid` は `null`、D1 の `meta.last_row_id` は行を入れなかった文と同じ 0)。RETURNING のない INSERT は、SQLite と同じく成功する。`"bigint"` は INTEGER をすべて `bigint` で、`"string"` はすべて 10 進の文字列で返す。指定は `connect(env.DINF_DB, { intMode: "bigint" })`、HTTP の本文の `"intMode": "string"` である。HTTP は JSON なので `"bigint"` を断る。CLI (`npx cf-d-infinity sql`) は、`--param` の数字と、表と `--json` の INTEGER を、桁を落とさずに運ぶ |
-| 引数の型 | 差分はない。Hrana は要求に書いた型のまま束縛する (`integer` は INTEGER、`float` は REAL。sqld と同じ。@libsql/client は JS の数を `float`、BigInt と真偽値を `integer` で送る)。D1 互換の API と Service Binding は、安全な整数の JS の数を INTEGER、ほかの数を REAL、`bigint` を INTEGER として束縛する。安全な範囲の外の整数の値の JS の数 (2^60 など) は、渡された double のまま REAL である (INTEGER の列では、型の親和性が整数にする)。HTTP の `/sql` と `/batch` の本文の JSON では、数字だけで書いた literal は、64 ビットに収まれば元の数字のまま INTEGER になる (`9223372036854775807` は丸めない。JS のクライアントが `JSON.stringify` で書いた 2^60 も、数字だけなので INTEGER である)。ほかの literal (小数点か指数のあるもの、64 ビットに収まらないもの) は JS の数として読み、安全な整数なら INTEGER、ほかは REAL として束縛する。DO の SQLite は JS の数を REAL として束縛し、BigInt を束縛できないので、D∞ が文の中の引数を `(CAST(? AS INTEGER)+0)` に包んで、型を保つ (2^53 を超える INTEGER は 10 進の文字列を包む)。値は、どの経路で答えても、分割で運んでも、型を変えない |
+| 引数の型 | 差分はない。Hrana は要求に書いた型のまま束縛する (`integer` は INTEGER、`float` は REAL。sqld と同じ。@libsql/client は JS の数を `float`、BigInt と真偽値を `integer` で送る)。型の印と値の JS の型が合わない引数 (`float` の文字列、`integer` の JS の数、base64 でない `blob`、知らない型など) は、文を実行する前に、引数の番号か名前を書いた `ARGS_INVALID` の誤りにする (2026-11-16 から。sqld が引数の誤りに使う code である)。誤りはその要求だけのもので、同じ pipeline のほかの要求と取引は続く。sqld は、そういう本文を JSON として読めず、pipeline の全体を HTTP 400 で断る。D1 互換の API と Service Binding は、安全な整数の JS の数を INTEGER、ほかの数を REAL、`bigint` を INTEGER として束縛する。安全な範囲の外の整数の値の JS の数 (2^60 など) は、渡された double のまま REAL である (INTEGER の列では、型の親和性が整数にする)。JS の数では `5.0` と `5` を見分けられないので、どちらも INTEGER である。型を正確に渡すには、Service Binding の `queryElements(sql, params)` に、引数を要素 (`i5`、`r5.0`、`tabc`、`b00FF`、`null`。エクスポートと同じ形、`docs/storage-format.md`) で渡す (2026-11-16 から。CLI の `--param 5.0` もこれで REAL のまま届く)。`Uint8Array`、`ArrayBuffer`、型つき配列は、そのバイトの BLOB である (D1 は型つき配列を要素ごとに 1 バイトへ切る)。数の配列 (`[65, 66]`) は、D1 互換の API だけが、D1 と同じく、そのバイトの BLOB として受け付ける (2026-11-16 から。D1 の結果は BLOB を数の配列で返すので、それを引数に戻すコードが動く)。受け付けるのは、どの要素も 0 以上 256 未満の JS の数である配列で、空の配列は空の BLOB、整数でない要素は 0 へ向けて切り捨てる (`1.5` は 1)。範囲の外の数 (`256`、`-1`)、NaN、数でない要素は、D1 と同じく `bind` が断る。穴のある配列 (`[, 1]`) は、D1 は `bind` で通して実行のときに落ちるが、D∞ は `bind` が断る (Miniflare 4.20260730.0 のローカルの D1 で測った)。Service Binding (`connect(env.DINF_DB)` の `bind` を含む) と HTTP は、数の配列を断る。HTTP の `/sql` と `/batch` の本文の JSON では、数の literal の型を文面で決める (2026-11-16 から)。数字だけで書いた literal は INTEGER で、64 ビットに収まれば元の数字のまま正確に読む (`9223372036854775807` は丸めない。JS のクライアントが `JSON.stringify` で書いた 2^60 も、数字だけなので INTEGER である)。小数点か指数のある literal (`5.0`、`1e5`、`1e20`) は REAL である。64 ビットに収まらない数字だけの literal は、SQLite がその literal を読むのと同じく REAL である。JS のクライアントの `JSON.stringify` は `5.0` を `5` と書くので、REAL の 5.0 を HTTP で渡すには、本文を文面で書くか、Hrana の `float` を使う。数の literal の元の文面を読めない実行環境 (JSON.parse の source text access のない V8) では、D1 互換の API と同じ規則 (安全な整数は INTEGER、ほかは REAL) で読む。D1 互換の API、Service Binding、HTTP は、値でない引数 (object など。Service Binding と HTTP では配列も。JSON には BLOB を書く形がない) と 64 ビットに収まらない `bigint` を、文を実行する前に誤りにする (`parameter 2 is an array; ...`)。DO の SQLite は JS の数を REAL として束縛し、BigInt を束縛できないので、D∞ が文の中の引数を `(CAST(? AS INTEGER)+0)` に包んで、型を保つ (2^53 を超える INTEGER は 10 進の文字列を包む)。値は、どの経路で答えても、分割で運んでも、型を変えない |
 | 結果の数の型 | 差分はない (2026-11-14 から)。整数の値の REAL (5.0 など) は、Hrana の `float` で返る (sqld と同じ)。シャードは結果を型つきで読む (INTEGER と TEXT に印を付けて運ぶ)。REAL の無限大は、Hrana が JSON で運べないので、クライアントの誤りになる (sqld も同じ) |
 | NUL (U+0000) を含む TEXT | 差分はない (2026-11-14 から)。どの経路で答えても、全部を返す。Worker の SQLite のドライバは TEXT を最初の NUL で切るので、D∞ は TEXT を BLOB にして読む |
 | HTTP の `/sql` と `/batch` の JSON の BLOB と無限大 | 値を JSON の値のまま書くので、BLOB はバイトの番号を鍵にした object (`{"0":0,"1":255}`)、REAL の ±無限大は `null` になる。`hex()` か `quote()` で読むか、Hrana を使う。D1 互換の API と Service Binding は、structured clone で BLOB を `Uint8Array` のまま返す |
 | 暗黙の rowid と `INTEGER PRIMARY KEY` の採番 | 一意で増えるが連続しない。削除された番号は再利用しない。接続を跨ぐと順序も保証しない |
+| 文の結果の `lastInsertRowid` (D1 の `meta.last_row_id`) | 文が最後に入れた行の rowid で、行を入れなかった文は `null` (D1 の `meta` は 0) である。SQLite の `last_insert_rowid()` と同じく、`REPLACE` が消してから入れた行は入れたことになり、UPSERT の `DO UPDATE` で更新した行と、`OR IGNORE` や `DO NOTHING` が入れなかった行は、ならない。文をどの経路で実行しても同じ値になる (2026-11-16 から。`test/last-insert-rowid.test.ts`、差分の検査が比べる)。違いは 2 つある。SQLite の接続の値は文をまたいで残るが、D∞ は文ごとに返し、`UPDATE` と `DELETE` は `null` である。rowid が行のキーでない表 (`INTEGER PRIMARY KEY` でない主キーの表) の行は、rowid を返さない。D∞ の行は、シャードをまたいで意味のある、そういう rowid を持たないからである |
 
 ### 制約
 
@@ -119,6 +120,12 @@ DO の SQLite には、文の長さ (100 KB)、束縛の変数 (100 個)、複�
 読んでから書く取引は `BEGIN IMMEDIATE` を使うのがよい。
 
 ロックは行ごとで、待ちは SQLite の busy_timeout に相当する 5 秒が上限である。
+書き込みのロックは、文の経路によらず、文が書いた行のすべてに取る。
+主キーで 1 行に絞る文はシャードが文を実行するときに、範囲や条件で書く文 (行を集めて Worker の SQLite で実行する文) は、文を実行した後に書いた行ごとに取る。
+後者の文は、取引の読み取り時刻のスナップショットで行を読んで計算するので、読み取り時刻とロックの間に別の接続が同じ行を確定していれば、`COMMIT` が `SQLITE_BUSY` になる。
+`BEGIN IMMEDIATE` でも同じである (最新を読むのは主キーの読みだけである)。
+行ロックの待ちは wound-wait で、古いものが先に行を取る。
+古さは、取引なら最初にロックを取った時刻、autocommit の書き込みならシャードが受けた時刻で比べ、同じミリ秒なら取引を古いものとする (autocommit はロックを持たず、取引の行を奪わずに待つ)。
 autocommit の文は内部でリトライし、`batch` も文が全部分かっているので内部でやり直す (DDL を含む `batch` は、次の「取引の中の DDL」を参照)。
 `BEGIN` で始めた対話的な取引のリトライはアプリの責任である。
 
@@ -134,16 +141,19 @@ Serializable は保たれ、書き込みがあれば `COMMIT` の検証で競合
 
 取引の途中で範囲の移動 (分割) があっても、取引は続けられる。
 動いた行への文は、新しい持ち主へ送る。
-動いた範囲を移動の時刻より前の読み取り時刻で読む文は、それまでの読みが今も成り立てば読み取り時刻を進めて読み、成り立たなければ競合 (`SQLITE_BUSY`) になる。
-どちらも、移動がなく、同じ行が別の接続に書かれたときと同じ扱いなので、答えは行の置き場所で変わらない。
+動いた範囲を移動の時刻より前の読み取り時刻で読む文も、その読み取り時刻のまま読む (新しい持ち主が、前の持ち主の記録に尋ねて答える)。
+だから、読むだけの取引は、移動では失敗しない。
+書く取引の `COMMIT` は、移動がないときと同じく、読んだ行が別の接続に変えられていれば `SQLITE_BUSY` になる。
+答えも失敗も、行の置き場所では変わらない。
 `not owner` で失敗することはない。
-(2026-11-15 に決めた約束である。今のコードは、動いた範囲に触る文を `not owner` で断る。`test/open/transaction-across-split.test.ts`。)
+読み取り時刻が、変更ログを残す時間 (`LOG_RETAIN_MS`、今は 10 分) より古くなった取引は、移動がなくても、読みが `read too old` で、`COMMIT` が競合で失敗することがある (資源の限り。Hrana ではどちらも `SQLITE_BUSY`)。
+(2026-11-15 に決めた約束を、2026-11-16 に改めた。前の約束では、移動の時刻より前の読み取り時刻で読む文は、読み取り時刻を進め、それまでに読んだ行が別の接続に書かれていれば競合になった。読むだけの取引が移動のために失敗するので改めた (`specs/m23c_old_reads_across_move.qnt`、`docs/design-refresh-across-move.md` の「古い読み」)。今のコードが守るのは一部である。動いた行への文は、範囲表を取り直して新しい持ち主へ送り、`not owner` では失敗しない。`Db.begin()` の取引は、分割の前に動いた範囲を読んでも書いてもいなければ、確定まで通る。まだ守らないのは 3 つで、どれも読んだ行が変わっていなくても失敗する。分割の前に動いた範囲を読んだ取引は、その範囲を移動の時刻より前の時刻で読む文が `read too old` で失敗する。分割の前に動いた行を書いたか、行ロックを取って読んだ取引は、次の文が `SQLITE_BUSY` (競合) で失敗する (どちらも `test/open/transaction-across-split.test.ts`)。SQL の `BEGIN` の取引は、分割の後に動いた行を書くと、`COMMIT` が `SQLITE_BUSY` (`read too old`) で失敗する (`test/open/locking-transaction-commit-after-split.test.ts`)。)
 
 ### 取引の中の DDL
 
 取引の中で DDL を実行すると、先にその取引を確定し、DDL の後の文は新しい取引になる。
 MySQL と同じ扱いで、SQLite とは違う。
-DDL は全シャードへの適用を伴い、取り消せないからである。
+DDL は全シャードへの適用を伴い、確定した後は取り消せないからである。
 先に確定しないと、手元に溜めた書き込みより先に DDL が効く。表を作り直す移行 (新しい表を作る、行を写す、古い表を消す、名前を変える) では、行が失われる。
 
 このため、次の点が SQLite と違う。
@@ -164,25 +174,50 @@ SQLite で、読み始めた取引から、後で作られた表が見えない�
 
 ### DDL
 
-DDL は全シャードへ適用してから完了を返す。
-適用が遅れると、古い表定義の Worker が書いた行が後から消えるからである。
+DDL は 2 相で進む (`docs/design-catalog-epoch.md` の段 3)。
+Meta が DDL を「準備中」として記録し、全シャードがそれを適用して確かめに通った後でだけ、確定を記録する。
+どこかで通らなければ取り消しを記録し、文を出した側には理由 (行で失敗した文なら SQLite のメッセージ) が返る。
+確定するまで、DDL はどの文からも見えない (表定義にも、`sqlite_master` にも、PRAGMA にも現れない)。
+確定は、全シャードが準備中の記録を適用した後でだけ記録される。準備中の記録を適用したシャードは、それより前の表定義で計画した要求を断るので、完了の後に古い表定義の書き込みが通ることはない。
+確定の後でも全シャードへ適用させてから完了を返すが、これは書き込みの禁止を早く解くためである。
 シャード数に比例して時間がかかるが、頻度の低い操作なので許容する。
 
-SQLite が拒否する文は、記録する前に断る。
-Meta が自分の SQLite の空の表で実行して確かめるので、`NOT NULL` で既定値のない `ADD COLUMN` や、重複した列名はここで止まる。
-行があるシャードでだけ失敗する文 (重複のある列への UNIQUE index、既存の行が反する `CHECK` 付きの `ADD COLUMN`) は、取り消す。
-適用できなかったシャードが取り消しを求め、全シャードが元の表定義に戻り、文を出した側には SQLite のメッセージが返る。
+DDL は、開いている取引を 2 度古くする。準備中の記録と、確定か取り消しの記録の、どちらでも表定義の epoch が進むからである (`docs/design-catalog-epoch.md` の決めたこと 6)。
+失敗した DDL も、ほかの表を作るだけの `CREATE TABLE` も同じである。古くなった取引の以後の文と `COMMIT` は、新しい記録を適用したシャードで断られる (`SQLITE_BUSY`)。取引をやり直す。
 
-シャードの増設の途中は、DDL を記録しない。
-最大 60 秒待ち、終わらなければ、出し直すよう求める。
-逆に、index を作っている間と、DROP の前に表への書き込みを止めている間は、増設が始まらない (Autoscaler は次の判断のときに始める)。
+準備中から確定か取り消しまでは、対象の表への書き込みが止まる。止まる DDL は次のとおりである。
+
+| DDL | 書き込みが止まるか |
+|---|---|
+| `CREATE TABLE`、`CREATE VIEW`、`DROP VIEW`、`DROP INDEX`、一意でない列だけの `CREATE INDEX` | 止まらない |
+| `DROP TABLE`、`ALTER TABLE ... RENAME TO`、`ALTER TABLE ... ADD COLUMN` | 止まる。全シャードへの往復の間 |
+| `CREATE UNIQUE INDEX`、式か `WHERE` のある `CREATE INDEX` | 止まる。各シャードが既存の行で文を試す間 (行の多い表では、index を 1 度作る時間) |
+| shard key を含まない列への `CREATE UNIQUE INDEX` | 止まる。既存の行から index の表を埋める間 (下) |
+
+止まっている間の書き込みは待つ (最大 30 秒。待ち切れなければ `SQLITE_BUSY` で、やり直してよい)。
+読みは止まらない。
+2026-11-16 までは、止まるのは index を埋める間と、取引が読んだ表の `DROP TABLE` の前だけだった。
+`ADD COLUMN` とシャード内の index は止めずに記録し、行があるシャードで失敗したら、記録した後で取り消していた。
+取り消すまでの間、ほかの接続は、どこでも効かない表定義で計画した (`test/ddl-driver-stops.test.ts`)。
+
+SQLite が空の表で拒否する文は、記録する前に断る。
+Meta が自分の SQLite の空の表で実行して確かめるので、重複した列名や、`STRICT` の表の型の誤りはここで止まる。
+行があるシャードでだけ失敗する文 (重複のある列への UNIQUE index、既存の行が反する `CHECK` か `NOT NULL` 付きの `ADD COLUMN`) は、
+各シャードが、書き込みを止めた表で文を試して巻き戻し、通らなければ取り消す。表は元のままで、文を出した側には SQLite のメッセージが返る
+(重複のある列への `CREATE UNIQUE INDEX` は `UNIQUE constraint failed: <表>.<列>, ...`)。
+試して通った文は、確定のときにもう一度実行する。行の多い表へのシャード内の UNIQUE index は、そのため 2 度作られる (書き込みが止まる時間も、その分だけ長い)。
+
+文を出した側が途中で止まっても (Worker の呼び出しの打ち切り)、書き込みの禁止は 5 秒のうちに解け、DDL は取り消される
+(文を出した側が、作業の間、期限を延ばし続ける)。延ばし続けても、5 分で打ち切る。書き込みが止まる時間の上限である。
+
+DDL は 1 つずつ進む。別の DDL が準備中の間は、次の DDL は待つ (最大 60 秒。終わらなければ、出し直すよう求める)。
+シャードの増設の途中も、DDL を記録しない。最大 60 秒待ち、終わらなければ、出し直すよう求める。
+逆に、DDL が準備中の間は、増設が始まらない (Autoscaler は次の判断のときに始める)。
 運べない大きさのグループ (16 MB を超える) で止まった増設は、終わるまで表定義の変更を止め続ける (`docs/scaling.md`)。
 
 shard key を含まない列への `CREATE UNIQUE INDEX` は、既存の行から index の表を埋める。
-その間、その表への書き込みは待つ (最大 30 秒。待ち切れなければ `SQLITE_BUSY` で、やり直してよい)。
-行が止まっているので、埋める作業と並行する書き込みが、index を壊すことはない。index は、出来上がって公開されるまで、どの文からも見えない。
+行が止まっているので、埋める作業と並行する書き込みが、index を壊すことはない。index は、出来上がって確定するまで、どの文からも見えない。
 1 回の要求で埋めきれない大きさの表では、エラーで止まり、index は作られず、表は元のままである。CREATE TABLE で宣言した UNIQUE は、埋める作業が要らない。
-作る側が途中で止まっても、書き込みの禁止は 5 秒のうちに解ける (作る側が、作業の間、期限を延ばし続ける)。延ばし続けても、5 分で打ち切る。
 
 ## 分散のための DDL
 

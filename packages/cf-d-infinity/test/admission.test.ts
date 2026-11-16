@@ -132,6 +132,6 @@ describe("an integer that JavaScript cannot hold exactly, arriving over Hrana", 
     expect((await c.client().query("SELECT id, v FROM big ORDER BY id")).values)
       .toEqual([[1n, -9007199254740993n], [9007199254740993n, 1n], [9223372036854775807n, -9223372036854775808n]]);
     expect(await run(c, "INSERT INTO big VALUES (?, ?)", [{ type: "integer", value: "9223372036854775808" }, { type: "integer", value: "1" }]))
-      .toMatch(/^the integer 9223372036854775808 does not fit in 64 bits/);
+      .toMatch(/^argument 1: the integer 9223372036854775808 does not fit in 64 bits/);
   });
 });

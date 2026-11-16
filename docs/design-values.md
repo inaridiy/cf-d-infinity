@@ -85,7 +85,7 @@ SQL の中の値は切れていないので、`hex()` や `json_array` を通せ
 - Worker の SQLite (sql.js) から TEXT を素の列で読むと、NUL から後ろを失う。`storedValue` (段 1) は、変換した値をタプル (`json_array`) で読む。`useBigInt` の素の読みは使わない。
 - 「Worker の SQLite」の節の「`useBigInt` で読む。読んだ値はそのまま `Value` である」は、TEXT については成り立たない。段 3 で `ScratchDb` の `query` を作るときに、TEXT を正確に読む形を決める。候補は 2 つある。結果の行をタプルで読む形と、TEXT を `CAST(... AS BLOB)` で読んで UTF-8 として戻す形である (`CAST('t' || c AS BLOB)` が全部のバイトを返すことは、node:sqlite で確かめた)。
 - シミュレータ (node:sqlite) の型つきの読みは、`'t' || c` を NUL で切って受け取る。DO では切れない。DO にできることがシミュレータにできない向きの違いなので、欠陥が黙って通ることはないが、NUL を含む TEXT の試験はシミュレータで落ちる。これも段 3 で決める。シミュレータの `query` が TEXT を正確に読む形にするか、NUL を含む TEXT の検査を workerd に置くかである。
-- 今のコードも、この違いで NUL を含む TEXT を失う (`test/open/nul-in-text.test.ts`)。シャードが答える文は全部を返し、Worker の SQLite が答える文は切って返す。INSERT … SELECT は、切れた値を保存する。シミュレータの検査は、シャードの側も基準の側も node:sqlite なので、どちらも切れて同じになり、見えなかった。
+- 今のコードも、この違いで NUL を含む TEXT を失う (`test/nul-in-text.test.ts`)。シャードが答える文は全部を返し、Worker の SQLite が答える文は切って返す。INSERT … SELECT は、切れた値を保存する。シミュレータの検査は、シャードの側も基準の側も node:sqlite なので、どちらも切れて同じになり、見えなかった。
 
 次の 4 つは、文書とコードからの推測だった。
 この設計はどれにも頼っているので、同じく段 0 で workerd で確かめた。
@@ -100,7 +100,7 @@ SQL の中の値は切れていないので、`hex()` や `json_array` を通せ
 表になかった事実が 3 つ見つかった。
 
 - SQL 関数の引数は、手元の workerd では 127 個まで通る (SQLite の既定)。公式の表は 32 個と書いている。本番が 32 で断るかは、手元では確かめられない。タプルの式は、どちらでも通るように、32 個ずつの入れ子のままにする。
-- 式の木の深さは 100 までである (SQLite の既定は 1,000。公式の表にない)。2 項の演算子で n 個の項をつなぐと、深さは n になる。D∞ が作る式のうち、列ごとの条件を OR や AND でつなぐものは、列の数だけ深くなる。今のコードは、97 列から 99 列の表に 1 行も書けない (`test/open/wide-table-expression-depth.test.ts`)。node:sqlite は上限を変えられないので、シミュレータでは見えない。
+- 式の木の深さは 100 までである (SQLite の既定は 1,000。公式の表にない)。2 項の演算子で n 個の項をつなぐと、深さは n になる。D∞ が作る式のうち、列ごとの条件を OR や AND でつなぐものは、列の数だけ深くなる。今のコードは、97 列から 99 列の表に 1 行も書けない (`test/wide-table-expression-depth.test.ts`)。node:sqlite は上限を変えられないので、シミュレータでは見えない。
 - `sqlite_version()`、`sqlite_source_id()`、`PRAGMA compile_options` は、DO では使えない (使える関数を許可の一覧で絞っている)。版を記録する手段は、挙動から見当を付けることだけである。
 
 ## 値の型と符号
@@ -196,7 +196,7 @@ SQL では `json_array(要素, ...)` で作る。
 | 境界 | 入る向き | 出る向き |
 |---|---|---|
 | Hrana | `integer` は `BigInt(文字列)` で INTEGER。`float` は REAL | INTEGER は `integer` (10 進の文字列)、REAL は `float` |
-| D1 互換の API、Service Binding、HTTP の `/sql` と `/batch` | `bigint` は INTEGER。`number` は、安全な整数なら INTEGER、ほかは REAL。真偽値は INTEGER。HTTP の JSON の、数字だけで書いた literal は、64 ビットに収まれば INTEGER (段 4) | 既定は、安全な範囲の INTEGER を `number` で返し、範囲の外は誤りにする。`intMode` で `bigint` か文字列を選べる。範囲の外の `last_row_id` は、既定では「返す rowid がない」(`null`、D1 の `meta` では 0。段 4)。HTTP は `bigint` を選べない |
+| D1 互換の API、Service Binding、HTTP の `/sql` と `/batch` | `bigint` は INTEGER。`number` は、安全な整数なら INTEGER、ほかは REAL。真偽値は INTEGER。HTTP の JSON の数の literal は文面で決め、数字だけなら INTEGER (64 ビットに収まれば正確。段 4)、小数点か指数があれば REAL (2026-11-16)。値でない引数は断る (2026-11-16) | 既定は、安全な範囲の INTEGER を `number` で返し、範囲の外は誤りにする。`intMode` で `bigint` か文字列を選べる。範囲の外の `last_row_id` は、既定では「返す rowid がない」(`null`、D1 の `meta` では 0。段 4)。HTTP は `bigint` を選べない |
 | Worker の SQLite (sql.js) | 下の「束縛」の表 | `useBigInt` で読む。INTEGER は `bigint`、REAL は `number` |
 | DO の SQL の API | 下の「束縛」の表 | 行イメージはタプル (文字列)、結果は型つきの読み |
 | シミュレータの node:sqlite | DO と同じ | DO と同じ (丸めて読む模倣を残す) |
@@ -308,6 +308,7 @@ Worker の SQLite で計算した値を引数に戻す場所 (`insertSelect`、V
 ### D1 互換の API、Service Binding、HTTP の JSON
 
 入る向きは、`toValue` (`src/client/d1.ts:24`、`src/entrypoint.ts:8`) の 1 か所で決める。
+`toValue` は型と 64 ビットの範囲を閉じ、値でない引数を、文を実行する前に断る (2026-11-16 の追記。この節の末尾)。
 `number` は、`Number.isSafeInteger` なら INTEGER、そうでなければ REAL とする。
 2^60 のような安全な範囲の外の整数の値は REAL になる。
 D∞ が丸めるのではなく、渡された double をそのまま入れる (INTEGER の列なら、SQLite がその値の整数にする)。
@@ -315,8 +316,10 @@ D∞ が丸めるのではなく、渡された double をそのまま入れる 
 断るなら、2^53 以上 2^63 未満の整数の値だけになるが、その範囲の REAL (1e17 など) を渡す文も断ることになる。
 2^53 以上の INTEGER を正確に渡すには、`bigint` を渡すか、Hrana を使う。
 
-HTTP の本文は JSON で、`JSON.parse` は数を JS の数に丸める。数字だけで書いた literal のうち、安全な整数の外にあって 64 ビットに収まるものは、reviver が受け取る元の文面 (`context.source`) から `bigint` にする (`src/entry.ts` の `exactIntegers`。段 4)。
-ほかの literal (安全な整数、小数点か指数のあるもの、64 ビットに収まらないもの) は、JS の数のまま `toValue` を通る。
+HTTP の本文は JSON で、`JSON.parse` は数を JS の数に丸める。数の literal の型は、reviver が受け取る元の文面 (`context.source`) で決める (`src/entry.ts` の `numberLiterals` と `jsonParams`)。
+数字だけで書いた literal は INTEGER である。安全な整数の外にあって 64 ビットに収まるものは、文面から `bigint` にする (段 4)。
+小数点か指数のある literal は REAL である。値が安全な整数のもの (`5.0`、`1e5`) は、reviver が印を付け、`toValue` の D1 の規則で INTEGER にならないようにする (2026-11-16 の追記)。
+64 ビットに収まらない数字だけの literal は、SQLite がその literal を読むのと同じく REAL である。
 JS の `JSON.stringify` は 1e21 未満の整数の値を数字だけで書くので、JS のクライアントが HTTP で 2^60 の double を送ると、Service Binding では REAL、HTTP では同じ値の INTEGER になる。値は等しく、違うのは格納の型だけである。
 HTTP の JSON では文面が値であり、数字だけの literal を整数として読むのは、JSON を読む多くの言語の決まりと同じである。
 Hrana の本文には reviver を掛けない (`float` の数は REAL である)。
@@ -330,6 +333,39 @@ HTTP の `/sql` は JSON なので、`"bigint"` は選べない (誤りにする
 `last_row_id` (`lastInsertRowid`) は、`"bigint"` と `"string"` では正確な値で返す。`"number"` で JS の数にできない `last_row_id` は、丸めずに「返す rowid がない」として扱う (`lastInsertRowid` は `null`、D1 の `meta.last_row_id` は行を入れなかった文と同じ 0)。誤りにはしない。RETURNING のない INSERT は結果の行を持たず、SQLite では成功するからである (段 4 の結果の「設計書から変えた点」の 2)。
 Service Binding は、呼び出し元の `intMode` を RPC の引数で運び (`query`、`batch`、`begin`)、`DinfDatabase` の側で変える。structured clone は `bigint` を運ぶので、`"bigint"` の結果もそのまま返る。
 誤りにするかどうかは値で決まり、行の置き場所には依らない。
+
+#### 2026-11-16 の追記: 入口で値を閉じる (計画書の未解決の問題 47)
+
+外部の確認で、入る向きに 2 つの穴が見つかった。
+1 つ目に、`toValue` の最後の枝が `v as Value` の素通しで、値でない引数が中へ入った。
+JSON の配列 `[[65, 66]]` は、要素の符号 (`encodeElem`) とキー文字列 (`keyString`) に `Uint8Array` として読まれ、BLOB の `x'4142'` になった。
+object `[{"a": 1}]` は、キー文字列を作る `lowerHex` の中で TypeError になった。
+`ArrayBuffer` も同じ TypeError になり、`Uint16Array` は workerd で要素ごとに 1 バイトへ切られ、キー文字列は要素から作られた。
+64 ビットの外の `bigint` は、入口では断らず、束縛のときに RangeError で落ちた。
+2 つ目に、HTTP の数を、文面ではなく値で読んでいた。`exactIntegers` は安全な整数を先に返し、`toValue` が安全な整数の JS の数を全部 INTEGER にしたので、文面に小数点や指数のある `5.0` と `1e5` が INTEGER になった。上の段落は、その前は「ほかの literal (安全な整数、小数点か指数のあるもの、64 ビットに収まらないもの) は、JS の数のまま `toValue` を通る」と書いていた。
+
+今の規則は次のとおりである。
+
+| 入口 | 規則 |
+|---|---|
+| HTTP の `/sql` と `/batch` (`src/entry.ts` の `numberLiterals` と `jsonParams`) | 数の literal は文面で決める。数字だけなら INTEGER (64 ビットに収まれば正確に読む。収まらなければ、SQLite の literal と同じく REAL)。小数点か指数があれば REAL。`true` と `false` は INTEGER の 1 と 0。JSON の配列と object は断る (JSON には BLOB を書く形がない)。`params` が配列でなければ 400 で断る。元の文面を読めない実行環境では、D1 互換の API と同じ規則で読む |
+| D1 互換の API と Service Binding (`src/client/d1.ts` の `toValue`、`src/entrypoint.ts`) | 変えていない数の規則 (安全な整数は INTEGER、ほかは REAL。`5.0` と `5` は JS の数として同じなので、どちらも INTEGER)。`bigint` は INTEGER で、64 ビットの外は断る。`Uint8Array`、`ArrayBuffer`、型つき配列と `DataView` は、そのバイトの BLOB。配列、object、symbol、関数は断る。D1 互換の API は、D1 と同じく `bind` が同期で断る |
+
+D1 との違いを、Miniflare 4.20260730.0 のローカルの D1 で確かめた (2026-11-16)。
+`Uint8Array` と `ArrayBuffer` のバイトの BLOB、値でない引数を `bind` が同期で断ること (`D1_TYPE_ERROR`) は同じである。
+D1 は、`Uint16Array` を要素ごとに 1 バイトへ切り (`new Uint16Array([0x4241])` が `X'41'`)、`DataView` を空の BLOB にする。D∞ はバイトを運ぶ (`X'4142'`)。
+D1 は、0 から 255 の数の配列 (`[65, 66]`) を BLOB として受け付ける。D∞ は断る (`Uint8Array` で渡す)。D1 の結果は BLOB を数の配列で返すので、D1 の結果をそのまま引数に戻すコードは、D∞ では断られる (D∞ の結果は `Uint8Array` なので、D∞ の結果を戻すなら通る)。受け付けるかは持ち主が決める。 (同じ日の後の作業で、D1 互換の API だけは D1 と同じく受け付けるようにした。Service Binding と HTTP は断る。`docs/sql-language.md` の「引数の型」)
+`bigint` は、D1 は断り、D∞ は INTEGER として受け付ける。`undefined` は、D1 は断り、D∞ は前から NULL にしている (変えていない)。
+
+断る誤りは `SqlError` で、何番目の引数か (1 から) と、受け付ける型を書く (`parameter 2 is an array; ...`、`parameter 1: the integer 9223372036854775808 does not fit in 64 bits`)。
+文を実行する前に断るので、取引の中でも何も書かない。どちらも引数の型で決まり、行の置き場所には依らない。
+HTTP の印 (小数点か指数のある安全な整数) は、reviver だけが作るクラスである。JSON の本文にも structured clone にも作れないので、利用者は偽れない。
+reviver は配列の要素の数だけを読み替え、本文の `token` などは JS の数のまま残す。
+Hrana の `fromH` は、型の印 (`type`) と値の JS の型が合うかを確かめていない (`float` の文字列が TEXT に、`float` の配列が BLOB になる)。`src/client/hrana.ts` はこの作業では触らなかったので、正しい挙動を期待する再現を `test/hrana-value-types.test.ts` に置いた。 (同じ日の後の作業で直した。型の印と合わない引数は `ARGS_INVALID`。`test/hrana-value-types.test.ts`)
+
+検査は、規則を先に書き、前のコードで落ちることを確かめてからコミットした (`test/entry-values.ts`、規則 2)。
+シミュレータでは `test/entry-values.test.ts` が、HTTP の本文の読み方と D1 互換の API を、1 と 2 のシャードで、表を読まない文と主キーで読み書きする文に流す。
+workerd では `test/binding.test.ts` が、HTTP の `/sql` と `/batch`、Service Binding の `query`、`batch`、取引の `execute`、Worker の中の D1 互換の API に、同じ場面を流す。
 
 ### シミュレータ
 
@@ -571,7 +607,7 @@ UPDATE の変更前の行は、今と同じく、先に主キーで読む。
 - 行を入れ直す文 (`insertRow`)。束縛の変数が 100 を超えないこと
 
 どの文も、式の木の深さが 100 に収まることも確かめる (主キーの列を AND でつなぐ条件は、主キーの列の数だけ深くなる)。
-今の確かめは深さを見ないので、97 列から 99 列の表が `CREATE TABLE` を通り、1 行も書けない (`test/open/wide-table-expression-depth.test.ts`)。
+今の確かめは深さを見ないので、97 列から 99 列の表が `CREATE TABLE` を通り、1 行も書けない (`test/wide-table-expression-depth.test.ts`)。
 確かめを落とすと、長い列名の広い表が `CREATE TABLE` を通り、後でシャードが trigger を作れずに止まる。
 断るかどうかは表定義だけで決まる (規則 4)。
 
@@ -785,8 +821,8 @@ workerd の事実は「確かめた事実」の節に書いた。
 
 | 検査 | 場所 | いまの結果 |
 |---|---|---|
-| 1 | `test/open/int64.test.ts` | 19 の場面を、シャード 1、2、4 と、実行 3 通りで流す。場面ごとに新しいクラスタと基準を使い、最初の食い違いで止めて、食い違い方を分ける。±(2^53 - 1) に収まる値では、どの場面も通る (D1 互換の API に BigInt を渡す場面を除く)。64 ビットの値では、19 の場面のどれもが、最初の大きな値で食い違う。断るのが 17、保存していない値を丸めて返すのが 1、D1 互換の API が BigInt を受け取れないのが 1 である。文書にある決まりで説明できない食い違いはなく、食い違い方は置き場所と経路で変わらない |
-| 2 | `test/typed-diff.test.ts` の末尾のブロック、`test/typed-diff-harness.ts` | 元の台本を、結果の INTEGER と REAL を区別して比べる。緩めるのは、文書にある 2 点だけである (整数の値の REAL を `integer` で返す、計算した 2^53 を超える整数を丸めて返す)。元の生成器には手を入れず、足す値と文は 2 つ目の生成器に置いた。どちらも通る。2^53 を超える整数と NUL を含む文字列は、同じ生成器に指定を付けて `test/open/typed-diff-wide.test.ts` が流す (いまは落ちる) |
+| 1 | `test/int64.test.ts` | 19 の場面を、シャード 1、2、4 と、実行 3 通りで流す。場面ごとに新しいクラスタと基準を使い、最初の食い違いで止めて、食い違い方を分ける。±(2^53 - 1) に収まる値では、どの場面も通る (D1 互換の API に BigInt を渡す場面を除く)。64 ビットの値では、19 の場面のどれもが、最初の大きな値で食い違う。断るのが 17、保存していない値を丸めて返すのが 1、D1 互換の API が BigInt を受け取れないのが 1 である。文書にある決まりで説明できない食い違いはなく、食い違い方は置き場所と経路で変わらない |
+| 2 | `test/typed-diff.test.ts` の末尾のブロック、`test/typed-diff-harness.ts` | 元の台本を、結果の INTEGER と REAL を区別して比べる。緩めるのは、文書にある 2 点だけである (整数の値の REAL を `integer` で返す、計算した 2^53 を超える整数を丸めて返す)。元の生成器には手を入れず、足す値と文は 2 つ目の生成器に置いた。どちらも通る。2^53 を超える整数と NUL を含む文字列は、同じ生成器に指定を付けて `test/typed-diff.test.ts` が流す (いまは落ちる) |
 | 3 | `test/value-codec.test.ts` (段 1) | 通る。JS で要素にして戻した値、node:sqlite と sql.js のタプルの式を JS で戻した値 (列は 1、32、33、64、100。NUL を含む文字列と 64 ビットの整数を含む)、2 万個の double のビット、どの関数の呼び出しも引数が 32 以下であること |
 | 4 | `test/key-conversions.test.ts` | 通る。今の `keyString` が等しいことと、型のない主キーで UNIQUE の違反になることが、いま保存できる値で一致する。段 1 で、新しい `keyString` の同じ確かめ (64 ビットの整数と、2^53 と 2^63 の前後の REAL を含む)、`keyValues` で引いた行が元の行であること、新旧の一致、`storedValue` と node:sqlite と sql.js の列の一致を足した。workerd の列との一致は `test/workerd-limits.test.ts` が見る |
 | 5 | 書いていない | 3 つとも、確かめる相手が段 2 か段 3 でできる。`query` は段 3 で足す入口である。捕捉でまとめた `after` は、今は本体から読み直しているので、比べる相手がない (段 2)。タプルは段 2 までない。シミュレータの節の 4 つ目 (結果の列が 100 を超える文を断る) は入れた |
@@ -798,11 +834,11 @@ workerd の事実は「確かめた事実」の節に書いた。
 直していない。
 どれも `test/open/` に、正しい振る舞いを期待する再現がある。
 
-1. NUL を含む TEXT が、Worker の SQLite を通ると最初の NUL で切れる。答えが経路で変わり、INSERT … SELECT は切れた値を保存する (`test/open/nul-in-text.test.ts`)。
-2. 97 列から 99 列の表は、`CREATE TABLE` を通るのに、DO では 1 行も書けない。式の木の深さが 100 を超える (`test/open/wide-table-expression-depth.test.ts`)。
-3. 列の数と、型のない列の数と、1 を足して 100 を超える表は、`CREATE TABLE` を通るのに、DO では読むことも書くこともできない。行イメージを読む文と、行を集める走査が、型のない列ごとに `typeof` の列を、さらに 2^53 の確かめの列を足すので、結果の列が 100 を超える。PRIMARY KEY のない表は、rowid の列がもう 1 つ加わる。主キーの 1 列と型のない 50 列の表が、いちばん小さい例である (`test/open/untyped-columns-result-limit.test.ts`)。
-4. 取引の中の、複数のシャードを読む文が、読んだ後に 2 つ以上のシャードで行が変わっていると、スナップショットを読み続けずに `read too old` で失敗する (`test/open/snapshot-read-after-two-shards-changed.test.ts`)。
-5. D1 互換の API に BigInt を渡すと、値が小さくても、内部の誤り「Do not know how to serialize a BigInt」で失敗する。段 3 で BigInt を INTEGER として受け取るようになる (`test/open/int64.test.ts` が見ている)。
+1. NUL を含む TEXT が、Worker の SQLite を通ると最初の NUL で切れる。答えが経路で変わり、INSERT … SELECT は切れた値を保存する (`test/nul-in-text.test.ts`)。
+2. 97 列から 99 列の表は、`CREATE TABLE` を通るのに、DO では 1 行も書けない。式の木の深さが 100 を超える (`test/wide-table-expression-depth.test.ts`)。
+3. 列の数と、型のない列の数と、1 を足して 100 を超える表は、`CREATE TABLE` を通るのに、DO では読むことも書くこともできない。行イメージを読む文と、行を集める走査が、型のない列ごとに `typeof` の列を、さらに 2^53 の確かめの列を足すので、結果の列が 100 を超える。PRIMARY KEY のない表は、rowid の列がもう 1 つ加わる。主キーの 1 列と型のない 50 列の表が、いちばん小さい例である (`test/untyped-columns-result-limit.test.ts`)。
+4. 取引の中の、複数のシャードを読む文が、読んだ後に 2 つ以上のシャードで行が変わっていると、スナップショットを読み続けずに `read too old` で失敗する (`test/snapshot-read-after-two-shards-changed.test.ts`)。
+5. D1 互換の API に BigInt を渡すと、値が小さくても、内部の誤り「Do not know how to serialize a BigInt」で失敗する。段 3 で BigInt を INTEGER として受け取るようになる (`test/int64.test.ts` が見ている)。
 
 2 と 3 は、同じ 1 つの穴である。表を作るときの確かめ (`assertReplays`) も、シミュレータも、DO の SQLite の上限のうち、式の木の深さ (100) と結果の列の数 (100) を知らなかった。作れる表と、DO で使える表が食い違う。
 直すときは、列の数ごとに個別に手当てするのではなく、DO の上限を 1 か所に持ち、表を作るときの確かめとシミュレータの両方がそれを見る形にする (計画書の不変条件 3)。
@@ -878,7 +914,8 @@ workerd の事実は「確かめた事実」の節に書いた。
 `Db.transaction` は、やり直すたびに表定義を取り直すが、文の計画は最初のものを使い続ける。そのため、基準経路の書き込み (`Txn.wasmWrite`) では、Worker の SQLite は取引の新しい表定義 (`this.cat`) で作られ、捕捉の trigger は計画の古い表定義 (`p.tables`) で作られることがあった。古い trigger は列の少ないタプルを書く。
 列名つきの行イメージの間は、変更後の行を本体から読み直していたので、食い違いは捕捉に現れなかった。
 trigger を、Worker の SQLite を作った表定義で作るようにした。基準経路だけの実行の `test/ddl-concurrent.test.ts` (ADD COLUMN と並行する取引、14 本) で見つかった。
-同じ食い違いは、行を集める走査にも残っている。走査は計画の表定義の列だけを読むので、足された列は Worker の SQLite で既定値になり、文がその列に触らなくても、確定した値を既定値で上書きする。段 1 でも同じだった (変更後の行を本体から読み直していたので、既定値を書いた)。直していない。再現は `test/open/reference-write-after-add-column.test.ts` にある。同じ場所の 2 つ目の直しになるので (規則 1)、計画を取引の表定義と結び付ける形 (表定義が変わったら計画し直す) を、持ち主に諮る。
+同じ食い違いは、行を集める走査にも残っている。走査は計画の表定義の列だけを読むので、足された列は Worker の SQLite で既定値になり、文がその列に触らなくても、確定した値を既定値で上書きする。段 1 でも同じだった (変更後の行を本体から読み直していたので、既定値を書いた)。直していない。再現は `test/reference-write-after-add-column.test.ts` にある。同じ場所の 2 つ目の直しになるので (規則 1)、計画を取引の表定義と結び付ける形 (表定義が変わったら計画し直す) を、持ち主に諮る。
+(2026-11-15 追記: その形で直した。やり直す試みのスナップショットが計画したものと違えば、計画を捨てて計画し直す。[design-catalog-epoch.md](./design-catalog-epoch.md) の「段 2 の結果」。再現は `test/reference-write-after-add-column.test.ts` へ移った。)
 
 守りを外した反例の試験 (`m14_red_no_drain` の 2 つの守りを外す場面) では、長さの確かめが、古い表定義の intent を新しい表に当てはめたことを見つける。その試験は反例そのものを確かめるので、確かめを切る (`SimOptions.noImageCheck`)。
 
@@ -895,11 +932,11 @@ trigger で捕捉する 1 行の UPDATE (`test/rowcost.test.ts` に足した操�
 ### 段 3 に残ること
 
 - `Value` を型のある値にし、`fromTypedValue`、`keyParams`、`TypedValue`、`typedOf` を消す。K1 を外す。
-- 行を集める走査 (`Scan.typed`、`scanSql`、`typedValues`、`__dinf_typeof_<i>`) と `exportRows` を型つきの読みにする。型のない列が 50 以上の表で、行を集める SELECT が結果の列の上限に当たる (`test/open/untyped-columns-result-limit.test.ts`。INSERT、UPDATE、DELETE は段 2 で通るようになった)。
-- NUL を含む TEXT (`test/open/nul-in-text.test.ts`)。段 2 は、利用者の TEXT を素の列で読む文を足していない。シャードの `listGroups`、`exportRows`、Worker の `scanShard` と走査は、今も素の列で読む。
+- 行を集める走査 (`Scan.typed`、`scanSql`、`typedValues`、`__dinf_typeof_<i>`) と `exportRows` を型つきの読みにする。型のない列が 50 以上の表で、行を集める SELECT が結果の列の上限に当たる (`test/untyped-columns-result-limit.test.ts`。INSERT、UPDATE、DELETE は段 2 で通るようになった)。
+- NUL を含む TEXT (`test/nul-in-text.test.ts`)。段 2 は、利用者の TEXT を素の列で読む文を足していない。シャードの `listGroups`、`exportRows`、Worker の `scanShard` と走査は、今も素の列で読む。
 - 列名の予約の `__dinf_`。`PROTOCOL_VERSION` を 5 にする。
 - 欠陥のスイッチ `unfencedRead` と `roundedImages`。
-- 利用者の文の式の木の深さ。シャードは、届いた文の深さを測らない。D∞ が作る文は表を作るときに確かめるが、深い利用者の文は、DO でだけ失敗し、シミュレータでは通る (`test/open/user-statement-expression-depth.test.ts`。99 列の主キーを整数の引数で引く文は、`bindTyped` の包みで深さ 102 になる)。見積もりを利用者の文の判定 (`shardLimitOf`) とシミュレータの模倣に使うかは、見積もりの多めの幅を確かめてから決める (不変条件 3)。
+- 利用者の文の式の木の深さ。シャードは、届いた文の深さを測らない。D∞ が作る文は表を作るときに確かめるが、深い利用者の文は、DO でだけ失敗し、シミュレータでは通る (`test/user-statement-expression-depth.test.ts`。99 列の主キーを整数の引数で引く文は、`bindTyped` の包みで深さ 102 になる)。見積もりを利用者の文の判定 (`shardLimitOf`) とシミュレータの模倣に使うかは、見積もりの多めの幅を確かめてから決める (不変条件 3)。
 
 ## 段 3 の結果 (2026-11-15)
 
@@ -929,7 +966,7 @@ trigger で捕捉する 1 行の UPDATE (`test/rowcost.test.ts` に足した操�
 ### 検査を先に直した (規則 2)
 
 値の読み方を変える前に、シミュレータと SQLite の基準が TEXT を全部読むようにした (`df0370c`)。
-node:sqlite のドライバは TEXT を最初の NUL で切るので、それまでは、シャードの側も基準の側も同じように切り、`test/open/nul-in-text.test.ts` の欠陥 (段 0 の欠陥の 1) が見えなかった。
+node:sqlite のドライバは TEXT を最初の NUL で切るので、それまでは、シャードの側も基準の側も同じように切り、`test/nul-in-text.test.ts` の欠陥 (段 0 の欠陥の 1) が見えなかった。
 
 - シミュレータ (`test/sim.ts`) は、結果を返す文を包み直して TEXT を BLOB で読み、DO のドライバと同じ値を返す。
 - 基準 (`test/typed-diff-harness.ts` の `referenceRows`) も同じく包み直し、RETURNING は項ごとに書き換えて読む。
@@ -960,7 +997,7 @@ UNIQUE の列をつなぐ範囲の条件 (`src/client/spans.ts`) は、釣り合
 
 - 段 2 までの多くの検査は、結果を JS の数で比べていた (`test/diff.ts`、`test/replay.ts`、`test/placement-oracle.ts`)。D∞ の結果の INTEGER は `bigint` になったので、比べる前に数にする (`test/sim.ts` の `asNumbers`)。型は `typed-diff` と `int64` が比べる。
 - JS の数の引数は REAL として束縛されるようになった。整数の列の型の親和性が整数に戻すので、答えは変わらないが、整数の束縛 (`(CAST(? AS INTEGER)+0)`) を並行の下で通らなくなる。`replay` と `history` の作業負荷は、整数の引数を `bigint` で渡すようにした。
-- `typed-diff` の段 0 の緩める印 (整数の値の REAL を `integer` で返す、計算した 2^53 を超える整数を丸めて返す) を外した。2 つ目の生成器は、2^53 を超える整数と NUL を含む文字列を混ぜて、`test/typed-diff.test.ts` が流す (`test/open/typed-diff-wide.test.ts` は消した)。
+- `typed-diff` の段 0 の緩める印 (整数の値の REAL を `integer` で返す、計算した 2^53 を超える整数を丸めて返す) を外した。2 つ目の生成器は、2^53 を超える整数と NUL を含む文字列を混ぜて、`test/typed-diff.test.ts` が流す (`test/typed-diff.test.ts` は消した)。
 - シミュレータは、利用者の表の読みごとに 2 つの文 (元の文と包み直した文) を用意するので、基準経路だけの実行 (`REFERENCE=full`) で、`test/ddl-concurrent.test.ts` の決定性の試験が変更の前の約 2 倍の時間 (110 秒。上限は 120 秒) になった。シミュレータの `SqliteBackend` が用意した文を文面ごとに覚えるようにして、40 秒になった (変更の前は 53 秒)。
 - `test/int64.test.ts` の古い読みの時刻の場面は、基準経路の実行に限って、未解決の問題 34 の `read too old` を認めていた。`REFERENCE=full` では、「普通」の実行もクラスタの指定で基準経路になるので、クラスタの指定も見るようにした。
 
@@ -1041,7 +1078,7 @@ DO の SQLite と Workers の CPU では測っていない。
 
 ### 設計書から変えた点
 
-1. **HTTP の JSON の整数の literal。** 「境界」の表は、HTTP の引数を D1 互換の API と同じ JS の数の規則で書いていた (2^53 以上の INTEGER を正確に渡すには `bigint` か Hrana)。HTTP では、本文の文面を JS の数に丸めるのは D∞ 自身なので、数字だけの literal で 64 ビットに収まるものを INTEGER として読むことにした (`src/entry.ts` の `exactIntegers`。reviver の `context.source` を使う)。決めたことの 2 (JS の数の引数) からは外れる。JS のクライアントが `JSON.stringify` で 2^60 の double を送ると、Service Binding では REAL、HTTP では同じ値の INTEGER になる。値は等しく、違うのは格納の型だけである。戻すなら、`src/worker.ts` の `readJson(request, exactIntegers)` の 2 つ目の引数を外す 1 行である。
+1. **HTTP の JSON の整数の literal。** 「境界」の表は、HTTP の引数を D1 互換の API と同じ JS の数の規則で書いていた (2^53 以上の INTEGER を正確に渡すには `bigint` か Hrana)。HTTP では、本文の文面を JS の数に丸めるのは D∞ 自身なので、数字だけの literal で 64 ビットに収まるものを INTEGER として読むことにした (`src/entry.ts` の `exactIntegers`。reviver の `context.source` を使う)。決めたことの 2 (JS の数の引数) からは外れる。JS のクライアントが `JSON.stringify` で 2^60 の double を送ると、Service Binding では REAL、HTTP では同じ値の INTEGER になる。値は等しく、違うのは格納の型だけである。戻すなら、`src/worker.ts` の `readJson(request, exactIntegers)` の 2 つ目の引数を外す 1 行である。2026-11-16 に、小数点か指数のある literal も文面で REAL と読むことにし、`exactIntegers` は `numberLiterals` になった (「D1 互換の API、Service Binding、HTTP の JSON」の 2026-11-16 の追記)。
 2. **`last_row_id`。** 設計書は決めていなかった。初めは結果の値と同じく、`"number"` で JS の数にできなければ誤りにした。`test/int64.test.ts` の、D1 互換の API で `bigint` の id を入れる場面が落ちた。RETURNING のない INSERT は結果の行を持たず、SQLite では成功する。誤りにすると、確定した書き込みが失敗に見え、呼び出し元がやり直すかもしれない。`"number"` では、「返す rowid がない」として扱うことにした。Service Binding と HTTP の `lastInsertRowid` は `null`、D1 の `meta.last_row_id` は行を入れなかった文と同じ 0 である。丸めない、書き込みを失敗に見せない、JSON に書ける、の 3 つを満たす。D1 の `meta` を `null` にしなかったのは、D1 の型が数で、Service Binding のクライアントは `lastInsertRowid` の `null` から「行を入れなかった」と「JS の数にできない」を見分けられないからである (見分けるには、RPC の形にもう 1 つ項目が要る)。`"bigint"` と `"string"` は正確な値を返す。行の中の INTEGER (RETURNING を含む) は、今までどおり誤りにする。
 3. **Service Binding の変換の場所。** 変換は `DinfDatabase` の側 (`pack`) で行い、クライアントは intMode を運ぶだけにした。アプリの Worker に入るクライアントにプランナーや変換のコードを入れないためである (`test/binding.test.ts` が 10 KB 未満を確かめる。今は約 4.8 KB)。
 4. **エクスポートの形式の版。** 設計書は file の形式を変えないと書いていた。CLI と Worker のあいだの JSON と file が、どちらも公開の後に版の違う相手と出会うので (古い CLI と新しい Worker、古い file と新しい CLI)、両方に版 (`EXPORT_FORMAT` = 1) を持たせた。版の行のない file (段 3 までの CLI が書いたもの) は断る (公開の前なので後方互換を持たない)。無限大の literal は `9e999` から `9.0e+999` (`realText`) になった。取り込みはどちらも読む。

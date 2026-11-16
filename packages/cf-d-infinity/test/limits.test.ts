@@ -63,7 +63,7 @@ describe("the size of a result", () => {
       return { columns: r.columns, rows: (function* () { for (const row of r.rows) { logRows++; yield row; } })() };
     };
     await expect(c.shard("s0").exec({
-      sql: "SELECT count(*) FROM docs", columns: ["count(*)"], params: [], spans: [{ kind: "table", table: "docs" }], T: old, minTs: 0, schema: cat.version,
+      sql: "SELECT count(*) FROM docs", columns: ["count(*)"], params: [], spans: [{ kind: "table", table: "docs" }], T: old, minTs: 0, schema: cat.schema, epoch: cat.epoch,
     })).rejects.toThrow(/delta exceeds K/);
     // 300 件の変更のうち、上限 (50 行) を超えたと分かるところまでしか読まない。
     expect(logRows).toBeLessThan(80);
@@ -173,12 +173,10 @@ describe("a shard split", () => {
     const rows = Math.ceil(GROUP_MAX_BYTES / 900_000) + 1;
     for (let i = 1; i <= rows; i++) await new Db(c).query("INSERT INTO docs VALUES (7, ?, ?)", [i, text(900_000)]);
     await expect(c.shard("s0").pull({ ...range, want: [{ g: JSON.stringify([7]), from: null }], to: "s1", maxBytes: 1_000_000 }).catch(async (e: Error) => {
-      // fence していない範囲の pull は別の理由で断られるので、fence してから試す。
+      // fence していない範囲の pull は別の理由で断られるので、移動を開いて、親にだけ適用させてから (fence してから) 試す。
       if (!/unfenced/.test(e.message)) throw e;
-      const slot = await c.reserveSplit("s0", "s1", range);
-      await c.shard("s1").beginIncoming({ ...range, from: "s0", slot: slot.id });
-      await c.shard("s0").fence({ ...range, to: "s1", slot: slot.id });
-      return c.shard("s0").pull({ ...range, want: [{ g: JSON.stringify([7]), from: null }], to: "s1", maxBytes: 1_000_000 });
+      const { epoch } = await c.moveAt("s0", "s1", range, ["s0"]);
+      return c.shard("s0").pull({ ...range, want: [{ g: JSON.stringify([7]), from: null }], to: "s1", maxBytes: 1_000_000, epoch });
     })).rejects.toThrow(/group too large to move: shard key \[7\]/);
   }, 60000);
 });

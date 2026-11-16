@@ -113,18 +113,21 @@ describe("a transaction that reads, at its old read time, a group the parent emp
     expect(await count((await readTwice({ noRangeFloor: true })).second)).toEqual([{ n: 2 }]);
   });
 
-  it("keeps the larger move time when the end of the move is reported again", async () => {
+  it("keeps the move time of the receive when the end of the move is reported again", async () => {
     const { c, range, moving, second } = await readTwice();
     // 範囲の中のキーを古い T で読み、断られた文面から床を読む。
     const floor = async () => Number(/moved at (\d+)/.exec(String(await answer(second, moving)))![1]);
     const m = await floor();
-    // 小さい m でもう一度届いても、床は下がらない。大きい m なら、上がる。再起動の後も同じである。
+    // 受け取り終えた移動に、もう一度届いても、その受け取りの m は変わらない。小さい m でも大きい m でも同じで、再起動の後も同じである。
+    // 段 4 より前は、大きい m なら床を上げた (同じ区間の、ほかの受け取りの行の m も書き換えた)。受け取りの記録は、受け取りごとに、
+    // そのときの m を残す (docs/design-refresh-across-move.md の「実装がすること」の 5。範囲が前の持ち主へ戻ると、同じ区間を 2 度受け取る)。
+    // どちらの m も、渡した側がその範囲について発行したどの時刻よりも大きいので、初めの m で足りる。
     await c.shard("s1").finishIncoming({ ...range, m: m - 1000 });
     expect(await floor()).toBe(m);
     await c.shard("s1").finishIncoming({ ...range, m: m + 7 });
-    expect(await floor()).toBe(m + 7);
+    expect(await floor()).toBe(m);
     c.restart("s1");
-    expect(await floor()).toBe(m + 7);
+    expect(await floor()).toBe(m);
   });
 
   it("still answers a read at or after the move time: the group is empty there", async () => {

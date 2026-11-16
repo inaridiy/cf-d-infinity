@@ -705,7 +705,7 @@ describe("a bug in whole-table reads that the same workload found (not specific 
 // ---- 検査が失敗し得ることの確認 ----
 
 /** シャードの private な実装を差し替える。欠陥の注入にだけ使う。 */
-type Inner = { schema: number; ensureSchema(version: number): Promise<void>; syncSchema(req: { version: number }): Promise<void> };
+type Inner = { prepared(req: { epoch: number }): Promise<{ ok: boolean }>; syncSchema(req: { schema: number }): Promise<{ moving: boolean }> };
 const inner = (core: ShardCore) => core as unknown as Inner;
 
 describe("the simulator is deterministic for this workload", () => {
@@ -733,12 +733,19 @@ describe("the checks are not vacuous", () => {
   }, 120_000);
 
   it("lost-write check: detects a DDL that returns before every shard applied it", async () => {
-    // specs/m11_schema_change.qnt の red_noSync に当たる。migration.test.ts の「DROP and CREATE」の消失と同じ欠陥である。
+    // specs/m11_schema_change.qnt の red_noSync、M21 の m21_red_drop_missing_ack に当たる。migration.test.ts の「DROP and CREATE」の
+    // 消失と同じ欠陥である。段 3 から、DROP は全シャードの prepared の ok を待ってから commit するので、どのシャードも prepare を適用せずに
+    // ok と答え、確定の後の適用もしないようにする (段 3 より前は、確定の後の syncSchema を空にして戻していた)。1 つのシャードだけを
+    // 待たない欠陥のスイッチ commitWithoutAcks では、この作業負荷は 60 seed で 1 度も当たらなかった (2026-11-16)。その欠陥は、
+    // test/m21-two-phase.test.ts の場面が決まった順で再生する。
     const s: Scenario = {
       ...CASES.dropAndRecreateTable.s,
       slowPhase2: false,
       inject: (c) => {
-        for (const core of c.cores.values()) inner(core).syncSchema = async () => {};
+        for (const core of c.cores.values()) {
+          inner(core).prepared = async () => ({ ok: true });
+          inner(core).syncSchema = async () => ({ moving: false });
+        }
       },
     };
     // 当たるかどうかは実行の間合いで変わる。seed を多めに取る。

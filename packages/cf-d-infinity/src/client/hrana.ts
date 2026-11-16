@@ -52,21 +52,74 @@ const toBase64 = (b: Uint8Array) => {
 };
 const fromBase64 = (s: string) => Uint8Array.from(atob(s.padEnd(Math.ceil(s.length / 4) * 4, "=")), (c) => c.charCodeAt(0));
 
-function fromH(v: HValue): Value {
-  switch (v.type) {
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+/**
+ * 標準の base64 (RFC 4648 の 4 節) か。末尾の埋め草 (`=`) は、あってもなくてもよい (前から、埋め草のない base64 も受け付けている)。
+ * 正規表現で書くと、繰り返しが数 MB の文字列 (本文は 8 MB まで) でスタックを使い切るので、文字を 1 つずつ見る。
+ */
+function isBase64(s: string): boolean {
+  let n = s.length;
+  let pad = 0;
+  while (pad < 2 && n > 0 && s.charCodeAt(n - 1) === 61 /* = */) {
+    n--;
+    pad++;
+  }
+  for (let i = 0; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 43 || c === 47)) return false;
+  }
+  // 最後の組は 2 文字か 3 文字 (1 文字では 1 バイトにならない)。埋め草は、その組を 4 文字にする数だけ置ける。
+  if (n % 4 === 1) return false;
+  return pad === 0 || (n % 4 !== 0 && (n + pad) % 4 === 0);
+}
+
+/**
+ * 引数の誤り (計画書の未解決の問題 51)。code は、sqld が引数の誤りに使う ARGS_INVALID である (Hrana の仕様は code を決めておらず、
+ * サーバに任せている)。文を実行する前に断るので、何も書かない。要求ごとの誤りとして返し、同じ pipeline のほかの要求と取引 (baton) は
+ * 続く。sqld は、型の印と値の合わない本文を JSON として読めず、pipeline の全体を HTTP 400 で断る。
+ */
+class ArgsInvalid extends SqlError {
+  readonly code = "ARGS_INVALID";
+}
+
+/** 誤りの文面に書く、JS の値の種類。値そのものは書かない (長いことがある)。 */
+const shown = (v: unknown): string =>
+  v === undefined ? "nothing" : v === null ? "null" : Array.isArray(v) ? "an array" : typeof v === "object" ? "an object" : `a ${typeof v}`;
+
+/**
+ * Hrana の値を値にする。型の印 (`type`) で枝を選び、値の JS の型が印と合うかを確かめる (2026-11-16 まで確かめず、`float` の文字列が
+ * TEXT に、`float` の配列が BLOB になり、知らない type は undefined のまま束縛へ進んだ)。合わなければ ArgsInvalid で断る。
+ * label は誤りの文面に書く引数の名前で、位置の引数は 1 から数えた番号、名前つきの引数は名前である。
+ */
+function fromH(v: unknown, label: string): Value {
+  const bad = (what: string) => new ArgsInvalid(`argument ${label} ${what}`);
+  if (typeof v !== "object" || v === null || Array.isArray(v)) throw bad(`is ${shown(v)}; a Hrana value is an object with a "type"`);
+  const h = v as { type?: unknown; value?: unknown; base64?: unknown };
+  switch (h.type) {
     case "null": return null;
     case "integer": {
-      // 整数は 10 進の文字列で届く。INTEGER (bigint) として正確に受け取る。64 ビットに収まらない値だけを断る。
-      if (!/^-?[0-9]+$/.test(v.value)) throw new SqlError(`not an integer: ${v.value.slice(0, 40)}`);
-      const big = BigInt(v.value);
-      if (big < -(2n ** 63n) || big > 2n ** 63n - 1n) throw new SqlError(`the integer ${v.value} does not fit in 64 bits`);
+      // 整数は 10 進の文字列で届く (JSON の数は 2^53 を超えると丸まる)。INTEGER (bigint) として正確に受け取る。
+      if (typeof h.value !== "string") throw bad(`is an integer with ${shown(h.value)} in "value"; an integer carries its decimal digits as a string`);
+      if (!/^-?[0-9]+$/.test(h.value)) throw bad(`is an integer whose "value" ${JSON.stringify(h.value.slice(0, 40))} is not decimal digits`);
+      const big = BigInt(h.value);
+      if (big < INT64_MIN || big > INT64_MAX) throw new ArgsInvalid(`argument ${label}: the integer ${h.value} does not fit in 64 bits`);
       return big;
     }
     // float は REAL である (JS の数)。sqld も float を REAL として束縛する。
-    case "float": return v.value;
-    case "text": return v.value;
-    case "blob": return fromBase64(v.base64);
+    case "float":
+      if (typeof h.value !== "number") throw bad(`is a float with ${shown(h.value)} in "value"; a float carries a number`);
+      return h.value;
+    case "text":
+      if (typeof h.value !== "string") throw bad(`is a text with ${shown(h.value)} in "value"; a text carries a string`);
+      return h.value;
+    case "blob":
+      if (typeof h.base64 !== "string") throw bad(`is a blob with ${shown(h.base64)} in "base64"; a blob carries its bytes as a base64 string`);
+      if (!isBase64(h.base64)) throw bad(`is a blob whose "base64" is not base64`);
+      return fromBase64(h.base64);
   }
+  const type = h.type === undefined ? "no type" : `the type ${typeof h.type === "string" ? JSON.stringify(h.type.slice(0, 40)) : shown(h.type)}`;
+  throw bad(`has ${type}; the types are null, integer, float, text and blob`);
 }
 
 /** INTEGER は integer (10 進の文字列)、REAL は float で返す。整数の値の REAL も float で返り、sqld と同じである。 */
@@ -78,14 +131,26 @@ function toH(v: Value): HValue {
   return { type: "float", value: v };
 }
 
+/**
+ * 文の引数。位置の引数 (`args`) と名前つきの引数 (`named_args`) の並び自体の形も、文を実行する前に確かめる。両方があれば、位置の
+ * 引数を `?1`、`?2` の名前で渡す。
+ */
 function args(s: Stmt): Params {
-  if (s.named_args?.length) {
-    const named: Record<string, Value> = {};
-    (s.args ?? []).forEach((v, i) => (named[`?${i + 1}`] = fromH(v)));
-    for (const a of s.named_args) named[a.name] = fromH(a.value);
-    return named;
+  const positional: unknown = s.args ?? [];
+  const namedArgs: unknown = s.named_args ?? [];
+  if (!Array.isArray(positional)) throw new ArgsInvalid(`arguments: "args" is ${shown(positional)}; it must be an array of Hrana values`);
+  if (!Array.isArray(namedArgs)) throw new ArgsInvalid(`arguments: "named_args" is ${shown(namedArgs)}; it must be an array of { name, value }`);
+  if (namedArgs.length === 0) return positional.map((v, i) => fromH(v, String(i + 1)));
+  const named: Record<string, Value> = {};
+  positional.forEach((v, i) => (named[`?${i + 1}`] = fromH(v, String(i + 1))));
+  for (const a of namedArgs as unknown[]) {
+    if (typeof a !== "object" || a === null || typeof (a as { name?: unknown }).name !== "string") {
+      throw new ArgsInvalid(`arguments: a named argument is ${shown(a)}${typeof a === "object" && a !== null ? " without a string \"name\"" : ""}; it must be { name, value }`);
+    }
+    const { name, value } = a as { name: string; value?: unknown };
+    named[name] = fromH(value, name);
   }
-  return (s.args ?? []).map(fromH);
+  return named;
 }
 
 function stmtResult(r: QueryResult) {
@@ -103,6 +168,7 @@ function stmtResult(r: QueryResult) {
 
 const failure = (e: unknown) => {
   const message = e instanceof Error ? e.message : String(e);
+  if (e instanceof ArgsInvalid) return { message, code: e.code };
   return {
     message,
     code: /UNIQUE|NOT NULL|CHECK|constraint/i.test(message) ? "SQLITE_CONSTRAINT"

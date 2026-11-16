@@ -215,7 +215,7 @@ S3 の字義そのものの反例 (`m5b_red_s3`, `m5b_red_s3_parent`) は報告�
 - 全表の読み。M5b は読みをグループ単位で扱う。実装の子は、全表の読みを、到着の m の最大 (`maxArrived`) より小さい T で断る。行を 1 つも運ばなかった分割では、これが 0 のままなので、子は古い T の全表の読みを断らない。答えが実際に欠けるかどうかは、親が残りの範囲について返す行にもよるので、走らせて確かめてはいない。床は、全表の読みにも当てる (床を持つ範囲に重なる読みを、T < m で断る)。
 - `finishMove` と `finishIncoming` の間。実装では別々の RPC で、モデルの `finishRange` は 1 手である。間に、要求から始まる pull が入ると、そのグループの到着の m は、床より大きくなる。子が到着の m と床の両方で断るかぎり、断る読みが増えるだけである。範囲の移動を終えるときに到着の記録を消す設計 (`docs/design-subslots.md` の「drain と finishMove」) は、この順序を含めては確かめていない。`finishMove` をやり直すと、親は新しい m を発行する。fence の後は親の範囲の行が変わらないので、どの m も床として使えるはずだが、これも確かめていない。
 - 範囲の一部だけの移し直し。モデルの範囲は、グループの全部である。子が受け取った範囲の一部を渡すときは、残りの部分の床を残す。
-- 読みと書き込みの両方をする取引の検証。書き込みは blind write だけである。
+- 読みと書き込みの両方をする取引の検証。書き込みは blind write だけである。移動をまたぐ取引の refresh と確定の検証は、M23 が、行のあるグループ 1 つの移動で扱った。
 - M18 の「行のない piece」。piece でも同じ形のはずだが、M18 には足していない。
 
 ### M1b で見つかった穴 (claim 3: 「読みの開始前に確定した書き込みは必ず見える」)
@@ -287,6 +287,31 @@ M1 と同じモデルで invariant `atomicVisibility`: 読み取り専用取引�
 - red: `RED_RA` refresh が HLC を進めない (3 取引で反例: R が T を 1 に進めた後、S1 で pts 1 の blind write が c = 1 で入る)、
   `RED_RB` 進めた後も旧 T の検証窓 (保守的、違反なし)、`RED_RC` 失敗後も T を進める (R が x を旧値、y を新値で読む)。
 - claim 3 は `freshReadPicked` (1 文の読み: 1 シャードも複数シャードも) と `freshReadSeq` (取引の 2 文目) に分けた。
+- 2026-11-16 追記: 移動をまたぐ refresh の規則 (M23 の `BOUNDED` と `PUSH`、[docs/design-refresh-across-move.md](../docs/design-refresh-across-move.md) の持ち主の判断 4) を、移動のない read-time refresh にもそろえる案を、定数で入れた。
+  `BOUNDED` は、refresh が (T, to] の変更だけを照合する (今の `changedSince` は to より後も数える)。
+  `PUSH` は、refresh が他の取引の intent で失敗せず、c の決まっていない intent を to より上へ push し、c の決まった (to 以下か確定した) intent は適用を待つ (読みの `settleIntents` と同じ扱い)。
+  どちらも false なら、今の実装とそれまでのインスタンスのままである (ghost の `gh` は、どちらかが true のときだけ動くので、`m1b_green` の状態数は 741,431 のまま変わらない)。
+  通らなかった refresh の扱い (fresh を捨てて T のまま読み続ける) と、anchor が c を決めた後の refresh (`refresh`。(pts, c] で、intent があれば失敗する) は変えていない。
+  名前が `_u` で終わるインスタンスは、それまでのインスタンスと同じ定数に `BOUNDED` と `PUSH` を足したもので、答えはどれも変わらなかった。
+  取引 2 件では、新しい規則が通す refresh の場面が作れない (読んだ span の書き込みか intent と、別の取引の確定による ReadTooOld の両方が要る) ので、テンプレートを 4 つに絞った取引 3 件のインスタンス (`FEW`) を足した。
+  `check.sh` は、新しいインスタンスの `serializable` と `atomicVisibility` を、2 つを合わせた `m1bSafe` で 1 回に確かめ、`m1b_red_ra_u` (約 2 分半) は `HEAVY=1` にした。
+
+  | インスタンス | 性質 | 定数 | 到達状態数 (distinct) | 深さ | 結果 |
+  |---|---|---|---|---|---|
+  | `m1b_green_u` | `serializable` / `atomicVisibility` | `m1b_green` と同じ (2 txn、tick 2) | 738,411 | 21 | No violation (`m1b_green` と同じ) |
+  | `m1b_green_u` | `freshReadPicked` | 同上 | 176,219 で反例 | 11 | 反例 (`m1b_green` と同じ。autocommit の 1 シャード読み) |
+  | `m1b_green_bump_u` | `serializable` / `freshReadPicked` | `m1b_green_bump` と同じ | 718,315 | 21 | No violation (同じ) |
+  | `m1b_green_bump_u` | `freshReadSeq` | 同上 | 103,047 で反例 | 9 | 反例 (同じ。範囲外) |
+  | `m1b_red_ra_u` | `serializable` | `m1b_red_ra` と同じ (3 txn、tick なし) | 6,975,967 で反例 | 14 | 反例 (同じ。約 2 分半) |
+  | `m1b_red_rb_u` | `serializable` | `m1b_red_rb` と同じ | 743,339 | 21 | No violation (同じ) |
+  | `m1b_red_rc_u` | `serializable` | `m1b_red_rc` と同じ | 591,509 で反例 | 13 | 反例 (同じ。W2 の c は窓 (0, to] の中にある) |
+  | `m1b_red_no_wait` | `atomicVisibility` | `PUSH` で、c の決まった intent の適用を待たない (2 txn) | 492,842 で反例 | 12 | 反例 (下) |
+  | `m1b_green3_u` | `serializable` / `atomicVisibility` | 3 txn、`FEW`、tick 1 | 2,269,733 | 21 | No violation |
+  | `m1b_no_push3` | `serializable` / `atomicVisibility` | 同上で、c の決まっていない intent を push せずに通す | 2,270,069 | 21 | No violation (下) |
+
+  witness は 3 つで、どれも到達した。`m1b_green_u` の `witnessReadRefreshAdvanced` (132,051)、`witnessFailedThenFinished` (546,879。refresh が通らなかった読むだけの取引が、古い T のまま読み終えて確定する。fresh を捨てた後の読みが答えられないまま、安全が空に通っているのではない)、`m1b_green3_u` の `witnessNewRulePass` (1,470,001。今の規則なら通らなかった refresh の 1 歩が通り、その取引が確定する) と `witnessFailedThenFinished` (1,424,423) である。決定的な run は、`m1b_green3_u` に 2 本ある。`pushPassTest` は、読んだ x に c の決まっていない U の intent があり、今の規則では refresh が失敗するのを、U を to より上へ push して通す (U の c は to より大きくなる)。`boundedPassTest` は、読んだ x に to より後の確定があるのを、(T, to] だけを見て通す。
+  `m1b_red_no_wait` の反例: R が x@S1 を T = 0 で読む。W (x と y、anchor S2) が x に intent を置き、c = 2 で確定し、y にだけ適用する。R の y の読みが ReadTooOld (to = 2) になり、S1 の refresh が、c の決まった x の intent (c = 2 ≤ to) を待たずに通る。R は x を旧値、y を W の値で読む。
+  `m1b_no_push3` が破れないのは、このモデルが 2 シャードだからである。refresh の後は、読んだシャードの時計も、to を出したシャードの時計も to 以上で、anchor はどちらかなので、後で決まる c は必ず to より大きい。push が要るのは、anchor が 3 つ目のシャードのときで、M23 と M23b の Y (c を anchor が任意に選ぶ) が、その場合を表す。M23b の `m23b_red_skip_push` (確かめが intent を push せずに通す) で、その形が破れることを確かめた。
 
 ### M8 `m8_recent_index.qnt` — __ver 廃止後の first-committer-wins
 
@@ -708,7 +733,7 @@ M5b の `singleOwner` は、破れようがない。M5b の blind write はグ�
 
 - 行のない piece。pull されないので、範囲の移動が終わるときに子が到着なしで受け持ち、親の時計を受け取る (M5b の `finishRange`)。piece でも同じ形のはずだが、確かめていない。
 - 2 つ目のグループ。slot を subslot で分けると、その slot にあるテナントが全部分かれる。移動は piece ごとなので、モデルの piece を別のグループのものと読めば同じである。
-- テナントの読みを含む取引の検証。commit のとき、読んだ範囲を T から確かめ直す。読みと同じ claim の確認が要るはずである。書き込みは blind write だけを扱う (M5b と同じ)。
+- テナントの読みを含む取引の検証。commit のとき、読んだ範囲を T から確かめ直す。読みと同じ claim の確認が要るはずである。書き込みは blind write だけを扱う (M5b と同じ)。移動をまたぐ確かめの規則は M23 が決めた (グループ 1 つの移動で、piece は扱っていない)。
 - 子の再分割、範囲表の版が 3 つ以上ある場合、シャードの併合。
 - 親が控えの行を消す ack。モデルの親は控えを持ち続ける。
 - piece の境界の決め方 (再送で同じ m を返すには、親が最初の pull で境界を決めて記録する必要がある) と、16 MB を超える 1 行。
@@ -794,7 +819,7 @@ witness は 6 つである。`witnessResplitWhileMoving` は、移動の途中�
 
 モデルにないもの。
 
-- 取引の検証。commit のとき、読んだ範囲を T から確かめ直す。分け直した claim で読んだ取引は、検証も同じ claim で行うことになり、読みと確定の間に piece が移ると、検証が断られる。そのときの手順 (中止してやり直すか、検証も分け直すか) は決めていない。書き込みは blind write だけを扱う (M5b、M18 と同じ)。
+- 取引の検証。commit のとき、読んだ範囲を T から確かめ直す。分け直した claim で読んだ取引は、検証も同じ claim で行うことになり、読みと確定の間に piece が移ると、検証が断られる。そのときの手順 (中止してやり直すか、検証も分け直すか) は決めていない。書き込みは blind write だけを扱う (M5b、M18 と同じ)。M23 は、グループ 1 つの移動で、検証を今の持ち主へ送り直し、子が親の記録で窓を埋める規則を確かめた。piece ごとの検証の分け直しは、M23 にもない。
 - 書き込みを伴うテナントの文。条件つきの UPDATE と DELETE は、読みを分け直して集め、主キーで書けば、この読みの上に乗る。UNIQUE の値を書く文は、M20 の条件 (子はグループが揃うまで受けない) に当たり、移動の間は通らない。
 - piece の境目を pull のときに決めること (M18 の「モデルにないもの」と同じ)。
 - 表の大きさ。1 GB のテナントを 1 MB の piece で運ぶと、表は約 1,000 行になる。応答に載せる量の上限と、まとめ方は扱っていない。
@@ -868,6 +893,7 @@ witness は 4 つである。`witnessCrossAppliedThenMoved` は、2 つの piece
 実装より先に書いたモデルである。
 設計は [docs/design-catalog-epoch.md](../docs/design-catalog-epoch.md) にある。
 2026-11-15 に設計の段 1 (Meta の `__epoch` の列と、`src/catalog.ts` の畳み込み) が入った。
+2026-11-16 に段 3 (DDL の 2 相化) と段 4 (移動を move-start と move-end の記録で進め、子が進める) が入り、Meta は遷移の条件 (開くのは 1 つ、終わり方は 1 つ、全シャードの ok、表定義の遷移と移動の排他) を列から確かめる。M12、M14、M15 は M21 が置き換えた。
 遷移の条件は `src/catalog.ts` の `refusal()` に書き、このモデルの乱択の実行と突き合わせている (`test/catalog-m21.test.ts`) が、Meta が条件として使うのは段 3 と段 4 からである。
 
 いまの Meta は、5 つの版と排他を別々に持っている。
@@ -1124,3 +1150,523 @@ witness は 7 つで、印を持つ同じ設定 (`m22_track`、`m22_track_split`
 - 取引の再試行、wound-wait、悲観のロックの待ち。断られた部分は、取引を中止する。
 - 2PC の中身 (M1、M9)。確定は 1 手で、全部の部分の intent が置かれた後だけである。
 - 行 3 つ、値 3 つ、取引 3 つ。piece 3 つで取引 2 つのインスタンスは `HEAVY=1` のときだけ流す。
+
+### M23 `m23_refresh_across_move.qnt` — 範囲の移動をまたぐ取引の read refresh と、子での確定 (未解決の問題 37)
+
+2026-11-15 に書いた。
+実装より先に書いたモデルである。
+設計は [docs/design-refresh-across-move.md](../docs/design-refresh-across-move.md) にある。
+
+約束 (`docs/sql-language.md` の「取引」) は、取引が途中の範囲の移動をまたいで続くことである。
+動いた行への文は新しい持ち主へ行き、動いた範囲を移動の時刻より前の T で読む文は、それまでの読みが今も成り立てば T を進め、成り立たなければ競合になる。
+今のコードは、親が渡した区間の確かめを `NotOwner` で断り、子が床より小さい T の確かめを `ReadTooOld` で断るので、移動をまたいだ取引は失敗する (`test/open/transaction-across-split.test.ts`)。
+親の記録だけで確かめると、子が受け取った後に確定した書き込みを見落とす。
+M5b、M18、M19 は、読みと blind write だけを扱い、読みと書き込みの両方をする取引の検証をモデルにしていなかった。
+
+舞台は、親 P、子 C、行 2 つである。
+行 K1 は P に残り、行 K2 のグループが P から C へ移る。
+移動は M5b の green の手順を M21 の形にまとめたもので、`start` (Meta の epoch が 0 から 1 になり、親の fence と子の受け取りと範囲表の切り替えが 1 手で起きる)、`pull` (親が m を決め、行と intent を応答に載せる)、`recv` (子が受け取り、時計を m まで進める)、`finish` (親が床を発行して子へ渡す) の 4 手である。
+シャードの記録 (`log`) は、そのシャードが確定した書き込みだけで、変更の確かめはこれを見る。
+子は、受け取った行を記録に残さない (実装の `receive` と同じ)。
+書き手は、K2 に書く autocommit の書き込み W 1 回と、K2 に書く 2PC の取引 Y 1 件である。
+Y が start の前に P で prepare すると、intent が pull に乗り、anchor が決める c が m 以下のまま、子で適用されることがある。
+取引 X は、全表 (K1 と K2) を読み、形によって全表をもう 1 回読み、K2 を書いて確定する。
+読みの宛先は Worker の範囲表で決まり、親は渡した K2 を `NotOwner` で断り (断る応答が範囲表を運ぶ)、子は到着の m か床より小さい T を `ReadTooOld` で断る。
+Worker は、それで T を進める refresh を始める。
+`OTHER` は、ほかのシャードの `ReadTooOld` による、任意の to への refresh で、範囲表の古い Worker の refresh を表す。
+悲観の書き込みは、持ち主が発行する F の最新を読み、T を進めない。
+確定は、K2 の持ち主が P なら 1 シャードの確定、C なら C で prepare してから P を anchor にする 2PC である。
+
+確かめ (refresh と確定の検証) の設計は 2 つあり、定数 `DESIGN` で選ぶ。
+設計 1 (推奨) では、Worker は今の範囲表の持ち主へ送り、親は渡したグループの Worker からの確かめを断り、子は自分の記録を from から見て、from が到着の m より前なら (from, m] を親の記録で埋める。
+設計 2 では、Worker が読んだシャード (親) と今の持ち主 (子) の両方へ送り、親は要求の epoch が移動を知っているときだけ答え、子はグループが届いてから自分の記録で答え、確定では Worker が親を K2 の検証に入れる。
+設計 0 は、この設計を入れない実装で、`PIN_ROUTING` なら今の実装 (取引は範囲表を取り直さない)、そうでなければ範囲表だけを取り直す実装である。
+どちらの設計でも、確かめに答えたシャードは時計を to まで進め、c の決まっていない intent を to より上へ push する。
+
+選択肢の定数が 2 つある。
+`FENCE_REFUSES` は、親が fence (`start`) の後、まだ渡していない K2 の読みと確かめも断る形で、今のコードの親である。
+定数を外した形は M19 の親で、渡していない piece に答える。
+この設計を段 2 の直後に入れると、親はまだ前者なので、両方を確かめた。
+`BOUNDED` は、refresh の確かめが (from, to] の変更だけを見る案である (今の `changedSince` は to より後も数える)。
+この案では、移動による `ReadTooOld` の refresh が通らなければ取引は失敗し、ほかの refresh が通らなくても、後の refresh を止めない。
+推奨は、設計 1 に、今のコードの親 (`FENCE_REFUSES`) と `BOUNDED` を合わせた形で、`m23_green_rec`、`m23_green_rec_pess`、`m23_live_rec` が確かめる。
+
+`m23Safe` は次の 5 つである。
+
+- `serializable`: 確定した X の読みは、確定の点 (読むだけなら T、書くなら c の直前) の値と一致する。同じ行を 2 回読んで違う値を見た X は確定しない。
+- `readConsistent`: シャードが答えた読みは、その時刻の真の値と一致する。
+- `placementIndependent`: X が失敗するのは、読んだ行に、読んだ後の別の取引の確定があったとき、または X が書く取引で、読んだ行に別の取引の intent があったときだけである。どちらも、移動がなくても失敗し得る場合である (規則 4)。
+- `boundedRefusals`: X が移動を理由に断られるのは 1 回までである。
+- `parentFrozen`: 親の K2 の記録は、pull の後は変わらない。設計 1 で、子が親に尋ねる手を、子が答える手と同じ 1 手にしてある理由である。
+
+`answersSafe` は `serializable` と `readConsistent` で、今の実装が、断るだけで答えを誤らないことを確かめる。
+`readOnlyBelowStart` は、読むだけの X が失敗するのは、refresh の窓 (読んだ時刻, to] に、読んだ行の別の取引の確定があったときだけである、という性質である。移動による refresh の to は、子が答えられるいちばん古い時刻 (到着の m か床) なので、範囲の床の規則の下では、この確定は避けられない。`BOUNDED` の案を比べるのに使う。
+時相の性質 `refreshTerminates` は、始めた refresh がいつか終わること (通るか、競合で終わる) である。
+公平性は、確かめの手 (親と子の答えと断り)、`pull`、`recv`、Y の phase 2 に、弱い公平性を置いた。
+
+設計の条件は定数で、赤はそれを 1 つずつ外す。
+赤のインスタンスは、`m23_red_no_push` (読むだけの取引の形) と活性のほかは、`m23_green` (設計 2 は `m23_alt_green`) と、外した条件のほかは同じ定数である。
+
+| 条件 (定数) | 外したインスタンス | 反例 |
+|---|---|---|
+| 設計 1: 親は、渡したグループの Worker からの確かめを断る (`OWNER_REFUSES`) | `m23_red_parent_alone` | X が P で全表を T = 0 で読む。K2 が C へ移り、C が W を c = 2 で確定する。範囲表の古い X が、ほかのシャードの `ReadTooOld` で T を 3 へ進める。確かめは K1 も K2 も P へ行き、P は自分の記録に変更がないので通す。X は K2 を C で読み直して W を見る |
+| 設計 1: 子は、from が到着の m より前なら、親の記録で埋める (`PEER`、`PEER_PREPARE`) | `m23_red_no_peer` | X が読んだ後、fence の前に、P が W を確定する。移動の後、子の記録は空なので、子は確かめを通す |
+| 同上、確定の検証だけ (`PEER_PREPARE`) | `m23_red_prepare_alone` | X が移動の前に P で K2 を読んで書く (書き込みは Worker に溜まる)。P が W を確定する。移動の後、P は確定を断り、X は範囲表を直して C で prepare する。C は自分の記録だけで通し、W が失われる |
+| 子は、自分の記録を from から見る。床からではない (`CHILD_FROM` = 0) | `m23_red_child_from_floor` | 子が受け取った後、範囲の移動を終える前に、W を c = 2 で確定する。床は 3。子は (3, ∞) だけを見る |
+| 同上。到着の m からでもない | `m23_red_child_from_arrival` | Y が P で prepare し、intent が pull に乗る (m = 2)。anchor が c = 2 を決め、子で適用する。子は (2, ∞) だけを見る。親の記録に Y はない |
+| 確かめに答えたシャードは、時計を to まで進める (`BUMP`) | `m23_red_no_bump` | 子が、to = 4 の確かめに答えるが、時計は 1 のままである。W が c = 2 で確定し、X は T = 4 で W を見る (M1b の `m1b_red_ra` の子の側) |
+| 確かめは、c の決まっていない intent を push する (`PUSH`) | `m23_red_no_push` | 読むだけの X。Y の intent (c は未定) が pull で子に移る。子の確かめは intent に当たって失敗し、X は動いた範囲を読めずに失敗する。移動がなければ、X は T = 0 のまま確定していた (`placementIndependent`) |
+| 設計 2: Worker は、読んだシャードと今の持ち主の両方へ送る (`ASK_BOTH`) | `m23_alt_red_parent_alone` | `m23_red_parent_alone` と同じ形で、X は範囲表を直しているが、確かめを P だけへ送る。P は、epoch が移動を知っているので答える |
+| 設計 2: 親は、要求の epoch が移動を知らなければ断る (`EPOCH_CHECK`) | `m23_alt_red_no_epoch` | 範囲表の古い X の確かめに、P が自分の記録で答える |
+| 設計 2: 子は、グループが届いてから答える (`WAIT_ARRIVAL`) | `m23_alt_red_unarrived` | Y の intent が pull の応答に乗って飛んでいる間に、子は「記録も intent もない」と答える。届いた後に、親は「intent はもうない」と答える。誰も push しないので、anchor が c を to 以下に決める |
+| 設計 2: 確定で、Worker は親を K2 の検証に入れる (`PARENT_VALIDATES`) | `m23_alt_red_prepare_alone` | `m23_red_prepare_alone` と同じ形 |
+| 設計 2: 子は from から見る | `m23_alt_red_child_from_floor` | `m23_red_child_from_floor` と同じ形 |
+| 設計 1: 子は、到着より前からの窓を、自分で親に尋ねる。Worker を前の持ち主へ回さない (`PINGPONG`) | `m23_live_red_pingpong` | 子が「前の持ち主へ」と断り、親が「渡した」と断る。`boundedRefusals` と `refreshTerminates` が破れる (答えは誤らない) |
+
+上限のない確かめ (今の `changedSince`) では、移動の後、範囲の移動を終えた後の時刻で、別の接続が動いた行を確定すると、読むだけの X は、床までの refresh が通らずに失敗する (`m23_green_ro` で `readOnlyBelowStart` が破れる)。
+`BOUNDED` の案では、どの形でも `m23Safe` は破れず、読むだけの X で `readOnlyBelowStart` が成り立つ。
+
+今の実装は、2 つの形で、移動のほかに何もない経路で X を失敗させる (`placementIndependent` が破れる)。
+2 つとも、親は fence の後に範囲の要求を全部断る (`FENCE_REFUSES`)。
+`m23_impl_pinned` (取引は範囲表を取り直さない) では、X が K2 を読み直す文が `not owner` で失敗する。
+`m23_impl` (範囲表だけ取り直す) では、確かめは読んだシャードへ行き、P は `NotOwner`、子は床で断る。
+どちらも、`answersSafe` は破れない。
+今の実装は、断るだけで、答えは誤らない。
+
+| インスタンス | 性質 | 定数 | 到達状態数 (distinct) | 深さ | 結果 |
+|---|---|---|---|---|---|
+| `m23_green` | `m23Safe` | 設計 1。全表を 2 回読み、K2 を楽観で書く。W 1 回、Y 1 件、OTHER (to は 5 まで)、tick 1 | 6,253,563 | 30 | No violation |
+| `m23_green_ro` | `m23Safe` | 同上で、読むだけ | 4,690,083 | 30 | No violation |
+| `m23_green_pess` | `m23Safe` | 同上で、全表を 1 回読み、K2 を悲観で書く | 2,996,564 | 27 | No violation |
+| `m23_green_fenced` | `m23Safe` | `m23_green` で、親は fence の後に全部断る (`FENCE_REFUSES`) | 6,329,435 | 30 | No violation |
+| `m23_green_bounded` | `m23Safe` | `m23_green` で、確かめの上限を to で切る (`BOUNDED`) | 10,499,956 | 30 | No violation |
+| `m23_green_ro_bounded` | `m23Safe` / `readOnlyBelowStart` | `m23_green_ro` で `BOUNDED` | 7,792,045 | 29 | No violation |
+| `m23_green_ro` | `readOnlyBelowStart` | 上限のない確かめ | 239,191 で反例 | 12 | 反例 (W が床より後の c で確定し、読むだけの X が失敗する) |
+| `m23_green_rec` | `m23Safe` | 推奨の組み合わせ。`m23_green` で `FENCE_REFUSES` と `BOUNDED` | 10,642,708 | 30 | No violation |
+| `m23_green_rec_pess` | `m23Safe` | 同上で、全表を 1 回読み、K2 を悲観で書く | 3,884,852 | 27 | No violation |
+| `m23_live_rec` | `refreshTerminates` (時相) / `readOnlyBelowStart` | `m23_live` で `FENCE_REFUSES` と `BOUNDED` | 60,014 | 22 | No violation |
+| `m23_alt_green` | `m23Safe` | 設計 2。`m23_green` と同じ形 | 8,066,377 | 33 | No violation |
+| `m23_alt_green_ro` / `m23_alt_green_pess` | `m23Safe` | 設計 2。読むだけ / 悲観 | 5,968,248 / 3,534,389 | 32 / 29 | No violation |
+| `m23_impl_pinned` | `answersSafe` | 設計 0、範囲表を取り直さない、`FENCE_REFUSES` | 3,936,872 | 25 | No violation |
+| `m23_impl` | `answersSafe` | 設計 0、範囲表を取り直す、`FENCE_REFUSES` | 6,479,113 | 27 | No violation |
+| `m23_live` | `refreshTerminates` (時相) | 設計 1。読むだけ、Y 1 件、W なし、tick なし、to は 3 まで | 56,791 | 22 | No violation |
+| `m23_live_fenced` | `refreshTerminates` (時相) | 同上で `FENCE_REFUSES` | 57,973 | 22 | No violation |
+| `m23_alt_live` | `refreshTerminates` (時相) | 設計 2。同上 | 74,720 | 25 | No violation |
+| `m23_green_wide` | `m23Safe` | `m23_green` で tick 2、to は 6 まで (HEAVY) | 35,995,564 (7 分ほど) | 32 | No violation |
+| `m23_red_parent_alone` | `serializable` | 条件を 1 つ外す | 2,306,724 で反例 | 17 | 反例 |
+| `m23_red_child_from_floor` | `serializable` | 同上 | 737,304 で反例 | 15 | 反例 |
+| `m23_red_child_from_arrival` | `serializable` | 同上 | 1,213,276 で反例 | 16 | 反例 |
+| `m23_red_no_peer` | `serializable` | 同上 | 836,951 で反例 | 15 | 反例 |
+| `m23_red_prepare_alone` | `serializable` | 同上 | 479,747 で反例 | 14 | 反例 |
+| `m23_red_no_bump` | `serializable` | 同上 | 183,890 で反例 | 12 | 反例 |
+| `m23_red_no_push` | `placementIndependent` | 同上 (読むだけ) | 136,393 で反例 | 12 | 反例 |
+| `m23_impl_pinned` / `m23_impl` | `placementIndependent` | 今の実装 / 範囲表だけ取り直す | 530 / 14,116 で反例 | 6 / 9 | 反例 |
+| `m23_live_red_pingpong` | `boundedRefusals` / `refreshTerminates` | 活性の赤 | 3,774 / 59,931 で反例 | 11 / 23 | 反例 |
+| `m23_alt_red_parent_alone` | `serializable` | 設計 2 で条件を 1 つ外す | 2,012,678 で反例 | 16 | 反例 |
+| `m23_alt_red_no_epoch` | `serializable` | 同上 | 2,277,576 で反例 | 17 | 反例 |
+| `m23_alt_red_child_from_floor` | `serializable` | 同上 | 1,248,225 で反例 | 15 | 反例 |
+| `m23_alt_red_unarrived` | `serializable` | 同上 | 5,341,752 で反例 | 19 | 反例 |
+| `m23_alt_red_prepare_alone` | `serializable` | 同上 | 724,661 で反例 | 14 | 反例 |
+
+状態数は、4 workers、heap 2.5 GB で、ほかの TLC の検査と同時に流して測った。
+green は 1 本 1 分から 3 分、赤は 15 秒から 1 分である。
+赤の状態数は、TLC が反例を見つけるまでに数えた数である。
+2026-11-15 に、`check.sh` の M23 の節を `HEAVY=1` で流し、60 件 (TLC の検査 42 件と run の試験 18 件) がすべて期待どおりだった。その後で足した推奨の組み合わせの 5 件 (`m23_green_rec`、`m23_green_rec_pess` と、その `witnessBelowArrival`、`m23_live_rec` の 2 件) は、1 本ずつ流して期待どおりだった。節の全体は、ほかの TLC の検査と同時に流して、`HEAVY=1` で 45 分ほど、なしで 40 分ほどかかる。
+2026-11-16 に、持ち主が設計 1 と確かめの上限を採ったので、設計 2 の 10 件と、上限のない今の親の 2 件 (`m23_green_fenced`、`m23_live_fenced`) を `HEAVY=1` にした (M23b の節を足して、検査の時間を抑えるため)。`HEAVY` なしの節を、ほかの TLC の検査と同時に流さずに流し、52 件がすべて期待どおりで、21 分かかった。
+
+witness は 7 つ (9 本) で、どれも到達した。
+
+| witness | インスタンス | 内容 | 到達状態数 |
+|---|---|---|---|
+| `witnessRefreshAcross` | `m23_green` | 移動の時刻をまたいで T を進めた refresh が通り、X が確定する | 1,161,558 |
+| `witnessCommitAcross` | `m23_green` | 移動の前に K2 を P で読んだ X が、K2 を書いて、移動の後に子で確定する | 518,237 |
+| `witnessReproduction` | `m23_green`、`m23_alt_green` | 再現の形。移動の前に P で全表を読み、移動の後に refresh で T を進めて読み直し (K2 は子で読む)、動いた行を子で書いて確定する。読んだ値はどれも変わらない | 1,817,438 / 3,018,135 |
+| `witnessConflictBelowFloor` | `m23_green` | 子が到着の後、床の前に確定した W で、X が競合になる (Y なし) | 557,072 |
+| `witnessBelowArrival` | `m23_green`、`m23_green_pess` | T が到着の m より小さいまま、X が子で確定する | 150,490 / 85,541 |
+| `witnessRefusedThenCommitted` | `m23_green` | 親が範囲表の古い X の確かめを断り、X が範囲表を直して確定する | 1,434,884 |
+| `witnessAborted` | `m23_green_ro` | 読むだけの X が、移動の後の読み直しで競合になる (設計の文書の、持ち主の判断 1) | 182,151 |
+
+決定的な run は、`m23_green` に 2 本 (再現の 2 つの試験と同じ形)、`m23_green_pess`、`m23_green_fenced`、`m23_green_ro_bounded`、`m23_alt_green` に 1 本ずつ、設計 2 の `child_from_floor` と `prepare_alone` を除く各赤に反例の 1 本がある。
+
+モデルが実装に求めること (設計の文書の「実装がすること」に、手順として書いた)。
+
+- 取引は `schema` だけを確定まで名乗り、範囲表は `NotOwner` のたびに取り直す。読んだ範囲と溜めた書き込みは、今の範囲表で宛先を決め直して、refresh と確定に送る。
+- 親は、渡した区間に触る Worker からの要求を、今と同じく `NotOwner` で断る。
+- 子は、確かめの下限を span と書き込みごとの `since ?? T` で決め、自分の記録を下限から見て、下限が到着の m (行のなかったグループは床) より前なら、親に (下限, m] を尋ねて合わせる。親は、自分の記録だけで答える (渡したグループの intent は、子が見る)。T と床を比べて断ることはしない。グループが届いてから答え、時計を to まで進める。
+- refresh の確かめは、c の決まっていない intent を to より上へ push し、c の決まった to 以下の intent は適用を待つ。
+- (案) refresh の確かめは (from, to] の変更だけを見る。移動による `ReadTooOld` の refresh が通らなければ、取引は競合で失敗する。
+
+モデルにないもの。
+
+- 移し直し (P から C、C から D)。2026-11-16 に、M23b (下の節) で確かめた。
+- piece と claim の分け直し (M19)、行を運ばなかったグループ (M5b の `finishRange`。子の窓の始まりは床になる)、応答の喪失と再送。
+- シャードが列を遅れて適用すること (M21)。`start` は Meta と親と子で 1 手である。
+- 2 つ以上の取引の確かめが同時に進むこと。X が書くのは K2 だけで、K1 に書く書き手はいない。
+- 行ロックと待ち (M9)。悲観の書き込みは、F の最新を読むことだけを表した。
+- 記録の切り詰め (`logLowWater`)。
+- 移動のない refresh で、intent を push すること、上限を to で切ること、通らなかった refresh の後も refresh を続けること (M1b)。M23 は、移動をまたぐ refresh だけを確かめた。2026-11-16 に、前の 2 つを M1b で確かめた (M1b の節)。3 つ目は、移動のない refresh では今のまま (`wantsFresh` を落とす) とし、変えない。
+- 設計 2 で、親が fence の後に全部断る形と、`BOUNDED` の案。
+
+### M23b `m23b_refresh_two_moves.qnt` — 範囲がもう一度動く間も続く取引 (移し直し。未解決の問題 37 の続き)
+
+2026-11-16 に書いた。
+実装より先に書いたモデルである。
+設計は [docs/design-refresh-across-move.md](../docs/design-refresh-across-move.md) の「移し直し」と「受け取りの記録を残す期間」にある。
+
+M23 は移動 1 回だけを扱った。
+取引が最初の移動の前の読み取り時刻を持ったまま、範囲がもう一度動くと (S0 から S1、S1 から S2)、窓には 3 つのシャードの記録が要る。
+M23b は、M23 の推奨の組み合わせ (設計 1、今のコードの親 `FENCE_REFUSES`、確かめの上限 `BOUNDED`、時計を進める、intent の push) を固定して、尋ねられたシャードが受け取りの記録をたどって尋ね続ける規則を確かめる。
+新しい core にしたのは、M23 の core の状態の形を変えると、M23 の状態数を全部取り直すことになるからである。
+
+舞台は、シャード S0、S1、S2 と行 2 つである。
+行 K1 は S0 に残り、行 K2 のグループが S0 から S1 へ (移動 1)、S1 から S2 へ (移動 2) 移る。
+`BACK` なら、移動 2 の行き先は S0 で、範囲は前の持ち主へ戻る。
+移動の 4 手は M23 と同じで、移動 2 は移動 1 を終えた後でだけ始まる (受け取り中のシャードは fence しない。`fenceStep`)。
+書き手は M23 と同じく、K2 に書く autocommit の書き込み W 1 回と、2PC の取引 Y 1 件で、Y の intent は移動のたびに pull に乗り、phase 2 は移動の記録をたどって、いまの持ち主に届く。
+取引 X の形も M23 と同じで、Worker は `NotOwner` で断られるたびに Meta から範囲表を取り直す。
+
+規則。
+いまの持ち主は、自分の記録を lo から確かめ、自分のいちばん新しい受け取りの記録 (渡した側と到着の m) を見て、lo < m なら渡した側に (lo, m] を尋ねる。
+尋ねられたシャードは、自分の記録を lo から (lo, up] で確かめ (up は尋ねた側の到着の m)、受け取りの記録のうち up より前に受け取ったいちばん新しいものを選んで、lo < その m なら、さらにその渡した側に尋ねる。
+尋ねる手は 1 つずつ別の手 (`askStep`) にした。
+いまの持ち主の答え (自分の記録の確かめ、時計を to まで進めること、intent の push) は、尋ね終わった後の 1 手である。
+
+`m23bSafe` は、M23 の `serializable`、`readConsistent`、`placementIndependent`、`parentFrozen` (渡したシャードは、受け取り直すまで K2 の書き込みを適用しない) に、`boundedRefusals` (断られる回数は移動の数以下) と `boundedAsks` (1 回の確かめが前の持ち主に尋ねる回数は移動の数以下) を合わせたものである。
+時相の性質は、`refreshTerminates` (始めた refresh はいつか終わる) と `asksEnd` (尋ね始めた確かめは、いつか尋ね終わる) である。
+公平性は、確かめの手 (S0 の K1、各シャードの K2)、尋ねる手、2 回の移動の `pull` と `recv`、Y の phase 2 に、弱い公平性を置いた。
+`check.sh` は、2 つを合わせた `chainLive` を確かめる。
+
+書き手 W と Y を両方入れると、状態数が掛け算で増える (W だけで 85 万、Y だけで 577 万、両方では読むだけの形でも 2,867 万)。
+`check.sh` の既定は、書き手を 1 つずつにしたインスタンス (`_w`、`_y`) で確かめ、両方を入れた形 (`m23b_green`、`m23b_green_ro`、`m23b_green_back`) は `HEAVY=1` にした。
+赤は、W で破れるもの (`stop_first`、`forget`、`mid_alone`) は `m23b_green_w` と、Y で破れるもの (`mid_from_arrival`、`skip_push`) は `m23b_green_y` と、外した条件のほかは同じ定数である。
+
+| 条件 (定数) | 外したインスタンス | 反例 |
+|---|---|---|
+| 尋ねられたシャードも尋ね続ける (`FOLLOW`) | `m23b_red_stop_first` | X が S0 で全表を T = 0 で読む。移動 1 の前に、W が S0 で K2 を c = 1 で確定する。2 回の移動の後、S2 は S1 に尋ねるが、S1 は S0 に尋ねない。X は S2 で W の値を読み、確定する |
+| 受け取りの記録を、受け取りを終えた後も残す (`KEEP`) | `m23b_red_forget` | 同じ形。S1 は移動 2 を始める前に移動 1 を終えているので、尋ねられたときには S0 から受け取ったことを忘れている (今のコードのメモリの `this.incoming` だけを引く実装) |
+| 同上、移動 1 回で | `m23b_red_forget_one` | 子が、受け取りを終えた後で、親に尋ねずに答える |
+| 尋ねられたシャードも、自分の記録を lo から見る (`MID_FROM_ARRIVAL` = false) | `m23b_red_mid_from_arrival` | Y が S0 で prepare し、intent が移動 1 の pull に乗る。anchor が c = 1 (m1 = 2 より小さい) を決め、S1 で適用する。S1 は (2, 4] だけを見て、S0 の (0, 2] にも Y はない |
+| 移動 2 で渡した S1 も、Worker からの確かめを断る (`MID_REFUSES`) | `m23b_red_mid_alone` | X は移動 1 と 2 の間に S1 で K2 を読み直す (範囲表は epoch 1)。移動 2 の後、S2 で W が確定する。範囲表の古い X の refresh に、S1 が自分の記録 (と S0) だけで答え、X は S2 で W の値を読む (M23 の `m23_red_parent_alone` を、2 回目の移動で) |
+| いまの持ち主の確かめが、c の決まっていない intent を to より上へ push する (`SKIP_PUSH` = false) | `m23b_red_skip_push` | Y が移動の後に S2 で prepare する (pts 5)。ほかのシャードの ReadTooOld による refresh (to = 5) に、S2 が intent を push せずに答える。Y の anchor が c = 5 を決め、X は T = 5 で Y の値を読む。M23 の `PUSH` = false は「intent があれば失敗する」(安全で、置き場所による失敗) で、こちらは「見ずに通す」(安全でない) である。M1b の 2 シャードでは、この形は破れない (`m1b_no_push3`) |
+| 受け取りの記録を時刻で選ぶ (`BY_TIME`) | `m23b_live_red_cycle` | 範囲が S0 から S1、S1 から S0 へ動く。S0 は S1 に (0, 3] を、S1 は S0 に (0, 1] を尋ね、S0 が窓の上端 1 より後に受け取った記録 (m2 = 3) をたどって、また S1 に尋ねる。`boundedAsks` と `asksEnd`、`refreshTerminates` が破れる (答えは誤らない) |
+
+| インスタンス | 性質 | 定数 | 到達状態数 (distinct) | 結果 |
+|---|---|---|---|---|
+| `m23b_green_w` | `m23bSafe` | 全表を 2 回読み、K2 を楽観で書く (再現の形)。書き手 W、OTHER (to は 5 まで)、tick なし | 848,611 | No violation |
+| `m23b_green_y` | `m23bSafe` | 同上で、書き手 Y | 5,770,037 | No violation |
+| `m23b_green_ro_w` / `m23b_green_ro_y` | `m23bSafe` と `readOnlyBelowStart` (`m23bSafeRO`) | 読むだけ。書き手 W / Y | 590,961 / 4,030,482 | No violation |
+| `m23b_green_pess` | `m23bSafe` | 全表を 1 回読み、K2 を悲観で書く。書き手 W と Y | 11,371,684 | No violation |
+| `m23b_green_back_y` | `m23bSafe` | 範囲が S0 へ戻る。読むだけ、書き手 Y | 3,625,419 | No violation |
+| `m23b_live` | `chainLive` (時相) | 読むだけ、Y、W なし、to は 4 まで | 1,925,233 | No violation |
+| `m23b_green_back` | `m23bSafe` | 範囲が S0 へ戻る。読むだけ、書き手 W と Y (HEAVY) | 23,598,512 | No violation |
+| `m23b_green_ro` | `m23bSafeRO` | 読むだけ、書き手 W と Y (HEAVY) | 28,666,862 | No violation |
+| `m23b_live_back` | `chainLive` (時相) | `m23b_live` で、範囲が S0 へ戻る (HEAVY) | 1,820,452 | No violation |
+| `m23b_green` | `m23bSafe` | 全表を 2 回読み、K2 を楽観で書く。書き手 W と Y、to は 6 まで (HEAVY) | 90,774,382 (18 分。深さ 45) | No violation |
+| `m23b_green_one` | `m23bSafe` | 移動 1 回 (M23 の推奨の組み合わせと同じ規則)。書き手 W と Y、tick 1 (HEAVY) | 17,524,677 | No violation |
+| `m23b_red_stop_first` | `serializable` | 条件を 1 つ外す (`m23b_green_w` の定数) | 260,896 で反例 | 反例 |
+| `m23b_red_forget` | `serializable` | 同上 | 47,383 で反例 | 反例 |
+| `m23b_red_forget_one` | `serializable` | 移動 1 回で、受け取りを終えたら記録を忘れる | 404,461 で反例 | 反例 |
+| `m23b_red_mid_from_arrival` | `serializable` | 条件を 1 つ外す (`m23b_green_y` の定数) | 2,395,489 で反例 | 反例 |
+| `m23b_red_mid_alone` | `serializable` | 条件を 1 つ外す (`m23b_green_w` の定数) | 366,772 で反例 | 反例 |
+| `m23b_red_skip_push` | `serializable` | 条件を 1 つ外す (`m23b_green_y` の定数) | 79,237 で反例 | 反例 |
+| `m23b_live_red_cycle` | `boundedAsks` / `chainLive` (時相、HEAVY) | 範囲が S0 へ戻り、記録を時刻で選ばない | 86,897 / 1,828,701 で反例 | 反例 |
+
+状態数は、4 workers、heap 2.5 GB で、ほかの TLC の検査と同時に流さずに測った。
+赤の状態数は、TLC が反例を見つけるまでに数えた数である。
+2026-11-16 に、`check.sh` の M23b の節を `HEAVY` なしで流し、26 件がすべて期待どおりで、13 分 (762 秒) かかった。その後で足した `m23b_red_skip_push` の 2 件 (TLC の赤と run) は、1 本ずつ流して期待どおりだった。
+
+witness は 5 つで、どれも到達した。
+
+| witness | インスタンス | 内容 | 到達状態数 |
+|---|---|---|---|
+| `witnessReproduction2` | `m23b_green_w` | 再現の形が 2 回の移動をまたぐ。移動 1 の前に S0 で全表を読み、2 回の移動の後に refresh で T を進めて読み直し (K2 は S2 で読む)、動いた行を S2 で書いて確定する。確かめは S1 と S0 に尋ね、読んだ値はどれも変わらない | 572,040 |
+| `witnessOneHop` | `m23b_green_w` | 移動 1 と 2 の間に S1 で読んだ K2 の refresh が、移動 2 をまたいで、S1 だけに尋ねて通り、確定する | 420,320 |
+| `witnessFoundAtS0` | `m23b_green_w` | 移動 1 の前に S0 で確定した W を、S2 から始まる尋ねる列が S0 で見つけ、X が競合になる | 67,471 |
+| `witnessBelowArrival2` | `m23b_green_pess` | T が移動 1 の m より小さいまま、X が S2 で確定する (悲観の取引) | 1,213,644 |
+| `witnessReadAcross2` | `m23b_green_back_y` | 範囲が S0 へ戻った後、2 回の移動をまたいで T を進めた refresh が通り、読むだけの X が確定する | 1,010,820 |
+
+決定的な run は、`m23b_green` に 3 本 (再現の形、S0 での競合、移動の間に読んだ取引)、`m23b_green_pess` と `m23b_green_back` に 1 本ずつ、`m23b_red_forget_one` を除く各赤 (`m23b_live_red_cycle` を含む) に反例の 1 本がある。
+
+モデルにないもの。
+
+- 3 回以上の移動。尋ねる列は、移動の数だけで終わる (選ぶ記録の m は窓の上端より小さい) が、モデルは 2 回までである。
+- 受け取りの記録を消す時期と、変更ログの切り詰め (`logLowWater`)。設計の文書の「受け取りの記録を残す期間」は、モデルの外の議論である。赤 `m23b_red_forget` は、消してはならない側だけを確かめる。
+- 範囲が前の持ち主へ戻る形での、書く取引 (S0 で 1 シャードの確定になる)。`BACK` のインスタンスは読むだけである。
+- M23 の「モデルにないもの」の全部 (piece、行のないグループ、応答の喪失、列の遅れた適用、2 つ以上の取引の確かめ、行ロック)。
+- 移動 2 が移動 1 を終える前に始まること。モデルでは前提として置いた (今のコードの `fenceStep` が断る)。
+
+### M23c `m23c_old_reads_across_move.qnt` — 移動の前の読み取り時刻の読みに、前の持ち主の記録で答える (古い読み。未解決の問題 37 の続き)
+
+2026-11-16 に書いた。
+実装より先に書いたモデルである。
+設計は [docs/design-refresh-across-move.md](../docs/design-refresh-across-move.md) の「古い読み」にある。
+
+M23 と M23b の規則では、子は、到着の m か床より小さい T の読みを `ReadTooOld` で断り、Worker が refresh で T を進める。
+窓 (T, m か床] に、読んだ行の別の接続の確定があると、読むだけの取引も競合で失敗する (案 A' の残る失敗)。
+持ち主の基準 (2026-11-16。ORM から使って SQLite と同じに振る舞う。分割だけが起こす失敗は許さない) では、これは許されない。
+M23c は、その読みに T のまま答える規則を確かめる。
+新しい core にしたのは、M23b と同じく、M23b の状態の形を変えると、M23b の状態数を全部取り直すことになるからである。
+
+舞台、書き手、取引 X、確かめ (refresh と確定の検証) は M23b と同じで、確かめは M23b の緑の条件に固定した (尋ね続ける、受け取りの記録を時刻で選ぶ、尋ねられた側も lo から見る、移動 2 で渡した S1 も断る、intent を push する)。
+足したものは 3 つである。
+
+- 古い読み。持ち主は、閾値 (グループの到着の m。運ばれなかったグループは範囲の床) より小さい T の K2 の読みを、受け取りの記録の渡した側に、窓の上端 up = 受け持ち始めた時刻で尋ねる。尋ねられた側は、自分の受け取りの記録を時刻で選んで、同じ規則で前へたどる。答えは、列の終わりのシャードの行 (土台) と、各シャードの記録の T 以下の版を合わせた中で、いちばん新しい版である。intent は持ち主だけが扱う。尋ねる列は 1 手で答える (前の持ち主の記録は pull の後で変わらない。各シャードは `logLowWater` との比べと記録の読みを同じ同期区間で行う、を前提として置いた)。
+- 保持。各シャードの `logLowWater` (`low`) を、時計 - `R` まで、`GCS` 回まで上げる手 (`gc`) と、渡した行を消す手 (`dropRows`) を足した。`RETAIN` なら、渡した行は `logLowWater` が手放した時刻以上になってから消す。受け取りの記録も、受け取った側の `logLowWater` が受け持ち始めた時刻以上になると消したものとして扱う。読みも確かめも、T か窓の下限が、答えに要るシャードの `logLowWater` より小さければ「古すぎる」で断る。
+- 空にされたグループ (`EMPTY`)。W の書き込みは K2 の行を消す。fence の後に K2 に行も intent もなければ pull されず、子は `finish` で範囲の床から受け持つ (M5b の `finishRange`)。
+
+土台の版は時刻を持たない (時刻 -1)。子は、受け取った行より前へは時間をさかのぼれず、受け取った行をそのまま答えるからである。そのため、K2 の最初の行 (版 0) は、S0 の記録ではなく土台に置いた。
+
+`m23cSafe` は、M23b の `serializable`、`readConsistent`、`boundedRefusals`、`boundedAsks`、`parentFrozen` に、`boundedHops` (1 回の読みが前の持ち主に尋ねる回数は移動の数以下) を足し、`placementIndependent` に「古すぎる」で断られたときを足したものである。
+`roNeverFails` は、読むだけの X が失敗するのは「古すぎる」で断られたときだけである、という性質で、読むだけのインスタンスは `m23cSafeRO` (`m23cSafe` と `roNeverFails`) を確かめる。
+古い読みを入れると、読むだけの X を失敗させる手は「古すぎる」の断りだけになる (移動による refresh がなくなり、ほかの refresh は通らなくても取引を失敗させない) ので、`roNeverFails` は形の上で成り立つ。「読むだけの取引は移動で失敗しない」の中身は、答えが正しいこと (`readConsistent`、`serializable`) と、読みが待ち続けずに取引が終わること (`txnEnds`) が担う。`txnEnds` は、移動 2 回、範囲が S0 へ戻る形、空にされたグループ、変更ログの切り詰め、書く取引のそれぞれで確かめた。`m23c_base_ro` は、古い読みを外すと `roNeverFails` が破れることを示す。
+`logLowWater` は時計 - `R` より上がらないので、「古すぎる」は、T が、答えに要るシャードの時計で保持の幅より古いときだけに起きる (実装では `LOG_RETAIN_MS`、今は 10 分)。
+時相の性質は 2 つある。
+`txnEnds` は、X がいつか確定するか失敗すること (読みが intent や到着を待ち続けない) で、`chainLive` は、M23b と同じく、始めた refresh と尋ねる列がいつか終わることである。
+公平性は、X の手の全体、2 回の移動の `pull`、`recv`、`finish`、Y の phase 2 に、弱い公平性を置いた。
+`check.sh` の既定は、`txnEnds` を OTHER なしの 2 つのインスタンスで確かめる。`chainLive` (OTHER あり) は HEAVY にした。古い読みは refresh も尋ねる列 (確かめの) も使わないので、この性質は M23b の `m23b_live` と同じ規則を確かめる。
+
+赤は、規則の条件を 1 つずつ外す。
+`m23c_red_prev_above` だけは、閾値を範囲の床にした形 (`m23c_green_split_floor`、緑) から、重ねることを外す。
+閾値を到着の m にするか範囲の床にするかは、重ねることがあれば答えを変えない。
+前の持ち主が到着の m 以上の T に答えて子の書き込みを落とすのは、重ねないときだけである。
+`m23c_red_no_retain` の前の持ち主は、行を消した後に「行なし」と答える (今の rollback-read は、今の行から T より後の確定を戻すので、そうなる)。行を消したことに気づいて断る形にしても、T は `logLowWater` より新しいので、読むだけの取引が置き場所のために失敗する (`roNeverFails` が破れるはずである)。モデルで確かめたのは前者だけである。
+
+| 条件 (定数) | 外したインスタンス | 反例 |
+|---|---|---|
+| 古い読み (`OLD_READS`)。外すと M23b の規則 | `m23c_base_ro` | 案 A' の形。X が S0 で全表を T = 0 で読む。W が K2 を c = 1 で S0 に確定する。移動 1 (m1 = 2、床 3) の後、S1 が T = 0 を断り、refresh の確かめが S0 の (0, 2] に W を見つけて、読むだけの X が失敗する (`roNeverFails`) |
+| 持ち主は、閾値より小さい T を前の持ち主に尋ねる (`FWD`) | `m23c_red_child_below` | 同じ形で、S1 が T = 0 に、受け取った行 (W の値) で答える |
+| 尋ねた側は、自分の記録の T 以下の版を重ねる (`MERGE`) | `m23c_red_no_merge` | Y が S0 で prepare し (pts 1)、X が T = 1 で読み始める。Y の intent が pull に乗り、anchor が c = 1 (m1 = 2 より小さい) を決め、S1 で適用する。S1 は S0 の答え (最初の行) をそのまま返す。「受け取る前に、子の書き込みはない」は成り立たない |
+| 同上、閾値を範囲の床にした形で | `m23c_red_prev_above` | 移動 1 (m1 = 1) を受け取った後、W が S1 で c = 2 で確定する。X は refresh で T = 2 にし、床 3 の後で K2 を読む。T は到着の m 以上だが床より小さいので、S1 は S0 に尋ね、S0 の答え (最初の行) をそのまま返す |
+| 渡した行を、`logLowWater` が手放した時刻を越えるまで残す (`RETAIN`) | `m23c_red_no_retain` | X が T = 0 で読む。移動 1 を終えると、S0 が渡した行を消す (今の `ack`)。S1 に尋ねられた S0 は、T = 0 の行を答えられず、「行なし」と答える |
+| 渡したシャードは、Worker の要求を断り、持ち主の尋ねにだけ答える (`PREV_ANSWERS` = false、epoch の確かめ) | `m23c_red_no_epoch` | `m23c_red_no_merge` と同じ intent の形で、範囲表の古い X (epoch 0) の読みに、S0 が、T = 1 < m1 = 2 なので、残した行で答える。S1 で適用された Y を見ない |
+| 持ち主が尋ねる。Worker が前の持ち主へ直接送らない (`WORKER_ROUTES` = false) | `m23c_red_worker_routes` | Y の intent (c は未定) が pull で S1 に移る。X の T = 1 の読みを、Worker が S0 へ送り、S0 が答える。誰も Y を push せず、anchor が c = 1 (T 以下) を決め、Y は S1 で適用される。X が読み直すと、S0 はまた最初の行を答えるが、T = 1 の値は Y である |
+| 運ばれなかったグループの窓の始まりを、範囲の床として記録に残す (`EMPTY_FLOOR`) | `m23c_red_empty_no_floor` | X が T = 0 で読む。W が K2 の行を消す (c = 1)。移動 1 は行を運ばず、S1 が床 2 から受け持つ。S1 は到着の記録がないので尋ねず、T = 0 に「行なし」と答える (今のコードの `noRangeFloor`、M5b の `m5b_red_emptied` と同じ欠陥) |
+
+| インスタンス | 性質 | 定数 | 到達状態数 (distinct) | 結果 |
+|---|---|---|---|---|
+| `m23c_green_ro_w` | `m23cSafeRO` | 読むだけ (全表を 2 回読む)。書き手 W、移動 2 回、OTHER (to は 5 まで) | 1,201,275 | No violation |
+| `m23c_green_ro_y` | `m23cSafeRO` | 同上で、書き手 Y | 7,833,657 | No violation |
+| `m23c_green_w` | `m23cSafe` | 全表を 2 回読み、K2 を楽観で書く。書き手 W | 1,761,688 | No violation |
+| `m23c_green_back_y` | `m23cSafeRO` | 範囲が S0 へ戻る。読むだけ、書き手 Y | 6,839,355 | No violation |
+| `m23c_green_split_floor` | `m23cSafeRO` | 閾値を範囲の床にする。読むだけ、書き手 W | 1,306,232 | No violation |
+| `m23c_green_retain` | `m23cSafeRO` | 変更ログを 2 回まで切り詰める (保持の幅 1)。移動 1 回、読むだけ、書き手 W | 7,457,625 | No violation |
+| `m23c_green_empty` | `m23cSafeRO` | W が K2 の行を消す。空のグループは運ばれない。読むだけ、移動 2 回 | 771,188 | No violation |
+| `m23c_green_empty_w` | `m23cSafe` | 同上で、書く取引 (楽観) | 1,129,299 | No violation |
+| `m23c_live_end` | `txnEnds` (時相) | 読むだけ、書き手 W と Y、OTHER なし | 88,802 | No violation |
+| `m23c_live_end_w` | `txnEnds` (時相) | 書く取引 (楽観)、書き手 W と Y、OTHER なし | 179,431 | No violation |
+| `m23c_live_end_back` | `txnEnds` (時相) | 範囲が S0 へ戻る。読むだけ、書き手 W と Y、OTHER なし | 91,644 | No violation |
+| `m23c_live_end_empty` | `txnEnds` (時相) | 空にされたグループ (子は finish で受け持つ)。読むだけ、書き手 W、OTHER なし | 1,676 | No violation |
+| `m23c_live_end_retain` | `txnEnds` (時相) | 変更ログを 2 回まで切り詰める。読むだけ、書き手 W、OTHER なし | 95,328 | No violation |
+| `m23c_green_y` | `m23cSafe` | 書く取引 (楽観)、書き手 Y (HEAVY) | 11,502,165 | No violation |
+| `m23c_green_split_floor_y` | `m23cSafeRO` | 閾値を範囲の床にする。読むだけ、書き手 Y (HEAVY) | 8,420,809 | No violation |
+| `m23c_green_pess` | `m23cSafe` | 全表を 1 回読み、K2 を悲観で書く。書き手 W と Y (HEAVY) | 24,056,593 (5 分) | No violation |
+| `m23c_green_retain_w` | `m23cSafe` | `m23c_green_retain` で、書く取引 (HEAVY) | 10,255,846 | No violation |
+| `m23c_green_retain2` | `m23cSafeRO` | 変更ログを 1 回切り詰める。移動 2 回、読むだけ、書き手 W (HEAVY) | 26,682,901 (5 分) | No violation |
+| `m23c_green_retain_y` | `m23cSafeRO` | 変更ログを 2 回まで切り詰める。移動 1 回、読むだけ、書き手 Y (重ねることと、受け取りの記録を消すことが同時に起きる) (HEAVY) | 47,652,651 (10 分) | No violation |
+| `m23c_live` | `chainLive` (時相) | 読むだけ、書き手 Y、OTHER あり (to は 4 まで) (HEAVY) | 3,442,150 (9 分) | No violation |
+| `m23c_base_ro` | `roNeverFails` | M23b の規則のまま。読むだけ、書き手 W | 19,450 で反例 | 反例 |
+| `m23c_red_child_below` | `readConsistent` | 条件を 1 つ外す (`m23c_green_ro_w` の定数) | 4,637 で反例 | 反例 |
+| `m23c_red_no_merge` | `readConsistent` | 同上 (`m23c_green_ro_y` の定数) | 6,017 で反例 | 反例 |
+| `m23c_red_prev_above` | `readConsistent` | `m23c_green_split_floor` から重ねることを外す | 6,576 で反例 | 反例 |
+| `m23c_red_no_retain` | `readConsistent` | 条件を 1 つ外す (`m23c_green_ro_w` の定数) | 2,674 で反例 | 反例 |
+| `m23c_red_no_epoch` | `readConsistent` | 同上 (`m23c_green_ro_y` の定数) | 1,191 で反例 | 反例 |
+| `m23c_red_worker_routes` | `readConsistent` | 同上 (`m23c_green_ro_y` の定数) | 4,038 で反例 | 反例 |
+| `m23c_red_empty_no_floor` | `readConsistent` | 同上 (`m23c_green_empty` の定数) | 2,222 で反例 | 反例 |
+
+状態数は、4 workers、heap 2.5 GB で、ほかの TLC の検査と同時に流さずに測った。
+赤の状態数は、TLC が反例を見つけるまでに数えた数で、流すたびに少し変わる。
+2026-11-16 に、`check.sh` の M23c の節を `HEAVY` なしで流し、40 件 (TLC の検査 27 件と run の試験 13 件) がすべて期待どおりで、15 分 (880 秒。初めの数分は、ほかの TLC の検査と同時だった) かかった。HEAVY の 7 件は 1 本ずつ流して期待どおりだった (`m23c_green_retain_y` が 10 分、`m23c_live` が 9 分、`m23c_green_pess` と `m23c_green_retain2` が 5 分ずつ)。
+`txnEnds` を OTHER ありで確かめると、ほかのシャードの `ReadTooOld` による refresh が、通らないまま何度でも始まる経路で破れる (25,693 状態で反例。モデルの OTHER は回数を数えないが、実装は 1 つの文につき 4 回までである)。これは検査の側の誤りなので、OTHER なしのインスタンスで確かめた。
+移動 2 回で変更ログを 2 回切り詰める形は、4 分で 2,045 万状態を数えても終わらなかったので、移動 1 回の形を既定にし、移動 2 回は切り詰め 1 回の形 (`m23c_green_retain2`) を HEAVY にした。
+
+witness は 6 つで、どれも到達した。
+
+| witness | インスタンス | 内容 | 到達状態数 |
+|---|---|---|---|
+| `witnessAPrime` | `m23c_green_ro_w` | 案 A' の形。読むだけの X が T で読み、W が動く行を (T, m1] の時刻で S0 に確定する。X は T を進めずに、移動の後に動いた行を前の持ち主に尋ねて読み、確定する | 17,620 |
+| `witnessForward2` | `m23c_green_ro_w` | 2 回の移動をまたいで、前の持ち主 2 つ (S1 と S0) に尋ねた読みがあり、X が確定する | 79,090 |
+| `witnessOverlay` | `m23c_green_ro_y` | 尋ねて答えた読みの答えが、持ち主の重ねた版 (pull に乗った Y を、受け取る前の c で適用したもの) で、X が確定する | 105,181 |
+| `witnessTooOld` | `m23c_green_retain` | 前の持ち主の `logLowWater` より古い読みが「古すぎる」で断られ、X が失敗する | 5,305 |
+| `witnessWriteAcross2` | `m23c_green_w` | 書く X が、T を進めずに、2 回の移動の後に動いた行を読み直し、移動 2 の行き先で書いて確定する | 663,395 |
+| `witnessEmptyRead` | `m23c_green_empty` | 空にされたグループを、子が前の持ち主に尋ねて、削除の前の T の行を答え、X が確定する | 11,037 |
+
+決定的な run は、`m23c_green_ro_w` に 2 本 (案 A' の形と、2 回の移動をまたぐ読み)、`m23c_green_ro_y`、`m23c_green_w`、`m23c_green_retain`、`m23c_green_empty` に 1 本ずつ、`m23c_base_ro` と各赤に反例の 1 本がある。
+
+わかったこと。
+
+- 案 A' の残る失敗は、移動の前の読み取り時刻の読みに T のまま答えれば、なくせる。読むだけの取引は、`logLowWater` より古いときのほかは失敗しない。
+- 「受け取る前に、子の書き込みはない」は、確定の時刻では成り立たない。前の持ち主の答えだけを使う形 (重ねない、Worker が前の持ち主へ直接送る、渡したシャードが範囲表の古い Worker に答える) は、どれも、pull に乗った intent を受け取る前の c で適用した版を落として破れる。
+- 閾値 (到着の m か範囲の床か) は、重ねることがあれば答えを変えない。閾値を到着の m にすると、子は、行を運んだグループの [到着の m, 床) の T に、自分の状態で答えてよい (M23 の設計の文書の判断 1 で、確かめていないとした点)。行を運ばなかったグループには、範囲の床が閾値として要る。
+
+モデルにないもの。
+
+- 尋ねる列をシャードごとの別の手にすること。前の持ち主の記録は pull の後で変わらないので 1 手にした。各シャードが `logLowWater` との比べと記録の読みを同じ同期区間で行う、を前提として置いた。
+- 全表の span (複数のグループ)。閾値を範囲の床にした形が、その答え方にあたる。
+- 渡した行を残す場所。範囲が戻ったとき (BACK)、残した行と受け取った行を別に持つものとして扱った。
+- 移動 2 回で変更ログを 2 回以上切り詰めること (状態数のため)。
+- M23b の「モデルにないもの」の全部。
+
+### M24 `m24_table_epochs.qnt` — 表ごとの epoch。DDL が取引を古くするのは、取引が頼る表を変えて確定したときだけ (未解決の問題 53)
+
+2026-11-16 に書いた。
+実装より先に書いたモデルである。
+設計は [docs/design-catalog-epoch.md](../docs/design-catalog-epoch.md) の「表ごとの epoch (2026-11-16)」にある。
+
+段 3 の取引は、表定義全体の epoch を 1 つ名乗り、それは prepare、commit、abort のどれでも進む。
+そのため、関係のない表の `CREATE TABLE` も、失敗した DDL も、開いている取引を全部古くする。
+決めた設計では、表と view が、それぞれ epoch を持つ (表は読みの epoch と書き込みの epoch の 2 つ)。
+epoch は commit だけで進み、要求は、計画が頼るもの (読む表、書く表、view とその元の表) と、その epoch を運ぶ。
+シャードは、運ばれたものだけを比べる。
+
+本体 (`m24_core`) は M21 の本体を写したもので、表定義のものを 4 つ (表 A、A の上の view V、別の表 B、まだない表 N) にした。
+A は M21 の表 (行 1 はシャード P、行 2 は Q) で、index は A の上の、シャードをまたぐ UNIQUE (`BUILD`) である。
+DDL は M21 の 3 つ (`BUILD`、`CHECK`、`DROP`。どれも A のもの) と移動 (`SPLIT`) に、2 つを足した。
+`NEWT` (`CREATE TABLE N`。fence はない) と、`ALTB` (B の、行で失敗し得る DDL。B の行の値が 2 なら Q の試しが通らずに abort、そうでなければ commit) である。
+取引は、A の 1 行を書き、書き込みの計画が B を読むことがあり (`VIA_B`)、確定の前に A か V を読む文を 1 つ実行できる (`TXN_READ`、`VIA_V`)。
+書き込み禁止の表への書き込みは、断らずに待つ (M21 は断る。いまの実装の `TableLocked` の待ちに合わせた)。
+M21 の設計の条件は、設計どおりに固定した (外した形は M21 が確かめている)。
+
+時刻、行ロック、取引の中の DDL は、小さなモデルで確かめる。
+
+- `m24_floor_*`: シャードの DDL の床。シャード 1 つ、表 A と B、時計 0〜5。別の接続の書き込みと、B の形を変える DDL の commit の後で、取引が古い T で A か B を読む (読み戻し。refresh と述語の検証も同じ規則)。
+- `m24_lock_*`: 行ロックと DDL の待ち。表 X の行 2 つ (P と Q)、悲観の取引 1 件 (P に書き、Q に書き、確定する)、X の DDL 1 回。ロックは、利用者の待ちで切れるか (`idleExpire`)、書き込み禁止で待っている間に切れる (`blockedExpire`)。
+- `m24_boundary_*`: M13 の本体に、ほかの接続の DDL が区切りの表に触るかを足したもの。
+
+決めたこと 6 (epoch を commit だけで進める) は、M21 の本体を、M21 のインスタンスと同じ定数で `SCHEMA_ON_PREPARE = false` にして確かめ直した (`m24b_m21_commit_only.qnt` の `m24_m21_*`。M21 を読み込むので、M24 の検査のたびに読まないよう、ファイルを分けた)。
+M21 のファイルは変えていない (`test/catalog-m21.test.ts` が、その sha256 を確かめている)。
+
+不変条件は、M21 のもの (`noServeBelowAck` と `pinned` を除く。`m21Safe`) と、新しい 3 つである。
+
+| 不変条件 | 意味 |
+|---|---|
+| `planMatches` | シャードが要求を受け付けるとき、要求が本当に頼るどのものの表定義も、計画のときと同じである (M21 の `noServeBelowAck` と `pinned` を、ものごとに言い直したもの) |
+| `noRefusalUnrelated` | 頼るものに触る表定義の記録が計画の後にないのに、持ち主が版の理由で断ることはない (「表 A の取引は、表 B の DDL で断られない」。M21 の `pinnedSurvives` を、ものごとにしたもの) |
+| `noRefusalWithoutChange` | 頼るものの表定義が計画の後に変わっていない (確定した DDL がない) のに、持ち主が版の理由で断ることはない (失敗した DDL は、触った表の取引も断らない) |
+| `noRestoreAcross` (`m24_floor`) | 形を変える DDL より前の行の image を、新しい形の表に戻さない |
+| `holderSurvives` (`m24_lock`) | 行を書いた取引は、ロックが利用者の待ちで切れていなければ、DDL のために断られない |
+| `boundarySafeAll` (`m24_boundary`) | M13 の `boundarySafe` と、区切りの表に触る DDL がないのに版の理由で断られないこと |
+
+`m24Safe` は `m21Safe` と新しい 3 つの論理積である。
+`noServeBelowAck` は、commit だけで進める形では定義から成り立たない (M21 の `m21_alt_commit_only_*` と同じ)。
+`pinned` は、名乗り直す手がないので、いつも成り立つ。
+
+2026-11-16 に、TLC (heap 2.5 GB、4 workers) で流した。
+既定の 56 個 (緑、赤、witness) と `run` の試験 23 モジュール (27 本) が、期待どおりだった。
+HEAVY の 38 個 (M21 の 3 つの場面と、M21 の赤の 35 本) は、表の下に書いた。M21 の赤のうち 2 本には、commit だけで進める形では反例がなかったので、`check.sh` では緑として確かめる。
+赤と witness の状態数は、TLC が最初の反例を見つけた所で止まるので、流すたびに少し変わる。表は最後に流したものである。
+既定の節 (TLC の 56 個) は 1,093 秒、`run` の試験は 1 分ほどだった。ほかの作業が試験を流していて、load average が 6.5〜7 の計算機で測った。
+
+| 種類 | インスタンス | invariant | 到達状態数 (distinct) | 確かめること |
+|---|---|---|---|---|
+| green | `m24_green_unrelated` | `m24Safe` | 273,599 | 関係のない `CREATE TABLE` と、B の DDL (確定か失敗)。A だけに頼る取引と、B を読んで A を書く取引。取引 1 件 |
+| green | `m24_green_build` | `m24Safe` | 493,011 | A の index の作成と、関係のない `CREATE TABLE`。index の commit より前の計画の読みは通り、書き込みは断られる |
+| green | `m24_green_check` | `m24Safe` | 391,605 | A の、行で失敗し得て形を変える DDL と、関係のない `CREATE TABLE` |
+| green | `m24_green_drop` | `m24Safe` | 131,090 | DROP TABLE A と、関係のない `CREATE TABLE`。V を通る読みも断られる |
+| green | `m24_green_split` | `m24Safe` | 272,399 | 移動と、関係のない `CREATE TABLE` |
+| red | `m24_red_global` | `noRefusalUnrelated` | 558 | 段 3 の形: 表定義全体の epoch 1 つを、どの記録でも進める。`CREATE TABLE N` の prepare で、A の取引が断られる |
+| red | `m24_red_global_commit_only` | `noRefusalUnrelated` | 28,699 | 全体の epoch 1 つを、commit だけで進める。`CREATE TABLE N` の commit で、A の取引が断られる |
+| red | `m24_red_prepare_advances` | `noRefusalWithoutChange` | 754 | 表ごとだが、prepare と abort でも進める。失敗する B の DDL の prepare で、B を読んだ取引が断られる |
+| red | `m24_red_read_deps` | `planMatches` | 29,508 | 書き込みの計画が読んだ表 (B) を、要求が運ばない |
+| red | `m24_red_apply_all` | `noRefusalUnrelated` | 146 | 段 3 の `schemaChanging`: 記録の適用中に、どの要求も断る |
+| red | `m24_red_apply_touched` | `noRefusalWithoutChange` | 273 | 記録の適用中に、記録が触る表に頼る要求を、待たせずに断る |
+| red | `m24_red_index` | `indexMatches` | 94,609 | index の DDL を、表とは別のものとして数える (`m21_red_stale` と同じ形) |
+| red | `m24_red_index` | `planMatches` | 60,452 | |
+| red | `m24_red_write_epoch` | `indexMatches` | 94,649 | 書き込みが、表の読みの epoch を比べる |
+| red | `m24_red_view` | `readConsistent` | 12,956 | view を通る計画が、元の表を運ばない。A の DROP の後で、V を通る読みに答える |
+| red | `m24_red_view` | `planMatches` | 12,810 | |
+| witness | `m24_green_unrelated` | `witnessAcrossUnrelated` | 167,641 | 取引が、計画の後の関係のない `CREATE TABLE` の commit と、関係のない DDL の abort を、両方とも適用したシャードで受け付けられ、確定する |
+| witness | `m24_green_unrelated` | `witnessAcrossFailedRead` | 10,176 | B を読んだ計画の書き込みが、B の DDL の abort の後で、計画し直さずに確定する |
+| witness | `m24_green_unrelated` | `witnessRefusedChanged` | 31,646 | B の DDL が確定すれば、B を読んだ計画は断られる |
+| witness | `m24_green_check` | `witnessAcrossFailedTouched` | 18,912 | A の DDL の prepare より前の計画の書き込みが、禁止の間は待ち、DDL の abort の後で確定する |
+| witness | `m24_green_check` | `witnessTrialRejectedThenWrite` | 21,092 | |
+| witness | `m24_green_check` | `witnessCheckCommittedThenWrite` | 131,224 | |
+| witness | `m24_green_build` | `witnessReadAcrossIndex` | 60,431 | index の commit より前に計画した読みが、commit を適用したシャードで答えられる |
+| witness | `m24_green_build` | `witnessPublicThenWrite` | 99,768 | |
+| witness | `m24_green_drop` | `witnessDroppedAfterWrites` | 39,470 | |
+| witness | `m24_green_split` | `witnessServedWhileDriverDead` | 6,887 | |
+| witness | `m24_green_split` | `witnessPinnedSurvives` | 364 | |
+| witness | `m24_green_split` | `witnessParentAnswersUncut` | 234 | |
+| green | `m24_red_global` | `witnessAcrossUnrelated` | 163,707 | 同じ witness は、段 3 の形では届かない |
+| green | `m24_red_global_commit_only` | `witnessAcrossUnrelated` | 267,282 | 全体の epoch を commit だけで進めても届かない |
+| green | `m24_red_prepare_advances` | `witnessAcrossFailedRead` | 242,702 | prepare でも進めると、B の DDL が失敗しても、B を読んだ取引は確定できない |
+| green | `m24_floor_green` | `floorSafe` | 1,903 | 床を表ごとに持ち、形を変えた表にだけ置き、読む表の行だけを読み戻す |
+| red | `m24_floor_red_global` | `noRefusalUnrelated` | 483 | 段 3 の形: 床がシャードに 1 つ |
+| red | `m24_floor_red_restore_all` | `noRefusalUnrelated` | 554 | 床は表ごとだが、読み戻すのは、すべての表の行 |
+| red | `m24_floor_red_no_floor` | `noRestoreAcross` | 637 | 形を変えた表に床を置かない |
+| witness | `m24_floor_green` | `witnessServedBelow` | 488 | B の DDL より古い T で、T より後に確定のある A を読み戻して答える |
+| witness | `m24_floor_green` | `witnessRefusedB` | 641 | B の DDL より前の B の確定を読み戻す読みは、断られる |
+| green | `m24_lock_green` | `holderSurvives` | 648 | prepare は行ロックを待ち、書き込み禁止に当たったロックを持つ取引は、遷移を取り消させる |
+| red | `m24_lock_red_no_wait` | `holderSurvives` | 735 | prepare が行ロックを待たない |
+| red | `m24_lock_red_no_wound` | `holderSurvives` | 86 | 書き込み禁止に当たった、ロックを持つ取引が、遷移を取り消させない |
+| witness | `m24_lock_green` | `witnessDdlAfterTxn` | 636 | 書いた取引が確定し、DDL は、その後で確定する |
+| witness | `m24_lock_green` | `witnessWoundThenCommit` | 430 | 別のシャードの書き込み禁止に当たった取引が、DDL を取り消させて確定する |
+| witness | `m24_lock_green` | `witnessDdlBusy` | 207 | シャードのロックの待ちが上限を過ぎて DDL が失敗し、取引が確定する |
+| green | `m24_boundary_green` | `boundarySafeAll` | 127 | M13 の設計を、表ごとに比べる形で |
+| red | `m24_boundary_red_main` | `prefixOfScript` | 9 | M13 の `m13_red_main` |
+| red | `m24_boundary_red_pin_only` | `ownDdlVisible` | 17 | M13 の `m13_red_pin_only` |
+| red | `m24_boundary_red_repin` | `pinned` | 87 | M13 の `m13_red_repin` |
+| red | `m24_boundary_red_retry_whole` | `prefixOfScript` | 121 | M13 の `m13_red_retry_whole` |
+| red | `m24_boundary_red_ddl_anyway` | `prefixOfScript` | 18 | M13 の `m13_red_ddl_anyway` |
+| red | `m24_boundary_red_global` | `noRefusalUnrelated` | 79 | すべての DDL の版と比べる (M13 と段 3 の形) |
+| witness | `m24_boundary_green` | `witnessUnrelatedNoRetry` | 125 | 関係のない DDL が区切りの途中に入っても、やり直さずに終わる |
+| witness | `m24_boundary_green` | `witnessRetriedAndDone` | 111 | |
+| witness | `m24_boundary_green` | `witnessOtherDdlThenDone` | 92 | |
+| green | `m24_boundary_red_global` | `witnessUnrelatedNoRetry` | 138 | 同じ witness は、すべての DDL の版と比べると届かない |
+| green | `m24_m21_green_split_txns` | `epochSafeCommitOnly` | 75,003 | M21 の `m21_green_split_txns` を、commit だけで進める形で |
+| green | `m24_m21_green_split` | `epochSafeCommitOnly` | 195,824 | M21 の `m21_green_split` を、commit だけで進める形で |
+
+HEAVY=1 のときだけ流すもの。
+
+| 種類 | インスタンス | invariant | 到達状態数 (distinct) | 確かめること |
+|---|---|---|---|---|
+| green | `m24_m21_green_drop` | `epochSafeCommitOnly` | 723,604 | M21 の `m21_green_drop` を、commit だけで進める形で |
+| green | `m24_m21_green_ddl2` | `epochSafeCommitOnly` | 525,350 | M21 の `m21_green_ddl2` を、同じく |
+| green | `m24_m21_green_split_build` | `epochSafeCommitOnly` | 1,613,382 | M21 の `m21_green_split_build` を、同じく (725 秒) |
+| red | `m24_m21_red_online` | `indexMatches` | 264,150 | M21 の赤を、commit だけで進める形で。以下同じ |
+| red | `m24_m21_red_online` | `notRelied` | 264 | |
+| red | `m24_m21_red_no_fence` | `indexMatches` | 231,053 | |
+| red | `m24_m21_red_visible` | `notRelied` | 251 | |
+| red | `m24_m21_red_no_drain` | `noWriteWhileFenced` | 9,226 | |
+| red | `m24_m21_red_stale` | `indexMatches` | 214,606 | |
+| red | `m24_m21_red_two_exits` | `oneExit` | 73,108 | |
+| red | `m24_m21_red_two_exits` | `indexMatches` | 76,436 | |
+| red | `m24_m21_red_repin` | `indexMatches` | 272,304 | |
+| red | `m24_m21_red_repin` | `pinned` | 210,540 | |
+| red | `m24_m21_red_scan_early` | `indexMatches` | 97,676 | |
+| red | `m24_m21_red_no_recheck` | `indexMatches` | 693,961 | |
+| red | `m24_m21_red_early_commit` | `indexMatches` | 318 | |
+| red | `m24_m21_red_trial_no_fence` | `commitApplies` | 314,472 | |
+| red | `m24_m21_red_trial_missing_ack` | `commitApplies` | 7,977 | |
+| red | `m24_m21_red_trial_early` | `commitApplies` | 250,603 | |
+| red | `m24_m21_red_trial_no_drain` | `commitApplies` | 290,508 | |
+| red | `m24_m21_red_drop_no_fence` | `guardHolds` | 90,387 | |
+| red | `m24_m21_red_drop_no_check` | `guardHolds` | 53,448 | |
+| red | `m24_m21_red_drop_check_early` | `guardHolds` | 37,746 | |
+| red | `m24_m21_red_drop_no_drain` | `guardHolds` | 81,102 | |
+| red | `m24_m21_red_drop_no_drain` | `noResurrect` | 69,843 | |
+| red | `m24_m21_red_drop_untied` | `guardHolds` | 89,290 | |
+| red | `m24_m21_red_drop_missing_ack` | `noLostAfterReturn` | 1,568 | |
+| red | `m24_m21_red_two_open` | `commitApplies` | 119,929 | |
+| green | `m24_m21_red_ddl_during_move` | `servable` | 565,944 | 反例がない。移動の途中に prepare を記録しても、prepare は要求を古くせず、DDL が移動の終わりまで待つだけになる (設計の文書の「移動の途中の prepare」) |
+| green | `m24_m21_red_ddl_during_move` | `epochSafeCommitOnly` | 565,944 | 同じインスタンスで、`noServeBelowAck` を除く M21 の不変条件の全部 (check.sh には入れていない) |
+| red | `m24_m21_red_move_during_ddl` | `servable` | 24,924 | 逆向きは、この形でも破れる。移動の前に ok と答えたシャードの分で commit が記録され、移動の途中のシャードが適用できない |
+| green | `m24_m21_red_end_early` | `servable` | 367,636 | 反例がない。理由は `ddl_during_move` と同じ |
+| green | `m24_m21_red_end_early` | `epochSafeCommitOnly` | 367,636 | 同じインスタンスで、M21 の不変条件の全部 (check.sh には入れていない) |
+| red | `m24_m21_red_pull_unfenced` | `moveKeepsWrites` | 1,230 | |
+| red | `m24_m21_red_pull_unfenced` | `readConsistent` | 2,145 | |
+| red | `m24_m21_red_pull_unfenced` | `sameShape` | 21,284 | |
+| red | `m24_m21_red_fence_first` | `servable` | 58 | |
+| red | `m24_m21_red_owner_unchecked` | `moveKeepsWrites` | 2,007 | |
+| red | `m24_m21_red_owner_unchecked` | `readConsistent` | 2,674 | |
+| red | `m24_m21_red_strict_epoch` | `pinnedSurvives` | 151 | |
+
+M24 の本体の場面は、取引 1 件である。取引 2 件の場面 (M21 の index の作成、CHECK、DROP と同じ数) は、この作業の計算機では、取引 1 件の場面の数十倍を超えて 5 分で終わらなかったので、インスタンスを置いていない。
+取引 2 件が index の項目を取り合う形は、M21 の場面を commit だけで進める形 (`m21_alt_commit_only_build`、`m24_m21_green_drop` など) が確かめる。表ごとの比べ方と取引 2 件の組み合わせは、確かめていない。
+
+モデルにないもの。
+
+- 時刻と、読みの答えの中身。本体の読みは、確定した最新の値を答えたかだけを見る。index の DDL の後で古い計画の読みに答えてよいことは、読みの経路が index と UNIQUE を使わない、という、計画と範囲のコードを読んだ結果に依る。モデルはそれを前提にしている (`changes` の表)。
+- 名前の作り直し (DROP の後の CREATE、RENAME)。DROP は消すところまでである。
+- 2PC の取引と、2 つ以上の表に書く取引。本体の取引は A の 1 行を書く。
+- 記録の適用の活性。ほかの表の intent のために適用が飢えないことは、時相の性質としては確かめていない。
+- `m24_lock` の取引は 1 件で、ロックを持つ取引どうしの順序 (wound-wait) は M9 が受け持つ。

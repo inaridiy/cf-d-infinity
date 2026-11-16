@@ -5,7 +5,8 @@
 // 比べるのは、設計が置き場所に依らないと約束していることだけである (下の「何を比べるか」)。約束のない違いは、数えて報告する。
 //
 // 台本は置き場所を知らない。キーを持ち主のシャードで選ばない (再現の試験の `on("s0")` のような選び方をしない)。主キーは明示し、
-// rowid の採番、lastInsertRowid、REAL の和は使わない。結果の順序は、一意な列の ORDER BY で決める。
+// rowid の採番と REAL の和は使わない。結果の順序は、一意な列の ORDER BY で決める。文の lastInsertRowid は、どの経路でも
+// 1 つの規則 (test/inserted-rowid.ts) で比べる。
 //
 // 何を比べるか (docs/overview.md の「Time and isolation」、docs/sql-language.md の「取引」):
 //   - autocommit の文: 開始前に確定した書き込みを全部見る (読み)、最新の状態に書く (書き込み)。置き場所の全部で同じで、
@@ -28,12 +29,15 @@
 //   - 最後の表の中身: 置き場所の全部で同じで、モデルとも同じでなければならない。どの行も、範囲表の持ち主のシャードにだけある。
 //
 // 置き場所 (placementsFor): シャード 1、2、4 と、1 シャードから seed で選んだ slot の境目で 3 回分割した 4 シャード (同じ数で、
-// 行の分け方が違う)。もう 1 つは、2 シャードで台本の途中 (7 割は取引の途中) に 1 回分割する。分割の後の取引の文と COMMIT は、
-// やり直してよい誤り (`not owner`、範囲の床の `read too old`。docs/overview.md の Growing) を許す。文書は、分割をまたいだ取引が
-// 続けられるとは約束していない。Db.begin() と SQL の BEGIN の取引は、自分の範囲表を持ち続けるので、動いた範囲に触れる文は
-// 取引の終わりまで `not owner` になる。baton は要求ごとに範囲表を取り直すので文は通るが、COMMIT は `not owner` で断られることが
-// ある (2026-11-14、seed 1 から 300 で数えた)。だからこの置き場所が分割の後に確かめるのは、ほぼ autocommit の文と、取引の文が
-// 通ったときの答えだけである。分割の前の手順だけをほかと比べ、後はモデルとだけ比べる。
+// 行の分け方が違う)。もう 1 つは、2 シャードで台本の途中 (7 割は取引の途中) に 1 回分割する。分割の後の取引の文は、競合
+// (`conflict`、範囲の床の `read too old`) だけを許し、`not owner` は違いとして報告する。Epoch の段 2 から、取引の文が範囲の移動で
+// 断られると、取引は範囲表を取り替えて文を計画し直す (2026-11-15、seed 1 から 300 で、分割の後の文の `not owner` は 3 つの実行の
+// 形のどれでも 0 になった。前は sim で 406)。文書の約束 (docs/sql-language.md の「取引」) のうち、まだ守らないのは 2 つで、どちらも
+// ここでは許す。分割の前に動いた範囲を読んだ取引の文は、移動の時刻より前の時刻で読もうとして `read too old` で断られ、動いた行を
+// 書いたか行ロックを取って読んだ取引の文は、範囲表を取り替えずに競合で断られる (未解決の問題 37)。COMMIT は、取引が分割の前に
+// 動いた範囲を読むか書くかしていると、`not owner` か `read too old` の競合で断られる (同じく 37。
+// test/open/locking-transaction-commit-after-split.test.ts)。COMMIT の競合はもともと許しているので、ここは緩いままである。
+// 分割の前の手順だけをほかと比べ、後はモデルとだけ比べる。
 //
 // モデルの状態の列が台本の順序と同じになるように、手順の間で仮想の時刻を進める (GAP_MS)。HLC は物理の ms を上位に持つので、
 // 後の手順の時刻は前の手順のどの時刻よりも大きい。半分の台本 (lag) は、確定の phase 2 の配送を遅らせ、手順の間で背後の仕事を
@@ -49,8 +53,9 @@
 //   - PATIENCE_MS は、ロックの待ちの上限とロックの期限 (どちらも 5 秒) より十分に短い。主キーで絞る autocommit の書き込みも、
 //     範囲の autocommit の書き込みも、ロックが空くまで待つ (2026-11-14 に確かめた)。取引が終わるまでの残りの手順は数十 ms で、
 //     待っている文が期限に当たることはない。
-//   - 待たされるのは、悲観的な取引 (SQL の BEGIN、baton) が主キーで絞る書き込みでロックを取った行だけである。範囲の書き込みは
-//     ロックを取らない (test/open/ranged-write-in-begin-takes-no-lock.test.ts)。モデルは、取引の書き込みのロックを仮定しない。
+//   - 待たされるのは、悲観的な取引 (SQL の BEGIN、baton) が書き込みでロックを取った行だけである。主キーで絞る書き込みも、範囲の
+//     書き込み (Worker の SQLite で実行する経路) も、書いた行のロックを取る (2026-11-16 から。test/ranged-write-in-begin-takes-no-lock.test.ts)。
+//     書いた行は文の形と行で決まるので、待たされるかどうかも置き場所に依らない。モデルは、取引の書き込みのロックを仮定しない。
 //   - 文書は、誰が先に行を取るか (wound-wait の年齢をどこで測るか) を約束していない。台本の手順の間に時刻を進めるので、
 //     後から出た autocommit の文は、取引より若い。
 //
@@ -64,6 +69,7 @@ import { keyString } from "../src/keys";
 import { ownerOf, shardsOf, SUBSLOTS } from "../src/routing";
 import type { Value } from "../src/types";
 import { rawRows } from "./ddl-harness";
+import { insertedRowids } from "./inserted-rowid";
 import { quiescentProblems } from "./invariants";
 import { asNumbers, prng, REFERENCE_ONLY, SimCluster } from "./sim";
 
@@ -80,6 +86,14 @@ const TABLES: Record<string, { cols: string[]; pk: string[]; order: string }> = 
 
 /** 書き手の文を待つ仮想の時間 (ms)。上の「待ちの扱い」。 */
 export const PATIENCE_MS = 1500;
+/**
+ * 悲観的な取引 (SQL の BEGIN、baton) で、シャードが文を実行する書き込みの形 (主キーか shard key の値の 1 つに絞る文)。シャードは
+ * 行ロックを取り、最新の時刻 F の状態で実行する。ほかの書き込み (範囲、条件、INSERT … SELECT) は、Worker の SQLite で、取引の
+ * 読む時点 T の行に対して実行する。基準経路だけの実行 (REFERENCE) では、どの書き込みも後者である。
+ */
+const AT_LATEST = new Set(["point update", "not null violation", "insert", "upsert", "point delete", "pinned group update", "pinned delete", "insert b", "replace b"]);
+/** モデルが取引の文ごとに残す、読む時点と書き込みの候補 (世界) の数の上限 (下の checkTrace の keepWorlds)。 */
+const WORLDS = 64;
 /** 台本の手順の間に進める仮想の時間 (ms)。HLC の順序を台本の順序に揃える (下の runPlacement)。 */
 const GAP_MS = 5;
 
@@ -222,7 +236,8 @@ export function makeScript(seed: number): Script {
 // ---- 結果 ----
 
 export type Outcome =
-  | { kind: "rows"; rows: Value[][]; changes: number }
+  /** last は文の lastInsertRowid (test/inserted-rowid.ts の規則)。行を入れなかった文は null。 */
+  | { kind: "rows"; rows: Value[][]; changes: number; last: number | null }
   | { kind: "error"; cls: "busy" | "constraint" | "unsupported" | "error"; message: string };
 
 export function errorOf(e: unknown): Outcome {
@@ -235,12 +250,12 @@ export function errorOf(e: unknown): Outcome {
 
 /** 比べるための文字列。誤りは種類で比べる。種類が error のものは文言も比べる (SQLite の文言で返す約束である)。 */
 export function keyOf(o: Outcome, withMessage = true): string {
-  if (o.kind === "rows") return JSON.stringify({ rows: o.rows, changes: o.changes });
+  if (o.kind === "rows") return JSON.stringify({ rows: o.rows, changes: o.changes, last: o.last });
   return o.cls === "error" && withMessage ? `error ${o.message}` : o.cls;
 }
 
 export const show = (o: Outcome | undefined): string =>
-  o === undefined ? "(not run)" : o.kind === "rows" ? `${JSON.stringify(o.rows).slice(0, 160)}${o.changes ? ` changes=${o.changes}` : ""}` : `${o.cls}: ${o.message.slice(0, 120)}`;
+  o === undefined ? "(not run)" : o.kind === "rows" ? `${JSON.stringify(o.rows).slice(0, 160)}${o.changes ? ` changes=${o.changes}` : ""}${o.last !== null ? ` lastInsertRowid=${o.last}` : ""}` : `${o.cls}: ${o.message.slice(0, 120)}`;
 
 // ---- 置き場所 ----
 
@@ -308,44 +323,28 @@ export interface Known {
   matches(step: Step, outcome: Outcome, p: Placement, beforeSplit: boolean): boolean;
 }
 
-export const KNOWN_OPEN: Known[] = [
-  {
-    id: "open problem 34 (read too old after rows on two shards changed)",
-    repro: "test/open/snapshot-read-after-two-shards-changed.test.ts",
-    how: "masked",
-    // 2 つ以上のシャードがあるときの、取引の文の `read too old: moved at`。分割の後のものは、文書にある範囲の床の拒否なので含めない。
-    // この欠陥は、1 つの文が 2 つ以上のシャードへ同時に要求を送るときにだけ起きる。1 つのシャードへ送る読み (主キー、shard key
-    // のグループ) の誤りは別の欠陥なので、伏せない。全部の文を表の丸ごとの走査にする実行 (REFERENCE=full) では、どの読みも全シャードへ送る。
-    matches: (step, o, p, beforeSplit) =>
-      step.conn === "tx" && step.kind === "stmt" && p.shards >= 2 && beforeSplit && o.kind === "error" && /^read too old: moved at/.test(o.message) &&
-      (process.env.REFERENCE === "full" || !["point", "pinned group"].includes(step.shape ?? "")),
-  },
-  {
-    // 分割で切る置き場所は、表定義を作った Db (分割の前の範囲表を覚えている) で初めの行を複数行の INSERT で入れると、これに当たる。
-    // 既定の実行では、分割の後に作った Db で入れる。
-    id: "a multi-row INSERT planned before a split writes its rows to two shards",
-    repro: "test/open/multi-row-insert-after-split.test.ts",
-    how: "avoided",
-    matches: () => false,
-  },
-];
+// 未解決の問題 34 (2 つのシャードで行が変わった後の複数シャードの読みの `read too old`) は、2026-11-16 に直した
+// (test/snapshot-read-after-two-shards-changed.test.ts)。伏せていた間は、取引の文の `read too old: moved at` を見分けて伏せていた。
+export const KNOWN_OPEN: Known[] = [];
 
 const toH = (v: number) => ({ type: "integer" as const, value: String(v) });
+/** lastInsertRowid を、台本の値と同じ JS の数にする (台本の rowid は小さい)。 */
+const rowidOf = (v: bigint | string | null | undefined): number | null => (v === null || v === undefined ? null : Number(v));
 const fromH = (v: { type: string; value?: string | number }): Value =>
   v.type === "null" ? null : v.type === "integer" || v.type === "float" ? Number(v.value) : (v.value as Value);
 
 interface HranaOut {
   baton: string | null;
-  results: ({ type: "ok"; response: { result: { rows: { type: string; value?: string }[][]; affected_row_count: number } } } | { type: "error"; error: { message: string } })[];
+  results: ({ type: "ok"; response: { result: { rows: { type: string; value?: string }[][]; affected_row_count: number; last_insert_rowid: string | null } } } | { type: "error"; error: { message: string } })[];
 }
 
 /** 取引の接続。3 通りの出し方を同じ形にする。 */
 function txDriver(c: SimCluster, s: Script) {
   const begin = s.immediate ? "BEGIN IMMEDIATE" : "BEGIN";
-  const asRows = async (p: Promise<{ values: Value[][]; changes: number }>): Promise<Outcome> => {
+  const asRows = async (p: Promise<{ values: Value[][]; changes: number; lastInsertRowid?: bigint | null }>): Promise<Outcome> => {
     try {
       const r = await p;
-      return { kind: "rows", rows: asNumbers(r.values), changes: r.changes };
+      return { kind: "rows", rows: asNumbers(r.values), changes: r.changes, last: rowidOf(r.lastInsertRowid) };
     } catch (e) {
       return errorOf(e);
     }
@@ -356,7 +355,7 @@ function txDriver(c: SimCluster, s: Script) {
     return {
       async begin(): Promise<Outcome> {
         tx = await db.begin();
-        return { kind: "rows", rows: [], changes: 0 };
+        return { kind: "rows", rows: [], changes: 0, last: null };
       },
       exec: (sql: string, params: number[]) => asRows(tx!.query(sql, params)),
       commit: () => asRows(tx!.commit().then(() => ({ values: [], changes: 0 }))),
@@ -379,7 +378,8 @@ function txDriver(c: SimCluster, s: Script) {
     baton = res.baton;
     const r = res.results[0]!;
     if (r.type === "error") return errorOf(new Error(r.error.message));
-    return { kind: "rows", rows: r.response.result.rows.map((row) => row.map(fromH)), changes: r.response.result.affected_row_count };
+    const { result } = r.response;
+    return { kind: "rows", rows: result.rows.map((row) => row.map(fromH)), changes: result.affected_row_count, last: rowidOf(result.last_insert_rowid) };
   };
   return { begin: () => one(begin), exec: one, commit: () => one("COMMIT"), rollback: () => one("ROLLBACK") };
 }
@@ -431,8 +431,9 @@ export async function runPlacement(s: Script, p: Placement, o: { mask: boolean }
     for (const ddl of SCHEMA) await admin.ddl(ddl);
     const cuts = prng(s.seed * 977 + 3);
     for (let j = 1; j <= (p.cuts ?? 0); j++) await splitAt(c, cuts, `s${j}`);
-    // 既定の実行では、分割の後に作った Db で入れる (KNOWN_OPEN の 2 つ目)。
-    const loader = o.mask ? new Db(c) : admin;
+    // 初めの行は、表定義を作った Db (分割の前の範囲表を覚えている) で、複数行の INSERT で入れる。分割で切る置き場所では、古い範囲表で
+    // 計画した INSERT が断られ、新しい範囲表で計画し直される (未解決の問題 35。Epoch の段 2 で直した。test/multi-row-insert-after-split.test.ts)。
+    const loader = admin;
     for (const [t, rows] of Object.entries(s.rows)) {
       await loader.query(`INSERT INTO ${t} VALUES ${rows.map((row) => `(${row.join(", ")})`).join(", ")}`);
     }
@@ -448,7 +449,7 @@ export async function runPlacement(s: Script, p: Placement, o: { mask: boolean }
     };
     const writerStep = async (step: Step) => {
       const promise = writers[step.conn as "w1" | "w2"].query(step.sql!, step.params!).then(
-        (r): Outcome => ({ kind: "rows", rows: asNumbers(r.values), changes: r.changes }),
+        (r): Outcome => ({ kind: "rows", rows: asNumbers(r.values), changes: r.changes, last: rowidOf(r.lastInsertRowid) }),
         errorOf,
       );
       const flag = { i: step.i, promise, done: false };
@@ -567,14 +568,14 @@ interface Evaluated {
 }
 
 export class Model {
-  private dbs = new Map<string, DatabaseSync>();
+  private dbs = new Map<string, { db: DatabaseSync; inserted: ReturnType<typeof insertedRowids> }>();
   private memo = new Map<string, Evaluated>();
 
-  private open(rows: Rows): { db: DatabaseSync; key: string } {
+  private open(rows: Rows): { db: DatabaseSync; inserted: ReturnType<typeof insertedRowids>; key: string } {
     const key = rowsKey(rows);
-    let db = this.dbs.get(key);
-    if (!db) {
-      db = new DatabaseSync(":memory:");
+    let open = this.dbs.get(key);
+    if (!open) {
+      const db = new DatabaseSync(":memory:");
       for (const s of SCHEMA) db.exec(s);
       for (const [t, list] of Object.entries(rows)) {
         const st = db.prepare(`INSERT INTO ${t} VALUES (${TABLES[t]!.cols.map(() => "?").join(", ")})`);
@@ -582,12 +583,13 @@ export class Model {
       }
       if (this.dbs.size > 400) {
         const [k0, d0] = this.dbs.entries().next().value!;
-        d0.close();
+        d0.db.close();
         this.dbs.delete(k0);
       }
-      this.dbs.set(key, db);
+      open = { db, inserted: insertedRowids(db) };
+      this.dbs.set(key, open);
     }
-    return { db, key };
+    return { ...open, key };
   }
 
   private read(db: DatabaseSync): Rows {
@@ -605,17 +607,19 @@ export class Model {
     const memoKey = `${rowsKey(rows)}\0${sql}\0${params.join(",")}`;
     const hit = this.memo.get(memoKey);
     if (hit) return hit;
-    const { db } = this.open(rows);
+    const { db, inserted } = this.open(rows);
     db.exec("SAVEPOINT m");
     let res: Evaluated;
     try {
+      inserted.start();
       const st = db.prepare(sql);
       let out: Outcome;
       if (st.columns().length > 0) {
         st.setReturnArrays(true);
-        out = { kind: "rows", rows: st.all(...(params as never[])) as unknown as Value[][], changes: 0 };
+        out = { kind: "rows", rows: st.all(...(params as never[])) as unknown as Value[][], changes: 0, last: rowidOf(inserted.last()) };
       } else {
-        out = { kind: "rows", rows: [], changes: Number(st.run(...(params as never[])).changes) };
+        const changes = Number(st.run(...(params as never[])).changes);
+        out = { kind: "rows", rows: [], changes, last: rowidOf(inserted.last()) };
       }
       const after = this.read(db);
       res = { out, delta: diff(rows, after), after };
@@ -630,7 +634,7 @@ export class Model {
   }
 
   close(): void {
-    for (const db of this.dbs.values()) db.close();
+    for (const { db } of this.dbs.values()) db.close();
     this.dbs.clear();
     this.memo.clear();
   }
@@ -694,6 +698,18 @@ export function checkTrace(s: Script, t: Trace, m: Model): Verdict {
     return same(r.out, e.out) && overlayKey(r.delta) === overlayKey(e.delta);
   };
   const fail = (i: number, what: string) => problems.push(`step ${i}: ${what}`);
+  // 候補の世界は、文ごとに増える (書き込みの文は、答え (変えた行の数) が同じでも、読んだ時点ごとに書いた値が違う)。数を WORLDS 個に
+  // 抑える。前は台本の順の先頭 64 個を残し、前の時点で読んだ世界を優先していた。取引が読む時点を進めてから書き、そのまま確定すると、
+  // 本当の世界が落ち、確定の時点で文が同じ答えにならないと誤って報告した (seed 296、2026-11-16。範囲の書き込みが行ロックを取るように
+  // なって、こう確定する取引が増えた)。半分は今までどおり順の先頭から、残りの半分は、いまの最新の状態でも同じ答えになる文が多い
+  // 世界から選ぶ。確定する取引の本当の世界は、確定の時点で全部の文が同じ答えになるので、後の半分に残る。
+  const keepWorlds = (next: World[]): World[] => {
+    if (next.length <= WORLDS) return next;
+    const head = next.slice(0, WORLDS / 2);
+    const rest = next.slice(WORLDS / 2).map((w, j) => ({ w, j, n: w.hist.filter((e) => holdsAt(e, latest())).length }));
+    rest.sort((x, y) => y.n - x.n || x.j - y.j);
+    return [...head, ...rest.slice(0, WORLDS - head.length).map((x) => x.w)];
+  };
   for (const i of t.order) {
     if (problems.length > 0) break;
     const step = s.steps[i]!;
@@ -715,7 +731,14 @@ export function checkTrace(s: Script, t: Trace, m: Model): Verdict {
     }
     if (step.kind === "stmt") {
       if (got.kind === "error" && got.cls === "busy" && relaxed(i)) {
-        // 分割の後の、範囲の床と移動の拒否 (docs/overview.md の Growing)。やり直してよい誤りで、文は何も変えていない。
+        // 分割の後の文は、`not owner` では失敗しない (docs/sql-language.md の「取引」。Epoch の段 2 から、取引は範囲表を取り替えて、
+        // 文を新しい持ち主で計画し直す)。分割は終えてから次の手順へ進むので、移動の途中の拒否 (`migrating`) もない。
+        if (!/^(conflict|read too old)/.test(got.message)) {
+          fail(i, `tx ${step.sql} ${JSON.stringify(step.params)}: after the split, the statement failed with ${show(got)}; a statement of a transaction across a split fails only with a conflict`);
+          break;
+        }
+        // 分割の後の、範囲の床の拒否 (docs/overview.md の Growing)。やり直してよい誤りで、文は何も変えていない。分割の前に動いた範囲を
+        // 読んだ取引は、読んだ行が変わっていなくても、ここで断られる (未解決の問題 37、test/open/transaction-across-split.test.ts)。
         // ただし、取引の最初の文なら、断られる前に読む時点 T が決まっていることがある (複数シャードの読みは、送る前に T を選ぶ)。
         // 次の文は、この時点から後のどこでも読んでよいものとする。
         if (first) {
@@ -753,14 +776,19 @@ export function checkTrace(s: Script, t: Trace, m: Model): Verdict {
       }
       choices.set(i, distinct.size);
       // 読む時点の候補が 2 つ以上残った。どの時点で読んだかで COMMIT の検証が変わるので、確定の成否は文書の約束の外になる。
-      // 悲観的な取引の書き込みは、文の時点の行に対して実行する (docs/sql-language.md の「取引」の表) ので数えない。
-      if ((!step.write || s.mode === "object") && new Set(next.map((w) => w.hist.at(-1)!.at)).size > 1) unforced = true;
+      // 悲観的な取引の書き込みのうち、シャードが文を実行するもの (AT_LATEST) は、最新の状態の行に対して実行するので数えない。
+      // 範囲や条件で書く文は、Worker の SQLite で、取引の読む時点 T のスナップショットの行に対して実行する (docs/sql-language.md の
+      // 「取引」)。読みと同じく数える。前は悲観的な取引の書き込みを全部数えなかった。確定の phase 2 が届いていないシャードは変更を
+      // 知らせないので T が進まず、4 シャードでだけ範囲の書き込みが古い行から計算され、確定が競合になった (seed 296、2026-11-16。
+      // 範囲の書き込みが行ロックを取るようになり、別の接続の書き込みで先に競合しなくなって、見えるようになった)。
+      const atLatest = step.write && s.mode !== "object" && !REFERENCE_ONLY && AT_LATEST.has(step.shape ?? "");
+      if (!atLatest && new Set(next.map((w) => w.hist.at(-1)!.at)).size > 1) unforced = true;
       first = false;
       if (next.length === 0) {
         fail(i, `tx ${step.sql} ${JSON.stringify(step.params)}: no state between the snapshot and now gives ${show(got)} (serial SQLite gives ${[...distinct].map((x) => x.slice(0, 80)).join(" or ")})`);
         break;
       }
-      worlds = next.slice(0, 64);
+      worlds = keepWorlds(next);
       continue;
     }
     // COMMIT と ROLLBACK
@@ -844,7 +872,11 @@ export async function checkSeed(seed: number, o: { mask: boolean }, s: Script = 
     };
     for (const step of s.steps) {
       const runs = traces.filter((t) => (t.truncatedAt === undefined || step.i < t.truncatedAt) && (t.splitAt === undefined || step.i < t.splitAt) && t.results[step.i]);
-      const groups = step.i > end ? groupBy(runs, ended) : [runs];
+      // 取引の終わりより後に効いた手順は、確定の成否が同じ置き場所の間でだけ比べる。待たされた書き手の文と、その後に後回しにした
+      // 書き手の文は、台本では取引の終わりより前でも、終わりの後に効く (runPlacement の release)。台本の番号で分けると、確定の成否が
+      // 置き場所で違ってよい台本で、後回しにした文の答えを、成否の違う置き場所の間で比べてしまう (seed 296、2026-11-16)。
+      const afterEnd = (t: Trace) => step.i > end || t.order.indexOf(step.i) > t.order.indexOf(end);
+      const groups = runs.some(afterEnd) ? groupBy(runs, ended) : [runs];
       for (const comparable of groups) {
         if (comparable.length < 2) continue;
         const keys = comparable.map((t) => keyOf(t.results[step.i]!.outcome));

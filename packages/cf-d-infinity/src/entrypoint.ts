@@ -4,10 +4,15 @@ import type { IntMode, RemoteResult, RemoteStatement, TransactionMode } from "./
 import type { Db, QueryResult } from "./client/db";
 import { toValue } from "./client/d1";
 import { intModeOf, rowidOut, rowsOut, valuesOut } from "./client/results";
-import type { Value } from "./types";
+import { SqlError, type Value } from "./types";
+import { decodeElem } from "./value";
 import { clusterStatus, dbFor, exportRows, handle, importRows, schemaSql, slowQueries, type Env, type ExportCursor, type SlowQuery } from "./worker";
 
-const values = (params: unknown[] = []): Value[] => params.map(toValue);
+/** 引数を値にする (src/client/d1.ts の toValue)。値でない引数は、文を実行する前に断る。 */
+const values = (params: unknown = []): Value[] => {
+  if (!Array.isArray(params)) throw new SqlError("params must be an array");
+  return params.map((v, i) => toValue(v, i));
+};
 /**
  * 結果は D1 と同じ形で返す。INTEGER の形は、呼び出し元が選んだ intMode である (src/client/results.ts。既定は JS の数で、JS の数で
  * 正確に表せない INTEGER は誤りにする)。structured clone は bigint を運ぶので、"bigint" の結果もそのまま RPC で返る。
@@ -50,6 +55,27 @@ export class DinfDatabase extends WorkerEntrypoint<Env> {
     const mode = intModeOf(intMode);
     const db = await dbFor(this.env, token, this.background);
     return pack(await db.query(sql, values(params)), db, mode);
+  }
+  /**
+   * 引数を要素 (src/value.ts。`i5`、`r5.0`、`tabc`、`b00FF`、null) で受け取る query。CLI の使い捨ての Worker が使う (bin/cli.js)。
+   * JS の数では REAL の 5.0 と INTEGER の 5 を見分けられず、query は D1 の規則で安全な整数の数を INTEGER にする。要素は型を
+   * 書くので、REAL は REAL のまま束縛される。要素でない引数と、64 ビットに収まらない INTEGER は、文を実行する前に断る。
+   */
+  async queryElements(sql: string, params: unknown[] = [], token = 0, intMode?: IntMode): Promise<RemoteResult> {
+    const mode = intModeOf(intMode);
+    if (!Array.isArray(params)) throw new SqlError("params must be an array");
+    const vals = params.map((e, i): Value => {
+      let v: Value;
+      try {
+        if (e !== null && typeof e !== "string") throw new Error();
+        v = decodeElem(e);
+      } catch {
+        throw new SqlError(`parameter ${i + 1} is not an element (i<digits>, r<real>, t<text>, b<hex> or null)`);
+      }
+      return typeof v === "bigint" ? toValue(v, i) : v;
+    });
+    const db = await dbFor(this.env, token, this.background);
+    return pack(await db.query(sql, vals), db, mode);
   }
   /** 全文を 1 取引で実行する。競合は内部でやり直す。表定義を変える文を含むと、その位置で区切る (Db.batch)。 */
   async batch(statements: RemoteStatement[], token = 0, intMode?: IntMode): Promise<RemoteResult[]> {

@@ -3,6 +3,7 @@ import initSqlJs, { type Database, type SqlJsStatic, type Statement } from "sql.
 import type { Catalog } from "../meta";
 import { SqlError, type Backend, type Plain, type PlainRow, type Value } from "../types";
 import { bindPlain, bindTyped, decodeScratch, restoreColumns, scratchElemSql, typedReadSql } from "../value";
+import { Scanner } from "./lexer";
 import { initStoredValue } from "./stored";
 
 // Emscripten の glue が self.location を参照する。Workers にはないので補う。
@@ -55,69 +56,26 @@ export interface Compiled {
   columns: string[];
 }
 
-/** 結果を返す文 (SELECT、VALUES、WITH で始まる文) か。型つきの読みに包めるのは、この形の文だけである。 */
-export const readsRows = (sql: string): boolean => /^\s*(?:(?:--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)\s*)*(SELECT|VALUES|WITH)\b/i.test(sql);
-
 /**
- * 文から、文字列の literal と注釈を除き、識別子を残した文面。引用した識別子 ("..."、`...`、[...]) は中身を残す。
- * 表定義を読む PRAGMA の関数の名前を探すのに使う。正規表現で文字列と注釈を順に消すと、`/* ' *\/ ... /* ' *\/` のように
- * 2 つを重ねた書き方で、間の名前を文字列と取り違えて見落とす (2026-11-12 の入口の安全の確認、指摘 3)。
+ * 文が、表定義を読む PRAGMA の関数 (`pragma_table_info` など) を名前で呼び得るか。文の字句 (src/sql/lexer.ts の Scanner) のうち、
+ * 名前になる字句 (引用しない語と、引用した識別子 "..."、`...`、[...]) の名前が `pragma_` で始まるかを見る (SQLite は名前の大文字と
+ * 小文字を区別しない)。文字列、注釈、引数の中は見ない。
+ * 前は、文字列と注釈を除いた文面 (identifierText) を `/\bpragma_/i` で探していた。正規表現で文字列と注釈を順に消すと、
+ * `/* ' *\/ ... /* ' *\/` のように 2 つを重ねた書き方で、間の名前を文字列と取り違えて見落とす (2026-11-12 の入口の安全の確認、指摘 3)
+ * ので手書きの走査にしたが、`\b` は、名前の途中 (`"x pragma_y"`、`a$pragma_x`) と引数 (`:pragma_x`) にも当たった。そういう名前の
+ * 列を、仮想表 (json_each など) を読む UPDATE か DELETE で使うと、表定義を読む文と見なされて断られた (2026-11-16、
+ * test/lexical-scans.test.ts)。
+ * SQLite は文字列の literal も表の名前として読む (`FROM 'pragma_table_info'('t')`) が、そう書いた文は、D∞ のパーサが構文の誤りとして
+ * 断るので、ここには届かない (test/lexical-scans.test.ts が確かめる)。
  */
-export function identifierText(sql: string): string {
-  let out = "";
-  let i = 0;
-  const n = sql.length;
-  while (i < n) {
-    const c = sql[i]!;
-    if (c === "'") {
-      i++;
-      while (i < n) {
-        if (sql[i] === "'") {
-          if (sql[i + 1] === "'") {
-            i += 2;
-            continue;
-          }
-          i++;
-          break;
-        }
-        i++;
-      }
-      out += " ";
-    } else if (c === '"' || c === "`") {
-      let id = "";
-      i++;
-      while (i < n) {
-        if (sql[i] === c) {
-          if (sql[i + 1] === c) {
-            id += c;
-            i += 2;
-            continue;
-          }
-          i++;
-          break;
-        }
-        id += sql[i];
-        i++;
-      }
-      out += ` ${id} `;
-    } else if (c === "[") {
-      const j = sql.indexOf("]", i + 1);
-      out += ` ${j < 0 ? sql.slice(i + 1) : sql.slice(i + 1, j)} `;
-      i = j < 0 ? n : j + 1;
-    } else if (c === "-" && sql[i + 1] === "-") {
-      const j = sql.indexOf("\n", i + 2);
-      i = j < 0 ? n : j + 1;
-      out += " ";
-    } else if (c === "/" && sql[i + 1] === "*") {
-      const j = sql.indexOf("*/", i + 2);
-      i = j < 0 ? n : j + 2;
-      out += " ";
-    } else {
-      out += c;
-      i++;
-    }
+export function namesPragmaFunction(sql: string): boolean {
+  const s = new Scanner(sql);
+  while (s.next()) {
+    // 引用した識別子は、引用符の次から見る。名前の先頭の 7 文字に引用符の重ね (`""`) があれば、`pragma_` ではない。
+    const from = s.kind === "word" ? s.start : s.kind === "quoted" ? s.start + 1 : -1;
+    if (from >= 0 && s.end - from >= 7 && sql.slice(from, from + 7).toLowerCase() === "pragma_") return true;
   }
-  return out;
+  return false;
 }
 
 export class ScratchDb implements Backend {
@@ -243,7 +201,7 @@ export class ScratchDb implements Backend {
       } else if (op.opcode === "VOpen") virtual = true;
     }
     const { columns } = this.run(sql, [], null, () => null);
-    return { tables: [...out], read: [...read], metadata: schema || (virtual && /\bpragma_/i.test(identifierText(sql))), columns };
+    return { tables: [...out], read: [...read], metadata: schema || (virtual && namesPragmaFunction(sql)), columns };
   }
 
   /**

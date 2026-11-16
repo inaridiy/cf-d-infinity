@@ -7,6 +7,7 @@
 // SQLite との比べ方は、基準経路だけの実行 (vitest.config.ts の reference-scans、reference-full) でも流す。
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
+import { insertedRowids } from "./inserted-rowid";
 import { clientOf } from "./libsql";
 import { prng, REFERENCE_ONLY, seedsOr, SimCluster } from "./sim";
 
@@ -108,21 +109,28 @@ async function run(seed: number, shards: number): Promise<string[]> {
     lite.exec(s);
     await client.execute(s);
   }
+  // 文の結果の lastInsertRowid も、どの経路でも 1 つの規則で比べる (test/inserted-rowid.ts)。
+  const inserted = insertedRowids(lite);
   const problems: string[] = [];
   for (const step of script(seed, 40)) {
     let want: string;
+    let wantRowid: bigint | null = null;
     try {
+      inserted.start();
       const st = lite.prepare(step.sql);
       // 2^53 を超える INTEGER は、DO と同じく精度を落とした数で比べる (node:sqlite は既定では例外を投げる)。
       st.setReadBigInts(true);
       want = st.columns().length ? show(st.all(...(step.args as never[])).map((r) => Object.values(r))) : (st.run(...(step.args as never[])), "ok");
+      wantRowid = inserted.last();
     } catch (e) {
       want = "error";
     }
     let got: string;
+    let gotRowid: bigint | null = null;
     try {
       const res = await client.execute({ sql: step.sql, args: step.args as never });
       got = res.columns.length ? show(res.rows.map((r) => res.columns.map((_c, i) => r[i]))) : "ok";
+      gotRowid = res.lastInsertRowid ?? null;
     } catch (e) {
       got = /unsupported:/.test(String(e)) ? `unsupported ${(e as Error).message.slice(0, 160)}` : `error`;
       if (got === "error" && want !== "error") got = `error ${(e as Error).message.slice(0, 120)}`;
@@ -130,6 +138,9 @@ async function run(seed: number, shards: number): Promise<string[]> {
     // Hrana は値を JSON で運ぶので、REAL の無限大を運べない (sqld も同じ)。クライアントの誤りになるのを、正しいとする。
     if (/"-?Infinity"/.test(want) && /HRANA_PROTO_ERROR/.test(got)) continue;
     if (got !== want) problems.push(`${step.sql} ${show(step.args)}\n  sqlite: ${want.slice(0, 200)}\n  ours:   ${got.slice(0, 200)}`);
+    else if (want !== "error" && wantRowid !== gotRowid) {
+      problems.push(`${step.sql} ${show(step.args)}\n  sqlite: lastInsertRowid ${wantRowid}\n  ours:   lastInsertRowid ${gotRowid}`);
+    }
   }
   return problems;
 }

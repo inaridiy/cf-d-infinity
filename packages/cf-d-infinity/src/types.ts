@@ -54,19 +54,12 @@ export interface TableDef {
    * この項目のない古い表定義では、省いた列の値は分からないものとして扱う。
    */
   defaults?: string[];
-  /** 出来上がった index だけが入る。作っている最中の index は building にあり、計画からは見えない。 */
+  /**
+   * 出来上がった index だけが入る。既存の行から作っている最中の index は、その遷移の prepare の ddl にあり、commit までは表定義に
+   * 入らないので、計画からは見えない。作っている間の書き込みの禁止は、表定義の印ではなく、スナップショットの開いている遷移
+   * (src/catalog.ts の Snapshot.open の fence) である。
+   */
   globalIndexes: GlobalIndexDef[];
-  /**
-   * 既存の行から作っている最中の、シャードをまたぐ UNIQUE の index。これがある間、シャードはこの表への書き込みを断る。
-   * 行が止まっているので、既存の行の項目を埋める作業は、並行する書き込みを考えなくてよい (specs/m12_unique_index_build.qnt)。
-   * 公開されると globalIndexes へ移り、取り消されると消える。
-   */
-  building?: GlobalIndexDef;
-  /**
-   * 表定義の変更が、この表への書き込みを止めている理由。取引が読んだ表を DROP する前に掛ける (specs/m14_rebuild_guard.qnt)。
-   * 掛けた版の次の版が、その DROP か、取り消しである。
-   */
-  locked?: string;
 }
 
 export type Affinity = "INTEGER" | "REAL" | "NUMERIC" | "TEXT" | "BLOB";
@@ -180,13 +173,29 @@ export interface ExecReq {
   lock?: LockOwner;
   /** 読み取りでロックを取る行。BEGIN IMMEDIATE の主キー読みに使う。 */
   lockRows?: { table: string; pk: string }[];
+  /**
+   * 要求を計画した表定義の epoch (Worker のスナップショットの Catalog.schema。表定義が最後に変わった epoch)。シャードは、自分の
+   * スナップショットの表定義の epoch と等しいことを確かめる。大きければ Meta の列を適用してから確かめ直し、小さければ古い計画として断る
+   * (docs/design-catalog-epoch.md の「要求ごとの確かめ」)。
+   */
   schema: number;
+  /**
+   * 要求を計画した Worker のスナップショットの epoch (Catalog.epoch)。シャードは、これが自分の epoch より大きく、要求の行が自分の
+   * スナップショットでは自分のものでないときに、Meta の列を適用してから所有を確かめ直す。等しいことは求めない。範囲表だけが進んだ
+   * epoch は、動いていない行の要求を古くしない (M21 の pinnedSurvives)。
+   */
+  epoch: number;
 }
 
 export interface LockOwner {
   txn: string;
   /** 開始時刻。古い取引が優先される (wound-wait)。 */
   start: Ts;
+  /**
+   * autocommit の書き込みの待ち手である。シャードが自分で付け、値はその書き込みに発行した時刻である。Worker は付けない。
+   * 同じ開始時刻なら、autocommit はどの取引よりも若い (src/shard/kernel.ts の older)。
+   */
+  auto?: Ts;
 }
 
 export interface ExecRes {
@@ -201,6 +210,12 @@ export interface ExecRes {
    * 無ければ、changes の長さと同じである。
    */
   count?: number;
+  /**
+   * 書き込みの文が入れた行 (表と主キーのキー文字列)。SQLite が入れた順である。捕捉が記録する (src/shard/rows.ts の capturedChanges)。
+   * REPLACE が消してから入れた行を含み、UPSERT の DO UPDATE で更新しただけの行と、OR IGNORE が入れなかった行は含まない。
+   * Worker は、文の結果の lastInsertRowid をこれだけから決める (src/client/db.ts の lastInsertRowid)。読みにはない。
+   */
+  inserted?: Pick<Change, "table" | "pk">[];
   T: Ts;
   hlc: Ts;
   epoch: number;
@@ -222,7 +237,9 @@ export interface PrepareReq {
   writes: Change[];
   spans: Span[];
   anchor: string;
+  /** 取引の表定義の epoch と、取引のスナップショットの epoch (ExecReq と同じ)。 */
   schema: number;
+  epoch: number;
 }
 export type PrepareRes = { ok: true; prepareTs: Ts } | { ok: false; reason: string };
 
@@ -236,7 +253,9 @@ export interface CommitReq {
   txn: string;
   T: Ts;
   participants: Participant[];
+  /** 取引の表定義の epoch と、取引のスナップショットの epoch (ExecReq と同じ)。参加者への prepare も、これを運ぶ。 */
   schema: number;
+  epoch: number;
 }
 export type CommitRes = { ok: true; c: Ts } | { ok: false; reason: string };
 
@@ -254,10 +273,19 @@ export interface ShardApi {
   prepare(req: PrepareReq): Promise<PrepareRes>;
   refresh(req: { txn: string; spans: Span[]; from: Ts; to: Ts }): Promise<{ ok: boolean; reason?: string }>;
   /**
-   * 表を消す前の確認。schema の版 (表の書き込み禁止) を適用した後で、spans に from より後の変更も intent もないかを答える。
-   * from は、取引がその範囲を読んだ時刻である。読みの要求が時刻を運ぶので、このシャードは from を見ている。
+   * 表を消す前の確認 (mode guard の遷移)。schema の表定義の epoch (その遷移の prepare。表の書き込み禁止) を適用した後で、spans に
+   * from より後の変更も intent もないかを答える。from は、取引がその範囲を読んだ時刻である。読みの要求が時刻を運ぶので、
+   * このシャードは from を見ている。
    */
   unchanged(req: { spans: Span[]; from: Ts; schema: number }): Promise<{ ok: boolean; reason?: string }>;
+  /**
+   * 表定義の遷移の prepare を適用したかを答える (docs/design-catalog-epoch.md の「Worker」)。epoch は prepare の epoch で、シャードは
+   * そこまで Meta の列を適用し (fence の表の intent を決着させ、以後その表への書き込みを断る)、mode が trial なら、書き込みを止めた表に
+   * 文を試して巻き戻し、SQLite が通したかを返す。その遷移が自分のスナップショットでもう開いていなければ (先に abort が記録された)、
+   * ok: false を返す。進める側は、範囲表の全シャードの ok を集めてから、Meta に commit を記録させる。
+   * early は欠陥のスイッチ checkBeforePrepare (Worker の側) だけが付ける。列を適用せずに、いまの表で試す (M21 の m21_red_trial_early)。
+   */
+  prepared(req: { epoch: number; early?: true }): Promise<{ ok: boolean; reason?: string }>;
   /** pieces は移動先への転送で使う。未到着ならその piece を先に引き取る。 */
   finalize(req: { txn: string; c: Ts; pieces?: Piece[] }): Promise<void>;
   abort(req: { txn: string; pieces?: Piece[] }): Promise<void>;
@@ -266,30 +294,30 @@ export interface ShardApi {
   flush(req: { upTo?: Ts }): Promise<FlushRes>;
   // 範囲の移動の要求は、範囲を token の区間 (Interval) で運ぶ。
   // いまのシャードは、両端が slot の境目にある区間の移動だけを受ける (ShardCore の wholeSlotsOnly)。
-  /** 子が受け入れの準備をする。親の fence より先に呼ぶ。 */
-  /** 範囲を受け取る準備をする。子の表定義の版を返す。親は、fence の前にその版まで追いつく。 */
-  /** 子が範囲を受け取り始める。slot は Meta が分割に渡した枠で、子は Meta に枠を示し、Meta が返す版で受け取り始める。 */
-  beginIncoming(req: Interval & { from: string; slot: string }): Promise<{ schema: number }>;
-  /** 親がスロットの受理を止める。以後は NotOwner を返す。 */
-  /** 親が範囲を送り出し始める。slot は分割の枠で、子が受け取り始めていなければ断る。 */
-  fence(req: Interval & { to: string; schema?: number; slot: string }): Promise<void>;
-  /** 終わっていない範囲の移動。増設をやり直すとき、同じ範囲を続けるのに使う。 */
+  // 移動は Meta の列の move-start で始まる (docs/design-catalog-epoch.md の段 4)。親は move-start を適用すると、その区間の書き込みを
+  // 断り (fence)、子は適用すると受け取り始め、自分で移動を進める。子から親への要求 (listGroups、pull、finishMove) は move-start の
+  // epoch を運び、親は、その epoch まで列を適用してから答える (M21 の PULL_AT_EPOCH)。
+  /** 終わっていない範囲の移動。 */
   moves(req: Record<string, never>): Promise<{ outgoing: (Interval & { to: string })[]; incoming: (Interval & { from: string })[] }>;
   /** 範囲にあるグループを列挙する。列挙するのはグループで、piece ではない。 */
-  listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null }): Promise<{ groups: string[]; cursor: GroupCursor | null }>;
+  listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch?: number }): Promise<{ groups: string[]; cursor: GroupCursor | null }>;
   /**
    * 区間 [start, end) の fence から、piece を子へ渡す。want は、グループごとに、子が欲しい piece を位置で指す。
    * いまは、どの piece もグループの全体なので、子は `{ g, from: null }` だけを送る。
    */
-  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number }): Promise<PiecePayload[]>;
+  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch?: number }): Promise<PiecePayload[]>;
   ack(req: { pieces: Piece[] }): Promise<void>;
-  /** 子が背景で全グループを引き取る。 */
-  drain(req: Interval): Promise<{ groups: number; rows: number; bytes: number }>;
+  /**
+   * 子が移動を終えるまで進める (docs/design-catalog-epoch.md の決めたこと 4)。epoch は移動の move-start の epoch で、子はそこまで列を
+   * 適用し (受け取り始め)、全グループを引き取り (drain)、親の finishMove で時計を受け取り、受け取り終えた印を付け、Meta に move-end を
+   * 記録させる。子が自分で (move-start を適用した後の仕事と alarm で) 進めている最中なら、それに合流する。運んだ数を返す。
+   */
+  drain(req: Interval & { epoch: number }): Promise<{ groups: number; rows: number; bytes: number }>;
   /**
    * 範囲を渡し終えた印を付ける。返す m は、このシャードがその範囲について発行した、どの時刻よりも大きい。
    * 受け取る側の finishIncoming に渡す。
    */
-  finishMove(req: Interval): Promise<{ m: Ts }>;
+  finishMove(req: Interval & { epoch?: number }): Promise<{ m: Ts }>;
   /** 範囲を受け取り終えた印を付ける。時計を m まで進めてから、届かなかったグループ (渡す側に行がなかった) を受け持ち始める。 */
   finishIncoming(req: Interval & { m: Ts }): Promise<void>;
   metrics(req: Record<string, never>): Promise<ShardMetrics>;
@@ -299,8 +327,11 @@ export interface ShardApi {
   exportRows(req: { table: string; after: Value[] | null; limit: number; skip?: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }>;
   /** 取引の rollback でロックを手放す。届かなくても TTL で消える。 */
   unlock(req: { txn: string }): Promise<void>;
-  /** DDL を適用する。全シャードへ適用してから DDL を完了させる。 */
-  syncSchema(req: { version: number }): Promise<{ moving: boolean }>;
+  /**
+   * 表定義の epoch schema まで、Meta の列を適用する。DDL を確定した側は、書き込みの禁止を早く解くために、全シャードへ適用させてから
+   * 完了を返す (正しさには要らない。次の要求が適用させる)。epoch があれば、範囲の記録もその epoch まで適用する。
+   */
+  syncSchema(req: { schema: number; epoch?: number }): Promise<{ moving: boolean }>;
   /** 現在の HLC を返す。複数シャードの読み取りの T を決めるのに使う。 */
   now(req: Record<string, never>): Promise<Ts>;
 }
@@ -308,10 +339,6 @@ export interface ShardApi {
 export interface FlushRes {
   flushTs: Ts;
   entries: { commitTs: Ts; txn: string; changes: Change[] }[];
-}
-
-export interface MetaApi {
-  ddlSince(version: number): Promise<{ version: number; ddl: string[] }>;
 }
 
 /**
@@ -330,6 +357,11 @@ export interface Piece {
   /** この piece を切り出した fence の、token の区間。受け取る側では、受け取った範囲の区間である。 */
   range: Interval;
   after: Pos;
+  /**
+   * この piece を運ぶ移動の move-start の epoch。同じグループが、範囲が前の持ち主へ戻るたびに、何度も同じシャードを出入りするので、
+   * 送り出しと到着の記録は、移動ごとに分ける (docs/design-refresh-across-move.md の「受け取りの記録を残す期間」)。
+   */
+  epoch: number;
 }
 
 /** 子が欲しい piece。from は、子がそのグループで揃えた位置の続き (null は先頭から)。at は、要求が名指しした行の位置である。 */
@@ -343,7 +375,7 @@ export interface PiecePayload extends Piece {
   /** 行は、変更と同じくタプルで運ぶ。 */
   rows: { table: string; row: Tuple }[];
   intents: PlainRow[];
-  /** 送り出した親の表定義の版。行はこの版の形をしている。 */
+  /** 送り出した親の表定義の epoch。行はこの表定義の形をしている。 */
   schema: number;
 }
 
@@ -362,6 +394,7 @@ export interface GroupCursor {
 /** シャードの健全性。0 でない項目があれば、運用者が見るべき状態である。 */
 export interface ShardHealth {
   id: string;
+  /** シャードのスナップショットの表定義の epoch (Catalog.schema と同じ数)。 */
   schema: number;
   format: number;
   bytes: number;
@@ -433,17 +466,39 @@ export interface Backend {
 
 /** 検証済みの欠陥を再導入するスイッチ。反例の再現テスト専用で、既定はすべて false。シャードと Meta (meta.ts) が読む。 */
 export interface Faults {
-  /** Meta が、書き込み禁止の版が期限切れで取り消された後でも、DROP を記録する (モデル m14_red_untied)。 */
-  dropAfterExpiry?: boolean;
-  /** Meta が、期限切れで消えた分割の枠を示す子の受け取りの始まりを断らない (モデル m15_red_late_start の 1 つ目の守り)。 */
-  startWithoutSlot?: boolean;
-  /** Meta が、親の fence の前に、分割の枠が生きていることを確かめない (モデル m15_red_late_start の 2 つ目の守り)。 */
-  fenceWithoutSlot?: boolean;
+  /**
+   * Meta の commit が、遷移が開いているかを確かめない (M21 の m21_red_two_exits と m21_red_drop_untied。段 3 まではあった
+   * dropAfterExpiry の意味を広げた)。期限切れか取り消しで abort された遷移の遅れた commit も、同じ prepare を開き直して確定する。
+   * abort から開き直すまでの間に書かれた行は、index の項目を持たないか (index の作成)、DROP で消える (取引が読んだ表の DROP)。
+   */
+  commitAfterAbort?: boolean;
+  /**
+   * Meta の commit が、ok を答えたシャードの集合が範囲表の全シャードを覆うことを確かめない (M21 の m21_red_early_commit、
+   * m21_red_trial_missing_ack、m21_red_drop_missing_ack)。Worker の側の同じ名前のスイッチと組で、Worker は 1 つのシャードの
+   * prepared を待たない (test/sim.ts の injectedFault が両方に入れる)。
+   */
+  commitWithoutAcks?: boolean;
+  /** Meta が、表定義の遷移が開いている間に、次の prepare を記録する (M21 の m21_red_two_open)。 */
+  overlappingTransitions?: boolean;
+  /** Meta が、移動が開いている間に、表定義の遷移を開く (prepare を記録する。M21 の m21_red_ddl_during_move)。 */
+  ddlDuringMove?: boolean;
+  /** Meta が、表定義の遷移が開いている間に、移動を開く (move-start を記録する。M21 の m21_red_move_during_ddl)。 */
+  moveDuringDdl?: boolean;
+  /** 子が、受け取り終える前に、Meta に move-end を記録させる (M21 の m21_red_end_early)。 */
+  endBeforeDrained?: boolean;
+  /**
+   * 親が、子からの移動の要求 (listGroups、pull、finishMove) が運ぶ move-start の epoch まで列を適用せずに答え、fence の前に頼まれた行を
+   * 渡す (M21 の m21_red_pull_unfenced。モデルでは、要求が epoch を運ばない形)。親は、渡した後も、古い範囲表の書き込みを受ける。
+   */
+  pullWithoutEpoch?: boolean;
   /** autocommit の書き込みが、他の取引の intent との UNIQUE を照合しない (2026-11 のレビューで見つかった欠陥)。 */
   autoIgnoresUniqueIntents?: boolean;
-  /** DDL を、持っている intent を決着させずに適用する。表や列が消えた後では、確定済みの取引の intent を適用できない。 */
+  /**
+   * 表定義の記録を、持っている intent を決着させずに適用する (M21 の m21_red_no_drain、_trial_no_drain、_drop_no_drain)。
+   * 表や列が消えた後では、確定済みの取引の intent を適用できない。
+   */
   ddlIgnoresIntents?: boolean;
-  /** DROP の守りの確認 (unchanged) が、決着していない intent を変更として数えない (specs/m14_rebuild_guard.qnt の m14_red_no_drain の 2 つ目の守り)。 */
+  /** DROP の守りの確認 (unchanged) が、決着していない intent を変更として数えない (M21 の m21_red_drop_no_drain の 2 つ目の守り)。 */
   unchangedIgnoresIntents?: boolean;
   /**
    * anchor が、同じ 2PC の ID の実行を 1 つずつにしない。abortIgnoresRecord と合わせると m17_red_resend になる。
@@ -481,7 +536,10 @@ export interface Faults {
   dropIntentsOnMove?: boolean;
   /** 子が T < m の読みを答える (m5b_red_s3 の子の undo に相当する)。 */
   servePastMove?: boolean;
-  /** 親が fence 後も要求を受理する。 */
+  /**
+   * シャードが所有を確かめない。親は fence 後も要求を受理し (__fenced の拒否を外す)、どのシャードも、自分のスナップショットの範囲表で
+   * 自分のものでない行の要求を受理する (M21 の m21_red_owner_unchecked。段 2 で意味を広げた)。
+   */
   ignoreFence?: boolean;
   /** 親が、移動を終えた範囲を含む全表の読みを受理する。古い範囲表の読み手が、子へ移った行を読み落とす。 */
   staleWideRead?: boolean;
@@ -492,9 +550,11 @@ export interface Faults {
    * 受け取った側が、移動より前の読みの時刻でも「行なし」と答える。
    */
   noRangeFloor?: boolean;
-  /** index を作っている最中の表への書き込みを、シャードが断らない (モデル m12_red_no_lock)。 */
+  /**
+   * prepare を適用したシャードが、fence の表への書き込みを断らない (M21 の m21_red_no_fence、_trial_no_fence、_drop_no_fence)。
+   */
   ignoreTableLock?: boolean;
-  /** index を公開する版を適用するとき、その版が運ぶ時刻まで時計を進めない (モデル m12_clock_red_no_clock)。 */
+  /** index を公開する commit を適用するとき、その commit が運ぶ時刻まで時計を進めない (M21 の m21_clock_red_no_clock)。 */
   publishWithoutClock?: boolean;
   /** 検証で F の代わりに T を使う。 */
   validateFromT?: boolean;
@@ -565,8 +625,22 @@ export class ReadTooOld extends Error {
 // 版 5 (2026-11-14): 値を、JS の型が格納の型である形にした (docs/design-values.md の段 3)。INTEGER は bigint、REAL は number で、
 // 整数の値の REAL の印 `{ real }` はなくなった。ExecReq に結果の列名 (columns) を足し、シャードは読みを型つきの読みに包んで、
 // 型のある値を返す。利用者の RETURNING は Worker が要素の式に書き換えて送る。版 4 の要求の数は意味が違うので、受け付けない。
-export const PROTOCOL_VERSION = 5;
-export const MIN_PROTOCOL_VERSION = 5;
+// 版 6 (2026-11-15): 要求が、Worker のスナップショットの epoch と表定義の epoch を運ぶ (docs/design-catalog-epoch.md の段 2)。
+// ExecReq、PrepareReq、CommitReq に epoch を足し、schema の数を DdlEntry.version から表定義の epoch に替えた。syncSchema は
+// { schema } を受け、beginIncoming、fence、PiecePayload の schema も表定義の epoch である。版 5 の要求の schema は意味が違うので、
+// 受け付けない。
+// 版 7 (2026-11-16): 書き込みの応答 (ExecRes) が、文が入れた行 (inserted) を運ぶ。Worker は、文の結果の lastInsertRowid を、これだけから
+// 決める (src/client/db.ts の lastInsertRowid)。版 6 のシャードは inserted を返さないので、新しい Worker と話すと、行を入れた文の
+// lastInsertRowid が null になる。新旧が混ざらないように、版 6 の要求は受け付けない。
+// 版 8 (2026-11-16): 表定義の変更を 2 相にした (docs/design-catalog-epoch.md の段 3)。シャードは Meta の列の prepare、commit、abort を
+// 適用し、新しい入口 prepared で prepare を適用したかと試した結果を答える。分割の枠の版 (startSplit の答え) は、表定義の epoch だけになった。
+// 版 7 のシャードは prepare の記録を適用できず、版 7 の Worker は Meta の古い入口 (applyDdl) を呼ぶので、版 7 の要求は受け付けない。
+// 版 9 (2026-11-16): 範囲の移動を Meta の列の move-start と move-end で進める (docs/design-catalog-epoch.md の段 4)。beginIncoming と
+// fence の入口がなくなり、子が自分で移動を進める (drain は move-start の epoch を受け、移動を終えるまで進める)。子から親への
+// listGroups、pull、finishMove は move-start の epoch を運ぶ。Piece は移動の epoch を運ぶ。版 8 のシャードは move-start から
+// 受け取りを始めず、版 8 の Autoscaler は分割の枠を取るので、版 8 の要求は受け付けない。
+export const PROTOCOL_VERSION = 9;
+export const MIN_PROTOCOL_VERSION = 9;
 
 export class VersionSkew extends Error {
   readonly retryable = true;
@@ -662,8 +736,24 @@ export function utf8Length(s: string): number {
  * 版 3 (2026-11-15): Meta の __ddl と __routing を、epoch の列 __epoch(epoch, rec) の 1 表にした (docs/design-catalog-epoch.md の段 1)。
  * __meta の shadow は、版ではなく epoch を持つ。シャードの形式は変わらない。版 2 からの移行は書かない。版 2 の Meta を開くと、
  * 新しいコードは空の列を読み、表定義をなくしたように見えるので、移行がないと言って起動を拒否する。
+ *
+ * 版 4 (2026-11-15): シャードの __ddl(version, entry) を、Meta の epoch の列の写し __epoch(epoch, rec) にした
+ * (docs/design-catalog-epoch.md の段 2)。シャードは表定義と範囲表を、この写しを畳んで作る。Meta の表は変わらないが、版の数は
+ * Meta とシャードで 1 つなので、版 3 の Meta も開かない。版 3 からの移行は書かない。版 3 のシャードを開くと、新しいコードは空の写しを
+ * 読み、表定義をなくしたように見えるので、移行がないと言って起動を拒否する。
+ *
+ * 版 5 (2026-11-16): 表定義の変更を 2 相にした (docs/design-catalog-epoch.md の段 3)。Meta とシャードの __epoch の表定義の記録が、
+ * 1 つの版を運ぶ commit (DdlEntry) から、prepare、commit (of)、abort の 3 種類になった。Meta の __meta の build_lease は lease
+ * (開いている遷移の期限) に、splits の枠の version は schema (表定義の epoch) になった。版 4 からの移行は書かない。版 4 のデータを
+ * 開くと、新しいコードは版 4 の commit の記録を畳めないので、移行がないと言って起動を拒否する。
+ *
+ * 版 6 (2026-11-16): 範囲の移動を Meta の列の move-start と move-end で進める (docs/design-catalog-epoch.md の段 4)。シャードの移動の
+ * 記録 (__fenced、__incoming、__moved、__moved_txn、__arrived) に、その移動の move-start の epoch の列を足し、送り出しと到着の
+ * 記録を移動ごとにした (__moved と __moved_txn と __arrived の主キーに epoch が入る)。範囲が前の持ち主へ戻ると、同じシャードが同じ
+ * 区間と同じグループを何度も受け取り、渡すからである。Meta の __meta の splits (分割の枠) はなくなった。版 5 からの移行は書かない。
+ * 版 5 のシャードを開くと、記録の表の形が違うので、移行がないと言って起動を拒否する。
  */
-export const STORAGE_FORMAT = 3;
+export const STORAGE_FORMAT = 6;
 
 /** 版 n の保存データを版 n + 1 にする移行。鍵は n である。最初の公開の前の形式は持たない (公開前は後方互換を持たない)。 */
 const STORAGE_MIGRATIONS: Record<number, (b: Backend) => void> = {};

@@ -3,16 +3,16 @@ import { Db, type Cluster, type StatementStat } from "./client/db";
 import { exportPage, importRows, type ExportCursor, type ExportPage } from "./transfer";
 
 export { importRows, type ExportCursor };
-import { collectMetrics, decide, DEFAULTS, healthProblems, needsFollowUp, nextShardNumber, split, splitsToResume, type AutoscalerState, type Thresholds } from "./autoscaler";
-import { MetaCore, type Catalog, type SplitMove } from "./meta";
+import { collectMetrics, decide, DEFAULTS, healthProblems, movesToResume, needsFollowUp, nextShardNumber, split, type AutoscalerState, type Thresholds } from "./autoscaler";
+import type { Move } from "./catalog";
+import { MetaCore, type Catalog } from "./meta";
 import { planSplit, shardsOf, type Interval } from "./routing";
 import { ShardCore } from "./shard/core";
 import { batonSealer, handlePipeline, serveHranaSocket, type BatonSeal, type PipelineReq } from "./client/hrana";
-import { toValue } from "./client/d1";
 import { intModeOf, rowidOut, rowsOut } from "./client/results";
 import { setSqlWasm } from "./sql/scratch";
 import { bindPlain, bindTyped, restoreColumns } from "./value";
-import { BadRequest, checkCount, checkSql, clusterName, ENTRY_LIMITS, exactIntegers, readJson, sameToken, shardCount, shardName } from "./entry";
+import { BadRequest, checkCount, checkSql, clusterName, ENTRY_LIMITS, jsonParams, numberLiterals, readJson, sameToken, shardCount, shardName } from "./entry";
 import { checkProtocol, PROTOCOL_VERSION, type Backend, type Plain, type PlainRow, type ShardApi, type ShardHealth, type Value } from "./types";
 // @ts-expect-error wrangler と esbuild がバンドル時に解決する
 import sqlWasm from "./sql-wasm.wasm";
@@ -133,10 +133,8 @@ export class DinfShard extends DurableObject<Env> {
       clock: { now: () => Date.now() },
       peer: (id) => shardStub(env, id),
       meta: {
-        ddlSince: (v) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).ddlSince(v) as never,
-        revokeDdl: (v, reason) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).revokeDdl(v, reason),
-        startSplit: (id, move) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).startSplit(id, move),
-        checkSplit: (id, move) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).checkSplit(id, move),
+        epochsSince: (after) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).epochsSince(after) as never,
+        endMove: (epoch) => env.DINF_META.getByName(clusterOfShard(ctx.id.name!)).endMove(epoch),
       },
       background: (p) => ctx.waitUntil(p),
       // 予約済みの alarm は後ろへずらさない。負荷が続くと毎回ずれて、いつまでも発火しなくなる。
@@ -211,8 +209,8 @@ export class DinfMeta extends DurableObject<Env> {
     this.core.setInitial(initial);
     return this.core.catalog();
   }
-  ddlSince(v: number) {
-    return this.core.ddlSince(v);
+  epochsSince(after: number) {
+    return this.core.epochsSince(after);
   }
   /** 遅い文を記録する。直近の SLOW_KEEP 件だけ残す。 */
   recordSlow(e: SlowQuery): void {
@@ -231,45 +229,30 @@ export class DinfMeta extends DurableObject<Env> {
     return sql.exec(`SELECT at, ms, plan, shards, rows, changes, attempts, error, sql FROM __slow ORDER BY seq DESC LIMIT ?`, Math.max(1, Math.min(limit, SLOW_KEEP)))
       .toArray().map((r) => ({ ...(r as unknown as SlowQuery), error: (r.error as string | null) ?? undefined }));
   }
-  applyDdl(sql: string, initial: string[], basedOn?: number) {
+  prepare(sql: string, initial: string[], opts: { guard?: string[] }, basedOn?: number) {
     this.core.setInitial(initial);
-    return this.core.applyDdl(sql, basedOn);
+    return this.core.prepare(sql, opts, basedOn);
   }
-  revokeDdl(version: number, reason: string) {
-    return this.core.revokeDdl(version, reason);
+  commit(epoch: number, acks: string[], at?: number) {
+    return this.core.commit(epoch, acks, at);
   }
-  switchRange(move: Interval & { to: string; from?: string }) {
-    return this.core.switchRange(move);
+  abort(epoch: number, reason: string) {
+    return this.core.abort(epoch, reason);
   }
-  publishIndex(table: string, name: string, version: number, at: number) {
-    return this.core.publishIndex(table, name, version, at);
+  renew(epoch: number) {
+    return this.core.renew(epoch);
   }
-  renewLock(version: number) {
-    return this.core.renewLock(version);
+  startMove(move: Move) {
+    return this.core.startMove(move);
   }
-  lockTables(tables: string[], basedOn?: number) {
-    return this.core.lockTables(tables, basedOn);
+  endMove(epoch: number) {
+    return this.core.endMove(epoch);
   }
-  beginSplit(move: SplitMove, basedOn: number) {
-    return this.core.beginSplit(move, basedOn);
-  }
-  startSplit(id: string, move: SplitMove) {
-    return this.core.startSplit(id, move);
-  }
-  checkSplit(id: string, move: SplitMove) {
-    return this.core.checkSplit(id, move);
-  }
-  endSplit(id: string) {
-    return this.core.endSplit(id);
-  }
-  splits() {
-    return this.core.splits();
+  moves() {
+    return this.core.moves();
   }
   batonSecret() {
     return this.core.batonSecret();
-  }
-  finishLock(version: number, sql: string) {
-    return this.core.finishLock(version, sql);
   }
   allocate(table: string, n: number, min?: number) {
     return this.core.allocate(table, n, min);
@@ -387,9 +370,9 @@ export class DinfAutoscaler extends DurableObject<Env> {
     this.event("tick", metrics.map((m) => ({ id: m.id, w: m.writes, r: m.reads, ms: m.elapsedMs, size: m.size, mig: m.migrating, probe: m.probeMs })));
     // 途中で失敗した増設は同じ範囲で再開する。各段は冪等である。
     for (const job of c.pending) this.runSplit(cluster, job);
-    // Meta に残っている分割の枠も再開する。別の進め方 (手で始めた分割など) が途中で止まると、枠が残り、
-    // 表定義の変更がいつまでも記録できなくなる。子が受け取り始めた分割は取り消せないので、終わらせる。
-    for (const job of splitsToResume(await cluster.splits(), (child) => c.pending.some((j) => j.child === child))) this.runSplit(cluster, job);
+    // Meta に開いたまま残っている移動も再開する。別の進め方 (手で始めた分割など) が途中で止まり、子が move-start をまだ知らないと、
+    // 移動が開いたまま残り、表定義の変更がいつまでも記録できなくなる。移動は取り消せないので、子に終わらせる。
+    for (const job of movesToResume(await cluster.moves(), (child) => c.pending.some((j) => j.child === child))) this.runSplit(cluster, job);
     const { routing } = await cluster.catalog();
     // 持続回数と cooldown は永続化する。メモリだけだと、再起動のたびに cooldown が消えて続けて割る。
     const saved = this.ctx.storage.sql.exec(`SELECT v FROM conf WHERE k = 'state'`).toArray()[0];
@@ -434,7 +417,7 @@ export class DinfAutoscaler extends DurableObject<Env> {
         this.save(c);
         this.event("split-done", r);
       },
-      // 表定義の変更が枠を持っている間は、分割を待たせる。次の判断のときに、もう一度始める。
+      // 表定義の遷移か、重なる移動が開いている間は、分割を待たせる。次の判断のときに、もう一度始める。
       (e) => this.event(/split busy:/.test(String(e)) ? "split-waiting" : "split-failed", { child: job.child, error: String(e) }),
     ).finally(() => this.running.delete(job.child)));
   }
@@ -454,16 +437,12 @@ export function clusterOf(env: Env, count?: number, prefix = "shard"): Cluster {
   return {
     shard: (id) => shardStub(env, id),
     catalog: () => meta.catalog(initial) as unknown as Promise<Catalog>,
-    applyDdl: (sql, basedOn) => meta.applyDdl(sql, initial, basedOn) as unknown as Promise<Catalog>,
-    switchRange: (move) => meta.switchRange(move) as never,
-    publishIndex: (table, name, version, at) => meta.publishIndex(table, name, version, at) as never,
-    revokeDdl: (version, reason) => meta.revokeDdl(version, reason),
-    renewLock: (version) => meta.renewLock(version),
-    lockTables: (tables, basedOn) => meta.lockTables(tables, basedOn) as never,
-    beginSplit: (move, basedOn) => meta.beginSplit(move, basedOn) as never,
-    endSplit: (id) => meta.endSplit(id),
-    splits: () => meta.splits() as never,
-    finishLock: (version, sql) => meta.finishLock(version, sql) as never,
+    prepare: (sql, opts, basedOn) => meta.prepare(sql, initial, opts, basedOn) as never,
+    commit: (epoch, acks, at) => meta.commit(epoch, acks, at) as never,
+    abort: (epoch, reason) => meta.abort(epoch, reason),
+    renew: (epoch) => meta.renew(epoch),
+    startMove: (move) => meta.startMove(move) as never,
+    moves: () => meta.moves() as never,
     allocate: (table, n, min) => meta.allocate(table, n, min),
   };
 }
@@ -579,30 +558,27 @@ export async function clusterStatus(env: Env, name = "shard", shards?: number) {
   const cat = await cluster.catalog();
   const ids = shardsOf(cat.routing);
   // 適用できない DDL で止まっているシャードは、適用を試みさせないと自分では気づかない (再起動で忘れる)。
-  await Promise.all(ids.map((id) => cluster.shard(id).syncSchema({ version: cat.version }).catch(() => {})));
+  await Promise.all(ids.map((id) => cluster.shard(id).syncSchema({ schema: cat.schema }).catch(() => {})));
   // 1 つのシャードが答えなくても、ほかの状態は見せる。
   const health = await Promise.all(ids.map((id) => cluster.shard(id).health({}).catch((e): ShardHealth => ({
     id, schema: -1, format: -1, bytes: 0, intents: 0, oldestIntentMs: 0, unapplied: 0,
     redriveErrors: [`does not answer: ${String((e as Error)?.message ?? e).slice(0, 200)}`], incoming: 0, outgoing: 0, logGenerations: 0,
   }))));
   return {
-    routing: cat.routing, shards: ids, schema: cat.version, health, problems: healthProblems(health),
+    // schema は表定義の epoch で、シャードの health の schema と同じ数である (段 2)。
+    routing: cat.routing, shards: ids, schema: cat.schema, health, problems: healthProblems(health),
     // 進行中の分割。終わるまで、表定義の変更は待つ。長く残っているなら、分割が進めなくなっている。
-    splits: await cluster.splits(),
+    moves: await cluster.moves(),
     scaler: await env.DINF_AUTOSCALER.getByName(name).status(),
   };
 }
 
 /** 利用者が実行した DDL を、実行した順に返す。論理エクスポートの先頭に置く。 */
 export async function schemaSql(env: Env, name = "shard"): Promise<string[]> {
-  const { ddl } = await env.DINF_META.getByName(name).ddlSince(0);
-  // 適用できずに取り消された文と、それを取り消した文は書き出さない。
-  const reverted = new Set(ddl.flatMap((e) => (e.reverts === undefined ? [] : [e.reverts, e.version])));
-  return ddl.flatMap((e) => {
-    if (typeof e.user !== "string" || e.user.trim() === "" || reverted.has(e.version)) return [];
-    // shard key は主キーの先頭の列で決まるので、利用者の文面のままで、取り込み先でも行の置き場所は同じになる。
-    return [e.user];
-  });
+  // 表定義の履歴には、commit された文だけが入る (取り消された文はない)。shard key は主キーの先頭の列で決まるので、利用者の文面のままで、
+  // 取り込み先でも行の置き場所は同じになる。
+  const { ddl } = (await clusterOf(env, undefined, name).catalog()) as Catalog;
+  return ddl.filter((s) => s.trim() !== "");
 }
 
 /** 表の行を、シャードの順、主キーの順に少しずつ返す。cursor が null になったら終わりである。 */
@@ -636,7 +612,8 @@ async function admin(env: Env, path: string, b: AdminReq): Promise<unknown> {
       // 上の /ddl と同じ理由で、Db の DDL を通す。
       await new Db(cluster, { ids: sharedIds }).ddl(b.sql!);
       if (name === "shard") cached = null;
-      return (await cluster.catalog()).version;
+      // 表定義の epoch (段 3 から、表定義の版の数はない)。
+      return (await cluster.catalog()).schema;
     }
     case "/admin/split": return split(cluster, shardName(name, b.parent), shardName(name, b.child));
     case "/admin/rowstats": {
@@ -696,8 +673,8 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
       checkCount(req?.requests?.length ?? 0, "pipeline requests");
       return Response.json(await handlePipeline(req, (token) => dbFor(env, token, background), await batonSeal(env)));
     }
-    // 引数の数字だけの literal は、64 ビットに収まれば正確に読む (exactIntegers)。
-    const body = (await readJson(request, exactIntegers)) as Statement & { token?: number; statements?: Statement[]; intMode?: unknown };
+    // 引数の数の literal は、文面で INTEGER か REAL かを決める (numberLiterals。数字だけなら INTEGER で、64 ビットまで正確に読む)。
+    const body = (await readJson(request, numberLiterals)) as Statement & { token?: number; statements?: Statement[]; intMode?: unknown };
     if (body.sql !== undefined) checkSql(body.sql);
     if (body.statements !== undefined) {
       checkCount(body.statements.length, "statements");
@@ -713,18 +690,18 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
     }
     const db = await dbFor(env, token, background);
     if (path === "/sql") {
-      // 引数は D1 互換の API と同じ toValue で値にする (数字だけの literal で 64 ビットに収まるものは、上で bigint になっている)。
+      // 引数は jsonParams で値にする。値でない引数 (JSON の配列と object) は、文を実行する前に断る。
       // 結果は D1 と同じ形で、INTEGER は本文の intMode の形である。JSON は bigint を書けないので、"number" か "string" だけを受ける
       // (src/client/results.ts)。intMode は文を実行する前に確かめる。
       const mode = intModeOf(body.intMode, true);
-      const r = await db.query(body.sql, (body.params ?? []).map(toValue));
+      const r = await db.query(body.sql, jsonParams(body.params));
       return Response.json({
         columns: r.columns, rows: rowsOut(r.columns, r.values, mode), changes: r.changes, lastInsertRowid: rowidOut(r.lastInsertRowid, mode), token: db.token,
       });
     }
     if (path === "/batch") {
       const mode = intModeOf(body.intMode, true);
-      const out = await db.batch((body.statements ?? []).map((s) => ({ sql: s.sql, params: (s.params ?? []).map(toValue) })));
+      const out = await db.batch((body.statements ?? []).map((s) => ({ sql: s.sql, params: jsonParams(s.params) })));
       const results = out.map((r) => ({ rows: rowsOut(r.columns, r.values, mode), changes: r.changes }));
       return Response.json({ results, token: db.token });
     }

@@ -2,59 +2,43 @@
 //
 // Meta は、表定義の変更と範囲表の切り替えを、追記だけの 1 本の列 (Meta の表 __epoch(epoch, rec)) に記録する。1 行が 1 つの epoch で、
 // epoch e のスナップショット (表定義、表の状態、範囲表) は、列の先頭から e までを畳んだものである。畳み込みと、記録を足せる条件
-// (M21、specs/m21_catalog_epoch.qnt の Meta の手) を、副作用のない関数としてここに置く。
+// (M21、specs/m21_catalog_epoch.qnt の Meta の手) を、副作用のない関数としてここに置く。Meta、シャード、Worker が同じ関数で畳む。
 //
-// 段 1 (いま) の Meta が書く記録は 3 種類である。
-//   commit (of なし)  表定義の版 1 つ。今の DdlEntry をそのまま持つ。index の作成と公開、DROP の前の書き込み禁止と DROP、
-//                     取り消し (逆操作の文を持つ次の版) も、それぞれ 1 つの commit である
-//   move-start        範囲表の切り替え (MetaCore.switchRange)
-//   move-end          分割の枠を返すこと (MetaCore.endSplit)
-// epoch 0 は最初の範囲表 (genesis) で、Meta が最初に範囲表を引いたときに書く。
-//
-// prepare、abort、prepare を終える commit (of のある commit) は、段 3 で Meta が書き始める。M21 の遷移の条件と突き合わせるために
-// (test/catalog-m21.test.ts)、型と畳み込みと条件 (refusal) は、いまから 5 種類を持つ。段 1 の Meta は refusal を呼ばない。
-// 記録を足してよいかは、今の仕組み (分割の枠、期限、basedOn、最新の版の確認) が決める。枠は範囲表の切り替えより前に取られ、
-// 記録を残さずに期限で消えるので、列だけからは決められないからである。
+// 記録は 6 種類である。
+//   genesis     epoch 0。最初の範囲表。Meta が最初に範囲表を引いたときに書く。
+//   prepare     表定義の遷移を開く (段 3)。fence の表への書き込みを止める。ddl は、まだ表定義に入らない。
+//   commit      遷移を確定する。of は終える prepare の epoch で、その prepare の ddl を表定義に入れる。
+//   abort       遷移を取り消す。禁止を解き、prepare が作った内部の表 (staging) を消すだけで、利用者の表に触る文を持たない。
+//   move-start  範囲の移動を開く (MetaCore.startMove。段 4)。範囲表の切り替えであり、親の fence であり、子の受け取りの始まりである。
+//   move-end    移動を閉じる (MetaCore.endMove)。子が受け取り終えた後で、子が記録させる。
+// 表定義の epoch (Snapshot.schema) は、prepare、commit、abort のどれでも進む (設計書の決めたこと 6)。
 import { applyMove, overlaps, shardsOf, type Interval, type Routing } from "./routing";
-import type { IndexInfo, ParsedDdl } from "./sql/ddl";
+import type { DdlMode, IndexInfo, ParsedDdl } from "./sql/ddl";
 import type { TableDef, Ts } from "./types";
 
-/** 表定義の版。段 1 の commit の記録が、この形のまま運ぶ。シャードは MetaCore.ddlSince で受け取り、__ddl に写す。 */
-export interface DdlEntry extends ParsedDdl {
-  version: number;
-  /** この版が取り消す版。取り消された版をまだ適用していないシャードは、両方を飛ばす。 */
-  reverts?: number;
-  /** 取り消しの理由。シャードが適用に失敗したときの SQLite のメッセージ。 */
-  reason?: string;
-  /** 取引が読んだ表を DROP する前に、その表を書き込み禁止にする版。次の版が、その DROP か、取り消しである (finishLock)。 */
-  guard?: { tables: string[] };
-  /**
-   * index を公開する版が運ぶ時刻。シャードは、この版を適用するときに、時計をここまで進める。
-   * index を使わずに確定した書き込みは、どれもこの時刻以下である。index を使う文は、この版を適用したシャードで読むので、
-   * この時刻より後になる。公開が、時刻の順の中の 1 点になる (specs/m12_unique_index_build.qnt の m12_clock)。
-   */
-  at?: Ts;
-}
+export type { DdlMode } from "./sql/ddl";
 
-/** prepare の進め方 (設計書の「表定義の遷移」の表)。 */
-export type DdlMode = "plain" | "trial" | "build" | "guard";
-
-/** 範囲の移動。from は渡す側で、段 1 の switchRange は from を省けるので、区間の持ち主が 1 つに決まらなければ持たない。 */
+/** 範囲の移動。from は渡す側 (親)、to は受け取る側 (子) である。 */
 export interface Move extends Interval {
-  from?: string;
+  from: string;
   to: string;
 }
 
 export type EpochRecord =
   /** epoch 0。最初の範囲表。 */
   | { kind: "genesis"; routing: Routing }
-  /** 表定義の遷移を開く (段 3)。fence の表を書き込み禁止にする。ddl は commit で確定する。 */
-  | { kind: "prepare"; mode: DdlMode; ddl: ParsedDdl; fence: string[] }
-  /** 段 1 の形。それだけで、表定義の版 1 つを記録する。 */
-  | { kind: "commit"; ddl: DdlEntry }
-  /** 遷移を確定する (段 3)。of は終える prepare の epoch で、その prepare の ddl を確定する。 */
+  /**
+   * 表定義の遷移を開く。fence の表を書き込み禁止にする。ddl は commit で確定する。staging は、prepare を適用したシャードが作る
+   * 内部の表で、abort を適用したシャードが名前で消す (ParsedDdl.staging)。
+   */
+  | { kind: "prepare"; mode: DdlMode; ddl: ParsedDdl; fence: string[]; staging?: { sql: string[]; defs: TableDef[] } }
+  /**
+   * 遷移を確定する。of は終える prepare の epoch で、その prepare の ddl を確定する。at は index を公開する commit が運ぶ時刻で、
+   * シャードは、この commit を適用するときに、時計をここまで進める。index を使わずに確定した書き込みは、どれもこの時刻以下である。
+   * index を使う文は、この commit を適用したシャードで読むので、この時刻より後になる (M21 の m21_clock、M12 の m12_clock)。
+   */
   | { kind: "commit"; of: number; at?: Ts }
-  /** 遷移を取り消す (段 3)。禁止を解くだけで、利用者の表に触る文を持たない。 */
+  /** 遷移を取り消す。禁止を解くだけで、利用者の表に触る文を持たない。 */
   | { kind: "abort"; of: number; reason: string }
   | ({ kind: "move-start" } & Move)
   /** 移動を閉じる。of は、その移動の move-start の epoch。 */
@@ -70,8 +54,9 @@ export interface OpenDdl {
   epoch: number;
   mode: DdlMode;
   fence: string[];
-  /** 段 1 では、遷移を開いた版 (index の作成か、DROP の前の書き込み禁止)。段 3 では、prepare の ddl。 */
-  ddl: ParsedDdl | DdlEntry;
+  /** prepare の ddl。commit が表定義に入れる。 */
+  ddl: ParsedDdl;
+  staging?: { sql: string[]; defs: TableDef[] };
 }
 
 /** 開いている移動。epoch は、その move-start の epoch。 */
@@ -84,32 +69,31 @@ export interface Snapshot {
   epoch: number;
   /** 表定義が最後に変わった epoch。prepare、commit、abort の記録で進み、移動の記録では進まない (設計書の決めたこと 6)。 */
   schema: number;
-  /**
-   * 段 1 の間だけ持つ、表定義の版 (DdlEntry.version。今の Catalog.version)。シャードと Worker が比べるのは、まだこれである。
-   * 要求が epoch を運ぶのは段 2 からである。of のある commit (段 3) は、版を進めない。
-   */
-  version: number;
   tables: Record<string, TableDef>;
   views: Record<string, string>;
   indexes: Record<string, IndexInfo>;
-  /** Worker の SQLite で再生する DDL の履歴。 */
+  /** Worker の SQLite で再生する DDL の履歴。commit された DDL の文だけが入る。 */
   ddl: string[];
-  /** 開いている表定義の遷移。 */
+  /** 開いている表定義の遷移。Meta は同時に 1 つしか開かない (M21 の ONE_OPEN)。 */
   open: OpenDdl | null;
+  /**
+   * 開いている表定義の遷移の全部。Meta の条件が守られていれば、open だけの 1 つか空である。欠陥のスイッチ overlappingTransitions
+   * (2 つ目の遷移を開く) を入れた Meta の列も畳めるように、一覧で持つ。書き込み禁止の表は、この全部の fence の和である。
+   */
+  opens: OpenDdl[];
   /** 範囲表。版は、最初の範囲表の版に、それまでの move-start の数を足したもの (今の Routing.version)。 */
   routing: Routing;
   /** 開いている移動 (move-start の後、move-end の前)。設計書の routing.ranges[].moving の代わりに、範囲表とは別に持つ。 */
   moves: OpenMove[];
-  /** 段 1: 最後の表定義の版が取り消しなら、取り消された版と理由 (今の Catalog.revoked)。 */
-  revoked?: { version: number; reason: string };
-  /** 段 3: 最後の表定義の記録が abort なら、その遷移と理由。 */
+  /** 最後の表定義の記録が abort なら、その遷移と理由。DDL を出した側が、失敗を利用者へ返すのに使う。 */
   aborted?: { of: number; reason: string };
 }
 
-const isDdlRecord = (r: EpochRecord): boolean => r.kind === "prepare" || r.kind === "commit" || r.kind === "abort";
+/** 表定義の記録か (prepare、commit、abort)。表定義の epoch (Snapshot.schema) は、この記録でだけ進む。 */
+export const isDdlRecord = (r: EpochRecord): boolean => r.kind === "prepare" || r.kind === "commit" || r.kind === "abort";
 
-/** 表定義の変更を、表定義と index と view に当てる。順番は今の MetaCore.current と同じ。 */
-function applyParsed(s: Snapshot, d: ParsedDdl): void {
+/** 表定義の変更を、表定義と index と view に当てる。 */
+function applyParsed(s: Snapshot, d: Pick<ParsedDdl, "defs" | "drops" | "views" | "dropViews" | "indexes" | "dropIndexes">): void {
   for (const t of d.defs) s.tables[t.name] = t;
   for (const n of d.drops) delete s.tables[n];
   Object.assign(s.views, d.views);
@@ -118,25 +102,25 @@ function applyParsed(s: Snapshot, d: ParsedDdl): void {
   for (const n of d.dropIndexes ?? []) delete s.indexes[n];
 }
 
-/** 段 1 の版が開く遷移。index の作成と、DROP の前の書き込み禁止だけが、次の版まで表への書き込みを止める。 */
-function opensWith(epoch: number, e: DdlEntry): OpenDdl | null {
-  if (e.build) return { epoch, mode: "build", fence: [e.build.table], ddl: e };
-  if (e.guard) return { epoch, mode: "guard", fence: e.guard.tables, ddl: e };
-  return null;
+/** 遷移を閉じる。of が開いていなければ投げる (列が壊れている)。 */
+function close(s: Snapshot, epoch: number, of: number, kind: string): OpenDdl {
+  const hit = s.opens.find((o) => o.epoch === of);
+  if (!hit) throw new Error(`the epoch log is broken: epoch ${epoch} ${kind}s epoch ${of}, which is not open`);
+  s.opens = s.opens.filter((o) => o !== hit);
+  s.open = s.opens.at(-1) ?? null;
+  return hit;
 }
 
 /**
  * 列を、先頭から upTo の epoch まで畳む。列は epoch の昇順で、epoch は 0 (genesis) か 1 から 1 ずつ増える。
- * 列が壊れていれば (番号が飛ぶ、開いていない遷移を終える、開いていない移動を閉じる) 投げる。記録を足す前に refusal と
- * Meta の今の確かめを通していれば、起きない。
+ * 列が壊れていれば (番号が飛ぶ、開いていない遷移を終える、開いていない移動を閉じる) 投げる。記録を足す前に refusal を通していれば、
+ * 起きない。
  */
 export function fold(log: readonly Logged[], upTo = Number.POSITIVE_INFINITY): Snapshot {
   const s: Snapshot = {
-    epoch: 0, schema: 0, version: 0, tables: {}, views: {}, indexes: {}, ddl: [], open: null,
+    epoch: 0, schema: 0, tables: {}, views: {}, indexes: {}, ddl: [], open: null, opens: [],
     routing: { version: 0, ranges: [] }, moves: [],
   };
-  // Worker で再生する文と、その文を記録した版。取り消しの版は、取り消された版の文を除き、自分の文も足さない (段 1)。
-  const replay: { version: number | null; user: string }[] = [];
   let last = -1;
   for (const { epoch, rec } of log) {
     if (epoch > upTo) break;
@@ -148,48 +132,37 @@ export function fold(log: readonly Logged[], upTo = Number.POSITIVE_INFINITY): S
     s.epoch = epoch;
     if (isDdlRecord(rec)) {
       s.schema = epoch;
-      delete s.revoked;
       delete s.aborted;
     }
     switch (rec.kind) {
       case "genesis":
         s.routing = rec.routing;
         break;
-      case "prepare":
-        s.open = { epoch, mode: rec.mode, fence: rec.fence, ddl: rec.ddl };
+      case "prepare": {
+        const o: OpenDdl = { epoch, mode: rec.mode, fence: rec.fence, ddl: rec.ddl };
+        if (rec.staging) o.staging = rec.staging;
+        s.opens = [...s.opens, o];
+        s.open = o;
+        // 内部の表 (index の表) は、prepare から表定義に載る。進める側が、commit の前に、ここへ項目を書くからである。
+        // 利用者の文からは見えない (内部の名前で、Worker の SQLite で再生する履歴にもない)。
+        for (const d of rec.staging?.defs ?? []) s.tables[d.name] = d;
         break;
-      case "commit":
-        if ("ddl" in rec) {
-          const e = rec.ddl;
-          applyParsed(s, e);
-          s.version = e.version;
-          if (e.reverts !== undefined) {
-            const i = replay.findIndex((x) => x.version === e.reverts);
-            if (i >= 0) replay.splice(i, 1);
-            s.revoked = { version: e.reverts, reason: e.reason ?? "" };
-          } else if (e.user) {
-            replay.push({ version: e.version, user: e.user });
-          }
-          // 段 1 では、最新の版が index の作成か書き込み禁止であるときだけ、遷移が開いている (今の MetaCore.building)。
-          s.open = opensWith(epoch, e);
-        } else {
-          const open = s.open;
-          if (open?.epoch !== rec.of) throw new Error(`the epoch log is broken: epoch ${epoch} commits epoch ${rec.of}, which is not open`);
-          applyParsed(s, open.ddl);
-          if (open.ddl.user) replay.push({ version: null, user: open.ddl.user });
-          s.open = null;
-        }
+      }
+      case "commit": {
+        const o = close(s, epoch, rec.of, "commit");
+        applyParsed(s, o.ddl);
+        if (o.ddl.user) s.ddl = [...s.ddl, o.ddl.user];
         break;
-      case "abort":
-        if (s.open?.epoch !== rec.of) throw new Error(`the epoch log is broken: epoch ${epoch} aborts epoch ${rec.of}, which is not open`);
-        s.open = null;
+      }
+      case "abort": {
+        const o = close(s, epoch, rec.of, "abort");
+        for (const d of o.staging?.defs ?? []) delete s.tables[d.name];
         s.aborted = { of: rec.of, reason: rec.reason };
         break;
+      }
       case "move-start": {
         s.routing = applyMove(s.routing, rec);
-        const m: OpenMove = { epoch, to: rec.to, start: rec.start, end: rec.end };
-        if (rec.from !== undefined) m.from = rec.from;
-        s.moves = [...s.moves, m];
+        s.moves = [...s.moves, { epoch, from: rec.from, to: rec.to, start: rec.start, end: rec.end }];
         break;
       }
       case "move-end":
@@ -198,13 +171,20 @@ export function fold(log: readonly Logged[], upTo = Number.POSITIVE_INFINITY): S
         break;
     }
   }
-  s.ddl = replay.map((x) => x.user);
   return s;
 }
 
-/** 分割の枠の名前 (MetaCore.beginSplit が付ける)。段 1 の endSplit が、どの移動を閉じるかを、これで引く。 */
-export const splitId = (m: { parent: string; child: string; start: number; end: number }): string =>
-  `split:${m.parent}:${m.child}:${m.start}:${m.end}`;
+/** 書き込みを止めている遷移のうち、表 table を fence に持つもの。なければ null。 */
+export function fencedBy(s: Pick<Snapshot, "opens">, table: string): OpenDdl | null {
+  return s.opens.find((o) => o.fence.includes(table)) ?? null;
+}
+
+/** 開いている遷移の名前。誤りの文 (TableLocked、SchemaBusy、期限切れの abort の理由) に使う。 */
+export function describeOpen(o: Pick<OpenDdl, "mode" | "fence" | "ddl">): string {
+  if (o.mode === "build") return `CREATE INDEX ${Object.keys(o.ddl.indexes ?? {})[0] ?? ""}`.trim();
+  if (o.mode === "guard") return `the lock on ${o.fence.join(", ")} before DROP TABLE`;
+  return o.ddl.user ?? "a schema change";
+}
 
 /** 記録を足せない理由。M21 の Meta の手の条件のどれに当たるかを rule に書く。 */
 export type Refusal =
@@ -232,10 +212,10 @@ export type Refusal =
 /**
  * スナップショット s (列の最後まで畳んだもの) の後に、記録 rec を足せるか。足せなければ理由を返す。
  * 条件は設計書の「同時に開ける遷移」と「Meta の入口」で、M21 の Meta の手 (prepareOp、commitOp、expire、startSplit、endSplit) の
- * 条件と同じものである。acks は、of のある commit を記録する前に、進める側が集めた ok のシャードである。
- * 移動の中身の条件 (子が受け取り終えた後でだけ move-end を記録する、M21 の END_AFTER_DRAIN) は、列からは決まらない。段 4 で、
- * 受け取り終えた子が自分で move-end を記録させることで守る。
- * 段 1 の commit (of なし) の条件は、今の Meta が決めるので、ここでは扱わない (投げる)。
+ * 条件と同じものである。acks は、commit を記録する前に、進める側が集めた ok のシャードである。
+ * Meta は、記録を足すたびに、ここで決める (段 3 から表定義の遷移の条件、段 4 から表定義の遷移と移動の排他と、移動の条件)。
+ * 移動の中身の条件 (子が受け取り終えた後でだけ move-end を記録する、M21 の END_AFTER_DRAIN) は、列からは決まらない。受け取り終えた
+ * 子が自分で move-end を記録させることで守る (kernel.ts の moveStep)。
  */
 export function refusal(s: Snapshot, rec: EpochRecord, acks: readonly string[] = []): Refusal | null {
   switch (rec.kind) {
@@ -246,20 +226,19 @@ export function refusal(s: Snapshot, rec: EpochRecord, acks: readonly string[] =
       if (s.moves.length > 0) return { rule: "ddl-waits-move", moves: s.moves };
       return null;
     case "commit": {
-      if (!("of" in rec)) throw new Error("a commit without of is a stage 1 version; MetaCore checks it, not refusal");
-      if (s.open?.epoch !== rec.of) return { rule: "one-exit", of: rec.of };
+      if (!s.opens.some((o) => o.epoch === rec.of)) return { rule: "one-exit", of: rec.of };
       // prepare から終わりまで、範囲表のシャードは変わらない (遷移が開いている間は move-start を記録しない)。
       const missing = shardsOf(s.routing).filter((x) => !acks.includes(x));
       return missing.length > 0 ? { rule: "all-acks", missing } : null;
     }
     case "abort":
-      return s.open?.epoch === rec.of ? null : { rule: "one-exit", of: rec.of };
+      return s.opens.some((o) => o.epoch === rec.of) ? null : { rule: "one-exit", of: rec.of };
     case "move-start": {
       if (s.open) return { rule: "move-waits-ddl", open: s.open };
       const owners = [...new Set(s.routing.ranges.filter((x) => overlaps(x, rec)).map((x) => x.shard))];
       if (!(owners.length === 1 && owners[0] === rec.from)) return { rule: "owner", owners };
       const ends = [rec.from, rec.to];
-      const clash = s.moves.filter((m) => overlaps(m, rec) || ends.includes(m.to) || (m.from !== undefined && ends.includes(m.from)));
+      const clash = s.moves.filter((m) => overlaps(m, rec) || ends.includes(m.to) || ends.includes(m.from));
       if (clash.length > 0) return { rule: "moves-overlap", moves: clash };
       if (s.routing.ranges.some((x) => x.shard === rec.to)) return { rule: "child-owns" };
       return null;

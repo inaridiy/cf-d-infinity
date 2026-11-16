@@ -153,7 +153,7 @@ describe("the cf-d-infinity command", () => {
     const wrangler = project("wrangler.jsonc", `{\n  // a comment with "name": "wrong"\n  "name": "ops-db", /* trailing */\n  "main": "src/index.ts",\n}\n`);
     expect((await cli(["sql", "SELECT 1 AS one"], { cwd: wrangler })).stdout).toContain("(1 row)");
     const cf = project("cloudflare.config.ts", `import { defineConfig } from "cf/config";\nexport default defineConfig({ worker: { name: "ops-db", compatibilityDate: "2026-11-04" } });\n`);
-    expect((await cli(["status"], { cwd: cf })).stdout).toMatch(/^4 shards, schema version \d+, routing version \d+\n/);
+    expect((await cli(["status"], { cwd: cf })).stdout).toMatch(/^4 shards, schema epoch \d+, routing version \d+\n/);
     const none = await cli(["sql", "SELECT 1"], { cwd: mkdtempSync(join(tmpdir(), "dinf-cli-")) });
     expect(none.code).toBe(1);
     expect(none.stderr).toMatch(/pass --worker/);

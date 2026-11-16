@@ -1,5 +1,7 @@
 // 入口の守り (2026-11-12 の入口の安全の確認、指摘 4 から 8)。HTTP と WebSocket の要求の大きさと件数の上限、hello の期限、
 // トークンの比べ方、管理の入口の入力の検証を、ここで決める。上限は README の Limitations に書く。
+import { kindOf, toValue } from "./client/d1";
+import { SqlError, type Value } from "./types";
 
 export const ENTRY_LIMITS = {
   /** 1 回の HTTP の本文の文字数。 */
@@ -38,25 +40,62 @@ const INT64_MIN = -(2n ** 63n);
 const INT64_MAX = 2n ** 63n - 1n;
 
 /**
- * JSON の整数の literal を正確に読む reviver (HTTP の /sql と /batch。docs/design-values.md の「D1 互換の API、Service Binding、
- * HTTP の JSON」)。JSON.parse は数を JS の数に丸めるので、`9223372036854775807` は隣の double になる。数字だけで書かれた literal
- * のうち、JS の安全な整数の外にあり 64 ビットに収まるものを、元の文面 (reviver の context.source) から bigint にする。bigint は
- * INTEGER として束縛される。ほかの数 (安全な整数、小数点か指数のある数、64 ビットに収まらない数) は JSON.parse の数のままで、
- * D1 互換の API と同じく、安全な整数は INTEGER、ほかは REAL になる。元の文面を受け取れない実行環境では、JS の数のままである。
+ * 小数点か指数のある JSON の数の literal で、値が安全な整数のもの (`5.0`、`1e5`)。文面では REAL だが、JS の数としては D1 の規則
+ * (安全な整数は INTEGER) で INTEGER になるので、numberLiterals が包んで印にする。印はこのクラスで、numberLiterals だけが作る。
+ * JSON の本文にも structured clone にも作れないので、利用者は偽れない (Service Binding で届いた同じ形の object は、toValue が断る)。
  */
-export function exactIntegers(_key: string, value: unknown, context?: { source?: string }): unknown {
-  if (typeof value !== "number" || Number.isSafeInteger(value)) return value;
+class RealLiteral {
+  constructor(readonly value: number) {}
+}
+
+/**
+ * HTTP の /sql と /batch の本文の reviver (docs/design-values.md の「D1 互換の API、Service Binding、HTTP の JSON」)。JSON の数の
+ * literal を、元の文面 (reviver の context.source) で読む。JSON.parse は文面を JS の数に丸めるので、値からは型が分からない
+ * (`5.0` は 5 に、`9223372036854775807` は隣の double になる)。
+ *   - 数字だけの literal は INTEGER。安全な整数の外で 64 ビットに収まるものは、文面から bigint にする。64 ビットに収まらないものは、
+ *     SQLite がその literal を読むのと同じく REAL で、JS の数のままにする。
+ *   - 小数点か指数のある literal は REAL。値が安全な整数のものは、RealLiteral で包む (jsonValue が REAL として外す)。
+ * 引数は配列の要素にだけあるので、配列の要素の数だけを読み替える。本文の token などの数は、JS の数のまま返す。
+ * 元の文面を渡さない実行環境 (JSON.parse の source text access のない V8) では、数を JS の数のまま返し、jsonValue が D1 の規則
+ * (安全な整数は INTEGER、ほかは REAL) で読む。そこでは `5.0` も INTEGER になる (2026-11-16。docs/sql-language.md の「引数の型」)。
+ */
+export function numberLiterals(this: unknown, _key: string, value: unknown, context?: { source?: string }): unknown {
+  if (typeof value !== "number" || !Array.isArray(this)) return value;
   const source = context?.source;
-  if (typeof source !== "string" || !/^-?[0-9]+$/.test(source)) return value;
-  const big = BigInt(source);
-  return big >= INT64_MIN && big <= INT64_MAX ? big : value;
+  if (typeof source !== "string") return value;
+  if (/^-?[0-9]+$/.test(source)) {
+    if (Number.isSafeInteger(value)) return value;
+    const big = BigInt(source);
+    return big >= INT64_MIN && big <= INT64_MAX ? big : value;
+  }
+  return Number.isSafeInteger(value) ? new RealLiteral(value) : value;
+}
+
+/**
+ * HTTP の本文の引数 1 つを値にする。numberLiterals の印は REAL、ほかの数と bigint は D1 互換の API と同じ toValue で読む
+ * (印の付かなかった数は、数字だけの literal か、値が安全な整数でない数である)。JSON の配列と object は値ではないので断る。
+ * JSON には BLOB を書く形がない。
+ */
+function jsonValue(v: unknown, i: number): Value {
+  if (v instanceof RealLiteral) return v.value;
+  if (typeof v === "object" && v !== null) {
+    throw new SqlError(`parameter ${i + 1} is ${kindOf(v)}; a parameter in JSON must be null, true, false, a number or a string (write a BLOB as x'...' in the statement, or use Hrana)`);
+  }
+  return toValue(v, i);
+}
+
+/** HTTP の /sql と /batch の引数 (numberLiterals で読んだ本文の params) を値にする。配列でなければ 400 で断る。 */
+export function jsonParams(params: unknown): Value[] {
+  if (params === undefined || params === null) return [];
+  if (!Array.isArray(params)) throw new BadRequest(400, "params must be an array");
+  return params.map((v, i) => jsonValue(v, i));
 }
 
 /**
  * 本文を JSON として読む。大きすぎれば 413、JSON でなければ 400 で断る。reviver は、利用者の値を運ぶ本文 (/sql と /batch) にだけ
- * 渡す (exactIntegers)。Hrana の本文は型を書いた値 (`float` の数は REAL) を運ぶので、渡さない。
+ * 渡す (numberLiterals)。Hrana の本文は型を書いた値 (`float` の数は REAL) を運ぶので、渡さない。
  */
-export async function readJson(request: Request, reviver?: typeof exactIntegers): Promise<unknown> {
+export async function readJson(request: Request, reviver?: typeof numberLiterals): Promise<unknown> {
   const declared = Number(request.headers.get("content-length") ?? 0);
   if (declared > ENTRY_LIMITS.bodyChars) throw new BadRequest(413, `request body is larger than ${ENTRY_LIMITS.bodyChars} bytes`);
   const text = await request.text();

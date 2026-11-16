@@ -348,9 +348,24 @@ describe("DDL through the HTTP /ddl endpoint", () => {
     expect((await sql("SELECT id FROM people WHERE email = ?", ["y@example.test"])).rows).toEqual([{ id: 2 }]);
     expect((await sql("INSERT INTO people(id, email) VALUES (3, 'x@example.test')")).status).toBe(400);
   });
+
+  // 行で失敗し得る DDL は、各シャードが、書き込みを止めた表で文を試して巻き戻してから確定する (docs/design-catalog-epoch.md の段 3)。
+  // 本物の DO の SQLite で、取引の中の DDL が巻き戻ることと、確定のときに同じ文がもう一度通ることを確かめる。
+  it("tries a change that can fail on rows on the fenced table, rolls the trial back, and runs it again at the commit", async () => {
+    await post("/ddl", { sql: "CREATE TABLE trial(id INTEGER PRIMARY KEY, email TEXT)" });
+    await sql("INSERT INTO trial(id, email) VALUES (1, 'a@example.test'), (2, 'b@example.test')");
+    expect((await post("/ddl", { sql: "ALTER TABLE trial ADD COLUMN n INTEGER DEFAULT 1 CHECK (n > 0)" })).status).toBe(200);
+    expect((await post("/ddl", { sql: "CREATE UNIQUE INDEX trial_id_email ON trial(id, email)" })).status).toBe(200);
+    expect((await sql("SELECT id, n FROM trial ORDER BY id")).rows).toEqual([{ id: 1, n: 1 }, { id: 2, n: 1 }]);
+    expect((await sql("INSERT INTO trial(id, email, n) VALUES (3, 'c@example.test', 0)")).status).toBe(400);
+    // 試しに通らない DDL は abort され、表は元のままである。
+    const bad = await post("/ddl", { sql: "ALTER TABLE trial ADD COLUMN m INTEGER CHECK (m IS NOT NULL)" });
+    expect(bad.status).toBe(400);
+    expect((await sql("INSERT INTO trial(id, email) VALUES (4, 'd@example.test')")).status).toBe(200);
+  });
 });
 
-// 書き込み禁止の期限の延長を、本物の DO で通す。期限 (meta.ts の INDEX_LEASE_MS、5 秒) より長くかかる index の作成は、
+// 書き込み禁止の期限の延長を、本物の DO で通す。期限 (meta.ts の LEASE_MS、5 秒) より長くかかる index の作成は、
 // 延長が周期で続かなければ、Meta に取り消されて失敗する。長くかからせるために、作る前に、その表に書いた取引を開いたままにする。
 describe("a UNIQUE index build that outlives one lease", () => {
   it("keeps its write lock past the lease by renewing it, and ends with the index and the rows agreeing", async () => {
@@ -376,8 +391,9 @@ describe("a UNIQUE index build that outlives one lease", () => {
   });
 });
 
-// 分割の枠 (M15) を、本物の DO で通す。枠を取り、子の受け入れが Meta の startSplit を、親の fence が checkSplit を呼び、
-// 終わりに枠を返す。返っていなければ、後の表定義の変更が待たされる。
+// 範囲の移動 (catalog epoch の段 4) を、本物の DO で通す。Autoscaler が Meta に move-start を記録させ、子が、親から行を引き取り、
+// 親の時計を受け取った後で、Meta に move-end を記録させる (子の DO から Meta の DO への endMove)。記録されていなければ、移動が
+// 開いたまま残り、後の表定義の変更が待たされる。
 describe("a split through /admin/split", () => {
   const admin = (path: string, body: object = {}) => post(path, body, ADMIN) as unknown as Promise<Record<string, unknown> & { status: number }>;
 
@@ -390,9 +406,9 @@ describe("a split through /admin/split", () => {
     const child = `shard-${Math.max(...before.shards.map((s) => Number(s.slice("shard-".length)))) + 1}`;
     const r = await admin("/admin/split", { parent, child });
     expect([r.status, r.error]).toEqual([200, undefined]);
-    const after = (await admin("/admin/status")) as unknown as { shards: string[]; splits: unknown[] };
+    const after = (await admin("/admin/status")) as unknown as { shards: string[]; moves: unknown[] };
     expect(after.shards).toContain(child);
-    expect(after.splits).toEqual([]);
+    expect(after.moves).toEqual([]);
     // 子へ移った行も含めて、全部の行が読め、書ける。
     expect((await sql("SELECT count(*) c, sum(v) s FROM sp")).rows).toEqual([{ c: 40, s: 8200 }]);
     expect((await sql("UPDATE sp SET v = v + 1")).error).toBeUndefined();

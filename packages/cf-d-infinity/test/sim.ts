@@ -1,12 +1,10 @@
 import { compoundTerms, depthOf, SHARD_LIMITS } from "../src/shard-limits";
 import { createHash } from "node:crypto";
-import { appendFileSync, mkdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { Db, type ClientFaults, type Cluster } from "../src/client/db";
 import { keyString } from "../src/keys";
-import { fold, type EpochRecord } from "../src/catalog";
-import { MetaCore, type SplitMove, type SplitSlot } from "../src/meta";
-import { MetaCore as OldMeta } from "./meta-old";
+import { fold, type EpochRecord, type Move } from "../src/catalog";
+import { MetaCore, type Catalog } from "../src/meta";
 import { initialRouting, shardsOf, tokenOf, type Interval, type Routing } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
@@ -391,9 +389,14 @@ export class SimNet {
 /** Worker の側の欠陥のスイッチの名前 (src/client/db.ts の ClientFaults)。 */
 const CLIENT_FAULTS = new Set([
   "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
-  "publishBeforeBackfill", "scanBeforeLock", "scanSkipsEmpty", "guardFromCommitTs", "splitWithoutSync",
+  "publishBeforeBackfill", "checkBeforePrepare", "scanSkipsEmpty", "guardFromCommitTs",
   "lockedReadsSkipValidation", "secondDmlNewSince", "secondDmlNewSpanSince",
 ]);
+/**
+ * Worker と Meta の両方が読むスイッチの名前。1 つの欠陥を、2 つの守りを外して戻す (commitWithoutAcks は、Worker が 1 つのシャードの
+ * prepared を待たず、Meta が ok の集合を確かめない)。injectedFault は、両方に入れる。
+ */
+const BOTH_FAULTS = new Set(["commitWithoutAcks"]);
 /** 範囲の作り方の欠陥のスイッチの名前 (src/client/spans.ts の spanFaults)。test/setup.ts が入れる。 */
 export const SPAN_FAULTS = new Set(["rowSpanDespiteUnique"]);
 /** 行イメージを値に戻すところの欠陥のスイッチの名前 (src/shard/rows.ts の imageFaults)。test/setup.ts が入れる。 */
@@ -403,10 +406,13 @@ export const IMAGE_FAULTS = new Set(["roundedImages"]);
  * 環境変数 FAULT で、欠陥のスイッチを 1 つ、全部のシミュレータに入れる。乱択の検査が、その欠陥を見つけるかを測るためにある
  * (scripts/fault-table.mjs)。試験が自分で入れるスイッチには、上書きせずに足す。
  */
-export function injectedFault(): { name: string; side: "shard" | "client" | "span" | "image" } | null {
+export function injectedFault(): { name: string; side: "shard" | "client" | "both" | "span" | "image" } | null {
   const name = process.env.FAULT;
   if (!name) return null;
-  return { name, side: CLIENT_FAULTS.has(name) ? "client" : SPAN_FAULTS.has(name) ? "span" : IMAGE_FAULTS.has(name) ? "image" : "shard" };
+  return {
+    name,
+    side: BOTH_FAULTS.has(name) ? "both" : CLIENT_FAULTS.has(name) ? "client" : SPAN_FAULTS.has(name) ? "span" : IMAGE_FAULTS.has(name) ? "image" : "shard",
+  };
 }
 
 export interface SimOptions {
@@ -437,7 +443,7 @@ export interface SimOptions {
   noImageCheck?: boolean;
   /** 仮想の実行環境の seed。同じ seed なら同じ実行になる。 */
   seed?: number;
-  /** index を既存の行から作る間の、書き込み禁止の期限と、その上限 (ms)。既定は meta.ts の INDEX_LEASE_MS と INDEX_BUILD_MAX_MS。 */
+  /** 表定義の遷移 (prepare から commit か abort まで) の、書き込み禁止の期限と、その上限 (ms)。既定は meta.ts の LEASE_MS と TRANSITION_MAX_MS。 */
   leaseMs?: number;
   buildMaxMs?: number;
   /**
@@ -479,6 +485,10 @@ function declaresRow(s: Span, table: string, key: { pk: string; sk: string }, to
   return s.claim === undefined || s.claim.some((x) => token >= x.start && token < x.end);
 }
 
+/** 子として移動を進めるシャードの alarm の間隔 (DO の alarm と同じ 5 秒) と、続けて発火させる回数の上限 (SimCluster.armMoveAlarm)。 */
+const MOVE_ALARM_MS = 5_000;
+const MOVE_ALARM_LIMIT = 60;
+
 /** Worker と DO の間の RPC だけをシミュレートしたクラスタ。ShardCore は本物を動かす。 */
 /** このプロセスの全クラスタで見つかった、範囲の外の行に依存する文。test/setup.ts が試験ごとに確かめて空にする。 */
 export const allSpanEscapes: SpanEscape[] = [];
@@ -502,56 +512,16 @@ export const realTimeCluster = { now: false };
 export function withOverrides(c: SimCluster, over: Partial<Cluster>): Cluster {
   return new Proxy(c as unknown as Cluster, { get: (t, p, r) => (p in over ? (over as Record<string | symbol, unknown>)[p] : Reflect.get(t, p, r)) });
 }
+/**
+ * RPC m が、表定義の記録 version (表定義の epoch) をシャードへ届ける要求か。段 3 から、prepare の記録は、進める側が prepared で届け、
+ * commit と abort の記録は、終えた後の syncSchema で届く。試験が、記録がシャードへ届くのを止める (net.gate) のに使う。
+ */
+export const delivers = (m: Pick<Rpc, "method" | "req">, version: number): boolean =>
+  (m.method === "prepared" && (m.req as { epoch: number }).epoch === version) ||
+  (m.method === "syncSchema" && (m.req as { schema: number }).schema === version);
+
 /** 行イメージの検査を、いまの試験の間だけ止めているか (SimOptions の noImageCheck)。test/setup.ts が試験ごとに戻す。 */
 export const imageCheckOff = { now: false };
-
-/**
- * META_SHADOW=<ディレクトリ> のとき、Meta の呼び出しを、段 1 より前の Meta (test/meta-old.ts) にも同じ順で流し、答えを比べる
- * (docs/design-catalog-epoch.md の段 1 の検査 (b))。違えば、呼び出しと 2 つの答えを、そのディレクトリのプロセスごとのファイルに書く。
- * 返すのは新しい Meta の答えなので、実行は変わらない。古い Meta には時計だけを渡し、乱数を渡さない。baton の鍵の乱数を取り合うと、
- * 実行が変わるからである。そのため baton の鍵は比べない。保存データから起動するクラスタ (stored) には掛けない。
- */
-function shadowMeta(next: MetaCore, old: OldMeta, dir: string): MetaCore {
-  const show = (x: unknown) => JSON.stringify(x, (_k, v) => (typeof v === "bigint" ? `${v}n` : v)) ?? "undefined";
-  const outcome = (r: PromiseSettledResult<unknown>): string => {
-    if (r.status === "fulfilled") return show(r.value);
-    const e = r.reason as Error;
-    return `throws ${e?.constructor?.name}: ${e?.message} ${show({ ...e })}`;
-  };
-  const settle = (f: () => unknown): Promise<unknown> => {
-    try {
-      return Promise.resolve(f());
-    } catch (e) {
-      return Promise.reject(e);
-    }
-  };
-  mkdirSync(dir, { recursive: true });
-  return new Proxy(next, {
-    get(target, k, receiver) {
-      const f = Reflect.get(target, k, receiver) as unknown;
-      if (typeof f !== "function" || k === "batonSecret") return f;
-      const g = Reflect.get(old, k) as (...a: unknown[]) => unknown;
-      return (...args: unknown[]) => {
-        const copy = structuredClone(args);
-        let out: unknown;
-        let thrown: { e: unknown } | null = null;
-        try {
-          out = (f as (...a: unknown[]) => unknown).apply(target, args);
-        } catch (e) {
-          thrown = { e };
-        }
-        const mine = thrown ? Promise.reject(thrown.e) : Promise.resolve(out);
-        void Promise.allSettled([mine, settle(() => g.apply(old, copy))]).then(([a, b]) => {
-          const x = outcome(a!);
-          const y = outcome(b!);
-          if (x !== y) appendFileSync(`${dir}/${process.pid}.txt`, `${String(k)} ${show(copy)}\n  new: ${x}\n  old: ${y}\n`);
-        });
-        if (thrown) throw thrown.e;
-        return out;
-      };
-    },
-  });
-}
 
 export class SimCluster implements Cluster {
   /** 起動時のシャード。増設後の一覧は catalog の routing を見る。 */
@@ -587,8 +557,8 @@ export class SimCluster implements Cluster {
 
   constructor(private o: SimOptions = {}) {
     const injected = injectedFault();
-    if (injected?.side === "shard") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
-    this.clientFaults = injected?.side === "client" ? { ...o.clientFaults, [injected.name]: true } : o.clientFaults;
+    if (injected?.side === "shard" || injected?.side === "both") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
+    this.clientFaults = injected?.side === "client" || injected?.side === "both" ? { ...o.clientFaults, [injected.name]: true } : o.clientFaults;
     if (process.env.RPC_TRACE) tracedNets.push(this.net);
     if (o.noImageCheck) imageCheckOff.now = true;
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
@@ -597,12 +567,6 @@ export class SimCluster implements Cluster {
     this.shardIds = o.stored ? [...o.stored.shards.keys()] : Array.from({ length: o.shards ?? 4 }, (_, i) => `s${i}`);
     this.metaBackend = new SqliteBackend(o.stored?.meta);
     this.meta = new MetaCore(this.metaBackend, this.shardIds, { runtime: this.runtime, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs, faults: o.faults });
-    if (process.env.META_SHADOW && !o.stored) {
-      const rt = this.runtime;
-      const clock: Runtime = { now: () => rt.now(), after: (ms, fn) => rt.after(ms, fn), cancel: (h) => rt.cancel(h), random: () => 0, uuid: () => "shadow" };
-      const old = new OldMeta(new SqliteBackend(), this.shardIds, { runtime: clock, leaseMs: o.leaseMs, buildMaxMs: o.buildMaxMs, faults: o.faults });
-      this.meta = shadowMeta(this.meta, old, process.env.META_SHADOW);
-    }
     for (const id of this.shardIds) this.core(id);
   }
 
@@ -677,14 +641,17 @@ export class SimCluster implements Cluster {
       runtime: this.runtime,
       peer: (to) => this.stub(id, to),
       meta: {
-        ddlSince: (v) => this.meta.ddlSince(v), revokeDdl: (v, reason) => this.meta.revokeDdl(v, reason),
-        startSplit: (id, move) => this.meta.startSplit(id, move), checkSplit: (id, move) => this.meta.checkSplit(id, move),
+        epochsSince: (after) => this.meta.epochsSince(after),
+        endMove: (epoch) => this.meta.endMove(epoch),
       },
       background: (p) => {
         this.background.add(p);
         void p.finally(() => this.background.delete(p));
       },
-      scheduleRedrive: () => void this.alarms.add(id),
+      scheduleRedrive: (why) => {
+        this.alarms.add(id);
+        if (why === "move") this.armMoveAlarm(id);
+      },
       faults: this.o.faults,
       K: this.o.K,
       lockTtlMs: this.o.lockTtlMs,
@@ -705,9 +672,12 @@ export class SimCluster implements Cluster {
    * claimed) とは別に、ここで確かめ直す。守りを欠陥のスイッチ (ignoreWriteClaim) で外しても、同じに確かめる。変更の行ごとに:
    *   1. 変更が名乗る行 (pk と sk) が、行イメージから読んだ行と同じである。
    *   2. 文の実行なら、文が宣言した範囲のどれかが、その行を覆う。
-   *   3. 変更後の行が残るなら、そのシャードが、その行の token を持っている。持ち主は、Meta の範囲表と、シャードが保存した範囲の
-   *      移動の記録 (__fenced と __incoming) から決める。シャードのメモリと、シャードの所有の規則は使わない。手放した token は
-   *      持たない。受け取った token と、範囲表がそのシャードに割り当てる token は持つ。
+   *   3. 変更後の行が残るなら、そのシャードが、その行の token を持っている。持ち主は、シャードが保存した記録 (Meta の epoch の列の写し
+   *      __epoch と、渡したグループの記録 __moved と __arrived) から決める。シャードのメモリと、シャードの所有の規則は使わない。
+   *      写しを畳んだ範囲表がそのシャードに割り当てる token を持ち、渡して、届き直してもおらず、その範囲を受け取り直してもいないグループの
+   *      行は持たない (段 4 から、
+   *      範囲表の切り替えと親の fence と子の受け取りの始まりは、同じ move-start の記録である。親は、その記録を写すまで、移る範囲の行を
+   *      持ち、書き込みを受けてよい。その行は、記録を写した後に子へ運ばれる)。
    * 確かめるだけで、処理は変えない (RPC の列も変わらない)。見つけたものは test/setup.ts が試験ごとに確かめる。
    */
   private checkWrites(e: WriteCheck): void {
@@ -735,20 +705,28 @@ export class SimCluster implements Cluster {
     if (e.spans && !e.spans.some((s) => declaresRow(s, c.table, key, token))) {
       return `the statement wrote a row outside its declared spans ${JSON.stringify(e.spans).slice(0, 200)}`;
     }
-    if (c.after && !this.ownsToken(e.shard, token)) {
+    if (c.after && !this.ownsToken(e.shard, token, key.sk)) {
       return `the row would stay on ${e.shard}, which does not own token ${token} (the range table gives it to ${this.routingOwner(token)})`;
     }
     return null;
   }
 
-  /** シャードが token を持っているか。Meta の範囲表と、シャードが保存した範囲の移動の記録から決める (checkWrites の 3)。 */
-  private ownsToken(shard: string, token: number): boolean {
+  /**
+   * シャードが、shard key sk の行の token を持っているか。シャードが保存した記録から決める (checkWrites の 3)。
+   * 写した epoch の列を畳んだ範囲表で、その token がシャードのものであり、そのグループを渡した後に、届き直したか、その範囲を受け取り直したこと
+   * (渡していなければ、それでよい)。
+   */
+  private ownsToken(shard: string, token: number, sk: string): boolean {
     const db = this.backends.get(shard)!.db;
-    const inside = (table: string) =>
-      (db.prepare(`SELECT lo, hi FROM ${table}`).all() as { lo: number; hi: number }[]).some((r) => token >= r.lo && token < r.hi);
-    if (inside("__fenced")) return false;
-    if (inside("__incoming")) return true;
-    return this.routingOwner(token) === shard;
+    const rows = db.prepare(`SELECT epoch, rec FROM __epoch ORDER BY epoch`).all() as { epoch: number; rec: string }[];
+    const routing = rows.length > 0 ? fold(rows.map((r) => ({ epoch: r.epoch, rec: JSON.parse(r.rec) as EpochRecord }))).routing : initialRouting(this.shardIds);
+    if (routing.ranges.find((x) => token >= x.start && token < x.end)?.shard !== shard) return false;
+    const last = (table: string) => (db.prepare(`SELECT max(epoch) AS e FROM ${table} WHERE g = ?`).get(sk) as { e: number | null }).e;
+    const out = last("__moved");
+    if (out === null) return true;
+    // 渡した後に、そのグループが届き直したか、そのグループを含む範囲を受け取り直していれば (行のないまま戻ったグループには到着の記録がない)、持つ。
+    const received = (db.prepare(`SELECT max(epoch) AS e FROM __incoming WHERE lo <= ? AND ? < hi`).get(token, token) as { e: number | null }).e;
+    return Math.max(last("__arrived") ?? -1, received ?? -1) > out;
   }
 
   /**
@@ -760,6 +738,35 @@ export class SimCluster implements Cluster {
     const log = fold(rows.map((r) => ({ epoch: r.epoch, rec: JSON.parse(r.rec) as EpochRecord })));
     const routing: Routing = rows.some((r) => r.epoch === 0) ? log.routing : initialRouting(this.shardIds);
     return routing.ranges.find((x) => token >= x.start && token < x.end)?.shard;
+  }
+
+  /**
+   * 子として移動を進めるシャードの alarm (docs/design-catalog-epoch.md の決めたこと 4)。DO の alarm と同じく、予約から MOVE_ALARM_MS の後に
+   * redrive を走らせ、まだ進める移動が残っていれば、もう一度予約する。仮想の時計のクラスタでだけ、仮想の時計で発火させる (実時間の
+   * タイマーは使わない)。移動のない alarm (取り残された intent と phase 2 の再駆動) は、今までどおり試験が fireAlarms で発火させる。
+   * 終わらない移動 (親が答えない) で発火し続けないよう、続けて発火させる回数に上限を置く。発火したときに、進める移動がもうなければ、
+   * redrive を走らせずに終える。
+   */
+  private moveAlarms = new Map<string, number>();
+  private armMoveAlarm(id: string): void {
+    if (!this.virtual || this.moveAlarms.has(id)) return;
+    this.moveAlarms.set(id, 0);
+    const fire = async () => {
+      const core = this.core(id);
+      if (core.movesToDrive === 0) {
+        this.moveAlarms.delete(id);
+        return;
+      }
+      await core.redrive().catch(() => undefined);
+      const fired = (this.moveAlarms.get(id) ?? 0) + 1;
+      if (this.core(id).movesToDrive > 0 && fired < MOVE_ALARM_LIMIT) {
+        this.moveAlarms.set(id, fired);
+        this.runtime.after(MOVE_ALARM_MS, () => void fire());
+      } else {
+        this.moveAlarms.delete(id);
+      }
+    };
+    this.runtime.after(MOVE_ALARM_MS, () => void fire());
   }
 
   /** 予約された alarm を発火させる。redrive が仕事を残したら、DO と同じく次の alarm を予約する。 */
@@ -828,44 +835,50 @@ export class SimCluster implements Cluster {
   catalog() {
     return this.meta.catalog();
   }
-  applyDdl(sql: string, basedOn?: number) {
-    return this.meta.applyDdl(sql, basedOn);
+  prepare(sql: string, opts: { guard?: string[] } = {}, basedOn?: number) {
+    return this.meta.prepare(sql, opts, basedOn);
   }
-  switchRange(move: Interval & { to: string; from?: string }) {
-    return this.meta.switchRange(move);
+  commit(epoch: number, acks: string[], at?: Ts) {
+    return this.meta.commit(epoch, acks, at);
   }
-  publishIndex(table: string, name: string, version: number, at: Ts) {
-    return this.meta.publishIndex(table, name, version, at);
+  abort(epoch: number, reason: string) {
+    return this.meta.abort(epoch, reason);
   }
-  revokeDdl(version: number, reason: string) {
-    return this.meta.revokeDdl(version, reason);
+  renew(epoch: number) {
+    return this.meta.renew(epoch);
   }
-  renewLock(version: number) {
-    return this.meta.renewLock(version);
+  startMove(move: Move) {
+    return this.meta.startMove(move);
   }
-  lockTables(tables: string[], basedOn?: number) {
-    return this.meta.lockTables(tables, basedOn);
-  }
-  beginSplit(move: SplitMove, basedOn: number) {
-    return this.meta.beginSplit(move, basedOn);
-  }
-  endSplit(id: string) {
-    return this.meta.endSplit(id);
-  }
-  splits() {
-    return this.meta.splits();
+  moves() {
+    return this.meta.moves();
   }
   /**
-   * 試験が分割の段を自分で進めるための、分割の枠。Autoscaler の split と同じく、全シャードに最新の版を適用させてから取る。
-   * 返る id を、beginIncoming と fence に渡す。
+   * 試験が範囲の移動を自分で進めるための入口。Meta に move-start を記録させ、tell に挙げたシャードに、その epoch まで列を適用させる
+   * (親なら fence が付き、子なら受け取り始めて、自分で移動を進め始める)。誰にも知らせなければ、記録だけが残る (進める側が止まった形)。
    */
-  async reserveSplit(parent: string, child: string, range: Interval): Promise<SplitSlot> {
-    const cat = await this.catalog();
-    for (const id of shardsOf(cat.routing)) await this.shard(id).syncSchema({ version: cat.version });
-    return this.meta.beginSplit({ parent, child, ...range }, cat.version);
+  async moveAt(parent: string, child: string, range: Interval, tell: string[] = []): Promise<{ epoch: number }> {
+    const { epoch } = await this.meta.startMove({ from: parent, to: child, ...range });
+    const { schema } = await this.catalog();
+    for (const id of tell) await this.shard(id).syncSchema({ schema, epoch });
+    return { epoch };
   }
-  finishLock(version: number, sql: string) {
-    return this.meta.finishLock(version, sql);
+  /**
+   * 試験が、表定義の変更を 1 手ずつ進めるための入口。DDL の prepare を記録し、全シャードの prepared の ok を集めて commit する
+   * (Db の changeSchema の、mode ごとの仕事を除いた形)。どこかのシャードが ok と答えなければ abort し、その理由で失敗する。
+   */
+  async applyDdl(sql: string): Promise<Catalog> {
+    const cat = await this.catalog();
+    const p = await this.meta.prepare(sql, {}, cat.schema);
+    if (p.epoch === null) return p.catalog;
+    const shards = shardsOf(p.catalog.routing);
+    const answers = await Promise.all(shards.map((id) => this.shard(id).prepared({ epoch: p.epoch! })));
+    const bad = answers.find((a) => !a.ok);
+    if (bad) {
+      await this.meta.abort(p.epoch, bad.reason ?? "refused");
+      throw new Error(bad.reason);
+    }
+    return this.meta.commit(p.epoch, shards);
   }
   allocate(table: string, n: number, min?: number) {
     return this.meta.allocate(table, n, min);

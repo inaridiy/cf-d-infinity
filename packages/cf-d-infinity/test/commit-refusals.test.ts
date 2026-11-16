@@ -73,11 +73,11 @@ describe("a write set that is too large, sent to a shard that gave the range awa
     while (!(slotOf(JSON.stringify([moving])) >= range.start && slotOf(JSON.stringify([moving])) < range.end)) moving++;
     await new Db(c).query("INSERT INTO docs VALUES (?, 'a')", [moving]);
     expect(await split(c, "s0", "s1", { range })).toMatchObject({ rows: 1 });
-    const { version } = await c.catalog();
+    const { schema, epoch } = await c.catalog();
     const key = JSON.stringify([moving]);
     const big = "x".repeat(MAX_WRITE_SET_BYTES + 1000);
     const request = async (shard: string, txn: string): Promise<PrepareReq> => ({
-      txn, T: await c.shard(shard).now({}), schema: version, anchor: shard, spans: [],
+      txn, T: await c.shard(shard).now({}), schema, epoch, anchor: shard, spans: [],
       writes: [{ table: "docs", pk: key, sk: key, before: [`i${moving}`, "ta"], after: [`i${moving}`, `t${big}`] }],
     });
     const local = (shard: string, txn: string) => request(shard, txn).then((req) => outcome(c.shard(shard).commitLocal(req)));

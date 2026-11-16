@@ -46,8 +46,13 @@ export type Effect =
   | { kind: "peer"; call: PeerCall }
   /** 相手のシャードを同時に呼び、全部の応答を待つ。結果は、応答の配列である。 */
   | { kind: "peers"; calls: PeerCall[] }
+  /**
+   * 子として、範囲の移動を終えるまで進める (核の move の手続き)。epoch は移動の move-start の epoch である。同じ移動を進めている最中
+   * なら、それに合流する (応答の後の仕事、alarm、進める側の drain の要求が、同じ移動を進める)。結果は運んだ数。
+   */
+  | { kind: "move"; epoch: number }
   /** Meta を呼ぶ。orNull は、失敗を null の結果にする。 */
-  | { kind: "meta"; method: "ddlSince" | "revokeDdl" | "startSplit" | "checkSplit"; args: unknown[]; orNull?: true };
+  | { kind: "meta"; method: "epochsSince" | "endMove"; args: unknown[]; orNull?: true };
 
 /** 待たずに始めること。殻は、1 歩が返った直後に、並んだ順に始める。 */
 export type Fork =

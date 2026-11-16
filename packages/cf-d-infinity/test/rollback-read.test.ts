@@ -51,10 +51,10 @@ describe("rollback-read reconstructs every past state", () => {
       }
 
       const shard = c.shard(c.shardIds[0]!);
-      const { version } = await c.catalog();
+      const { schema, epoch } = await c.catalog();
       for (const s of snapshots) {
         const past = await shard.exec({
-          T: s.T, sql: dump, columns: ["id", "code", "n"], params: [], spans: [{ kind: "sk", table: "t", sk: "[1]" }], schema: version,
+          T: s.T, sql: dump, columns: ["id", "code", "n"], params: [], spans: [{ kind: "sk", table: "t", sk: "[1]" }], schema, epoch,
         });
         expect(new QueryResult(past.columns, past.values).rows).toEqual(s.rows);
       }
@@ -68,7 +68,7 @@ describe("rollback-read reconstructs every past state", () => {
     await db.ddl(`CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (tenant_id,id))`);
     const T = (await db.query("SELECT count(*) c FROM t WHERE tenant_id = 1")).ts!;
     for (let i = 0; i < 5; i++) await db.query("INSERT INTO t VALUES (1,?)", [i]);
-    const { version } = await c.catalog();
-    await expect(c.shard("s0").exec({ T, sql: "SELECT 1", columns: ["1"], params: [], spans: [], schema: version })).rejects.toThrow(/read too old/);
+    const { schema, epoch } = await c.catalog();
+    await expect(c.shard("s0").exec({ T, sql: "SELECT 1", columns: ["1"], params: [], spans: [], schema, epoch })).rejects.toThrow(/read too old/);
   });
 });

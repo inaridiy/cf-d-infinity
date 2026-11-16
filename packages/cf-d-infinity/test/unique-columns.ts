@@ -246,9 +246,10 @@ export function checkColumns(seed: number, o: GenOptions = {}): ColumnsRun & { g
     for (const d of x.value.defs) schema.tables[d.name] = d;
     Object.assign(schema.indexes, x.value.indexes ?? {});
     if (!/^CREATE UNIQUE/.test(sql)) continue;
-    // D∞ が記録した UNIQUE の列。シャードの中の UNIQUE は uniques の最後に足され、シャードをまたぐものは、作っている最中の index
-    // (building) になる。
-    const cols = next.building?.name === name ? next.building.columns : next.uniques[next.uniques.length - 1] ?? [];
+    // D∞ が記録した UNIQUE の列。シャードの中の UNIQUE は uniques の最後に足され、シャードをまたぐものは、作る index (mode build の
+    // prepare の ddl の表定義の globalIndexes の最後) になる。
+    const built = x.value.mode === "build" ? next.globalIndexes.at(-1) : undefined;
+    const cols = built?.name === name ? built.columns : next.uniques[next.uniques.length - 1] ?? [];
     const coll = (c: string) => (next.collation[c] ?? "BINARY").toUpperCase();
     const parts = (lite.prepare("SELECT cid, name, coll, key FROM pragma_index_xinfo(?) ORDER BY seqno").all(name) as unknown as XinfoRow[]).filter((p) => p.key === 1);
     const wantKey = keyOf(parts.map((p) => p.name ?? "<expr>"), parts.map((p) => p.coll.toUpperCase()));

@@ -592,9 +592,9 @@ export async function runPlacement(s: Script, p: Placement, o: { mask: boolean; 
     }
     const cuts = prng(s.seed * 977 + 3);
     for (let j = 1; j <= (p.cuts ?? 0); j++) await splitAt(c, cuts, `s${j}`);
-    // 分割の前に作った Db で複数行の INSERT を流すと、既知の欠陥 (test/open/multi-row-insert-after-split.test.ts) に当たる。
-    // 分割の後に作った Db で流す。
-    const db = new Db(c);
+    // 行は、表定義を作った Db (分割の前の範囲表を覚えている) で入れる。古い範囲表で計画した複数行の INSERT は、断られて、新しい
+    // 範囲表で計画し直される (未解決の問題 35。Epoch の段 2 で直した。test/multi-row-insert-after-split.test.ts)。
+    const db = admin;
     for (const f of s.families) {
       for (const sql of f.rows) {
         if (missing.has(/^INSERT INTO (\w+)/.exec(sql)![1]!)) continue;

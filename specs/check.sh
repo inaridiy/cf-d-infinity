@@ -182,6 +182,24 @@ witness $f m1b_green witnessReadRefreshAdvanced
 tests   $f m1b_green
 tests   $f m1b_red_ra
 tests   $f m1b_red_rc
+# 2026-11-16: 移動のない read-time refresh を、移動をまたぐ refresh と同じ規則 (上限 to、intent の push と待ち) にそろえた形。答えは上と同じ
+green   $f m1b_green_u m1bSafe                          # serializable と atomicVisibility
+red     $f m1b_green_u freshReadPicked
+witness $f m1b_green_u witnessReadRefreshAdvanced
+witness $f m1b_green_u witnessFailedThenFinished        # 通らなかった refresh の後も、読むだけの取引が古い T のまま確定する
+green   $f m1b_green_bump_u freshReadPicked
+red     $f m1b_green_bump_u freshReadSeq
+green   $f m1b_red_rb_u serializable
+red     $f m1b_red_rc_u serializable
+red     $f m1b_red_no_wait atomicVisibility             # c の決まった intent の適用を待たない
+green   $f m1b_green3_u m1bSafe                         # 取引 3 件、テンプレート 4 つ
+witness $f m1b_green3_u witnessNewRulePass              # いまの規則なら通らなかった refresh が通り、取引が確定する
+witness $f m1b_green3_u witnessFailedThenFinished
+green   $f m1b_no_push3 m1bSafe                         # push しなくても、2 シャードでは破れない (後で決まる c は必ず to より大きい)
+if [ "${HEAVY:-0}" = "1" ]; then
+  red   $f m1b_red_ra_u serializable                    # 取引 3 件 (約 3 分)
+fi
+for m in m1b_green_u m1b_red_ra_u m1b_red_rc_u m1b_red_no_wait m1b_green3_u; do tests $f $m; done
 
 echo "== M8 recent_index (__ver 廃止後の first-committer-wins)"
 f=m8_recent_index.qnt
@@ -475,6 +493,115 @@ for m in m21_green_build m21_green_check m21_green_drop m21_green_split m21_gree
          m21_red_two_open m21_red_ddl_during_move m21_red_move_during_ddl m21_red_end_early m21_red_pull_unfenced m21_red_fence_first \
          m21_red_owner_unchecked m21_red_strict_epoch m21_alt_commit_only_check m21_clock_red_no_clock m21_clock_red_skip_empty m21_guard_red_commit_ts; do tests $f $m; done
 
+echo "== M24 table epochs (DDL が取引を古くするのは、取引が頼る表を変えて確定したときだけ。未解決の問題 53。実装より先に書いたモデル)"
+f=m24_table_epochs.qnt
+green   $f m24_green_unrelated m24Safe                  # 関係のない CREATE TABLE と、B の DDL (確定か失敗)。A だけに頼る取引と、B を読んで A を書く取引
+green   $f m24_green_build m24Safe                      # A の index の作成と、関係のない CREATE TABLE。index の commit より前の計画は、読みは通り、書き込みは断られる
+green   $f m24_green_check m24Safe                      # A の、行で失敗し得て形を変える DDL と、関係のない CREATE TABLE
+green   $f m24_green_drop m24Safe                       # DROP TABLE A と、関係のない CREATE TABLE。V を通る読みも断られる
+green   $f m24_green_split m24Safe                      # 移動と、関係のない CREATE TABLE
+red     $f m24_red_global noRefusalUnrelated            # 段 3 の形: 表定義全体の epoch 1 つを、どの記録でも進める
+red     $f m24_red_global_commit_only noRefusalUnrelated  # 全体の epoch 1 つを、commit だけで進める
+red     $f m24_red_prepare_advances noRefusalWithoutChange  # 表ごとだが、prepare と abort でも進める: 失敗した DDL が、触った表の取引を断る
+red     $f m24_red_read_deps planMatches                # 書き込みの計画が読んだ表を、要求が運ばない
+red     $f m24_red_apply_all noRefusalUnrelated         # 段 3 の schemaChanging: 記録の適用中に、どの要求も断る
+red     $f m24_red_apply_touched noRefusalWithoutChange # 記録の適用中に、記録が触る表に頼る要求を、待たせずに断る
+red     $f m24_red_index indexMatches                   # index の DDL を、表とは別のものとして数える
+red     $f m24_red_index planMatches
+red     $f m24_red_write_epoch indexMatches             # 書き込みが、表の読みの epoch を比べる
+red     $f m24_red_view readConsistent                  # view を通る計画が、元の表を運ばない
+red     $f m24_red_view planMatches
+witness $f m24_green_unrelated witnessAcrossUnrelated   # 取引が、関係のない CREATE TABLE の commit と、関係のない DDL の abort をまたいで確定する
+witness $f m24_green_unrelated witnessAcrossFailedRead  # B を読んだ計画の書き込みが、B の DDL の abort の後で、計画し直さずに確定する
+witness $f m24_green_unrelated witnessRefusedChanged    # B の DDL が確定すれば、B を読んだ計画は断られる
+witness $f m24_green_check witnessAcrossFailedTouched   # A の DDL の prepare より前の計画の書き込みが、禁止の間は待ち、DDL の失敗の後で確定する
+witness $f m24_green_check witnessTrialRejectedThenWrite
+witness $f m24_green_check witnessCheckCommittedThenWrite
+witness $f m24_green_build witnessReadAcrossIndex       # index の commit より前に計画した読みが、commit を適用したシャードで答えられる
+witness $f m24_green_build witnessPublicThenWrite
+witness $f m24_green_drop witnessDroppedAfterWrites
+witness $f m24_green_split witnessServedWhileDriverDead
+witness $f m24_green_split witnessPinnedSurvives
+witness $f m24_green_split witnessParentAnswersUncut
+green   $f m24_red_global witnessAcrossUnrelated        # 同じ witness は、段 3 の形では届かない
+green   $f m24_red_global_commit_only witnessAcrossUnrelated
+green   $f m24_red_prepare_advances witnessAcrossFailedRead
+# DDL の床 (古い時刻の行の読み戻し)
+green   $f m24_floor_green floorSafe
+red     $f m24_floor_red_global noRefusalUnrelated      # 段 3 の形: 床がシャードに 1 つ
+red     $f m24_floor_red_restore_all noRefusalUnrelated # 読み戻すのが、すべての表の行
+red     $f m24_floor_red_no_floor noRestoreAcross       # 形を変えた表に床を置かない
+witness $f m24_floor_green witnessServedBelow
+witness $f m24_floor_green witnessRefusedB
+# 行ロックと DDL の待ち (触った表に書いた取引)
+green   $f m24_lock_green holderSurvives
+red     $f m24_lock_red_no_wait holderSurvives          # prepare が行ロックを待たない
+red     $f m24_lock_red_no_wound holderSurvives         # 書き込み禁止に当たった、ロックを持つ取引が、遷移を取り消させない
+witness $f m24_lock_green witnessDdlAfterTxn
+witness $f m24_lock_green witnessWoundThenCommit
+witness $f m24_lock_green witnessDdlBusy
+# 取引の中の DDL (M13 を表ごとにしたもの)
+green   $f m24_boundary_green boundarySafeAll
+red     $f m24_boundary_red_main prefixOfScript
+red     $f m24_boundary_red_pin_only ownDdlVisible
+red     $f m24_boundary_red_repin pinned
+red     $f m24_boundary_red_retry_whole prefixOfScript
+red     $f m24_boundary_red_ddl_anyway prefixOfScript
+red     $f m24_boundary_red_global noRefusalUnrelated   # すべての DDL の版と比べる (M13 と段 3 の形)
+witness $f m24_boundary_green witnessUnrelatedNoRetry   # 関係のない DDL が区切りの途中に入っても、やり直さずに終わる
+witness $f m24_boundary_green witnessRetriedAndDone
+witness $f m24_boundary_green witnessOtherDdlThenDone
+green   $f m24_boundary_red_global witnessUnrelatedNoRetry  # 同じ witness は、すべての DDL の版と比べると届かない
+for m in m24_green_unrelated m24_green_build m24_green_check m24_green_drop m24_green_split \
+         m24_red_global m24_red_global_commit_only m24_red_prepare_advances m24_red_read_deps m24_red_apply_all m24_red_apply_touched \
+         m24_red_index m24_red_write_epoch m24_red_view \
+         m24_floor_green m24_floor_red_global m24_floor_red_restore_all m24_floor_red_no_floor \
+         m24_lock_green m24_lock_red_no_wait m24_lock_red_no_wound m24_boundary_green m24_boundary_red_global; do tests $f $m; done
+# 決めたこと 6 の確かめ直し: M21 の場面を、epoch を commit だけで進める形で (index の作成と CHECK は、M21 の m21_alt_commit_only_*)
+f=m24b_m21_commit_only.qnt
+green   $f m24_m21_green_split_txns epochSafeCommitOnly
+green   $f m24_m21_green_split epochSafeCommitOnly
+if [ "${HEAVY:-0}" = "1" ]; then                        # M21 の大きな場面と、M21 の赤 (noServeBelowAck を除く) を、commit だけで進める形で
+  green $f m24_m21_green_drop epochSafeCommitOnly
+  green $f m24_m21_green_ddl2 epochSafeCommitOnly
+  green $f m24_m21_green_split_build epochSafeCommitOnly
+  red   $f m24_m21_red_online indexMatches
+  red   $f m24_m21_red_online notRelied
+  red   $f m24_m21_red_no_fence indexMatches
+  red   $f m24_m21_red_visible notRelied
+  red   $f m24_m21_red_no_drain noWriteWhileFenced
+  red   $f m24_m21_red_stale indexMatches
+  red   $f m24_m21_red_two_exits oneExit
+  red   $f m24_m21_red_two_exits indexMatches
+  red   $f m24_m21_red_repin indexMatches
+  red   $f m24_m21_red_repin pinned
+  red   $f m24_m21_red_scan_early indexMatches
+  red   $f m24_m21_red_no_recheck indexMatches
+  red   $f m24_m21_red_early_commit indexMatches
+  red   $f m24_m21_red_trial_no_fence commitApplies
+  red   $f m24_m21_red_trial_missing_ack commitApplies
+  red   $f m24_m21_red_trial_early commitApplies
+  red   $f m24_m21_red_trial_no_drain commitApplies
+  red   $f m24_m21_red_drop_no_fence guardHolds
+  red   $f m24_m21_red_drop_no_check guardHolds
+  red   $f m24_m21_red_drop_check_early guardHolds
+  red   $f m24_m21_red_drop_no_drain guardHolds
+  red   $f m24_m21_red_drop_no_drain noResurrect
+  red   $f m24_m21_red_drop_untied guardHolds
+  red   $f m24_m21_red_drop_missing_ack noLostAfterReturn
+  red   $f m24_m21_red_two_open commitApplies
+  green $f m24_m21_red_ddl_during_move servable       # commit だけで進める形では反例がない: 移動の途中の prepare は要求を古くせず、DDL が移動の終わりまで待つだけになる
+  red   $f m24_m21_red_move_during_ddl servable
+  green $f m24_m21_red_end_early servable              # 同じ理由で反例がない (design-catalog-epoch.md の「移動の途中の prepare」)
+  red   $f m24_m21_red_pull_unfenced moveKeepsWrites
+  red   $f m24_m21_red_pull_unfenced readConsistent
+  red   $f m24_m21_red_pull_unfenced sameShape
+  red   $f m24_m21_red_fence_first servable
+  red   $f m24_m21_red_owner_unchecked moveKeepsWrites
+  red   $f m24_m21_red_owner_unchecked readConsistent
+  red   $f m24_m21_red_strict_epoch pinnedSurvives
+fi
+
 echo "== M22 unique keys (主キー以外の UNIQUE をキーの行にまとめる。グループが piece ごとに動く間も、UNIQUE の値を書く文が通る。実装より先に書いたモデル)"
 f=m22_unique_keys.qnt
 green   $f m22_green uniqueSafe                         # グループの全部が piece ごとに移る。決着させてから切る規則も、子がグループを待つ規則もない
@@ -511,6 +638,143 @@ fi
 for m in m22_track m22_track_split m22_green3_one m22_red_key_at_row m22_red_key_unarrived m22_red_no_key_lock m22_red_no_key_body \
          m22_red_key_after_commit m22_red_keep_old_key m22_red_key_intent_with_row m22_red_physical_unique m22_red_group_refuse \
          m22_live_red_group_wait; do tests $f $m; done
+
+echo "== M23 refresh across move (範囲の移動をまたぐ取引の read refresh と、子での確定。実装より先に書いたモデル)"
+f=m23_refresh_across_move.qnt
+# 設計 1 (推奨): Worker は今の持ち主へ送り、子が、到着より前の窓を親の記録で埋める
+green   $f m23_green m23Safe                            # 全表を 2 回読み、動いた行を楽観で書く (再現の形)。W と Y、範囲表の古い Worker の refresh あり
+green   $f m23_green_ro m23Safe                         # 読むだけの取引
+green   $f m23_green_pess m23Safe                       # 悲観の取引。T は最初の読みのまま、子で確定する
+red     $f m23_red_parent_alone serializable            # 親が、渡したグループの確かめに、自分の記録だけで答える (範囲表の古い Worker は子に尋ねない)
+red     $f m23_red_child_from_floor serializable        # 子が、自分の記録を床から確かめる (到着の後、床の前の確定を見落とす)
+red     $f m23_red_child_from_arrival serializable      # 子が、到着の m から確かめる (pull に乗った intent を m 以下の c で適用したものを見落とす)
+red     $f m23_red_no_peer serializable                 # 子が、到着より前からの窓を、親の記録で埋めない
+red     $f m23_red_prepare_alone serializable           # 確定の検証でだけ、親の記録で埋めない (失われた更新)
+red     $f m23_red_no_bump serializable                 # 確かめに答えたシャードが、時計を to まで進めない
+red     $f m23_red_no_push placementIndependent         # 確かめが、c の決まっていない intent で失敗する (読むだけの取引が、移動のために失敗する)
+red     $f m23_impl_pinned placementIndependent         # いまの実装: 取引が範囲表を取り直さず、動いた行の文が not owner で失敗する
+red     $f m23_impl placementIndependent                # 範囲表だけ取り直す: 確かめは読んだシャードへ行き、親は not owner、子は床で断る
+green   $f m23_impl_pinned answersSafe                  # どちらも、断るだけで、答えは誤らない
+green   $f m23_impl answersSafe
+red     $f m23_live_red_pingpong boundedRefusals        # 子が「前の持ち主へ」と断り、親が「渡した」と断る
+live    $f m23_live refreshTerminates                   # 活性: 始めた refresh は、いつか終わる
+live_red $f m23_live_red_pingpong refreshTerminates
+witness $f m23_green witnessRefreshAcross               # 移動の時刻をまたいで T を進めた refresh が通り、確定する
+witness $f m23_green witnessCommitAcross                # 移動の前に親で読んだ取引が、動いた行を子で書いて確定する
+witness $f m23_green witnessReproduction                # 再現の形 (test/open/transaction-across-split.test.ts の 1 つ目) が確定する
+witness $f m23_green witnessConflictBelowFloor          # 子が到着の後、床の前に確定した書き込みで、取引が競合になる
+witness $f m23_green witnessBelowArrival                # T が到着の m より小さいまま、子で確定する
+witness $f m23_green witnessRefusedThenCommitted        # 親が範囲表の古い取引の確かめを断り、取引が範囲表を直して確定する
+witness $f m23_green_pess witnessBelowArrival
+witness $f m23_green_ro witnessAborted                  # 読むだけの取引が、移動の後の読み直しで競合になる (持ち主の判断 1)
+# 段 2 の直後の親 (fence の後は範囲の要求を全部断る。M19 の前)。確かめの上限と組み合わせた形 (下の推奨の組み合わせ) を既定にし、
+# 上限のない形は HEAVY にした (2026-11-16、M23b を足して、節の時間を抑えるため)
+if [ "${HEAVY:-0}" = "1" ]; then
+  green $f m23_green_fenced m23Safe
+  live  $f m23_live_fenced refreshTerminates
+fi
+# 確かめの上限を to で切る案 (持ち主の判断 1。2026-11-16 に採った)
+red     $f m23_green_ro readOnlyBelowStart              # 上限のない確かめでは、床より後の確定でも、読むだけの取引が失敗する
+green   $f m23_green_bounded m23Safe
+green   $f m23_green_ro_bounded m23Safe
+green   $f m23_green_ro_bounded readOnlyBelowStart      # 上限を切れば、読むだけの取引が失敗するのは、窓 (from, 床] に確定があるときだけである
+# 推奨の組み合わせ (設計 1、段 2 の直後の親、確かめの上限)
+green   $f m23_green_rec m23Safe
+green   $f m23_green_rec_pess m23Safe
+witness $f m23_green_rec_pess witnessBelowArrival
+live    $f m23_live_rec refreshTerminates
+green   $f m23_live_rec readOnlyBelowStart
+# 設計 2 (退けた案): Worker が親と子の両方に尋ね、親は要求の epoch で確かめる。2026-11-16 に設計 1 を採ったので、HEAVY にした
+if [ "${HEAVY:-0}" = "1" ]; then
+  green   $f m23_alt_green m23Safe
+  green   $f m23_alt_green_ro m23Safe
+  green   $f m23_alt_green_pess m23Safe
+  red     $f m23_alt_red_parent_alone serializable      # Worker が、読んだシャード (親) だけに尋ねる
+  red     $f m23_alt_red_no_epoch serializable          # 親が、要求の epoch を見ずに答える
+  red     $f m23_alt_red_child_from_floor serializable
+  red     $f m23_alt_red_unarrived serializable         # 子が、グループが届く前に答える (飛んでいる intent を、親も子も見ない)
+  red     $f m23_alt_red_prepare_alone serializable     # 確定で、Worker が親を検証に入れない
+  live    $f m23_alt_live refreshTerminates
+  witness $f m23_alt_green witnessReproduction
+  green   $f m23_green_wide m23Safe                     # tick 2 回、T の上限 6
+fi
+for m in m23_green m23_green_pess m23_green_fenced m23_green_ro_bounded m23_red_parent_alone m23_red_child_from_floor m23_red_child_from_arrival m23_red_no_peer \
+         m23_red_prepare_alone m23_red_no_bump m23_red_no_push m23_impl_pinned m23_impl m23_live_red_pingpong \
+         m23_alt_green m23_alt_red_parent_alone m23_alt_red_no_epoch m23_alt_red_unarrived; do tests $f $m; done
+
+echo "== M23b refresh across two moves (範囲がもう一度動く間も続く取引。受け取りの記録をたどって前の持ち主たちに尋ねる。実装より先に書いたモデル)"
+f=m23b_refresh_two_moves.qnt
+# 書き手 W と Y を両方入れると大きいので、既定では 1 つずつにした (両方の形は HEAVY)
+green   $f m23b_green_w m23bSafe                        # 全表を 2 回読み、動いた行を楽観で書く (再現の形)。書き手は W。範囲表の古い Worker の refresh あり
+green   $f m23b_green_y m23bSafe                        # 同じ形で、書き手は Y (intent が移動のたびに運ばれ、m 以下の c で適用されることがある)
+green   $f m23b_green_ro_w m23bSafeRO                   # 読むだけの取引。m23bSafe と readOnlyBelowStart (失敗するのは、窓 (読んだ時刻, to] に確定があるときだけ)
+green   $f m23b_green_ro_y m23bSafeRO
+green   $f m23b_green_pess m23bSafe                     # 悲観の取引 (W と Y)。T は最初の読みのまま、2 回の移動の後に確定する
+green   $f m23b_green_back_y m23bSafe                   # 範囲が S0 へ戻る (閉路)。読むだけ
+red     $f m23b_red_stop_first serializable             # 尋ねられたシャードが、それ以上尋ねない (最初の前の持ち主で止まる)
+red     $f m23b_red_forget serializable                 # 受け取りを終えたら、受け取りの記録を忘れる
+red     $f m23b_red_forget_one serializable             # 同上、移動 1 回で
+red     $f m23b_red_mid_from_arrival serializable       # 尋ねられたシャードが、自分の記録を自分の到着の m から確かめる
+red     $f m23b_red_mid_alone serializable              # 移動 2 で渡したシャードが、範囲表の古い Worker の確かめに答える
+red     $f m23b_red_skip_push serializable              # いまの持ち主の確かめが、c の決まっていない intent を push せずに通す (anchor が to 以下の c を決める)
+red     $f m23b_live_red_cycle boundedAsks              # 範囲が戻ったとき、記録を時刻で選ばないと、尋ね合いが終わらない
+live    $f m23b_live chainLive                          # 活性: 始めた refresh も、尋ね始めた確かめも、いつか終わる (refreshTerminates と asksEnd)
+witness $f m23b_green_w witnessReproduction2            # 再現の形が、2 回の移動をまたいで、前の持ち主 2 つに尋ねて確定する
+witness $f m23b_green_w witnessOneHop                   # 移動の間に読んだ取引が、前の持ち主 1 つにだけ尋ねて確定する
+witness $f m23b_green_w witnessFoundAtS0                # 移動 1 の前に S0 で確定した書き込みを、尋ねる列が見つける
+witness $f m23b_green_pess witnessBelowArrival2         # T が移動 1 の m より小さいまま、移動 2 の行き先で確定する
+witness $f m23b_green_back_y witnessReadAcross2         # 範囲が戻った後、2 回の移動をまたいで T を進めて確定する
+if [ "${HEAVY:-0}" = "1" ]; then                        # 活性の検査 (1 本 3 分ほど) と、書き手 W と Y の両方
+  live     $f m23b_live_back chainLive                  # 範囲が S0 へ戻る形でも、refresh と尋ねる列が終わる
+  live_red $f m23b_live_red_cycle chainLive             # 記録を時刻で選ばないと終わらない (安全の赤 boundedAsks は既定で確かめる)
+  green $f m23b_green m23bSafe                          # T の上限 6
+  green $f m23b_green_ro m23bSafeRO
+  green $f m23b_green_back m23bSafe
+  green $f m23b_green_one m23bSafe                      # 移動 1 回 (M23 の推奨の組み合わせと同じ規則)
+fi
+for m in m23b_green m23b_green_pess m23b_green_back m23b_red_stop_first m23b_red_forget m23b_red_mid_from_arrival m23b_red_mid_alone \
+         m23b_red_skip_push m23b_live_red_cycle; do tests $f $m; done
+
+echo "== M23c old reads across moves (移動の前の読み取り時刻の読みに、前の持ち主の記録で答える。実装より先に書いたモデル)"
+f=m23c_old_reads_across_move.qnt
+green   $f m23c_green_ro_w m23cSafeRO                   # 読むだけの取引。書き手 W、2 回の移動。読むだけの取引は「古すぎる」のほかでは失敗しない
+green   $f m23c_green_ro_y m23cSafeRO                   # 同上、書き手 Y (pull に乗った intent が、受け取る前の c で子で適用される)
+green   $f m23c_green_w m23cSafe                        # 書く取引 (楽観)。書き手 W
+green   $f m23c_green_back_y m23cSafeRO                 # 範囲が S0 へ戻る。読むだけ、書き手 Y
+green   $f m23c_green_split_floor m23cSafeRO            # 閾値を範囲の床にしても、持ち主が自分の版を重ねれば安全 (全表の span の形)
+green   $f m23c_green_retain m23cSafeRO                 # 変更ログを切り詰める (移動 1 回)。渡した行は logLowWater が手放した時刻を越えるまで残す
+green   $f m23c_green_empty m23cSafeRO                  # 空にされたグループは運ばれず、子は範囲の床より前の T を前の持ち主に尋ねる
+green   $f m23c_green_empty_w m23cSafe                  # 同上で、書く取引 (確定の検証も、範囲の床を窓の上端にして前の持ち主に尋ねる)
+red     $f m23c_base_ro roNeverFails                    # M23b の規則のまま: 案 A' の形で、読むだけの取引が移動のために失敗する
+red     $f m23c_red_child_below readConsistent          # 持ち主が、到着より前の T に、受け取った行で答える
+red     $f m23c_red_no_merge readConsistent             # 持ち主が、自分の版を重ねない (受け取る前の c で適用した intent を落とす)
+red     $f m23c_red_prev_above readConsistent           # 閾値を床にして重ねない: 前の持ち主が到着の m 以上の T に答え、子の書き込みを落とす
+red     $f m23c_red_no_retain readConsistent            # 渡した行を、移動を終えたら消す (今の ack)
+red     $f m23c_red_no_epoch readConsistent             # 渡したシャードが、範囲表の古い Worker の読みに、残した行で答える
+red     $f m23c_red_worker_routes readConsistent        # Worker が古い読みを前の持ち主へ直接送る (持ち主は重ねず、intent も push しない)
+red     $f m23c_red_empty_no_floor readConsistent       # 運ばれなかったグループの窓の始まり (範囲の床) を記録しない
+live    $f m23c_live_end txnEnds                        # 活性: 取引はいつか終わる (読みが intent や到着を待ち続けない)。OTHER なし
+live    $f m23c_live_end_w txnEnds                      # 同上、書く取引
+live    $f m23c_live_end_back txnEnds                   # 同上、範囲が S0 へ戻る形
+live    $f m23c_live_end_empty txnEnds                  # 同上、空にされたグループ (子は finish で受け持つ)
+live    $f m23c_live_end_retain txnEnds                 # 同上、変更ログを切り詰める形
+witness $f m23c_green_ro_w witnessAPrime                # 案 A' の形の読むだけの取引が、T を進めずに確定する
+witness $f m23c_green_ro_w witnessForward2              # 2 回の移動をまたいで、前の持ち主 2 つに尋ねた読みで確定する
+witness $f m23c_green_ro_y witnessOverlay               # 持ち主の重ねた版 (受け取る前の c で適用した intent) が答えになる
+witness $f m23c_green_retain witnessTooOld              # 前の持ち主の logLowWater より古い読みが「古すぎる」で断られる
+witness $f m23c_green_w witnessWriteAcross2             # 書く取引が、T を進めずに 2 回の移動をまたいで確定する
+witness $f m23c_green_empty witnessEmptyRead            # 空にされたグループの、削除の前の行を、前の持ち主に尋ねて読む
+if [ "${HEAVY:-0}" = "1" ]; then
+  green $f m23c_green_y m23cSafe                        # 書く取引、書き手 Y
+  green $f m23c_green_pess m23cSafe                     # 悲観の取引、書き手 W と Y
+  green $f m23c_green_split_floor_y m23cSafeRO
+  green $f m23c_green_retain_w m23cSafe                 # 書く取引で、変更ログを切り詰める
+  green $f m23c_green_retain2 m23cSafeRO                # 移動 2 回で、変更ログを 1 回切り詰める
+  green $f m23c_green_retain_y m23cSafeRO               # 変更ログを切り詰め、書き手 Y (重ねることと、受け取りの記録を消すこと)
+  live  $f m23c_live chainLive                         # OTHER ありで、refresh と尋ねる列が終わる (古い読みはどちらも使わない。M23b の m23b_live と同じ規則)
+fi
+for m in m23c_green_ro_w m23c_green_ro_y m23c_green_w m23c_green_retain m23c_green_empty m23c_base_ro m23c_red_child_below \
+         m23c_red_no_merge m23c_red_prev_above m23c_red_no_retain m23c_red_no_epoch m23c_red_worker_routes m23c_red_empty_no_floor; do tests $f $m; done
 
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
