@@ -207,23 +207,27 @@ describe("argument values at every entry, on workerd", () => {
         } else expect.soft(got[step].status, label).toBe(200);
       }
     }
+    // local は、この Worker の中の D1 互換の API である。数の配列だけ、期待が Service Binding と違う (c.d1)。
+    const wantOf = (name: "binding" | "local", c: (typeof JS_VALUES)[number]) => (name === "local" ? c.d1 ?? c.want : c.want);
     for (const name of ["binding", "local"] as const) {
       for (const [i, c] of JS_VALUES.entries()) {
         const got = r[name][i];
         if (got === null) continue;
+        const want = wantOf(name, c);
         for (const step of Object.keys(got)) {
           const label = `${name} ${c.label} ${step}`;
-          if ("error" in c.want) {
-            expect.soft(got[step], label).toMatchObject({ error: expect.stringMatching(c.want.error) });
+          if ("error" in want) {
+            expect.soft(got[step], label).toMatchObject({ error: expect.stringMatching(want.error) });
             expect.soft(got[step].name, label).not.toBe("TypeError");
           } else if (step === "insert") expect.soft(got[step], label).toEqual({ row: null });
-          else expect.soft(got[step], label).toEqual({ row: row(c.want, step === "key", shownValue) });
+          else expect.soft(got[step], label).toEqual({ row: row(want, step === "key", shownValue) });
         }
       }
     }
     // 断った値の行は、どの入口でも入っていない。
     const accepted = HTTP_LITERALS.filter(([, w]) => !("error" in w)).length
-      + JS_VALUES.filter((c) => c.rpc !== false && !("error" in c.want)).length + JS_VALUES.filter((c) => !("error" in c.want)).length;
+      + JS_VALUES.filter((c) => c.rpc !== false && !("error" in wantOf("binding", c))).length
+      + JS_VALUES.filter((c) => !("error" in wantOf("local", c))).length;
     expect(r.rows).toBe(String(accepted));
   });
 });

@@ -90,14 +90,16 @@ describe("the D1 compatible API reads a JS value by its JS type", () => {
     it(`gives each value the type the D1 rule names, without a table, by primary key and in a batch, on ${shards} shards`, async () => {
       const d1 = new D1Compatible(new Db(new SimCluster({ shards })), { intMode: "bigint" });
       await d1.prepare(TABLE).run();
-      for (const [i, { label, value, want }] of JS_VALUES.entries()) {
+      for (const [i, { label, value, want: binding, d1: own }] of JS_VALUES.entries()) {
+        // D1 互換の API の期待。数の配列だけが Service Binding と違う。
+        const want = own ?? binding;
         check(`${label} in SELECT`, await outcome(async () => d1.prepare(SELECT).bind(value()).first()), want);
         const inserted = await outcome(async () => (await d1.prepare(INSERT).bind(i, value()).run(), null));
         if ("error" in want) check(`${label} in INSERT`, inserted, want);
         check(`${label} by key`, await outcome(async () => d1.prepare(BY_KEY).bind(i, value()).first()), want, true);
         check(`${label} in batch`, await outcome(async () => (await d1.batch([d1.prepare(SELECT).bind(value())]))[0]!.results[0] as Record<string, unknown>), want);
       }
-      expect(await d1.prepare("SELECT count(*) AS c FROM ev").first("c")).toBe(accepted(JS_VALUES.map((c) => c.want)));
+      expect(await d1.prepare("SELECT count(*) AS c FROM ev").first("c")).toBe(accepted(JS_VALUES.map((c) => c.d1 ?? c.want)));
       for (const empty of [null, undefined]) check(`${empty} in SELECT`, await outcome(async () => d1.prepare(SELECT).bind(empty).first()), { t: "null", v: null });
     });
   }

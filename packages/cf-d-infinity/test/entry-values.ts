@@ -6,6 +6,9 @@
 //     64 ビットに収まらない数字だけの literal は、SQLite の literal と同じく REAL である。
 //   - D1 互換の API と Service Binding: JS の数は、安全な整数なら INTEGER、ほかは REAL。bigint は INTEGER で、64 ビットの外は断る。
 //     BLOB は Uint8Array、ArrayBuffer、型つき配列のバイトである (D1 は型つき配列を要素ごとに 1 バイトへ切る。src/client/d1.ts)。
+//   - D1 互換の API だけは、D1 と同じく、0 以上 256 未満の数の配列を BLOB として受け付ける (2026-11-16、持ち主から任された判断)。
+//     要素は 0 へ向けて切り捨てる (1.5 は 1)。範囲の外の数、数でない要素、穴のある配列は、bind が断る。Service Binding と HTTP は、
+//     配列を断る。D1 の挙動は Miniflare 4.20260730.0 のローカルの D1 で測った (docs/sql-language.md の「引数の型」)。
 //   - どの入口も、値でないもの (配列、object など) を、文を実行する前に利用者の誤りとして断る。内部の TypeError にしない。
 import type { Value } from "../src/types";
 
@@ -21,6 +24,9 @@ export const BY_KEY = "SELECT typeof(id) AS t, id AS v, typeof(x) AS tx, x AS vx
 const ARRAY = /parameter \d+ is an array/;
 const OBJECT = /parameter \d+ is an object/;
 const WIDE = /parameter \d+: the integer -?\d+ does not fit in 64 bits/;
+/** D1 互換の API が断る配列 (バイトにならない要素がある)。 */
+const BYTES = /parameter \d+ is an array with .+ at index \d+; an array parameter is the bytes of a BLOB/;
+const blob = (...b: number[]) => ({ t: "blob", v: new Uint8Array(b) });
 
 /** HTTP の本文の JSON の literal (文面のまま送る) と、規則が決める値。 */
 export const HTTP_LITERALS: [string, Want][] = [
@@ -45,9 +51,10 @@ export const HTTP_LITERALS: [string, Want][] = [
 
 /**
  * D1 互換の API と Service Binding に渡す JS の値と、規則が決める値。rpc が false の値は、structured clone で運べないので、
- * Service Binding では流さない (呼び出し元の実行環境が送る前に断る)。
+ * Service Binding では流さない (呼び出し元の実行環境が送る前に断る)。d1 は、D1 互換の API の期待が Service Binding と違う値の、
+ * D1 互換の API の期待である (数の配列)。
  */
-export const JS_VALUES: { label: string; value: () => unknown; want: Want; rpc?: false }[] = [
+export const JS_VALUES: { label: string; value: () => unknown; want: Want; d1?: Want; rpc?: false }[] = [
   { label: "5", value: () => 5, want: { t: "integer", v: 5n } },
   // JS の数では 5.0 と 5 を見分けられない。
   { label: "5.0", value: () => 5.0, want: { t: "integer", v: 5n } },
@@ -66,7 +73,26 @@ export const JS_VALUES: { label: string; value: () => unknown; want: Want; rpc?:
   { label: "Uint8Array", value: () => new Uint8Array([65, 66]), want: { t: "blob", v: new Uint8Array([65, 66]) } },
   { label: "ArrayBuffer", value: () => new Uint8Array([65, 66]).buffer, want: { t: "blob", v: new Uint8Array([65, 66]) } },
   { label: "Uint16Array", value: () => new Uint16Array([0x4241]), want: { t: "blob", v: new Uint8Array([0x41, 0x42]) } },
-  { label: "[65, 66]", value: () => [65, 66], want: { error: ARRAY } },
+  // 数の配列。D1 互換の API は、D1 と同じく BLOB として受け付け、Service Binding は断る。
+  { label: "[65, 66]", value: () => [65, 66], want: { error: ARRAY }, d1: blob(65, 66) },
+  { label: "[]", value: () => [], want: { error: ARRAY }, d1: blob() },
+  { label: "[0, 255]", value: () => [0, 255], want: { error: ARRAY }, d1: blob(0, 255) },
+  // D1 は、範囲の中の整数でない数を 0 へ向けて切り捨てる。
+  { label: "[1.5, 255.9, -0]", value: () => [1.5, 255.9, -0], want: { error: ARRAY }, d1: blob(1, 255, 0) },
+  { label: "[256]", value: () => [256], want: { error: ARRAY }, d1: { error: BYTES } },
+  { label: "[-1]", value: () => [-1], want: { error: ARRAY }, d1: { error: BYTES } },
+  { label: "[-0.5]", value: () => [-0.5], want: { error: ARRAY }, d1: { error: BYTES } },
+  { label: "[NaN]", value: () => [NaN], want: { error: ARRAY }, d1: { error: BYTES } },
+  { label: "[Infinity]", value: () => [Infinity], want: { error: ARRAY }, d1: { error: BYTES } },
+  { label: '["65"]', value: () => ["65"], want: { error: ARRAY }, d1: { error: BYTES } },
+  { label: "[65n]", value: () => [65n], want: { error: ARRAY }, d1: { error: BYTES } },
+  { label: "[true]", value: () => [true], want: { error: ARRAY }, d1: { error: BYTES } },
+  { label: "[null]", value: () => [null], want: { error: ARRAY }, d1: { error: BYTES } },
+  { label: "[[1]]", value: () => [[1]], want: { error: ARRAY }, d1: { error: BYTES } },
+  { label: "[65, \"x\"]", value: () => [65, "x"], want: { error: ARRAY }, d1: { error: BYTES } },
+  // 穴のある配列。D1 は bind で通し、実行のときに本文の誤り (D1_ERROR) で落ちる。D∞ は bind が断る。
+  { label: "[, 1]", value: () => [, 1], want: { error: ARRAY }, d1: { error: BYTES } },
+  { label: "new Array(2)", value: () => new Array(2), want: { error: ARRAY }, d1: { error: BYTES } },
   { label: "{ a: 1 }", value: () => ({ a: 1 }), want: { error: OBJECT } },
   { label: "Date", value: () => new Date(0), want: { error: OBJECT } },
   { label: "symbol", value: () => Symbol("s"), want: { error: /parameter \d+ is a symbol/ }, rpc: false },
