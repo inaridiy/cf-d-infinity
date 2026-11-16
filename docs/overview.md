@@ -170,18 +170,22 @@ declaration or onto a shard that does not own the row.
 ## Schema changes
 
 DDL goes through `DinfMeta`, which records schema changes and range moves in one append-only epoch log
-([design-catalog-epoch.md](./design-catalog-epoch.md)). The change is applied on every shard before the statement
-returns, and every request carries the epoch of the snapshot it was planned on and the epoch at which the schema last
-changed. A shard keeps a copy of the part of the log it has applied and rejects a request planned against an older
+([design-catalog-epoch.md](./design-catalog-epoch.md)). Every schema change is two-phase: Meta records a *prepare*,
+every shard applies it and answers, and only then does Meta record the *commit*; if any shard refuses, or the driver
+stops, Meta records an *abort*. The change is applied on every shard before the statement returns, and every request
+carries the epoch of the snapshot it was planned on and the epoch at which the schema last changed. A shard keeps a copy of the part of the log it has applied and rejects a request planned against an older
 schema, so a Worker with a stale cache cannot write through a dropped table. A request planned on a snapshot where
 only the range table moved is not stale.
 
 `DinfMeta` runs the shard statements of a change in its own SQLite, on empty copies of the tables, and records the
-change only if they succeed. A statement that parses but that SQLite rejects is therefore refused up front. A
-statement that fails only where rows exist (a `UNIQUE` index over duplicates, `ADD COLUMN` with a `CHECK`) is
-*withdrawn*: the shard that cannot apply it asks `DinfMeta` to record the inverse as the next version, shards that
-have not applied the change skip both versions, and the caller gets SQLite's message. This is safe because a new
-version is recorded only after every shard applied the previous one, so nothing can have been built on the change.
+prepare only if they succeed. A statement that parses but that SQLite rejects is therefore refused up front. The
+prepare stops writes to the tables the change must keep still (a table it drops, renames or adds a column to, or
+indexes from its rows); a shard that applies it refuses those writes until it applies the commit or the abort. A
+statement that can fail only where rows exist (a `UNIQUE` index over duplicates, `ADD COLUMN` with a `CHECK`) is tried
+by every shard on its fenced table and rolled back; if a shard's rows break it, the change is aborted and the caller
+gets SQLite's message. Nothing is undone: a change enters the schema only at its commit, so no statement ever planned
+on a change that did not happen. One transition is open at a time, and the driver renews a 5-second lease; if it
+stops, Meta aborts the change within the lease, and in any case after 5 minutes. Model M21.
 
 Five rules keep a schema change from tearing a transaction that is under way:
 
@@ -190,30 +194,30 @@ Five rules keep a schema change from tearing a transaction that is under way:
 - A write rechecks the schema version after any wait (a row lock, a group still arriving, the prepare round at the
   anchor), because DDL may have been applied meanwhile.
 - A new global (cross-shard `UNIQUE`) index on a table that has rows is built while writes to that table wait. The
-  version that records the index write-locks the table, shards refuse writes to it, and the index stays invisible to
-  planning until it is published. The rows are indexed while they cannot change, then Meta publishes or withdraws the
-  index exactly once. The builder renews a 5-second lease; if it stops, the lock lifts within the lease, and a build
-  ends after 5 minutes in any case. The publishing version carries a timestamp that every shard's clock moves past,
-  so statements that use the index come after every write made without it. Model M12.
+  prepare write-locks the table and creates the empty index table, and the index stays invisible to planning until it
+  is committed. The rows are indexed while they cannot change, then Meta commits or aborts the index exactly once. The
+  committing record carries a timestamp that every shard's clock moves past, so statements that use the index come
+  after every write made without it. Model M21 (it replaced M12).
 - A schema change inside a transaction first commits what the transaction did, and the statements after it form a
   new transaction (as in MySQL). A transaction keeps the schema version it first planned with until it commits, also
   when it continues on another connection. Model M13.
-- A `DROP TABLE` of a table the transaction read (the last step of a table rebuild) write-locks the table, has every
-  shard check that nothing changed in what the transaction read since it read it, and only then drops it. If
-  something changed, the drop fails as a conflict and no row is lost. Model M14.
+- A `DROP TABLE` of a table the transaction read (the last step of a table rebuild) write-locks the table at its
+  prepare, has every shard check that nothing changed in what the transaction read since it read it, and only then
+  commits. If something changed, the drop is aborted as a conflict and no row is lost. Model M21 (it replaced M14).
 - A shard born from a split catches up to its parent's schema before it accepts the parent's rows.
 - A shard that is handing over or receiving a range applies no schema change until the move is finished, and the
   parent catches up to the child's version before it fences the range. Rows and intents in transit then always have
   the shape of the table that receives them. Splits and schema changes take turns through a maintenance slot at
-  Meta: a split takes it only after every shard has applied the latest version, uses the version Meta returns with
-  it, and holds it until the child has received the range; Meta records no schema change meanwhile, so no request
-  planned at the current version is refused by a moving shard. Splits share the slot with each other; an index build
-  or a pre-drop lock holds it alone. A split that stops before the child starts receiving releases the slot after 5
-  seconds; one that has started cannot be undone, so the autoscaler resumes it. Model M15.
+  Meta: a split takes it only while no schema transition is open, uses the schema epoch Meta returns with it, and
+  holds it until the child has received the range; Meta opens no schema transition meanwhile, so no request planned
+  at the current schema is refused by a moving shard. Splits share the slot with each other. A split that stops before
+  the child starts receiving releases the slot after 5 seconds; one that has started cannot be undone, so the
+  autoscaler resumes it. Model M15 (stage 4 of the catalog epoch design replaces the slot with move records).
 
 The first four came out of randomized tests and a model (M11) that found six ways the first implementation got it
-wrong; the fifth, and the validation and withdrawal above, came out of a second design review and are covered by
-simulator tests but not yet by a model.
+wrong; the fifth came out of a second design review and is covered by simulator tests but not yet by a model. The
+two-phase transition replaced an earlier scheme that recorded a change at once and withdrew it afterwards when a
+shard could not apply it.
 
 ## Growing
 

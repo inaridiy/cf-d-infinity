@@ -10,11 +10,11 @@ Test references are `packages/cf-d-infinity/test/<file>.test.ts:<line>` or a tes
 counterexample.
 
 Categories:
-- A: the implementation has the guard, and a deterministic replay exists (78 rows; every row with a guard).
-  Of these, 53 also have a fault switch, and the replay checks that the switch produces the violation. 19 have no switch,
-  and 6 have a switch whose replay runs only the fixed code; for those 25 the replay checks the fixed code on the
-  model's ordering, not that removing the guard breaks it. (Recounted from this table on 2026-11-13; the three M5b range-floor rows were added on 2026-11-14, the four M21 rows of catalog epoch stage 2 on 2026-11-15.)
-- D: a design alternative the implementation never had or no longer has, or a variant another mechanism already covers; no switch needed (13 rows, M16 and M17 included).
+- A: the implementation has the guard, and a deterministic replay exists (83 rows; every row with a guard).
+  Of these, 62 also have a fault switch, and the replay checks that the switch produces the violation. 16 have no switch,
+  and 5 have a switch whose replay runs only the fixed code; for those 21 the replay checks the fixed code on the
+  model's ordering, not that removing the guard breaks it. (Recounted from this table on 2026-11-16, after catalog epoch stage 3 replaced the rows of M12 and M14 by 22 rows of M21. Before it, on 2026-11-15: 78 rows, 53, 19 and 6.)
+- D: a design alternative the implementation never had or no longer has, or a variant another mechanism already covers; no switch needed (14 rows, M16 and M17 included; `m15_red_no_based_on` became D in stage 3).
 - P: models for a mechanism that is designed but not in the code yet, so there is no guard to switch off. M18
   (`specs/m18_subslot_split.qnt`), M19 (`m19_claim_resplit.qnt`) and M20 (`m20_unique_piecewise.qnt`) model moving one
   tenant in pieces, stages 2 to 4 of [design-subslots.md](./design-subslots.md). Their 16 red modules get rows, switches
@@ -23,13 +23,16 @@ Categories:
   `m19_red_stale_map`, `m19_red_mixed_t`, `m19_red_gap`, `m19_red_forget_map`, `m19_red_piece_without_clock`,
   `m19_live_red_child_waits`, `m20_red_piecewise`, `m20_red_late_intent`, `m20_red_child_early`,
   `m20_red_child_reads_parent_per_piece`.
-  M21 (`m21_catalog_epoch.qnt`) models one epoch log in Meta in place of today's separate schema versions, write
+  M21 (`m21_catalog_epoch.qnt`) models one epoch log in Meta in place of the separate schema versions, write
   bans and split slot ([design-catalog-epoch.md](./design-catalog-epoch.md)). Its 31 red modules (the `red` lines of
-  the M21 section of `specs/check.sh`) get rows when the design is implemented. Many of them restate a red of M11 to
-  M15 that already has a row here; those rows move to M21 when M12, M14 and M15 are retired. Stage 2 (requests carry
-  the epoch and the schema epoch, 2026-11-15) gave rows to the four it reaches: `m21_red_no_recheck`, `m21_red_stale`,
-  `m21_red_owner_unchecked` and `m21_red_strict_epoch` (category A, in the table below). The other 27 stay in P until
-  stages 3 and 4.
+  the M21 section of `specs/check.sh`) get rows as the design is implemented. Stage 2 (requests carry the epoch and
+  the schema epoch, 2026-11-15) gave rows to the four it reaches: `m21_red_no_recheck`, `m21_red_stale`,
+  `m21_red_owner_unchecked` and `m21_red_strict_epoch`. Stage 3 (two-phase schema changes, 2026-11-16) gave rows to
+  the 22 it reaches and retired the rows of M12 and M14: each M12 and M14 red is restated by an M21 red, and the
+  table names the M12 or M14 module it replaces. The five reds of stage 4 (`m21_red_ddl_during_move`,
+  `m21_red_move_during_ddl`, `m21_red_end_early`, `m21_red_pull_unfenced`, `m21_red_fence_first`) stay in P. M15's
+  rows stay until stage 4 removes the split slot they describe; `m21_red_fence_first` replays today as
+  `test/open/fenced-before-switch.test.ts`.
   M22 (`m22_unique_keys.qnt`) models every non-primary-key UNIQUE as key rows that move with their piece
   ([design-unique-keys.md](./design-unique-keys.md)). It has 10 red modules (the `red` and `live_red` lines of the M22
   section of `specs/check.sh`). Eight get rows, switches and replays when the design is implemented, and the rows of
@@ -94,31 +97,15 @@ Categories:
 | m11_red_early_public | index public before backfill finishes | publishBeforeBackfill (added 2026-11-12; publishes before any entry is written, as in the model's trace) | unique-index-build ("a UNIQUE index that spans shards is published after the existing rows are indexed (m11_red_early_public)"; added 2026-11-12) | A |
 | m11_red_no_write_only | writes skip a write-only index | none | none | D |
 | m11_red_no_sync | DDL returns before all shards applied it | none (stub at ddl-concurrent:687, seed sweep) | migration:247 (fixed) | A |
-| m12_red_online | index used and maintained while being built (old design) | none | ddl-concurrent:368; unique-index-build:51 (fixed design) | D |
-| m12_red_no_lock | shard accepts writes during the build | ignoreTableLock | unique-index-build:109 | A |
-| m12_red_visible | planner uses the unfinished index | none | unique-index-build:41 (fixed) | A |
-| m12_red_no_drain | version advanced while intents are held | ddlIgnoresIntents | ddl-concurrent:436 (fixed) | A |
-| m12_red_stale | shard accepts stale-version plans | none | migration:234 (fixed, guard-only) | A |
-| m12_red_two_exits | late publish after expiry withdrawal | none | unique-index-build:63 (fixed) | A |
-| m12_red_repin | transaction takes new version without replanning | repinOnRestore | txn-across-schema-change:53 | A |
-| m12_red_scan_early | scan before the shard applied the lock version | scanBeforeLock (added 2026-11-12; removes both the sync before the scan and the lock version the scan names) | unique-index-build ("the rows are read for the index only after their shard applied the write lock (m12_red_scan_early)"; added 2026-11-12) | A |
-| m12_clock_red_no_clock | publish version carries no timestamp | publishWithoutClock | unique-index-build:140 | A |
-| m12_clock_red_skip_empty | build skips empty shards' clocks | scanSkipsEmpty (added 2026-11-12; the build still reads the empty shard, the switch drops its clock) | unique-index-build ("the publication timestamp of a UNIQUE index includes the clocks of shards with no rows (m12_clock_red_skip_empty)"; added 2026-11-12) | A |
 | m13_red_main | DDL takes effect before buffered writes, plus repin | noImplicitCommit (+repinOnRestore) | migration-tools:122 (fixed) | A |
 | m13_red_pin_only | DDL does not commit first; own new table unwritable | noImplicitCommit | migration-tools:161 (fixed) | A |
 | m13_red_repin | transaction takes new version without replanning | repinOnRestore | txn-across-schema-change:53 | A |
 | m13_red_retry_whole | batch retried from the top, replaying committed parts | replayAcrossSchemaChange | migration-tools:195 | A |
 | m13_red_ddl_anyway | DDL runs after the preceding commit failed | ddlAfterFailedCommit | migration-tools:145 (fixed) | A |
-| m14_red_no_lock | DROP guard checks but does not lock | ignoreTableLock / dropWithoutGuard | rebuild-guard:181 (fixed, guard-only) | A |
-| m14_red_no_check | DROP guard locks but does not check | dropWithoutGuard | rebuild-guard:81 | A |
-| m14_red_check_early | check before the lock version is applied | none | rebuild-guard:74 (fixed) | A |
-| m14_red_no_drain | lock version applied with intents unsettled | ddlIgnoresIntents + unchangedIgnoresIntents (two guards; added 2026-11-12) | rebuild-guard ("the guard settles intents before it checks for changes"); with only the drain removed the pending-write check still stops it | A |
-| m14_red_untied | DROP passes after the lock expires | dropAfterExpiry (Meta side, in `Faults`; added 2026-11-12) | rebuild-guard ("the DROP after a rebuild is recorded only while the lock still holds (m14_red_untied)"; added 2026-11-12) | A |
-| m14_red_commit_ts | check from the copy's commit ts instead of read ts | guardFromCommitTs + refreshNoBump (two guards: the commit-time refresh carries the commit ts to every shard the copy read; added 2026-11-12) | rebuild-guard ("the guard checks for changes from the time the copy read the table (m14_red_commit_ts)"); with only the commit ts put back the refresh still stops it | A |
 | m15_red_no_slot | DDL recorded mid-split (not atomic) | none | ddl-vs-split-race:15 (fixed) | A |
 | m15_red_stale_begin | split uses version read before taking the slot | none | split-hazards:79; child-behind-parent:17 | A |
 | m15_red_early_release | slot returned before the child finishes | none | split-slot:62 (fixed) | A |
-| m15_red_no_based_on | slot taken before all shards applied the latest version | splitWithoutSync (in `ClientFaults`, read by autoscaler's reserveSplit; added 2026-11-12) | split-slot ("a split takes its slot only after every shard applied the latest version (m15_red_no_based_on)"; added 2026-11-12); on fixed code the first `split()` fails with `stale schema` before taking a slot, so the replay runs it again as the Autoscaler does (open problem 22, `test/open/split-reserve-revoked.test.ts`) | A |
+| m15_red_no_based_on | slot taken before all shards applied the latest version, so a revocation lands mid-split | splitWithoutSync (in `ClientFaults`, read by autoscaler's reserveSplit; added 2026-11-12). Since catalog epoch stage 3 (2026-11-16) it reproduces nothing: the flaw needs a revocation, and a schema change that fails on rows is now aborted at its prepare. A split does not take its slot while a transition is open, and a prepare is not recorded while a slot is held, so no schema record lands mid-split. The successor red, `m21_red_move_during_ddl`, gets its row in stage 4 | split-slot ("a split does not start while a schema change is open, so no schema record lands mid-split (m15_red_no_based_on)", with and without the switch); split-reserve-revoked (open problem 22, closed in stage 3) | D |
 | m15_red_late_start | child starts after the slot expired | startWithoutSlot + fenceWithoutSlot (Meta side; two guards: startSplit, and checkSplit before the parent fences; added 2026-11-12) | split-slot ("a child that starts receiving after the split slot lapsed (m15_red_late_start)"); with only the start put back the fence check still stops it | A |
 | m16_red_body_only | prepare checks UNIQUE only against the body, not with other intents applied (added 2026-11-12) | autoIgnoresUniqueIntents (the autocommit path; transactions use the same `uniquePending`) | review-regressions:65 | A |
 | m16_red_intents_only | prepare checks UNIQUE only with other intents applied, not against the body (added 2026-11-12) | none: the body check is SQLite's own UNIQUE constraint on the shard's table, which the code cannot run without | none | D |
@@ -132,6 +119,28 @@ Categories:
 | m21_red_stale | the shard accepts a plan made on an older schema epoch | none (the check in `schemaStep`, src/shard/kernel.ts) | epoch-requests ("refuses a request planned on an older schema epoch, whatever epoch it carries"; fixed, guard-only; added 2026-11-15) | A |
 | m21_red_owner_unchecked | the shard does not look ownership up in its own snapshot | ignoreFence (widened in stage 2: it now also turns off the snapshot check, next to the `__fenced` refusal) | epoch-requests ("refuses a row that its snapshot gives to another shard ..." and "put back with ignoreFence ..."; added 2026-11-15); migration ("a parent that ignores the fence accepts a write the child never sees") for the parent's side | A |
 | m21_red_strict_epoch | the shard requires the request's epoch to equal its own, so a split refuses unmoved rows of transactions planned before it (not a safety flaw) | none | transaction-on-unmoved-rows-across-split (four tests, through the Worker); epoch-requests ("serves an unmoved row to a request planned before a split that the shard has applied" and "... a newer epoch ... without fetching the log"; added 2026-11-15) | A |
+| m21_red_online | the index is used and maintained while it is being built (the design before 2026-11; M12's m12_red_online) | none | unique-index-build ("a write waits for the build, and does not delete a row because of an index that is then withdrawn"); ddl-concurrent ("BUG-2b (fixed): writes wait while a UNIQUE index is built ...") (fixed design) | D |
+| m21_red_no_fence | a shard that applied the prepare of an index build accepts writes to the fenced table (M12's m12_red_no_lock, M11's m11_impl_backfill) | ignoreTableLock | unique-index-build ("put back: a shard that accepts the write leaves the index with the value the row no longer has"); ddl-concurrent ("BUG-2 (randomized) (fixed): leaves no index entry without a matching row") | A |
+| m21_red_visible | the planner uses the unfinished index (M12's m12_red_visible) | none (the index enters the schema only at its commit) | unique-index-build ("a read that gathers the table does not fail because of the index"; fixed) | A |
+| m21_red_no_drain | a shard applies a schema record while it holds intents (M12's m12_red_no_drain, M11's m11_impl_inflight) | ddlIgnoresIntents | ddl-concurrent ("BUG-4 (fixed): a cross-shard commit in flight across CREATE INDEX stays visible through the index"; fixed) | A |
+| m21_red_two_exits | a commit goes through after the transition was aborted (M12's m12_red_two_exits) | commitAfterAbort (widened from dropAfterExpiry in stage 3: Meta records the aborted prepare again and commits it) | m21-two-phase ("a late commit after the lease lapsed is refused (m21_red_two_exits)"; the put-back publishes an index without entries, because applying the abort dropped the staging table) | A |
+| m21_red_repin | a transaction takes a newer schema epoch without planning again (M12's m12_red_repin, M13's m13_red_repin) | repinOnRestore | txn-across-schema-change ("put back: a transaction that takes the new version commits a row that the index does not know") | A |
+| m21_red_scan_early | the build reads a shard's rows before that shard applied the prepare (M12's m12_red_scan_early) | checkBeforePrepare (widened from scanBeforeLock in stage 3: every check of a transition runs before the prepared round, naming the schema epoch before the prepare) | unique-index-build ("the rows are read for the index only after their shard applied the write lock (m21_red_scan_early)") | A |
+| m21_red_early_commit | the commit is recorded before every shard acknowledged the prepare (M11's m11_red_early_public) | publishBeforeBackfill (commits before any entry is written, as in the model's trace). commitWithoutAcks alone does not reach this shape: the build's scan names the prepare epoch, so the shard it skipped applies the prepare before its rows are read | unique-index-build ("a UNIQUE index that spans shards is published after the existing rows are indexed (m11_red_early_public)") | A |
+| m21_red_trial_no_fence | a trial is not protected by a fence: a write that breaks the change lands between the trial and the commit | ignoreTableLock | m21-two-phase ("a trial is not undone by a write before the commit (m21_red_trial_no_fence)") | A |
+| m21_red_trial_missing_ack | a change that can fail on rows is committed without one shard's trial | commitWithoutAcks (new in stage 3; two guards: the Worker skips the last shard's prepared and sync, Meta does not check that the acknowledgements cover the range table; `FAULT=` sets both) | m21-two-phase ("a change is committed only after every shard tried it (m21_red_trial_missing_ack)"; a third test keeps Meta's check alone and shows it refuses the commit) | A |
+| m21_red_trial_early | a shard answers a trial before it applied the prepare | checkBeforePrepare | m21-two-phase ("a shard tries the change only after it applied the prepare (m21_red_trial_early)") | A |
+| m21_red_trial_no_drain | a shard applies the prepare of a trial with intents unsettled, so the trial passes over a pending row | ddlIgnoresIntents | m21-two-phase ("the prepare settles the intents of the fenced table before the trial (m21_red_trial_no_drain)") | A |
+| m21_red_drop_no_fence | the DROP of a table a transaction read checks for changes but does not stop writes (M14's m14_red_no_lock) | ignoreTableLock (dropWithoutGuard removes the check as well) | m21-two-phase ("the DROP of a table a transaction read stops writes until it commits (m21_red_drop_no_fence)") | A |
+| m21_red_drop_no_check | the DROP stops writes but does not check for changes (M14's m14_red_no_check) | dropWithoutGuard | rebuild-guard ("put back: without the guard, the table is dropped and the row is lost") | A |
+| m21_red_drop_check_early | the check runs before the shard applied the prepare (M14's m14_red_check_early) | checkBeforePrepare | m21-two-phase ("the guard checks for changes only after the shard applied the prepare (m21_red_drop_check_early)") | A |
+| m21_red_drop_no_drain | the prepare of the DROP is applied with intents unsettled (M14's m14_red_no_drain, M11's m11_impl_drop) | ddlIgnoresIntents + unchangedIgnoresIntents (two guards) | rebuild-guard ("the guard settles intents before it checks for changes"); review-regressions ("without settling intents first, the committed transaction is stuck forever (the bug)"); ddl-concurrent ("BUG-5 (fixed): DROP TABLE does not lose a committed write to another table in the same transaction") | A |
+| m21_red_drop_untied | the DROP commits after its lease lapsed and the transition was aborted (M14's m14_red_untied) | commitAfterAbort | rebuild-guard ("the DROP after a rebuild is committed only while the lock still holds (m21_red_drop_untied)") | A |
+| m21_red_drop_missing_ack | the DDL returns before every shard applied the prepare (M11's m11_red_no_sync) | commitWithoutAcks | m21-two-phase ("a DROP TABLE returns only after every shard applied its prepare (m21_red_drop_missing_ack)"); ddl-concurrent ("lost-write check: detects a DDL that returns before every shard applied it", with every shard answering prepared without applying: commitWithoutAcks skips one shard of three and the randomized workload did not hit it in 60 seeds) | A |
+| m21_red_two_open | two schema transitions are open at once: a DROP commits while an index on the same table is built | overlappingTransitions (new in stage 3) | m21-two-phase ("one schema transition is open at a time (m21_red_two_open)"). In the model's order, Meta's own SQLite refuses the build's commit on the dropped table (a second guard), so no shard is left with a commit it cannot apply; with an ADD COLUMN instead of the DROP, the build's commit puts back the table definition without the column | A |
+| m21_clock_red_no_clock | the commit that publishes the index carries no timestamp (M12's m12_clock_red_no_clock) | publishWithoutClock | unique-index-build ("put back: without the timestamp, a statement fails on a row that, in timestamp order, is not there yet") | A |
+| m21_clock_red_skip_empty | the build skips the clocks of shards with no rows (M12's m12_clock_red_skip_empty) | scanSkipsEmpty (the build still reads the empty shard, the switch drops its clock) | unique-index-build ("the publication timestamp of a UNIQUE index includes the clocks of shards with no rows (m12_clock_red_skip_empty)") | A |
+| m21_guard_red_commit_ts | the DROP's check starts from the copy's commit time instead of its read time (M14's m14_red_commit_ts) | guardFromCommitTs + refreshNoBump (two guards) | rebuild-guard ("the guard checks for changes from the time the copy read the table (m14_red_commit_ts)"); with only the commit ts put back the refresh still stops it | A |
 
 Two changes of the Worker's transaction layer (2026-11-16) use M9 as it is, with no new module. A pessimistic
 transaction now also locks the rows that a statement run in the Worker's SQLite wrote (`Txn.lockWritten`, open problem 36):
