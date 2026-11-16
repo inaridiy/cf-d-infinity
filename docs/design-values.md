@@ -355,6 +355,7 @@ object `[{"a": 1}]` は、キー文字列を作る `lowerHex` の中で TypeErro
 文を実行する前に断るので、取引の中でも何も書かない。どちらも引数の型で決まり、行の置き場所には依らない。
 HTTP の印 (小数点か指数のある安全な整数) は、reviver だけが作るクラスである。JSON の本文にも structured clone にも作れないので、利用者は偽れない。
 reviver は配列の要素の数だけを読み替え、本文の `token` などは JS の数のまま残す。
+Hrana の `fromH` は、型の印 (`type`) と値の JS の型が合うかを確かめていない (`float` の文字列が TEXT に、`float` の配列が BLOB になる)。`src/client/hrana.ts` はこの作業では触らなかったので、正しい挙動を期待する再現を `test/open/hrana-value-types.test.ts` に置いた。
 
 検査は、規則を先に書き、前のコードで落ちることを確かめてからコミットした (`test/entry-values.ts`、規則 2)。
 シミュレータでは `test/entry-values.test.ts` が、HTTP の本文の読み方と D1 互換の API を、1 と 2 のシャードで、表を読まない文と主キーで読み書きする文に流す。
