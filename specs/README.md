@@ -1505,3 +1505,127 @@ witness は 6 つで、どれも到達した。
 - 渡した行を残す場所。範囲が戻ったとき (BACK)、残した行と受け取った行を別に持つものとして扱った。
 - 移動 2 回で変更ログを 2 回以上切り詰めること (状態数のため)。
 - M23b の「モデルにないもの」の全部。
+
+### M24 `m24_table_epochs.qnt` — 表ごとの epoch。DDL が取引を古くするのは、取引が頼る表を変えて確定したときだけ (未解決の問題 53)
+
+2026-11-16 に書いた。
+実装より先に書いたモデルである。
+設計は [docs/design-catalog-epoch.md](../docs/design-catalog-epoch.md) の「表ごとの epoch (2026-11-16)」にある。
+
+段 3 の取引は、表定義全体の epoch を 1 つ名乗り、それは prepare、commit、abort のどれでも進む。
+そのため、関係のない表の `CREATE TABLE` も、失敗した DDL も、開いている取引を全部古くする。
+決めた設計では、表と view が、それぞれ epoch を持つ (表は読みの epoch と書き込みの epoch の 2 つ)。
+epoch は commit だけで進み、要求は、計画が頼るもの (読む表、書く表、view とその元の表) と、その epoch を運ぶ。
+シャードは、運ばれたものだけを比べる。
+
+本体 (`m24_core`) は M21 の本体を写したもので、表定義のものを 4 つ (表 A、A の上の view V、別の表 B、まだない表 N) にした。
+A は M21 の表 (行 1 はシャード P、行 2 は Q) で、index は A の上の、シャードをまたぐ UNIQUE (`BUILD`) である。
+DDL は M21 の 3 つ (`BUILD`、`CHECK`、`DROP`。どれも A のもの) と移動 (`SPLIT`) に、2 つを足した。
+`NEWT` (`CREATE TABLE N`。fence はない) と、`ALTB` (B の、行で失敗し得る DDL。B の行の値が 2 なら Q の試しが通らずに abort、そうでなければ commit) である。
+取引は、A の 1 行を書き、書き込みの計画が B を読むことがあり (`VIA_B`)、確定の前に A か V を読む文を 1 つ実行できる (`TXN_READ`、`VIA_V`)。
+書き込み禁止の表への書き込みは、断らずに待つ (M21 は断る。いまの実装の `TableLocked` の待ちに合わせた)。
+M21 の設計の条件は、設計どおりに固定した (外した形は M21 が確かめている)。
+
+時刻、行ロック、取引の中の DDL は、小さなモデルで確かめる。
+
+- `m24_floor_*`: シャードの DDL の床。シャード 1 つ、表 A と B、時計 0〜5。別の接続の書き込みと、B の形を変える DDL の commit の後で、取引が古い T で A か B を読む (読み戻し。refresh と述語の検証も同じ規則)。
+- `m24_lock_*`: 行ロックと DDL の待ち。表 X の行 2 つ (P と Q)、悲観の取引 1 件 (P に書き、Q に書き、確定する)、X の DDL 1 回。ロックは、利用者の待ちで切れるか (`idleExpire`)、書き込み禁止で待っている間に切れる (`blockedExpire`)。
+- `m24_boundary_*`: M13 の本体に、ほかの接続の DDL が区切りの表に触るかを足したもの。
+
+決めたこと 6 (epoch を commit だけで進める) は、M21 の本体を、M21 のインスタンスと同じ定数で `SCHEMA_ON_PREPARE = false` にして確かめ直した (`m24_m21_*`)。
+M21 のファイルは変えていない (`test/catalog-m21.test.ts` が、その sha256 を確かめている)。
+
+不変条件は、M21 のもの (`noServeBelowAck` と `pinned` を除く。`m21Safe`) と、新しい 3 つである。
+
+| 不変条件 | 意味 |
+|---|---|
+| `planMatches` | シャードが要求を受け付けるとき、要求が本当に頼るどのものの表定義も、計画のときと同じである (M21 の `noServeBelowAck` と `pinned` を、ものごとに言い直したもの) |
+| `noRefusalUnrelated` | 頼るものに触る表定義の記録が計画の後にないのに、持ち主が版の理由で断ることはない (「表 A の取引は、表 B の DDL で断られない」。M21 の `pinnedSurvives` を、ものごとにしたもの) |
+| `noRefusalWithoutChange` | 頼るものの表定義が計画の後に変わっていない (確定した DDL がない) のに、持ち主が版の理由で断ることはない (失敗した DDL は、触った表の取引も断らない) |
+| `noRestoreAcross` (`m24_floor`) | 形を変える DDL より前の行の image を、新しい形の表に戻さない |
+| `holderSurvives` (`m24_lock`) | 行を書いた取引は、ロックが利用者の待ちで切れていなければ、DDL のために断られない |
+| `boundarySafeAll` (`m24_boundary`) | M13 の `boundarySafe` と、区切りの表に触る DDL がないのに版の理由で断られないこと |
+
+`m24Safe` は `m21Safe` と新しい 3 つの論理積である。
+`noServeBelowAck` は、commit だけで進める形では定義から成り立たない (M21 の `m21_alt_commit_only_*` と同じ)。
+`pinned` は、名乗り直す手がないので、いつも成り立つ。
+
+2026-11-16 に、TLC (heap 2.5 GB、4 workers) で流した。
+既定の 56 個 (緑、赤、witness) と `run` の試験 23 個が、期待どおりだった。HEAVY の 42 個の結果は、表の下に書いた。
+
+| 種類 | インスタンス | invariant | 到達状態数 (distinct) | 確かめること |
+|---|---|---|---|---|
+| green | `m24_green_unrelated` | `m24Safe` | 273,599 | 関係のない `CREATE TABLE` と、B の DDL (確定か失敗)。A だけに頼る取引と、B を読んで A を書く取引。取引 1 件 |
+| green | `m24_green_build` | `m24Safe` | 493,011 | A の index の作成と、関係のない `CREATE TABLE`。index の commit より前の計画の読みは通り、書き込みは断られる |
+| green | `m24_green_check` | `m24Safe` | 391,605 | A の、行で失敗し得て形を変える DDL と、関係のない `CREATE TABLE` |
+| green | `m24_green_drop` | `m24Safe` | 131,090 | DROP TABLE A と、関係のない `CREATE TABLE`。V を通る読みも断られる |
+| green | `m24_green_split` | `m24Safe` | 272,399 | 移動と、関係のない `CREATE TABLE` |
+| red | `m24_red_global` | `noRefusalUnrelated` | 551 | 段 3 の形: 表定義全体の epoch 1 つを、どの記録でも進める。`CREATE TABLE N` の prepare で、A の取引が断られる |
+| red | `m24_red_global_commit_only` | `noRefusalUnrelated` | 30,552 | 全体の epoch 1 つを、commit だけで進める。`CREATE TABLE N` の commit で、A の取引が断られる |
+| red | `m24_red_prepare_advances` | `noRefusalWithoutChange` | 792 | 表ごとだが、prepare と abort でも進める。失敗する B の DDL の prepare で、B を読んだ取引が断られる |
+| red | `m24_red_read_deps` | `planMatches` | 25,997 | 書き込みの計画が読んだ表 (B) を、要求が運ばない |
+| red | `m24_red_apply_all` | `noRefusalUnrelated` | 146 | 段 3 の `schemaChanging`: 記録の適用中に、どの要求も断る |
+| red | `m24_red_apply_touched` | `noRefusalWithoutChange` | 283 | 記録の適用中に、記録が触る表に頼る要求を、待たせずに断る |
+| red | `m24_red_index` | `indexMatches` | 94,553 | index の DDL を、表とは別のものとして数える (`m21_red_stale` と同じ形) |
+| red | `m24_red_index` | `planMatches` | 60,564 | |
+| red | `m24_red_write_epoch` | `indexMatches` | 94,541 | 書き込みが、表の読みの epoch を比べる |
+| red | `m24_red_view` | `readConsistent` | 12,893 | view を通る計画が、元の表を運ばない。A の DROP の後で、V を通る読みに答える |
+| red | `m24_red_view` | `planMatches` | 12,759 | |
+| witness | `m24_green_unrelated` | `witnessAcrossUnrelated` | 167,637 | 取引が、計画の後の関係のない `CREATE TABLE` の commit と、関係のない DDL の abort を、両方とも適用したシャードで受け付けられ、確定する |
+| witness | `m24_green_unrelated` | `witnessAcrossFailedRead` | 10,346 | B を読んだ計画の書き込みが、B の DDL の abort の後で、計画し直さずに確定する |
+| witness | `m24_green_unrelated` | `witnessRefusedChanged` | 31,673 | B の DDL が確定すれば、B を読んだ計画は断られる |
+| witness | `m24_green_check` | `witnessAcrossFailedTouched` | 18,844 | A の DDL の prepare より前の計画の書き込みが、禁止の間は待ち、DDL の abort の後で確定する |
+| witness | `m24_green_check` | `witnessTrialRejectedThenWrite` | 21,558 | |
+| witness | `m24_green_check` | `witnessCheckCommittedThenWrite` | 131,630 | |
+| witness | `m24_green_build` | `witnessReadAcrossIndex` | 60,460 | index の commit より前に計画した読みが、commit を適用したシャードで答えられる |
+| witness | `m24_green_build` | `witnessPublicThenWrite` | 99,437 | |
+| witness | `m24_green_drop` | `witnessDroppedAfterWrites` | 39,589 | |
+| witness | `m24_green_split` | `witnessServedWhileDriverDead` | 6,215 | |
+| witness | `m24_green_split` | `witnessPinnedSurvives` | 326 | |
+| witness | `m24_green_split` | `witnessParentAnswersUncut` | 245 | |
+| green | `m24_red_global` | `witnessAcrossUnrelated` | 163,707 | 同じ witness は、段 3 の形では届かない |
+| green | `m24_red_global_commit_only` | `witnessAcrossUnrelated` | 267,282 | 全体の epoch を commit だけで進めても届かない |
+| green | `m24_red_prepare_advances` | `witnessAcrossFailedRead` | 242,702 | prepare でも進めると、B の DDL が失敗しても、B を読んだ取引は確定できない |
+| green | `m24_floor_green` | `floorSafe` | 1,903 | 床を表ごとに持ち、形を変えた表にだけ置き、読む表の行だけを読み戻す |
+| red | `m24_floor_red_global` | `noRefusalUnrelated` | 524 | 段 3 の形: 床がシャードに 1 つ |
+| red | `m24_floor_red_restore_all` | `noRefusalUnrelated` | 518 | 床は表ごとだが、読み戻すのは、すべての表の行 |
+| red | `m24_floor_red_no_floor` | `noRestoreAcross` | 498 | 形を変えた表に床を置かない |
+| witness | `m24_floor_green` | `witnessServedBelow` | 509 | B の DDL より古い T で、T より後に確定のある A を読み戻して答える |
+| witness | `m24_floor_green` | `witnessRefusedB` | 600 | B の DDL より前の B の確定を読み戻す読みは、断られる |
+| green | `m24_lock_green` | `holderSurvives` | 648 | prepare は行ロックを待ち、書き込み禁止に当たったロックを持つ取引は、遷移を取り消させる |
+| red | `m24_lock_red_no_wait` | `holderSurvives` | 735 | prepare が行ロックを待たない |
+| red | `m24_lock_red_no_wound` | `holderSurvives` | 88 | 書き込み禁止に当たった、ロックを持つ取引が、遷移を取り消させない |
+| witness | `m24_lock_green` | `witnessDdlAfterTxn` | 636 | 書いた取引が確定し、DDL は、その後で確定する |
+| witness | `m24_lock_green` | `witnessWoundThenCommit` | 433 | 別のシャードの書き込み禁止に当たった取引が、DDL を取り消させて確定する |
+| witness | `m24_lock_green` | `witnessDdlBusy` | 220 | シャードのロックの待ちが上限を過ぎて DDL が失敗し、取引が確定する |
+| green | `m24_boundary_green` | `boundarySafeAll` | 127 | M13 の設計を、表ごとに比べる形で |
+| red | `m24_boundary_red_main` | `prefixOfScript` | 9 | M13 の `m13_red_main` |
+| red | `m24_boundary_red_pin_only` | `ownDdlVisible` | 17 | M13 の `m13_red_pin_only` |
+| red | `m24_boundary_red_repin` | `pinned` | 79 | M13 の `m13_red_repin` |
+| red | `m24_boundary_red_retry_whole` | `prefixOfScript` | 107 | M13 の `m13_red_retry_whole` |
+| red | `m24_boundary_red_ddl_anyway` | `prefixOfScript` | 17 | M13 の `m13_red_ddl_anyway` |
+| red | `m24_boundary_red_global` | `noRefusalUnrelated` | 82 | すべての DDL の版と比べる (M13 と段 3 の形) |
+| witness | `m24_boundary_green` | `witnessUnrelatedNoRetry` | 125 | 関係のない DDL が区切りの途中に入っても、やり直さずに終わる |
+| witness | `m24_boundary_green` | `witnessRetriedAndDone` | 111 | |
+| witness | `m24_boundary_green` | `witnessOtherDdlThenDone` | 88 | |
+| green | `m24_boundary_red_global` | `witnessUnrelatedNoRetry` | (下) | 同じ witness は、すべての DDL の版と比べると届かない |
+| green | `m24_m21_green_split_txns` | `epochSafeCommitOnly` | 75,003 | M21 の `m21_green_split_txns` を、commit だけで進める形で |
+| green | `m24_m21_green_split` | `epochSafeCommitOnly` | 195,824 | M21 の `m21_green_split` を、commit だけで進める形で |
+
+HEAVY=1 のときだけ流すもの。
+
+| 種類 | インスタンス | invariant | 到達状態数 (distinct) | 確かめること |
+|---|---|---|---|---|
+| green | `m24_m21_green_drop` | `epochSafeCommitOnly` | 723,604 | M21 の `m21_green_drop` を、commit だけで進める形で |
+| green | `m24_m21_green_ddl2` | `epochSafeCommitOnly` | (下) | M21 の `m21_green_ddl2` を、同じく |
+| green | `m24_m21_green_split_build` | `epochSafeCommitOnly` | (流していない) | M21 の `m21_green_split_build` を、同じく |
+| red | `m24_m21_red_*` (28 個、35 本) | M21 の赤と同じ (`noServeBelowAck` を除く) | (下) | M21 の赤を、commit だけで進める形で |
+| green | `m24_green_unrelated2`、`_build2`、`_check2`、`_drop2` | `m24Safe` | (下) | 取引 2 件 |
+
+モデルにないもの。
+
+- 時刻と、読みの答えの中身。本体の読みは、確定した最新の値を答えたかだけを見る。index の DDL の後で古い計画の読みに答えてよいことは、読みの経路が index と UNIQUE を使わない、という、計画と範囲のコードを読んだ結果に依る。モデルはそれを前提にしている (`changes` の表)。
+- 名前の作り直し (DROP の後の CREATE、RENAME)。DROP は消すところまでである。
+- 2PC の取引と、2 つ以上の表に書く取引。本体の取引は A の 1 行を書く。
+- 記録の適用の活性。ほかの表の intent のために適用が飢えないことは、時相の性質としては確かめていない。
+- `m24_lock` の取引は 1 件で、ロックを持つ取引どうしの順序 (wound-wait) は M9 が受け持つ。

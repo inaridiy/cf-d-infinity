@@ -493,6 +493,118 @@ for m in m21_green_build m21_green_check m21_green_drop m21_green_split m21_gree
          m21_red_two_open m21_red_ddl_during_move m21_red_move_during_ddl m21_red_end_early m21_red_pull_unfenced m21_red_fence_first \
          m21_red_owner_unchecked m21_red_strict_epoch m21_alt_commit_only_check m21_clock_red_no_clock m21_clock_red_skip_empty m21_guard_red_commit_ts; do tests $f $m; done
 
+echo "== M24 table epochs (DDL が取引を古くするのは、取引が頼る表を変えて確定したときだけ。未解決の問題 53。実装より先に書いたモデル)"
+f=m24_table_epochs.qnt
+green   $f m24_green_unrelated m24Safe                  # 関係のない CREATE TABLE と、B の DDL (確定か失敗)。A だけに頼る取引と、B を読んで A を書く取引
+green   $f m24_green_build m24Safe                      # A の index の作成と、関係のない CREATE TABLE。index の commit より前の計画は、読みは通り、書き込みは断られる
+green   $f m24_green_check m24Safe                      # A の、行で失敗し得て形を変える DDL と、関係のない CREATE TABLE
+green   $f m24_green_drop m24Safe                       # DROP TABLE A と、関係のない CREATE TABLE。V を通る読みも断られる
+green   $f m24_green_split m24Safe                      # 移動と、関係のない CREATE TABLE
+red     $f m24_red_global noRefusalUnrelated            # 段 3 の形: 表定義全体の epoch 1 つを、どの記録でも進める
+red     $f m24_red_global_commit_only noRefusalUnrelated  # 全体の epoch 1 つを、commit だけで進める
+red     $f m24_red_prepare_advances noRefusalWithoutChange  # 表ごとだが、prepare と abort でも進める: 失敗した DDL が、触った表の取引を断る
+red     $f m24_red_read_deps planMatches                # 書き込みの計画が読んだ表を、要求が運ばない
+red     $f m24_red_apply_all noRefusalUnrelated         # 段 3 の schemaChanging: 記録の適用中に、どの要求も断る
+red     $f m24_red_apply_touched noRefusalWithoutChange # 記録の適用中に、記録が触る表に頼る要求を、待たせずに断る
+red     $f m24_red_index indexMatches                   # index の DDL を、表とは別のものとして数える
+red     $f m24_red_index planMatches
+red     $f m24_red_write_epoch indexMatches             # 書き込みが、表の読みの epoch を比べる
+red     $f m24_red_view readConsistent                  # view を通る計画が、元の表を運ばない
+red     $f m24_red_view planMatches
+witness $f m24_green_unrelated witnessAcrossUnrelated   # 取引が、関係のない CREATE TABLE の commit と、関係のない DDL の abort をまたいで確定する
+witness $f m24_green_unrelated witnessAcrossFailedRead  # B を読んだ計画の書き込みが、B の DDL の abort の後で、計画し直さずに確定する
+witness $f m24_green_unrelated witnessRefusedChanged    # B の DDL が確定すれば、B を読んだ計画は断られる
+witness $f m24_green_check witnessAcrossFailedTouched   # A の DDL の prepare より前の計画の書き込みが、禁止の間は待ち、DDL の失敗の後で確定する
+witness $f m24_green_check witnessTrialRejectedThenWrite
+witness $f m24_green_check witnessCheckCommittedThenWrite
+witness $f m24_green_build witnessReadAcrossIndex       # index の commit より前に計画した読みが、commit を適用したシャードで答えられる
+witness $f m24_green_build witnessPublicThenWrite
+witness $f m24_green_drop witnessDroppedAfterWrites
+witness $f m24_green_split witnessServedWhileDriverDead
+witness $f m24_green_split witnessPinnedSurvives
+witness $f m24_green_split witnessParentAnswersUncut
+green   $f m24_red_global witnessAcrossUnrelated        # 同じ witness は、段 3 の形では届かない
+green   $f m24_red_global_commit_only witnessAcrossUnrelated
+green   $f m24_red_prepare_advances witnessAcrossFailedRead
+# DDL の床 (古い時刻の行の読み戻し)
+green   $f m24_floor_green floorSafe
+red     $f m24_floor_red_global noRefusalUnrelated      # 段 3 の形: 床がシャードに 1 つ
+red     $f m24_floor_red_restore_all noRefusalUnrelated # 読み戻すのが、すべての表の行
+red     $f m24_floor_red_no_floor noRestoreAcross       # 形を変えた表に床を置かない
+witness $f m24_floor_green witnessServedBelow
+witness $f m24_floor_green witnessRefusedB
+# 行ロックと DDL の待ち (触った表に書いた取引)
+green   $f m24_lock_green holderSurvives
+red     $f m24_lock_red_no_wait holderSurvives          # prepare が行ロックを待たない
+red     $f m24_lock_red_no_wound holderSurvives         # 書き込み禁止に当たった、ロックを持つ取引が、遷移を取り消させない
+witness $f m24_lock_green witnessDdlAfterTxn
+witness $f m24_lock_green witnessWoundThenCommit
+witness $f m24_lock_green witnessDdlBusy
+# 取引の中の DDL (M13 を表ごとにしたもの)
+green   $f m24_boundary_green boundarySafeAll
+red     $f m24_boundary_red_main prefixOfScript
+red     $f m24_boundary_red_pin_only ownDdlVisible
+red     $f m24_boundary_red_repin pinned
+red     $f m24_boundary_red_retry_whole prefixOfScript
+red     $f m24_boundary_red_ddl_anyway prefixOfScript
+red     $f m24_boundary_red_global noRefusalUnrelated   # すべての DDL の版と比べる (M13 と段 3 の形)
+witness $f m24_boundary_green witnessUnrelatedNoRetry   # 関係のない DDL が区切りの途中に入っても、やり直さずに終わる
+witness $f m24_boundary_green witnessRetriedAndDone
+witness $f m24_boundary_green witnessOtherDdlThenDone
+green   $f m24_boundary_red_global witnessUnrelatedNoRetry  # 同じ witness は、すべての DDL の版と比べると届かない
+# 決めたこと 6 の確かめ直し: M21 の場面を、epoch を commit だけで進める形で (index の作成と CHECK は、M21 の m21_alt_commit_only_*)
+green   $f m24_m21_green_split_txns epochSafeCommitOnly
+green   $f m24_m21_green_split epochSafeCommitOnly
+if [ "${HEAVY:-0}" = "1" ]; then                        # M21 の大きな場面と、M21 の赤 (noServeBelowAck を除く) を、commit だけで進める形で。取引 2 件の M24
+  green $f m24_m21_green_drop epochSafeCommitOnly
+  green $f m24_m21_green_ddl2 epochSafeCommitOnly
+  green $f m24_m21_green_split_build epochSafeCommitOnly
+  red   $f m24_m21_red_online indexMatches
+  red   $f m24_m21_red_online notRelied
+  red   $f m24_m21_red_no_fence indexMatches
+  red   $f m24_m21_red_visible notRelied
+  red   $f m24_m21_red_no_drain noWriteWhileFenced
+  red   $f m24_m21_red_stale indexMatches
+  red   $f m24_m21_red_two_exits oneExit
+  red   $f m24_m21_red_two_exits indexMatches
+  red   $f m24_m21_red_repin indexMatches
+  red   $f m24_m21_red_repin pinned
+  red   $f m24_m21_red_scan_early indexMatches
+  red   $f m24_m21_red_no_recheck indexMatches
+  red   $f m24_m21_red_early_commit indexMatches
+  red   $f m24_m21_red_trial_no_fence commitApplies
+  red   $f m24_m21_red_trial_missing_ack commitApplies
+  red   $f m24_m21_red_trial_early commitApplies
+  red   $f m24_m21_red_trial_no_drain commitApplies
+  red   $f m24_m21_red_drop_no_fence guardHolds
+  red   $f m24_m21_red_drop_no_check guardHolds
+  red   $f m24_m21_red_drop_check_early guardHolds
+  red   $f m24_m21_red_drop_no_drain guardHolds
+  red   $f m24_m21_red_drop_no_drain noResurrect
+  red   $f m24_m21_red_drop_untied guardHolds
+  red   $f m24_m21_red_drop_missing_ack noLostAfterReturn
+  red   $f m24_m21_red_two_open commitApplies
+  red   $f m24_m21_red_ddl_during_move servable
+  red   $f m24_m21_red_move_during_ddl servable
+  red   $f m24_m21_red_end_early servable
+  red   $f m24_m21_red_pull_unfenced moveKeepsWrites
+  red   $f m24_m21_red_pull_unfenced readConsistent
+  red   $f m24_m21_red_pull_unfenced sameShape
+  red   $f m24_m21_red_fence_first servable
+  red   $f m24_m21_red_owner_unchecked moveKeepsWrites
+  red   $f m24_m21_red_owner_unchecked readConsistent
+  red   $f m24_m21_red_strict_epoch pinnedSurvives
+  green $f m24_green_unrelated2 m24Safe
+  green $f m24_green_build2 m24Safe
+  green $f m24_green_check2 m24Safe
+  green $f m24_green_drop2 m24Safe
+fi
+for m in m24_green_unrelated m24_green_build m24_green_check m24_green_drop m24_green_split \
+         m24_red_global m24_red_global_commit_only m24_red_prepare_advances m24_red_read_deps m24_red_apply_all m24_red_apply_touched \
+         m24_red_index m24_red_write_epoch m24_red_view \
+         m24_floor_green m24_floor_red_global m24_floor_red_restore_all m24_floor_red_no_floor \
+         m24_lock_green m24_lock_red_no_wait m24_lock_red_no_wound m24_boundary_green m24_boundary_red_global; do tests $f $m; done
+
 echo "== M22 unique keys (主キー以外の UNIQUE をキーの行にまとめる。グループが piece ごとに動く間も、UNIQUE の値を書く文が通る。実装より先に書いたモデル)"
 f=m22_unique_keys.qnt
 green   $f m22_green uniqueSafe                         # グループの全部が piece ごとに移る。決着させてから切る規則も、子がグループを待つ規則もない

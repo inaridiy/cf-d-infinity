@@ -991,3 +991,216 @@ RPC の列。`test/history.test.ts` と `test/replay.test.ts` の既定の seed 
 - `Db.preparedAll` の、移動の途中のシャードを待って尋ね直す手は、Meta が移動の間に prepare を記録しなくなれば (DDL_WAITS_MOVE が列で決まれば)、起きなくなる。残すか消すかを決める。
 - 決めたこと 6 の、表定義の epoch を commit だけで進める案は、段 3 の実装の上で、赤を確かめ直してから採るかを決める (段 3 は、どの記録でも進める)。
 - `specs/README.md` の M21 の節は、段 3 に合わせて直す必要がある (この作業は `specs/` を書かないので、直していない)。「Meta が条件として使うのは段 3 と段 4 から」は、段 3 で `one-open`、`one-exit`、`all-acks` を使い始めたことに、「実装が入った時点で、M12、M14、M15 は M21 が置き換える」は、M12 と M14 を段 3 で、M15 を段 4 で置き換えることにする。
+
+## 表ごとの epoch (2026-11-16)
+
+状態：設計とモデル。実装はまだない。
+未解決の問題 53 を閉じる変更である。
+モデルは M24 (`specs/m24_table_epochs.qnt`) で、結果は [specs/README.md](../specs/README.md) の M24 の節に書いた。
+関数と行の番号は `9e53efa` のものである。
+
+### 問題
+
+段 3 の取引は、表定義全体の epoch (`schema`) を 1 つ名乗る。
+この epoch は prepare、commit、abort のどれでも進む (決めたこと 6)。
+そのため、どの DDL も、開いている取引を全部、2 度古くする。関係のない表の `CREATE TABLE` でも、失敗した DDL でも同じである。
+古くなった取引の以後の文と `COMMIT` は、`SQLITE_BUSY` で断られる。
+
+表を見ずに取引を断る所は、ほかに 4 つある。
+
+| 場所 | 何をするか |
+|---|---|
+| シャードの `schemaStep` (`src/shard/kernel.ts:2141`) | 表定義の記録を適用している間 (`schemaChanging`)、古い表定義の要求を全部断る |
+| シャードの `ddlFloor` (`:1489`、`:1522`、`:2032`) | DDL の commit を適用するたびに、シャードに 1 つの床を置く。どの表についても、床より古い時刻の読み戻し (`deltaAfter`)、refresh、述語の検証を断る。読み戻すのも、T より後に確定した全部の表の行である |
+| Worker の `Txn.load` (`src/client/db.ts:874`) | Hrana の baton の取引を組み立て直すとき、表定義全体の epoch が変わっていれば、取引を失敗させる。`@libsql/client` の https は、この経路である |
+| Worker の `Txn.reroute` (`:807`) | 表定義全体の epoch が同じスナップショットでなければ、範囲表を取り替えず、範囲の移動で断られた文が失敗する |
+
+持ち主の基準 (2026-11-16) は、Drizzle のような ORM から使ったときに SQLite と同じに振る舞うことである。
+D∞ の仕組みだけが起こし、SQLite では起きない失敗は、認めない。
+SQLite (WAL) では、ほかの接続の DDL は、別の表の取引を失敗させない。
+
+### 規則
+
+| 要素 | 決定 |
+|---|---|
+| 表定義のもの | 表と view。名前 (大文字小文字を区別しない) で引く。消した名前も、消した epoch を持ち続ける。作り直した表は、より新しい epoch になる |
+| ものの epoch | 表は 2 つ持つ。読みの epoch と、書き込みの epoch である。view は 1 つ持つ |
+| 読みの epoch が進む記録 | その表の読みが返すもの (列、行の形、表があるか) か、シャードが古い時刻の行をその表に読み戻せるかを変える DDL の commit。`CREATE TABLE`、`DROP TABLE`、`RENAME TO` (古い名前と新しい名前の両方)、`ADD COLUMN`、シャード内の UNIQUE index と、式か WHERE のある index の作成 (前の行を戻すと、新しい制約や式で失敗し得る) |
+| 書き込みの epoch が進む記録 | 読みの epoch が進む記録と、index の DDL の commit (`CREATE INDEX`、`DROP INDEX`。シャードをまたぐ UNIQUE を含む)。index の DDL は、index の名前ではなく、その表の epoch を進める |
+| view の epoch が進む記録 | `CREATE VIEW` と `DROP VIEW` の commit |
+| epoch を進める記録の種類 | commit だけ (決めたこと 6 を改める。下の「決めたこと 6 を改める」)。prepare と abort は、どの epoch も進めない。prepare が作る内部の表 (`__gidx_<index>`) だけは、prepare の epoch で生まれる |
+| 計画が頼るもの | 文が開く表 (view を通るなら、その元の表。`Db.tablesOf` が Worker の SQLite のコンパイルで確かめる表)、文が名指す view、文が書く表 |
+| 要求が運ぶもの | 頼るものごとに、名前と epoch と、書き込みとして頼るか。書く表は書き込みの epoch、ほかは読みの epoch である |
+| シャードが比べるもの | 運ばれたものだけを、自分のスナップショットと比べる。要求のほうが新しければ、列をその epoch まで適用してから比べ直す。古ければ `stale schema` で断る。等しければ通す |
+| 取引のスナップショット | 最初に読むか書くかしたときの表定義の全体を、確定まで使う (今と同じ。M13)。初めて触る表も、その表定義で計画する |
+
+読みの epoch と書き込みの epoch を分けたのは、index の DDL の後も、読むだけの取引が続けられるようにするためである (下の「触った表の DDL と SQLite」)。
+読みの経路は、index と UNIQUE の情報を使わない。
+計画 (`src/sql/plan.ts`) が `uniques` と `globalIndexes` を見るのは INSERT と UPDATE で、範囲 (`src/client/spans.ts` の `statementSpans`) が `uniques` で範囲を広げるのは書き込みだけである。
+グローバル index は読みの経路に使わない (`docs/sql-language.md`)。
+シャード内の index は、シャードの SQLite が自分で使い、答えを変えない。
+読みの epoch が index の作成で進むのは、古い時刻の読み戻しが、新しい UNIQUE や式で失敗し得る index (上の表) だけである。
+
+要求が運ぶものの数は、その要求の範囲と書き込みが名指す表と、文が名指す view の数である。
+要求はもともと範囲と書き込みで表を名指していて、その大きさは文と取引の上限 (1 MB の書き込みなど) で決まるので、新しい上限は置かない。
+数が多いときに表定義全体の epoch へ戻す、という逃げ道も置かない。置くと、成否が文の形ではなく、頼る表の数で決まるからである。
+
+### シャード
+
+| 確かめ | 規則 | 今の何を置き換えるか |
+|---|---|---|
+| 表定義 | 要求が運ぶ、頼るものごとに比べる (上の表) | `schemaStep` の `schema` の比べ |
+| 待ちの後の確かめ直し | 同じく、頼るものごとに比べ直す | `enter` の `schema` の確かめ直し (M21 の `m21_red_no_recheck`) |
+| 遷移の仕事の要求 | `prepared`、index の作成の行の走査、DROP の前の `unchanged` は、prepare の epoch を `atLeast` として運び、シャードはそこまで列を適用してから答える | 要求の `schema` に prepare の epoch を名乗らせて、適用させていた。commit だけで進める形では、prepare はどの epoch も進めないので、別に運ぶ (M21 の `CHECK_AT_EPOCH`) |
+| 記録の適用中 | 適用している記録が変えるもの (fence の表を含む) に頼る要求は、適用が終わるまで待つ。断らない。ほかの要求は通す | `schemaChanging` の間、全部の要求を断る |
+| intent の決着 | 記録を適用する前に決着させるのは、その記録が変える表 (fence の表、文が作る、変える、消す表、index の表) の intent だけである | `settleAll` が全部の intent を決着させる |
+| 床 | 床を表ごとに持ち、読みの epoch を進める commit を適用したとき、その表にだけ置く。古い時刻の読み戻しで戻すのは、読む表の行だけで、見る床もその表のものだけである。refresh の窓と述語の検証も、範囲の表の床だけを見る | シャードに 1 つの `ddlFloor` |
+| 行ロック | 表 X の prepare は、X の行のロックがある間は適用しない。待ちの上限は busy_timeout と同じ 5 秒で、過ぎれば `prepared` に ok でないと答え、DDL が `SQLITE_BUSY` で失敗する | prepare は intent を決着させるだけで、ロックを待たない |
+
+記録の適用中に要求を断っていたのは、受けると intent が増え続けて、適用がいつまでも終わらないからである。
+決着させるのを、記録が変える表の intent だけにすれば、ほかの表への要求を受けても、待つ intent は増えない。
+記録が変える表への要求は、受け付けずに待たせるので、これも増えない。
+決着を全部の表にしたまま、ほかの表の要求を通すと、適用が飢える。2 つは一緒に入れる。
+
+### Worker
+
+- 計画は、文ごとに、頼るものとその epoch を、取引のスナップショットから集める。取引の COMMIT は、シャードごとに、そのシャードの書き込みと確かめる範囲が頼るものを運ぶ。
+- 取引は、最初に読むか書くかしたときのスナップショットの epoch を、確定まで名乗る (今の `Txn.planned`)。
+- `Txn.reroute` は、表定義全体の epoch を比べずに、新しい範囲表を取る。表定義は取引のスナップショットのまま計画する。範囲表と表定義は独立で、表定義の遷移と移動は Meta が並べない。
+- `Txn.load` は、表定義全体の epoch が変わっていても、取引を失敗させない。取引のスナップショットの epoch で畳んだ表定義 (Meta の列を、その epoch まで畳んだもの) で計画し、範囲表はいまのものを使う。baton は、今と同じく、その epoch を運ぶ。
+- 書き込み禁止で待つ (`TableLocked`) 文は、表定義全体の epoch が進むまでではなく、禁止を掛けた遷移が閉じる (commit か abort が記録される) まで待つ (`Db.schemaMovedPast`)。commit だけで進める形では、abort の後に epoch が進まないからである。
+- 表 X の行のロックを持つ取引の文か `COMMIT` が、X の書き込み禁止で断られたら、Worker は Meta に、その遷移を取り消させる (`abort`。開いていれば記録され、DDL は `SQLITE_BUSY` で失敗する)。その後、禁止が解けるのを待つ。
+- 何もしていない取引の最初の文が `stale schema` で断られたら、新しいスナップショットで計画し直す (今の `Txn.rebase` と同じ)。
+
+### 触った表の DDL と SQLite
+
+取引が頼る表 X を、ほかの接続の DDL が変えるときの扱いを、SQLite (WAL、busy_timeout 5 秒) と比べた。
+
+| 取引の状態 | SQLite | D∞ にできること |
+|---|---|---|
+| X に書いた (行ロックを持つ) | DDL が、取引の書き込みのロックを待つ。busy_timeout を過ぎれば、DDL が `SQLITE_BUSY` で失敗する。取引は失敗しない | (a) prepare が、X の行のロックを持つ取引を待つ。できる。シャードは、自分の行のロックと intent を、表ごとに知っている |
+| X を読んだだけで、後で X を読む | 古い表定義と古い行のまま読み続ける。`COMMIT` も通る | (b) 古い表定義のまま答える。できるのは、シャードが今の表で古い計画に同じ答えを返せる DDL だけである。index の DDL (読みの epoch を進めないもの) がそれに当たる。列を足す、名前を変える、表を消す DDL の後は、古い時刻の行を新しい形の表に読み戻せず、古い名前の表もない。シャードは、開いている読むだけの取引を知らないので、そのために古い表を残しておくこともできない |
+| X を読んだだけで、後で X に書く | 書くときに `SQLITE_BUSY` (スナップショットが古い。ほかの接続の確定があれば、DDL でなくても) | (c) 再試行できる競合 (`SQLITE_BUSY`)。いつでもできる。今の扱いを、表ごとにしたもの |
+| X にまだ触っていない | 初めて X を読む文は、取引のスナップショットの古い表定義で答える | (b) と同じ。index の DDL の後は答え、ほかは (c) |
+
+推奨は、(a) をロックを持つ取引に、(b) を index の DDL に、残りに (c) を使う組み合わせである。
+SQLite とまだ違うのは、次の 4 つだけである。
+
+1. 読むだけの取引が、触った表か初めて触る表を、ほかの接続の DDL (列を足す、名前を変える、表を消す、シャード内の UNIQUE index か、式か WHERE のある index を作る) の確定の後で読むと、その文が `SQLITE_BUSY` になる。SQLite は古いスナップショットで答える。
+2. 行ロックは、そのシャードで文を実行しないまま 5 秒経つと切れる (TTL。Worker が落ちたときのため)。その後は DDL が待たずに進み、取引のその表への次の文か `COMMIT` が `SQLITE_BUSY` になる。SQLite の書き込みのロックは、`COMMIT` まで切れない。
+3. `Db.begin()` の取引 (楽観) は、`COMMIT` まで行ロックを持たないので、DDL を待たせない。`COMMIT` が `SQLITE_BUSY` になる。`transaction(fn)` も同じだが、自分でやり直す。SQL の `BEGIN`、Hrana の取引と baton、D1 互換の batch は悲観なので、当たらない。
+4. 書いた取引が、別のシャードで X の書き込み禁止に当たったときは、DDL を取り消させる (上の「Worker」の、遷移を取り消させる手)。DDL は `SQLITE_BUSY` で失敗する。SQLite では、取引が書き込みのロックを持つ間、DDL はそもそも始まらない。結果 (DDL が `SQLITE_BUSY` で失敗し、取引は続く) は同じだが、DDL の側は、待たずに失敗することがある。
+
+(a) の待ちを入れないと、書いた取引の `COMMIT` が、DDL の後で古い計画として断られる (`m24_lock_red_no_wait`)。
+取り消させる手を入れないと、取引が P に行ロックを持ったまま Q の書き込み禁止で待つ間に、P のロックが切れて DDL が確定し、取引が断られる (`m24_lock_red_no_wound`)。
+P のロックの TTL は、Q で待っている間は延びないからである。
+
+### 決めたこと 6 を改める
+
+表ごとの epoch は、commit だけで進める。
+理由は 3 つある。
+
+1. 失敗した DDL は、触った表の取引も古くしない。SQLite では、失敗した DDL は何も変えない。prepare でも進めると、失敗した B の DDL が、B を読んだ取引を断る (`m24_red_prepare_advances`。`noRefusalWithoutChange` を破る)。
+2. 書き込みは、prepare から終わりまで、書き込み禁止が止める。prepare より前に計画した書き込みは、禁止の間は待ち、abort の後はそのまま通り、commit の後は古い計画として断られる (`m24_green_check` の `witnessAcrossFailedTouched`)。
+3. M21 の不変条件 (`noServeBelowAck` を除く) は、M21 の全部の場面で、commit だけで進める形でも成り立つ。M21 の赤も、全部が同じ不変条件を破る (下の「モデル」)。`noServeBelowAck` は、この形では定義から成り立たない。
+
+この形で要るものは 2 つで、上の表に入れた。遷移の仕事の要求が prepare の epoch を別に運ぶこと、書き込み禁止で待つ文が遷移が閉じるまで待つことである。
+
+### 取引の中の DDL (M13)
+
+M13 の規則 (DDL の前に取引を確定する、取引は版を名乗り続ける、断られた区切りだけをやり直す、確定に失敗したら DDL を実行しない) は変えない。
+`m24_boundary_*` は、M13 の本体に、ほかの接続の DDL が区切りの表に触るか、を足したもので、表ごとに比べても `boundarySafe` が成り立ち、M13 の赤 5 つが同じ不変条件を破り、関係のない DDL が区切りの途中に入っても、区切りがやり直されないこと (`witnessUnrelatedNoRetry`) を確かめた。
+表定義全体の版と比べると、関係のない DDL の後で区切りがやり直しになる (`m24_boundary_red_global`)。
+
+### モデル (M24)
+
+M24 は M21 の本体を写し、表定義のものを 4 つ (表 A、A の上の view V、別の表 B、まだない表 N) にして、DDL を 2 つ (`CREATE TABLE N`、B の行で失敗し得る DDL) 足したものである。
+M21 の設計の条件は、設計どおりに固定した。新しい条件を定数にし、赤はそれを 1 つずつ外す。
+床、行ロック、取引の中の DDL は、小さなモデル (`m24_floor_*`、`m24_lock_*`、`m24_boundary_*`) で確かめた。
+決めたこと 6 は、M21 の本体を、M21 のインスタンスと同じ定数で、epoch を commit だけで進める形にして確かめ直した (`m24_m21_*`。M21 のファイルは、`test/catalog-m21.test.ts` が sha256 を確かめているので変えない)。
+
+| 条件 | 外したときの赤 | 破れる不変条件 |
+|---|---|---|
+| ものごとに比べる (`PER_TABLE`) | `m24_red_global` (段 3 の形)、`m24_red_global_commit_only` (commit だけで進めても、全体の epoch 1 つのまま) | `noRefusalUnrelated` |
+| commit だけで進める (`SCHEMA_ON_PREPARE`) | `m24_red_prepare_advances` | `noRefusalWithoutChange` |
+| view を通る計画は元の表にも頼る (`EXPAND_VIEW`) | `m24_red_view` | `readConsistent`、`planMatches` |
+| index の DDL は、その表の書き込みの epoch を進める (`INDEX_ON_TABLE`) | `m24_red_index` | `indexMatches`、`planMatches` |
+| 書き込みは書き込みの epoch を比べる (`WRITE_EPOCH`) | `m24_red_write_epoch` | `indexMatches` |
+| 書き込みの計画は、読んだ表にも頼る (`READ_DEPS`) | `m24_red_read_deps` | `planMatches` |
+| 記録の適用中は、変わるものに頼る要求を待たせ、ほかは通す (`APPLY_REFUSES`) | `m24_red_apply_all` (段 3 の形)、`m24_red_apply_touched` (変わるものに頼る要求を断る) | `noRefusalUnrelated`、`noRefusalWithoutChange` |
+| 床を表ごとに持つ | `m24_floor_red_global` | `noRefusalUnrelated` |
+| 読み戻すのは読む表の行だけ | `m24_floor_red_restore_all` | `noRefusalUnrelated` |
+| 形を変えた表には床を置く | `m24_floor_red_no_floor` | `noRestoreAcross` |
+| prepare は行ロックを待つ | `m24_lock_red_no_wait` | `holderSurvives` |
+| 書き込み禁止に当たった、ロックを持つ取引は、遷移を取り消させる | `m24_lock_red_no_wound` | `holderSurvives` |
+| ほかの接続の DDL と比べるのは、区切りの表に触ったものだけ | `m24_boundary_red_global` | `noRefusalUnrelated` |
+
+新しい不変条件は 3 つで、M21 の `noServeBelowAck` と `pinned` と `pinnedSurvives` を、ものごとに言い直したものである。
+
+- `planMatches`: シャードが要求を受け付けるとき、要求が本当に頼るどのものの表定義も、計画のときと同じである。
+- `noRefusalUnrelated`: 頼るものに触る表定義の記録 (prepare、commit、abort のどれでも) が計画の後にないのに、持ち主が版の理由で断ることはない。「表 A の取引は、表 B の DDL で断られない」である。
+- `noRefusalWithoutChange`: 頼るものの表定義が計画の後に変わっていない (確定した DDL がない) のに、持ち主が版の理由で断ることはない。失敗した DDL は、触った表の取引も断らない。
+
+witness は、取引が、計画の後の関係のない `CREATE TABLE` の commit と、関係のない DDL の abort の両方を適用したシャードで受け付けられ、確定すること (`witnessAcrossUnrelated`) を含む。
+同じ witness は、段 3 の形 (`m24_red_global`) と、全体の epoch を commit だけで進める形 (`m24_red_global_commit_only`) では届かない (緑として確かめた)。
+
+確かめていないこと。
+
+- 時刻と、読みの答えの中身。M24 の本体の読みは、確定した最新の値を答えたかだけを見る。index の DDL の後で古い計画の読みに答えてよいことは、読みが index を使わないという、計画と範囲のコードを読んだ結果に依る (上の「規則」)。モデルはそれを前提にしている。
+- 名前の作り直し (DROP の後の CREATE、RENAME)。名前で引き、消した名前も epoch を持ち続ければ、古い計画は古い epoch を運ぶので断られる。モデルの DROP は消すところまでである。
+- 2PC の取引 (anchor から参加者への prepare)。M24 の取引は 1 シャードである。参加者への prepare も、その参加者の書き込みと範囲が頼るものを運ぶ。
+- 取引が 2 つ以上の表に書く形。M24 の取引は A の 1 行を書く。B は読むだけである。
+- 活性。記録の適用が、ほかの表の intent のために飢えないこと (上の「シャード」の最後の段落) は、時相の性質としては確かめていない。
+
+### 実装の一覧
+
+規則 2 により、各項目の前に、落ちる検査を用意する。
+
+| # | 場所 | すること | 先に落ちる検査 | 欠陥のスイッチ (赤) |
+|---|---|---|---|---|
+| 1 | `src/sql/ddl.ts` | `ParsedDdl` に、その DDL が変えるもの (`changes: { read: string[]; write: string[]; views: string[] }`) を足す。上の「規則」の表のとおりに決める | 表の DDL の一覧ごとに、変えるものを確かめる試験 | |
+| 2 | `src/catalog.ts` | `Snapshot` に、ものごとの epoch (`objects: Record<name, { read, write }>`、view は `views` の epoch) を足し、`fold` が commit で進める。消した名前も残す。`Snapshot.schema` は commit だけで進める (Meta の `basedOn` と Worker のキャッシュに残す) | `fold` の試験 (CREATE、DROP、作り直し、RENAME、index、view、abort では進まない) | `epochOnPrepare` (`m24_red_prepare_advances`) |
+| 3 | 要求の型 (`ExecReq`、`PrepareReq`、`CommitReq`、anchor から参加者への prepare、`refresh`、`unchanged`) | `schema` を `deps: { name; epoch; write? }[]` に替える。遷移の仕事の要求は `atLeast` を運ぶ。`PROTOCOL_VERSION` を上げる | | |
+| 4 | Worker の計画 (`src/client/db.ts`、`src/sql/plan.ts`) | 文ごとに頼るものを集める。開く表は `Db.tablesOf` の表 (view の元の表を含む)、名指す view、書く表は書き込みの epoch | 関係のない表の `CREATE TABLE`、失敗した DDL、確定した DDL の後で、取引の文と `COMMIT` が通る試験 (今は落ちる) | `globalSchemaEpoch` (`m24_red_global`)、`viewDepsOnly` (`m24_red_view`)、`indexAsObject` (`m24_red_index`)、`writeDepsOnlyWritten` (`m24_red_read_deps`) |
+| 5 | シャードの `schemaStep` と `enter` | 頼るものごとに比べ、待ちの後も比べ直す。書き込みは書き込みの epoch と比べる | 同じ表の DDL の後で古い計画が断られる試験 (今の `stale-plan-after-wait`、`epoch-requests` を、ものごとに書き直す) | `writeComparesRead` (`m24_red_write_epoch`)。`noSchemaRecheck` は残す |
+| 6 | シャードの記録の適用 (`applyStep`、`settleAllStep`、`schemaChanging`) | 決着させる intent を、記録が変える表のものに絞る。適用中は、変わるものに頼る要求を待たせ、ほかは通す | 別の表の記録を適用しているシャードへの取引の文が通る試験 (今は `not owner: stale schema` で落ちる) | `applyRefusesAll` (`m24_red_apply_all`)、`applyRefusesTouched` (`m24_red_apply_touched`) |
+| 7 | シャードの床 (`ddlFloor`、`deltaAfter`、`refresh`、`predicateChanged`) | 表ごとの床。読む表の行だけを読み戻す | 別の表の DDL の後で、取引の 2 文目 (古い T の読み戻し)、refresh、述語の検証が通る試験 (今は `read too old` か競合で落ちる) | `globalDdlFloor` (`m24_floor_red_global`)、`restoreAllTables` (`m24_floor_red_restore_all`)、`noFloorOnChange` (`m24_floor_red_no_floor`) |
+| 8 | Worker の取引 (`Txn.reroute`、`Txn.load`、`Db.schemaMovedPast`) | 範囲表だけを取り替える。baton は、取引のスナップショットの epoch で畳んだ表定義で組み立て直す。書き込み禁止の待ちは、遷移が閉じるまで | baton の取引と `Db.begin()` の取引が、関係のない DDL と分割をまたいで確定する試験 (今は `the schema changed while the transaction was open` で落ちる) | `doomOnSchemaChange` (`m24_red_global` の Worker の側。モデルの取引は組み立て直さないので、赤はない) |
+| 9 | シャードの prepare の適用 | fence の表の行のロックがある間は適用しない。5 秒で `prepared` に ok でないと答える | 悲観の取引が行を書いた表への `ALTER TABLE` が、取引の `COMMIT` の後で通るか、`SQLITE_BUSY` で失敗する試験 (今は取引の `COMMIT` が落ちる) | `prepareIgnoresLocks` (`m24_lock_red_no_wait`) |
+| 10 | Worker の取引 | ロックを持つ表の書き込み禁止に当たったら、Meta に遷移を取り消させる | 2 つのシャードに書く悲観の取引の 2 つ目の書き込みが、DDL の書き込み禁止に当たる試験 | `noWound` (`m24_lock_red_no_wound`) |
+| 11 | `docs/model-coverage.md`、`specs/README.md` | M24 の赤の行を、項目ごとに P から A に移す | | |
+
+決めたこと 6 の変更 (2 のうち commit だけで進めること) は、3 のうち `atLeast` と、8 のうち `Db.schemaMovedPast` と一緒になら、先に入れてよい。
+それだけで、失敗した DDL は取引を古くしなくなる。ただし、表定義全体の epoch のままなので、確定した DDL は、関係のない表のものでも、全部の取引を古くし続ける (`m24_red_global_commit_only`)。
+その後に、1、2 の残り、3、4、5 を一緒に入れる (運ぶものと比べるものは、片方だけでは意味がない)。
+6、7、8 の残りは、それぞれ独立に入れられる。9 と 10 は一緒に入れる。
+
+### 実装の後の `docs/sql-language.md`
+
+「取引の中の DDL」の最後の段落と、「DDL」の「DDL は、開いている取引を 2 度古くする」の段落は、実装の後で次のようになる。
+文書は、実装が入るまで今のまま (段 3 の挙動) にしておく。
+
+> 取引が最初に読むか書くかした後で、別の接続が表定義を変えても、取引は最初の表定義のまま続く。
+> 後から作られた表は見えない (`no such table`)。SQLite で、読み始めた取引から、後で作られた表が見えないのと同じである。
+> 別の接続の DDL が取引を失敗させるのは、その DDL が、取引の文が頼る表 (読む表、書く表、view の元の表) を変えて確定したときだけである。
+> 別の表の DDL、新しい表を作る DDL、失敗した DDL は、取引に影響しない。
+> 頼る表を変えた DDL が確定した後では、その表を読む文と書く文が `SQLITE_BUSY` で断られる。取引をやり直す。
+> ただし、index を作るか消すだけの DDL (一意でない列の `CREATE INDEX`、shard key を含まない列への `CREATE UNIQUE INDEX`、`DROP INDEX`) の後も、その表を読む文は通る。書く文は断られる。
+> 取引が表の行を書いて行ロックを持っている間は、その表の DDL のほうが待つ (最大 5 秒。待ち切れなければ、DDL が `SQLITE_BUSY` で失敗する)。
+> 取引が別のシャードで、DDL の書き込みの禁止に当たったときも、DDL のほうが `SQLITE_BUSY` で失敗する。
+> SQLite で、書いた取引が書き込みのロックを持つ間、ほかの接続の DDL が待つのと同じである。
+>
+> SQLite と違うのは、次の 3 つである。
+>
+> - 読むだけの取引は、SQLite では、ほかの接続の DDL の後も、古い表定義と古い行のまま読み続けられる。この DB では、列を足す、名前を変える、表を消す、シャード内の UNIQUE index か、式か WHERE のある index を作る DDL が確定した後で、その表を読む文が `SQLITE_BUSY` になる。その取引で初めて読む表でも同じである。
+> - 行ロックは、そのシャードで文を実行しないまま 5 秒経つと切れる。その後は DDL が待たずに進み、取引のその表への次の文か `COMMIT` が `SQLITE_BUSY` になる。
+> - `Db.begin()` と `transaction(fn)` の取引は、`COMMIT` まで行ロックを持たないので、DDL を待たせない。`COMMIT` が `SQLITE_BUSY` になる (`transaction(fn)` は自分でやり直す)。
+
+> DDL が取引を古くするのは、確定したときだけで、古くなるのは、その DDL が変えた表に頼る取引だけである (`docs/design-catalog-epoch.md` の「表ごとの epoch」)。
+> 失敗した DDL と、ほかの表の DDL は、取引を古くしない。
+
+### 持ち主の判断が要ること
+
+1. **触った表の扱い**。推奨は上の組み合わせ ((a) ロックを持つ取引には DDL を待たせる、(b) index の DDL の後も読みは通す、ほかは (c))。(a) を入れず (c) だけにすると、仕組みは小さい (9 と 10 がなくなる) が、ORM の移行 (列を足す) と並行して書いている取引の `COMMIT` が `SQLITE_BUSY` になる。SQLite では DDL のほうが待つ。
+2. **読みの epoch と書き込みの epoch を分けること**。分けなければ (表に epoch 1 つ)、index を足す移行の間、その表を読むだけの取引も `SQLITE_BUSY` になる。分ける費用は、epoch が 2 つになることと、index の種類で読みの epoch を進めるかを決める表 (上の「規則」) を保つことである。推奨は分ける側である。
+3. **行ロックの TTL**。SQLite との違いの 2 つ目 (5 秒文を実行しない取引の行ロックが切れる) は、表ごとの epoch とは別の、今からある違いである。この設計は変えない。
