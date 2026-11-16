@@ -5,13 +5,14 @@
 //
 // 束縛するときは、SQLite ごとに数の束縛の仕方が違う。DO の SQLite (と、シミュレータの node:sqlite) は JS の数をすべて REAL として
 // 束縛し、BigInt は束縛できない。sql.js (Worker の SQLite) は 32 ビットに収まる整数の値の数を INTEGER として束縛し、BigInt を TEXT と
-// して束縛する。どちらでも値の型が保たれるように、文の中の引数の位置を字句で見つけ、型を変える式で包む (bindTyped)。包む式は型の
+// して束縛する。どちらでも値の型が保たれるように、文の中の引数の位置を字句 (src/sql/lexer.ts) で見つけ、型を変える式で包む (bindTyped)。包む式は型の
 // 親和性を持たない形にする。`CAST(? AS INTEGER)` だけだと列と同じ親和性を持ち、`'05' = ...` の比べ方が変わる。`(CAST(? AS INTEGER)+0)`
 // は、比べ方、typeof、文字列への変換のどれも、素の INTEGER の引数と同じに振る舞う (2026-11-12 に node:sqlite で確かめた)。
 // 2^53 以上の INTEGER は、10 進の文字列を束縛して同じ式で包む。±2^63 の端まで正確な INTEGER になる (3 つのエンジンで確かめた)。
 //
 // 内部の表 (`__meta`、`__log_g*`、`__intents` など) の値は、時刻、版、token、カウンタで、どれも 2^53 に収まる。内部の表の読み書きは、
 // 整数の値の JS の数を INTEGER として束縛する (bindPlain)。利用者の値を内部の入口へ渡すと、型 (Plain は bigint を受け付けない) で落ちる。
+import { Scanner } from "./sql/lexer";
 import type { Plain, Value } from "./types";
 
 /**
@@ -30,74 +31,34 @@ interface Placeholder {
 /**
  * 文の中の引数の位置を、SQLite の番号の付け方で返す。`?` は、それまでに付いた最大の番号の次。`?NNN` は NNN。
  * `:name`、`@name`、`$name` は、初めて現れたときに次の番号が付き、同じ名前は同じ番号である。
- * 文字列、識別子の引用、注釈の中は飛ばす。
+ * 引数は字句解析 (src/sql/lexer.ts の Scanner) の param の字句である。文字列、識別子の引用、注釈の中は字句にならない。
+ * 前は手書きの走査で、識別子の文字の直後の名前つきの引数 (`THEN:b`、`1 AND@c`) を見落とした。SQLite はそれも引数として読む。
+ * 利用者の文の引数は、計画の前に `?` に書き換わる (src/sql/cst.ts の bindParams) ので、利用者の文には現れなかった
+ * (2026-11-16、test/lexical-scans.test.ts)。
  */
 export function placeholders(sql: string): Placeholder[] {
   const out: Placeholder[] = [];
   const names = new Map<string, number>();
   let max = 0;
-  let i = 0;
-  const n = sql.length;
-  const isName = (c: string) => /[A-Za-z0-9_$]/.test(c) || c.charCodeAt(0) > 127;
-  while (i < n) {
-    const c = sql[i]!;
-    if (c === "'" || c === '"' || c === "`") {
-      const j = sql.indexOf(c, i + 1);
-      if (j < 0) return out;
-      // 引用の中の 2 重の引用符は、閉じずに続く。
-      i = j + 1;
-      while (i < n && sql[i] === c) {
-        const k = sql.indexOf(c, i + 1);
-        if (k < 0) return out;
-        i = k + 1;
-      }
-      continue;
-    }
-    if (c === "[") {
-      const j = sql.indexOf("]", i + 1);
-      if (j < 0) return out;
-      i = j + 1;
-      continue;
-    }
-    if (c === "-" && sql[i + 1] === "-") {
-      const j = sql.indexOf("\n", i + 2);
-      i = j < 0 ? n : j + 1;
-      continue;
-    }
-    if (c === "/" && sql[i + 1] === "*") {
-      const j = sql.indexOf("*/", i + 2);
-      i = j < 0 ? n : j + 2;
-      continue;
-    }
-    if (c === "?") {
-      let j = i + 1;
-      while (j < n && /[0-9]/.test(sql[j]!)) j++;
-      const index = j > i + 1 ? Number(sql.slice(i + 1, j)) : max + 1;
+  const s = new Scanner(sql);
+  while (s.next()) {
+    if (s.kind !== "param") continue;
+    const { start, end } = s;
+    let index: number;
+    if (sql.charCodeAt(start) === 63) {
+      // ? と ?NNN
+      index = end > start + 1 ? Number(sql.slice(start + 1, end)) : max + 1;
       max = Math.max(max, index);
-      out.push({ start: i, end: j, index });
-      i = j;
-      continue;
-    }
-    if ((c === ":" || c === "@" || c === "$") && i + 1 < n && isName(sql[i + 1]!) && !(i > 0 && isName(sql[i - 1]!))) {
-      let j = i + 1;
-      while (j < n && isName(sql[j]!)) j++;
-      const name = sql.slice(i, j);
-      let index = names.get(name);
-      if (index === undefined) {
+    } else {
+      const name = sql.slice(start, end);
+      const seen = names.get(name);
+      if (seen === undefined) {
         index = max + 1;
         names.set(name, index);
         max = index;
-      }
-      out.push({ start: i, end: j, index });
-      i = j;
-      continue;
+      } else index = seen;
     }
-    if (isName(c)) {
-      // 識別子や数の literal の途中の `$` などを、引数と取り違えない。
-      while (i < n && isName(sql[i]!)) i++;
-      continue;
-    }
-    i++;
+    out.push({ start, end, index });
   }
   return out;
 }
