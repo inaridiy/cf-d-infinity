@@ -1349,6 +1349,13 @@ RPC の列。`test/history.test.ts` と `test/replay.test.ts` の既定の seed 
 分割が速く終わるので、作業負荷が終わる前に、作業負荷の側の上限 (`MAX_SPLITS`、12 回) により近くまで割る。
 分割の時期が変わるので、取引の要求 (`exec`、`prepare`、`commit`、`finalize`、`refresh` など) の数と交わり方も変わる。どの試験も、前後とも通る。
 `syncSchema` と、子から親への `listGroups`、`pull`、`finishMove` が運ぶ epoch による列の適用は、Meta への呼び出し (`epochsSince`) なので、RPC の列には出ない。
+その後の `e0e6233` (シミュレータの、移動のための alarm と、送り出した側の試験) でも同じ 61 件を流し、61 件とも `ffd3ca2` と同じ列だった。alarm を足しても、この作業負荷の RPC の列は変わらなかった。
+
+### 表定義の epoch を commit だけで進める案 (M24) との関係
+
+段 4 は、表定義の epoch を、`prepare`、`commit`、`abort` のどれでも進める今の決め方 (決めたこと 6) の上で実装した。
+M21 の段 4 の赤の再生のうち 3 つは、この決め方に頼っている。`m21_red_ddl_during_move`、`m21_red_end_early`、`m21_red_move_during_ddl` の再生 (`test/m21-moves.test.ts`) は、どれも、受け取り中の子が、移動の途中に記録された表定義の記録 (`prepare` か `abort`) を適用できず、その epoch で計画した読みを断ることを、破れの姿として確かめる。`prepare` と `abort` が表定義の epoch を進めなければ、その読みは断られない。
+M24 (`specs/m24_*`) は、commit だけで進める決め方で、前の 2 つ (`ddl_during_move`、`end_early`) が `servable` の形では反例でなくなると報告している。問題 53 の実装で決め方を変えるときに、この 3 つの再生の破れの姿を見直す。`ddl-waits-move` と、受け取り終えた後でだけ move-end を記録させる規則は、M24 でも残る。`m21_red_pull_unfenced` の再生は、表定義の epoch の決め方に頼らない。
 
 ### 未解決の問題 17 と 37
 
@@ -1376,9 +1383,41 @@ RPC の列。`test/history.test.ts` と `test/replay.test.ts` の既定の seed 
 - 決めたこと 6 の、表定義の epoch を commit だけで進める案は、まだ決めていない (段 3 と同じ)。
 - 分割の途中で止まる進め方と、範囲が戻る移動を、乱択の検査の生成器に入れること。いまは決まった並びの試験だけが確かめる (上の「危険と、確かめていないこと」)。
 
-乱択の検査 (`scripts/sweep.mjs`、段 4 の後のコード `ffd3ca2`)。
+乱択の検査。
 
-| 検査 | seed | 組 | 結果 |
-|---|---|---|---|
-| `test/history.test.ts` | 1 から 300 | sim、reference-scans、reference-full | 5,400 件が通り、落ちたものはない (1 プロセス、3 つの組を並べて 3,674 秒) |
-| `test/elle-sim.test.ts` | 1 から 300 | sim、reference-scans、reference-full | 900 件が通り、落ちたものはない (1,621 秒) |
+| 検査 | seed | 組 | コード | 結果 |
+|---|---|---|---|---|
+| `test/history.test.ts` | 1 から 300 | sim、reference-scans、reference-full | `ffd3ca2` | 5,400 件が通り、落ちたものはない (`scripts/sweep.mjs`、1 プロセス、3 つの組を並べて 3,674 秒) |
+| `test/elle-sim.test.ts` | 1 から 300 | sim、reference-scans、reference-full | `ffd3ca2` | 900 件が通り、落ちたものはない (1,621 秒) |
+| `test/replay.test.ts` | 1 から 300 | sim | `ffd3ca2` | 900 件が通り、落ちたものはない |
+| `test/history.test.ts` | 1 から 300 | sim | `e0e6233` | 1,800 件が通り、落ちたものはない |
+| `test/elle-sim.test.ts` | 1 から 300 | sim | `e0e6233` | 300 件が通り、落ちたものはない |
+| `test/replay.test.ts` | 1 から 300 | sim | `e0e6233` | 900 件が通り、落ちたものはない |
+
+`replay` は分割を含まない (再起動と DDL はある) ので、sim の組だけで流した。
+
+欠陥の表 (`scripts/fault-table.mjs --from 1 --to 40 --procs 3 --harness history,ddl-concurrent`、コミットした木を `git archive` で取り出して。前は `9e53efa`、後は `e0e6233`)。移動の欠陥の行だけを流し、分割を含まない `replay` は外した (前後とも同じ)。
+各欄は、落ちた試験の数 / 流した seed ごとの試験の数である。
+
+| 欠陥 | 前: history | 前: ddl-concurrent | 後: history | 後: ddl-concurrent |
+|---|---|---|---|---|
+| (なし) | 0/240 | 0/520 | 0/240 | 0/520 |
+| `servePastMove` | 5/240 | 0/520 | 4/240 | 2/520 |
+| `ignoreFence` | 82/240 | 80/520 | 79/240 | 76/520 |
+| `dropIntentsOnMove` | 4/240 | 7/520 | 13/240 | 9/520 |
+| `applyAfterMoved` | 0/240 | 1/520 | 0/240 | 0/520 |
+| `finishWithoutClock` | 0/240 | 0/520 | 0/240 | 0/520 |
+| `noRangeFloor` | 0/240 | 0/520 | 0/240 | 0/520 |
+| `staleWideRead` | 0/240 | 16/520 | 0/240 | 20/520 |
+| `ddlDuringMove` (新) | | | 0/240 | 6/520 |
+| `moveDuringDdl` (新) | | | 0/240 | 22/520 |
+| `endBeforeDrained` (新) | | | 0/240 | 4/520 |
+| `pullWithoutEpoch` (新) | | | 78/240 | 80/520 |
+
+見つけた数が減った行は 2 つで、どちらも、決まった順の再生はスイッチを入れると落ちる。
+- `ignoreFence` (162 から 155)。このスイッチは所有の確かめを外す (M21 の `m21_red_owner_unchecked`、M5b の `m5b_red_s3_parent`)。外したことが答えを変えるのは、親が区間を手放した後に、古い範囲表の要求が親に届いたときだけである。段 4 では、move-start が記録されてから親がそれを適用するまで、親はスナップショットで区間を持ち、古い範囲表の要求に答えるのが正しい (M21 の、親の fence は start を適用したことである)。段 4 より前は、範囲表を切り替える前に親が fence したので、スイッチが効く期間は、それより長かった。どの seed の範囲でも、ほとんどの seed (1 から 6 の全部) で見つかる。減った理由は推し量ったもので、場面ごとには数えていない。
+- `applyAfterMoved` (1 から 0)。前に見つけたのは ddl-concurrent の「CREATE UNIQUE INDEX (global) and ADD COLUMN while shards split」の seed 23 だけで (行が失われた)、後は同じ seed で通る。このスイッチは、渡したグループの phase 2 を親で適用する (M5b の `m5b_red_p2`、`_p2_window`)。答えが変わるのは、2 相の取引の intent が pull に乗り、その phase 2 が pull の後に親に届いたときだけである。段 4 では、親の fence (move-start の適用) と最初の pull が続けて起きる (子の最初の `listGroups` か `pull` が、親に適用させる) ので、fence の前に置かれて pull の後まで決着しない intent が少なくなる。これも推し量ったもので、測っていない。決まった順の再生 (`test/migration.test.ts` の「m5b_red_p2 ...」と「m5b_red_p2_window ...」) は、スイッチを入れると落ちる。
+
+新しい 4 つのスイッチは、どれも ddl-concurrent が見つける。`pullWithoutEpoch` は、history でも見つかる (親が fence の前に行を渡し、その後の書き込みが子に届かない)。`ddlDuringMove`、`moveDuringDdl`、`endBeforeDrained` を history が見つけないのは、history の作業負荷が、最初の CREATE TABLE のほかに DDL を出さないからである。`e0e6233` の 3 つは、seed を 3 つに分けて、1 つの作業プロセスずつ流した。
+`test/ddl-vs-split-race.test.ts` と `test/child-behind-parent.test.ts` は、子の受け取りを止める形に直した後 (上の「検査」) も通る。
+全部の試験 (`npx vitest run --maxWorkers=3`、4 つの組) を `e0e6233` で流し、187 ファイルのうち 180 が通り 7 が飛ばされ、1,954 件のうち 1,916 件が通り、38 件が飛ばされ、落ちたものはなかった (313 秒)。workerd の組の `test/workerd.test.ts` の「a split through /admin/split」は、本物の DO で、子の DO が Meta の DO に `endMove` を送る形を通す。
