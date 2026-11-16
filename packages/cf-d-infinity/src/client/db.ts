@@ -1,7 +1,7 @@
 import type {
   Change, CommitRes, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
 } from "../types";
-import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, utf8Length } from "../types";
+import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, isWriteOutsideClaim, utf8Length } from "../types";
 import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, imageAt, imageStatements, joinTerms, pkValues, q, scanList, tupleOfRow } from "../shard/rows";
 import { decodeReturned, typedReadSql, type Tuple } from "../value";
 import type { Catalog, SplitMove, SplitSlot } from "../meta";
@@ -161,8 +161,89 @@ function covered(x: Interval, parts: Interval[]): boolean {
   return false;
 }
 
-/** 採番のブロックの控え (Db.idsMark)。表ごとの次の番号とブロックの終わり。 */
-type IdsMark = Map<string, { next: number; end: number }>;
+/** 1 回の採番 (Db.nextId)。終わりが end のブロックから、first から n 個を取った。戻したら returned を付ける。 */
+interface Allocation {
+  table: string;
+  first: number;
+  n: number;
+  end: number;
+  returned?: true;
+}
+
+/**
+ * 文の 1 回の試みが採番した番号 (計画書の未解決の問題 50。不変条件: 採番した rowid は、どの接続にも 1 度しか配らない)。
+ * 試みを捨てるか、試みが失敗すると、Db.giveBack がこの番号を戻す (SQLite も、失敗した INSERT の rowid を使わない)。
+ * 戻すのは、ブロックの次の番号が、まだその採番の直後にあるときだけである。同じブロックを共有する別の接続 (worker.ts の sharedIds) が
+ * 後から取っていれば、戻さずに飛ばす。前は、試みの前のブロックの控えに戻していたので、その間に別の接続が取った番号を、もう一度配った。
+ * 入れ子の試み (計画の途中の読み、INSERT … SELECT が分けた文、取引として計画し直した文) の採番は、外の試みの控えにも入る。
+ * 外の試みが失敗すれば、中の試みが採番して使わなかった番号も戻せる。1 つの採番は 1 度しか戻さない (returned)。
+ */
+export class Taken {
+  readonly list: Allocation[] = [];
+  constructor(private readonly outer: Taken | null = null) {}
+  add(a: Allocation): void {
+    this.list.push(a);
+    this.outer?.add(a);
+  }
+}
+
+/**
+ * 文の結果の lastInsertRowid (docs/sql-language.md の「lastInsertRowid」、計画書の未解決の問題 46)。文が最後に入れた行の rowid で、
+ * 行を入れなかった文は null である。どの経路の結果も、ここだけで決める。
+ * inserted は、文が入れた行を、SQLite が入れた順に並べたものである。文を実行した SQLite の捕捉が記録する (シャードの ExecRes.inserted、
+ * Worker の SQLite の rows.ts の capturedChanges)。REPLACE で入れ直した行は入り、UPSERT の DO UPDATE で更新した行と、OR IGNORE が
+ * 入れなかった行は入らない。SQLite の last_insert_rowid と同じである。
+ * 前は経路ごとに数えていた。基準経路は Worker の SQLite の last_insert_rowid() を読み、捕捉の印の INSERT の rowid (1) や、TEXT の
+ * 主キーの表の隠れた rowid を返した。シャードへ送る経路は、計画が VALUES の最後の行の rowid を返し、DO UPDATE で更新しただけの行も
+ * 入れたことにした。利用者が明示した rowid 0 は null にしていた。
+ * rowid が行のキーでない表 (INTEGER PRIMARY KEY でない主キーの表) の行は、rowid を返さない。D∞ の行は、そういう rowid を持たない。
+ */
+export function lastInsertRowid(cat: Catalog, inserted: readonly Pick<Change, "table" | "pk">[]): bigint | null {
+  const last = inserted.at(-1);
+  if (!last) return null;
+  const def = cat.tables[last.table];
+  if (!def || (def.rowidAlias === null && !def.implicitRowid)) return null;
+  const id = pkValues(last.pk)[0];
+  return typeof id === "bigint" ? id : null;
+}
+
+/**
+ * 宛先ごとに分けて実行した文の、入れた行を、文の VALUES の順に並べる (lastInsertRowid に渡す)。宛先の中の順は、そのシャードの
+ * SQLite が入れた順である。宛先の VALUES の行 (WriteTarget.rows) に、入れた行を前から当てて、VALUES の中の位置を知る。
+ * 同じ主キーの行が 2 つあれば (OR IGNORE が 2 つ目を入れない)、先の行に当てる。行を知らない宛先 (UPDATE、DELETE) は、送った順に並べる。
+ */
+function valuesOrder(parts: readonly { rows?: WriteTarget["rows"]; inserted: readonly Pick<Change, "table" | "pk">[] }[]): Pick<Change, "table" | "pk">[] {
+  const placed: { at: number; seq: number; row: Pick<Change, "table" | "pk"> }[] = [];
+  for (const part of parts) {
+    const rows = part.rows ?? [];
+    let j = 0;
+    for (const row of part.inserted) {
+      let k = j;
+      while (k < rows.length && rows[k]!.pk !== row.pk) k++;
+      // 当たる行がなければ (行を知らない宛先)、後ろに置き、次の行は同じ位置から探す。
+      const at = k < rows.length ? rows[k]!.at : Number.MAX_SAFE_INTEGER;
+      if (k < rows.length) j = k + 1;
+      placed.push({ at, seq: placed.length, row });
+    }
+  }
+  return placed.sort((x, y) => x.at - y.at || x.seq - y.seq).map((x) => x.row);
+}
+
+/**
+ * 確定が断られた理由を、呼び出し側へ返す誤りにする。1 シャードの確定 (commitLocal) が返す理由も、anchor が参加者の prepare の
+ * 拒否を運んできた理由も、ここを通す。やり直して通り得る理由だけを競合 (ConflictError) にする。
+ *   unique             UNIQUE の違反。SQLite と同じ誤りにする。
+ *   write outside claim シャードの書き込みの守りの拒否 (src/types.ts の WriteOutsideClaim)。要求の作り方の誤りで、やり直しても同じ変更を
+ *                      送るので、また断られる。前は競合として、Db.transaction が上限までやり直した (test/prepare-refusal-not-retried.test.ts)。
+ */
+function commitRefusal(reason: string): Error {
+  if (reason.startsWith("unique")) return new SqlError(`UNIQUE constraint failed (${reason})`);
+  if (isWriteOutsideClaim(new Error(reason))) return new SqlError(reason);
+  return new ConflictError(reason);
+}
+
+/** 悲観的な取引が、書いた行のロックを取るために送る読み (Txn.lockWritten)。行を読まない。 */
+const LOCK_SQL = `SELECT NULL AS "locked" WHERE 0`;
 
 /** 1 文の実行の記録。遅い文の一覧に使う。 */
 export interface StatementStat {
@@ -337,8 +418,6 @@ export const BYTE_BUDGET = SHARD_LIMITS.resultBytes;
 /** 読み取りのコンテキスト。autocommit と Txn で実行経路を共有する。 */
 class ReadScope {
   T: Ts | undefined;
-  /** 取引だけが T を進められる。autocommit の読み取りは最初から全シャードの最大を取る。 */
-  protected wantsFresh = false;
   /** 取引でない読み取りは、開始前に確定した書き込みを必ず見る。取引は自分のスナップショットを読み続ける。 */
   protected realtime = true;
   constructor(protected db: Db, protected cat: Catalog) {}
@@ -348,11 +427,20 @@ class ReadScope {
   }
   protected record(_shard: string, _spans: Span[]): void {}
 
-  async call(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "epoch" | "overlay">): Promise<ExecRes> {
+  /** 読みを 1 つ送る。autocommit の読みは T を進めないので、新しい確定を知らせてもらわない (fresh なし)。 */
+  call(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "epoch" | "overlay">): Promise<ExecRes> {
+    return this.send(shard, req, { T: this.T, fresh: false });
+  }
+
+  /**
+   * 要求を、時点 at.T で送る。at.fresh なら、範囲に at.T より新しい確定があるとき、シャードは読まずに `read too old: moved at` で
+   * 答える。答えの判断は、この要求が運んだ at だけで行う (Txn.call)。
+   */
+  protected async send(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "epoch" | "overlay">, at: { T: Ts | undefined; fresh: boolean }): Promise<ExecRes> {
     const spans = withClaims(this.cat.routing, shard, req.spans);
     const full: ExecReq = {
-      ...req, spans, T: this.T, minTs: this.db.token, schema: this.cat.schema, epoch: this.cat.epoch, overlay: this.overlay(shard),
-      fresh: this.wantsFresh, realtime: this.realtime,
+      ...req, spans, T: at.T, minTs: this.db.token, schema: this.cat.schema, epoch: this.cat.epoch, overlay: this.overlay(shard),
+      fresh: at.fresh, realtime: this.realtime,
     };
     const res = await this.db.shardOf(shard).exec(full).catch(rerouted);
     this.T ??= res.T;
@@ -554,7 +642,11 @@ export interface TxnDump {
 /** OCC の取引。commit まで書き込みは Worker のメモリにだけある。 */
 export class Txn extends ReadScope {
   commitTs: Ts | undefined;
-  protected override wantsFresh = true;
+  /**
+   * これから送る読みに、新しい確定を知らせてもらうか (ExecReq.fresh)。T を進められなかったら (advance)、以後はスナップショットのまま
+   * 読み続けるので、付けない。送った読みの答えは、この値ではなく、その読みが運んだ値で判断する (call)。
+   */
+  private wantsFresh = true;
   protected override realtime = false;
   private writes = new Map<string, Map<string, Change>>();
   private spans = new Map<string, Span[]>();
@@ -598,16 +690,21 @@ export class Txn extends ReadScope {
   /**
    * 読む行に T より新しい commit があれば、それまでの読みが変わっていないことを確かめて T を進める。
    * 別のシャードの時計が進んでいるだけで、確定済みの行が見えなくなるのを防ぐ。
-   * 確かめた範囲に変更があれば、古い読みに依存しているので取引は競合になる。
+   * 確かめた範囲に変更があれば、T を進めず、スナップショットのまま読み続ける。書き込みがあれば、commit の検証で競合になる。
+   *
+   * 答えは、その要求が運んだ時点と fresh だけで判断する。1 つの文が複数のシャードへ並べて送った要求の答えを、並んだ別の要求の答えが
+   * 変えた取引の状態 (wantsFresh) で判断すると、答えが置き場所で変わる。前は、1 つ目の答えで T を進められないと決めた後、2 つ目の
+   * シャードの `moved at` (fresh を付けて送った要求の答え) を、やり直さずに `read too old` として投げた。変わった行が 1 つのシャードに
+   * あればスナップショットが返り、2 つのシャードにあれば失敗した (計画書の未解決の問題 34、test/snapshot-read-after-two-shards-changed.test.ts)。
    */
   override async call(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "epoch" | "overlay">): Promise<ExecRes> {
     for (let attempt = 0; ; attempt++) {
-      // この要求が運ぶ T。応答を待っている間に、別の読みが T を進めることがある。
-      const sent = this.T;
+      // この要求が運ぶ時点と fresh。応答を待っている間に、別の読みが T を進めるか、T を進めるのをやめることがある。
+      const at = { T: this.T, fresh: this.wantsFresh };
       let res: ExecRes | undefined;
       let failure: unknown;
       try {
-        res = await super.call(shard, req);
+        res = await this.send(shard, req, at);
       } catch (e) {
         failure = e;
       }
@@ -615,15 +712,18 @@ export class Txn extends ReadScope {
       while (this.advancing) await this.advancing;
       // 送った後で T が進んでいた。この応答は古い時点の状態で、進んだ T までの間に変わっていないことを誰も確かめていない。
       // そのまま使うと、1 つの文の中で別々の時点の行が混ざる。いまの T で読み直す。失敗した文の「読み」も同じである。
-      const stale = sent !== undefined && this.T !== undefined && sent < this.T;
+      const stale = at.T !== undefined && this.T !== undefined && at.T < this.T;
       if (failure === undefined) {
         if (!stale) return res!;
         if (attempt >= 20) throw new ConflictError("the read timestamp kept moving while this statement was reading");
         continue;
       }
+      // fresh を付けて送った要求の `moved at` は、範囲に新しい確定があるという知らせで、読みの失敗ではない。T を進められれば進めた T で、
+      // 進められなければ (この要求か、並んだ別の要求の答えで、進めないと決めた後なら) fresh を付けずに、スナップショットで読み直す。
+      // fresh を付けずに送った要求の `moved at` (範囲の床) は、そのまま返す。
       const moved = /moved at (\d+)/.exec((failure as Error)?.message ?? "");
-      if (moved && attempt < 4 && this.T !== undefined && this.wantsFresh) {
-        await this.advance(Number(moved[1]));
+      if (moved && at.fresh && attempt < 4 && this.T !== undefined) {
+        if (this.wantsFresh) await this.advance(Number(moved[1]));
         continue;
       }
       if (stale && attempt < 20 && !isRetryable(failure)) continue;
@@ -810,31 +910,30 @@ export class Txn extends ReadScope {
 
   /**
    * 文を、取引の表定義と範囲表で計画して実行する。範囲の移動で断られたら (reroute)、試みを捨てて、新しい範囲表で計画し直す。
-   * 捨てた試みが採番した rowid は戻す。断られた試みの要求は送り直さない。計画し直すと、宛先と文の分け方 (複数行の INSERT の
-   * まとめ) が、新しい範囲表で決まり直すからである。
+   * 断られた試みの要求は送り直さない。計画し直すと、宛先と文の分け方 (複数行の INSERT のまとめ) が、新しい範囲表で決まり直すからである。
+   * 試みが採番した rowid は、試みを捨てるか、文が失敗したら戻す (Taken、Db.giveBack)。文が失敗しても、溜めた変更は文の前に戻る
+   * (atomically) ので、番号はどこにも使われていない。outer は、この文を中に含む試みの控えである (INSERT … SELECT が分けた文など)。
    */
-  async statement(stmt: Node, params: Params): Promise<QueryResult> {
+  async statement(stmt: Node, params: Params, outer: Taken | null = null): Promise<QueryResult> {
     if (this.doomed) throw this.doomed;
     const source = text(stmt);
     for (let attempt = 0; ; attempt++) {
       const cat = this.cat;
-      const mark = this.db.idsMark();
-      let planned: IdsMark | undefined;
+      const taken = new Taken(outer);
       try {
-        return await runPlanned(attempt === 0 ? stmt : parseStatements(source)[0], source, params, cat, this.planContext(), (p) => this.execute(p),
-          () => (planned = this.db.idsMark()));
+        return await runPlanned(attempt === 0 ? stmt : parseStatements(source)[0], source, params, cat, this.planContext(taken), (p) => this.execute(p, taken));
       } catch (e) {
+        this.db.giveBack(taken.list);
         if (attempt >= REROUTES || !(await this.reroute(e, cat))) throw e;
-        if (planned) this.db.idsUndo(mark, planned);
       }
     }
   }
 
-  /** 計画の途中で表を読む式は、この取引の読みとして実行する。読んだ範囲が commit で検証される。 */
-  planContext(): PlanContext {
+  /** 計画の途中で表を読む式は、この取引の読みとして実行する。読んだ範囲が commit で検証される。taken は、計画している試みの控えである。 */
+  planContext(taken: Taken | null = null): PlanContext {
     return {
-      ...this.db.planContext(this.cat),
-      read: async (sql, params) => (await this.statement(parseStatements(sql)[0], params)).values[0] ?? null,
+      ...this.db.planContext(this.cat, taken),
+      read: async (sql, params) => (await this.statement(parseStatements(sql)[0], params, taken)).values[0] ?? null,
     };
   }
 
@@ -851,13 +950,17 @@ export class Txn extends ReadScope {
     });
   }
 
-  /** 悲観的な取引では最新の状態で実行してロックを取る。読んだ範囲は F から検証する。 */
-  private async dml(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "epoch" | "overlay">): Promise<ExecRes> {
+  /**
+   * 悲観的な取引では最新の状態で実行してロックを取る。読んだ範囲は F から検証する。
+   * overlay は、文が取引自身の書き込みを読むときに要る。何も読まない要求 (lockWritten) には送らない (シャードが巻き戻す書き込みも課金される)。
+   */
+  private async dml(shard: string, req: Omit<ExecReq, "T" | "minTs" | "schema" | "epoch" | "overlay">, o: { overlay?: false } = {}): Promise<ExecRes> {
     if (!this.pessimistic) return this.call(shard, req);
     this.lockOwner ??= { txn: this.txnId, start: this.db.startStamp() };
     const spans = withClaims(this.cat.routing, shard, req.spans);
     const res = await this.db.shardOf(shard).exec({
-      ...req, spans, T: this.T, minTs: this.db.token, schema: this.cat.schema, epoch: this.cat.epoch, overlay: this.overlay(shard), lock: this.lockOwner,
+      ...req, spans, T: this.T, minTs: this.db.token, schema: this.cat.schema, epoch: this.cat.epoch, overlay: o.overlay === false ? [] : this.overlay(shard),
+      lock: this.lockOwner,
     }).catch(rerouted);
     this.T ??= res.T;
     this.db.observe(res.hlc);
@@ -888,12 +991,13 @@ export class Txn extends ReadScope {
     }
   }
 
-  async execute(p: Plan): Promise<QueryResult> {
+  /** 計画を実行する。taken は、計画した試みの控えである (INSERT … SELECT が分けた文の採番を、そこへ入れる)。 */
+  async execute(p: Plan, taken: Taken | null = null): Promise<QueryResult> {
     if (this.doomed) throw this.doomed;
     switch (p.kind) {
       case "write": return this.atomically(() => this.write(p));
       case "wasmWrite": return this.atomically(() => this.wasmWrite(p));
-      case "insertSelect": return this.atomically(() => this.insertSelect(p));
+      case "insertSelect": return this.atomically(() => this.insertSelect(p, taken));
       case "noop":
         return new QueryResult([], []);
       case "ddl":
@@ -908,6 +1012,8 @@ export class Txn extends ReadScope {
   private async write(p: Extract<Plan, { kind: "write" }>): Promise<QueryResult> {
     const out: { columns: string[]; values: Value[][] } = { columns: [], values: [] };
     let changes = 0;
+    // 宛先ごとの、入れた行。文の lastInsertRowid は、これを VALUES の順に並べて決める (valuesOrder)。
+    const inserted: { rows?: WriteTarget["rows"]; inserted: Pick<Change, "table" | "pk">[] }[] = [];
     // 利用者の RETURNING の列名。書き換える前の文を、Worker の SQLite でコンパイルして取る。
     const columns = p.returning ? (await this.db.compiled(p.returning, this.cat)).columns : [];
     const one = async (t: WriteTarget, target: Target) => {
@@ -919,7 +1025,10 @@ export class Txn extends ReadScope {
       if (res.columns.length) out.columns = res.columns;
       out.values.push(...res.values);
       changes += res.count ?? res.changes.length;
-      for (const c of res.changes) this.buffer(target.shard, c);
+      inserted.push({ rows: t.rows, inserted: res.inserted ?? [] });
+      // 悲観的な取引では、シャードが文を実行するときに、変えた行のロックを取っている (dml)。
+      const locking = this.wrote(res.changes.map((change) => ({ shard: target.shard, change })));
+      if (locking) await locking;
       // 1 シャードへ送った文は、別のシャードの行との衝突を解決できない。衝突を自分で解決する文なら、基準経路で実行し直す。
       await this.indexChanges(res.changes, resolvesConflicts(t.sql) ? "resolve" : "fail");
     };
@@ -941,7 +1050,7 @@ export class Txn extends ReadScope {
     }));
     const failed = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
     if (failed) throw failed.reason;
-    return new QueryResult(out.columns, out.values, changes, p.lastRowid);
+    return new QueryResult(out.columns, out.values, changes, lastInsertRowid(this.cat, valuesOrder(inserted)));
   }
 
   /**
@@ -989,25 +1098,21 @@ export class Txn extends ReadScope {
         const returned = [...w.query(p.sql, p.params).rows].map((row) => row.map(decodeReturned));
         // 変更した行の数は、SQLite の数え方そのままである。REPLACE が消した行は数えない。
         const counted = w.raw(`SELECT changes()`).values[0]?.[0] as number;
-        // 利用者が明示した rowid は 2^53 を超え得るので、型ごと読む。
-        const last = w.select(`SELECT last_insert_rowid()`, []).values[0]?.[0] as bigint;
-        const changes = capturedChanges(w, catalog);
+        // 文の lastInsertRowid は、捕捉が記録した、入れた行から決める (lastInsertRowid)。Worker の SQLite の last_insert_rowid() は
+        // 読まない。捕捉の印の INSERT (__cap_on) の rowid や、利用者に見えない rowid を返すからである。
+        const { changes, inserted } = capturedChanges(w, catalog);
         const more = await this.conflicting(changes, catalog, have, asked);
         if (more.length > 0) {
           loaded.push(...more);
           this.withinRowBudget(have.size);
           continue;
         }
-        for (const c of changes) {
-          this.buffer(ownerOf(this.cat.routing, c.sk), c);
-          const def = catalog(c.table);
-          const idColumn = def.rowidAlias ?? (def.implicitRowid ? "rowid" : null);
-          const id = idColumn !== null && c.after ? imageAt(def, c.after, idColumn) : undefined;
-          if (typeof id === "bigint") this.db.planContext(this.cat).sawId(def.name, id);
-        }
+        // 書いた行を、持ち主のシャードの変更として取引へ入れる。悲観的な取引では、ここでロックを取る (wrote)。
+        const locking = this.wrote(changes.map((change) => ({ shard: ownerOf(this.cat.routing, change.sk), change })));
+        if (locking) await locking;
         // 同じ値の行は全部ここにあり、SQLite が一意性を確かめ終えている。index の項目は、確かめ直さずに書く。
         await this.indexChanges(changes, "trusted");
-        return new QueryResult(columns, returned, counted, p.lastRowid ?? (last === 0n ? null : last));
+        return new QueryResult(columns, returned, counted, lastInsertRowid(this.cat, inserted));
       } finally {
         w.close();
       }
@@ -1102,11 +1207,18 @@ export class Txn extends ReadScope {
     return out;
   }
 
-  private async insertSelect(p: Extract<Plan, { kind: "insertSelect" }>): Promise<QueryResult> {
+  /**
+   * INSERT … SELECT。SELECT を読み、読んだ行を引数にした INSERT … VALUES に分けて、順に実行する。分けた文の結果を、1 つの文の結果に
+   * まとめる。RETURNING の行はつなぎ (前は捨てていた。計画書の未解決の問題 40)、変更した行の数は足し、lastInsertRowid は、最後に
+   * 行を入れた文のものである。分けた文は VALUES の順に流すので、文の間の順は SQLite が入れる順と同じである。
+   * 結果の列名は、元の文を Worker の SQLite でコンパイルして取る。行を 1 つも入れなくても、RETURNING の列名を返す (SQLite と同じ)。
+   * taken は、この文を計画した試みの控えで、分けた文の採番もそこへ入れる (文が失敗したら、外の試みが戻す)。
+   */
+  private async insertSelect(p: Extract<Plan, { kind: "insertSelect" }>, taken: Taken | null): Promise<QueryResult> {
     // 読みは型つきなので、読んだ値は型のある値である。INTEGER と REAL を取り違えずに、そのまま引数として束縛し直せる。
     const src = await this.read(p.select);
-    if (src.values.length === 0) return new QueryResult([], []);
     const cols = p.columns ? `(${p.columns.map(q).join(", ")}) ` : "";
+    const values: Value[][] = [];
     let changes = 0;
     let last: bigint | null = null;
     // DO の bound parameter の上限 (100) に収まる行数ずつ流す。
@@ -1115,11 +1227,64 @@ export class Txn extends ReadScope {
     for (let at = 0; at < src.values.length; at += per) {
       const chunk = src.values.slice(at, at + per);
       const rows = chunk.map((row) => `(${row.map(() => "?").join(", ")})`).join(", ");
-      const r = await this.query(`${p.head} ${cols}VALUES ${rows}${p.tail ? ` ${p.tail}` : ""}`, [...chunk.flat(), ...p.tailParams]);
+      const sql = `${p.head} ${cols}VALUES ${rows}${p.tail ? ` ${p.tail}` : ""}`;
+      this.sqls.push(sql);
+      const r = await this.statement(parseStatements(sql)[0], [...chunk.flat(), ...p.tailParams], taken);
+      values.push(...r.values);
       changes += r.changes;
       last = r.lastInsertRowid ?? last;
     }
-    return new QueryResult([], [], changes, last);
+    const columns = p.returning ? (await this.db.compiled(p.returning, this.cat)).columns : [];
+    return new QueryResult(columns, values, changes, last);
+  }
+
+  /**
+   * 書き込みの文が変えた行を、取引へ入れる。文をどこで実行したか (シャードの SQLite か、Worker の SQLite か) によらず、文の変更は
+   * 全部ここを通る。index の項目 (indexWrite) は通らない。
+   *   1. 悲観的な取引 (SQL の BEGIN、baton) では、まだロックのない行のロックを取る (lockWritten)。文書は、書き込みは経路によらず
+   *      文の時点で行ロックを取ると約束している (docs/sql-language.md の「取引」、docs/design.md の「悲観的な取引」)。シャードで実行した
+   *      文 (Txn.write) は、シャードが文を実行するときにロックを取り、変更に F (since) を付けて返すので、ここでは取らない。Worker の
+   *      SQLite で実行した文 (Txn.wasmWrite) の行は、ここで取る。前は取らず、別の接続が待たずに書けて、COMMIT が競合になった
+   *      (計画書の未解決の問題 36、test/ranged-write-in-begin-takes-no-lock.test.ts)。
+   *   2. 行を持ち主のシャードの変更として溜める (buffer)。
+   *   3. 文が新しいキーに置いた行 (入れた行と、主キーを書き換えた行) の rowid を採番に知らせる (Db.sawId。以後の採番は、それより
+   *      大きくする)。前からあった行の rowid は、その行を入れた文が知らせている。
+   * ロックを取らないなら待たない (Promise を返さない)。待ちを 1 つ足すと、並べて送る文の RPC の順序が変わる。
+   */
+  private wrote(changes: { shard: string; change: Change }[]): Promise<void> | undefined {
+    const finish = () => {
+      for (const { shard, change } of changes) {
+        this.buffer(shard, change);
+        const def = this.cat.tables[change.table];
+        const idColumn = def ? (def.rowidAlias ?? (def.implicitRowid ? "rowid" : null)) : null;
+        const id = def && idColumn !== null && change.after && change.before === null ? imageAt(def, change.after, idColumn) : undefined;
+        if (typeof id === "bigint") this.db.sawId(def!.name, id);
+      }
+    };
+    const unlocked = this.pessimistic ? changes.filter((x) => x.change.since === undefined) : [];
+    if (unlocked.length === 0) return void finish();
+    return this.lockWritten(unlocked).then(finish);
+  }
+
+  /**
+   * 悲観的な取引で、文が書いた行のロックを取る (wrote)。シャードごとに 1 回、行ロックを取る読み (ExecReq.lockRows) を送る。BEGIN IMMEDIATE
+   * の主キーの読み (shardRead) と同じ手順で、シャードは行の intent を決着させ、最新の時刻 F でロックを取る (specs/m9_protocol.qnt の
+   * ロック読み。待ちは wound-wait)。読む文は行を読まず (LOCK_SQL)、範囲は書いた行の主キーである (持ち主の確かめと intent の決着に使う。
+   * 範囲は F から検証される)。
+   * 行の値は、文が読んだ時点 T のスナップショットから計算してある。T と F の間に別の接続が同じ行を確定していれば、文が読んだ範囲
+   * (T から検証する) が COMMIT で競合になる。変更には F を付けない (書き込みも T から検証する。M9 の F からの検証より厳しい)。
+   */
+  private async lockWritten(rows: { shard: string; change: Change }[]): Promise<void> {
+    const byShard = new Map<string, Change[]>();
+    for (const { shard, change } of rows) byShard.set(shard, [...(byShard.get(shard) ?? []), change]);
+    const settled = await Promise.allSettled([...byShard].map(([shard, list]) =>
+      this.dml(shard, {
+        sql: LOCK_SQL, params: [], columns: ["locked"],
+        spans: list.map((c) => rowSpan(c.table, c.pk, c.sk)),
+        lockRows: list.map((c) => ({ table: c.table, pk: c.pk })),
+      }, { overlay: false })));
+    const failed = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed) throw failed.reason;
   }
 
   private buffer(shard: string, c: Change): void {
@@ -1261,10 +1426,7 @@ export class Txn extends ReadScope {
         else throw e;
       }
     }
-    if (!res.ok) {
-      if (res.reason.startsWith("unique")) throw new SqlError(`UNIQUE constraint failed (${res.reason})`);
-      throw new ConflictError(res.reason);
-    }
+    if (!res.ok) throw commitRefusal(res.reason);
     this.commitTs = res.c;
     this.db.observe(res.c);
   }
@@ -1348,22 +1510,21 @@ export class Db {
     return this.catalog();
   }
 
-  /** 採番のブロックの控えを取る。計画し直す試みの前に取り、捨てた試みの採番を idsUndo で戻す。 */
-  idsMark(): IdsMark {
-    return new Map([...this.ids].map(([k, v]) => [k, { ...v }]));
-  }
-
   /**
-   * 捨てる試みが採番した番号を戻す (SQLite も、失敗した INSERT の rowid を使わない)。before は試みの前の控え、after は試みが
-   * 計画を終えたときの控えである。戻すのは、同じブロックで、計画の後に誰も取っていない (いまの次の番号が after と同じ) ときだけである。
-   * 同じブロックを共有する別の接続 (worker.ts の sharedIds) が後から取った番号を、もう一度配らないためである。
+   * 捨てる試みか、失敗した試みが採番した番号を戻す (Taken。SQLite も、失敗した INSERT の rowid を使わない)。後の採番から順に見て、
+   * ブロックの次の番号がまだその採番の直後にあれば、次の番号をその採番の先頭へ戻す。直後になければ (同じブロックを共有する別の接続が
+   * 後から取った)、その表のそれより前の採番は戻さない。戻した番号は、もう一度配っても、どこにも使われていない。
    */
-  idsUndo(before: IdsMark, after: IdsMark): void {
-    for (const [k, v] of before) {
-      const now = this.ids.get(k);
-      const mine = after.get(k);
-      if (!now || !mine || now.end !== v.end || mine.end !== now.end || mine.next !== now.next) continue;
-      now.next = v.next;
+  giveBack(list: readonly Allocation[]): void {
+    const kept = new Set<string>();
+    for (let i = list.length - 1; i >= 0; i--) {
+      const a = list[i]!;
+      if (a.returned || kept.has(a.table)) continue;
+      const b = this.ids.get(a.table);
+      if (b && b.end === a.end && b.next === a.first + a.n) {
+        b.next = a.first;
+        a.returned = true;
+      } else kept.add(a.table);
     }
   }
 
@@ -1434,17 +1595,12 @@ export class Db {
     return known;
   }
 
-  planContext(cat: Catalog): PlanContext {
+  /** 文を計画するときの、Db の側の材料。taken は、計画している試みの控えで、プランナの採番をそこへ入れる (null なら記録しない)。 */
+  planContext(cat: Catalog, taken: Taken | null = null): PlanContext {
     return {
       reference: this.reference,
-      nextId: (table, n) => this.nextId(table, n),
-      sawId: (table, big) => {
-        // 採番は 2^53 未満の範囲で続ける (docs/design-values.md の持ち主の判断の 4)。それより大きい ID は、採番した ID と重ならない。
-        if (big > MAX_SAFE || big < -MAX_SAFE) return;
-        const id = Number(big);
-        const b = this.ids.get(table);
-        if (!b || id >= b.next) this.pendingSeen.set(table, Math.max(this.pendingSeen.get(table) ?? 0, id));
-      },
+      nextId: (table, n) => this.nextId(table, n, taken),
+      sawId: (table, big) => this.sawId(table, big),
       evaluate: async (sql, params) => {
         const w = await openScratch(cat);
         try {
@@ -1456,10 +1612,22 @@ export class Db {
     };
   }
 
+  /** 利用者が明示した rowid か、文が新しいキーに置いた行の rowid を知らせる。以後の採番は、それより大きくする。 */
+  sawId(table: string, big: bigint): void {
+    // 採番は 2^53 未満の範囲で続ける (docs/design-values.md の持ち主の判断の 4)。それより大きい ID は、採番した ID と重ならない。
+    if (big > MAX_SAFE || big < -MAX_SAFE) return;
+    const id = Number(big);
+    const b = this.ids.get(table);
+    if (!b || id >= b.next) this.pendingSeen.set(table, Math.max(this.pendingSeen.get(table) ?? 0, id));
+  }
+
   private pendingSeen = new Map<string, number>();
 
-  /** rowid をブロック単位で採番する。Meta への問い合わせはブロックごとの 1 回で済む。番号は INTEGER (bigint) で返す。 */
-  private async nextId(table: string, n: number): Promise<bigint> {
+  /**
+   * rowid をブロック単位で採番する。Meta への問い合わせはブロックごとの 1 回で済む。番号は INTEGER (bigint) で返す。
+   * 採番は taken (試みの控え) に記録する。試みを捨てるか、試みが失敗したら、giveBack が戻す。
+   */
+  private async nextId(table: string, n: number, taken: Taken | null): Promise<bigint> {
     const seen = this.pendingSeen.get(table);
     this.pendingSeen.delete(table);
     let b = this.ids.get(table);
@@ -1472,6 +1640,7 @@ export class Db {
     }
     const first = b.next;
     b.next += n;
+    taken?.add({ table, first, n, end: b.end });
     return BigInt(first);
   }
 
@@ -2128,25 +2297,25 @@ export class Db {
       // 取引の中の文は、取引の表定義で計画する (Txn.catalog)。
       const txn = this.current;
       const cat = txn?.catalog ?? (await this.catalog());
-      // 失敗した文の採番を戻す。SQLite でも失敗した INSERT は rowid を消費しない。
-      const saved = new Map([...this.ids].map(([k, v]) => [k, { ...v }]));
+      // この試みの採番。文が失敗したら戻す (Taken)。SQLite でも失敗した INSERT は rowid を消費しない。
+      const taken = new Taken();
       try {
         const fresh = attempt === 0 ? stmt : parseStatements(source)[0];
-        const ctx = this.current ? this.current.planContext() : this.planContext(cat);
+        const ctx = this.current ? this.current.planContext(taken) : this.planContext(cat, taken);
         return await runPlanned(fresh, source, params, cat, ctx, async (p) => {
           // 計画の途中で表を読む文は、読みと書き込みを 1 つの取引にする。試みごとに、取引の表定義で計画し直す。
           if (p.kind === "inTxn") {
             let at: (() => Ts | undefined) | undefined;
             const r = await this.transaction(async (tx) => {
               at = () => tx.commitTs ?? tx.T;
-              return tx.statement(parseStatements(source)[0], params);
+              return tx.statement(parseStatements(source)[0], params, taken);
             });
             return new QueryResult(r.columns, r.values, r.changes, r.lastInsertRowid, r.ts ?? at?.());
           }
-          return this.dispatch(p, cat, { source, params, before: saved });
+          return this.dispatch(p, cat, { source, params, taken });
         }, (p) => (info.plan = p.kind));
       } catch (e) {
-        for (const [k, v] of saved) if (this.ids.get(k)?.end === v.end) this.ids.get(k)!.next = v.next;
+        this.giveBack(taken.list);
         // 文が取引を終えたか、別の取引に替えた (取引の中の DDL)。前の取引の分は、もう確定したか、失われた。やり直さない。
         // やり直すと、取引の外の文として、DDL だけが効く (specs/m13_txn_schema_boundary.qnt の m13_red_ddl_anyway)。
         if (txn && this.current !== txn) {
@@ -2206,14 +2375,14 @@ export class Db {
    * 古い表定義の計画は、足された列を知らない (未解決の問題 38)。スナップショットが同じなら、同じ計画で送り直す (計画は待ちを
    * 含み、採番もするので、競合のたびに計画し直すと、分割も DDL もない実行の RPC の列まで変わる)。
    */
-  private async dispatch(p: Plan, cat: Catalog, again: { source: string; params: Params; before: IdsMark }): Promise<QueryResult> {
+  private async dispatch(p: Plan, cat: Catalog, again: { source: string; params: Params; taken: Taken }): Promise<QueryResult> {
     if (p.kind === "tcl") return this.control(p);
     if (p.kind === "noop") return new QueryResult([], []);
     if (p.kind === "ddl") {
       await this.ddl(p.sql);
       return new QueryResult([], []);
     }
-    if (this.current) return this.current.execute(p);
+    if (this.current) return this.current.execute(p, again.taken);
     if (p.kind === "shard" || p.kind === "gather" || p.kind === "partial" || p.kind === "meta") {
       const scope = new ReadScope(this, cat);
       const r = await scope.read(p);
@@ -2225,19 +2394,20 @@ export class Db {
     if (fast) return this.autoWrite(p, t!, cat);
     // 取引として実行した autocommit の文にも、確定の時刻を付けて返す。読みだけなら、読んだ時刻である。
     let at: (() => Ts | undefined) | undefined;
-    // 計画を終えたときの採番の控え。計画し直すときに、捨てる計画が採番した番号を戻す (idsUndo)。
-    let planned: IdsMark | null = this.idsMark();
+    // 最初の計画 (p) の採番。計画し直すときに、捨てる計画の番号を戻す (giveBack)。
+    let planned: Allocation[] | null = [...again.taken.list];
     const r = await this.transaction(async (tx) => {
       const now = tx.catalog;
       let out: QueryResult;
       // p は cat で計画したものである。試みのスナップショットが cat と違えば、その試みでも、後の試みでも、p は使わない
       // (計画し直した試みが競合で断られた後に p へ戻ると、古い計画を送り直すことになる)。
-      if (now.epoch === cat.epoch && now.schema === cat.schema) out = await tx.execute(p);
+      if (now.epoch === cat.epoch && now.schema === cat.schema) out = await tx.execute(p, again.taken);
       else {
-        // 戻すのは、最初の計画の採番だけである。計画し直した試みの採番は、その試みが計画を終えた後の控えを持たないので戻さない。
-        if (planned) this.idsUndo(again.before, planned);
+        // 捨てる最初の計画の採番を戻す (1 度だけ)。計画し直した文の採番は、この試みの控え (again.taken) に入り、文が失敗すれば
+        // attemptStatement が戻す。
+        if (planned) this.giveBack(planned);
         planned = null;
-        out = await tx.statement(parseStatements(again.source)[0], again.params);
+        out = await tx.statement(parseStatements(again.source)[0], again.params, again.taken);
       }
       at = () => tx.commitTs ?? tx.T;
       return out;
@@ -2301,6 +2471,6 @@ export class Db {
       sql: t.sql, params: t.params, columns, spans, write: t.write, schema: cat.schema, epoch: cat.epoch, minTs: this.token,
     }).catch(rerouted);
     this.observe(res.hlc);
-    return new QueryResult(res.columns, res.values, res.count ?? res.changes.length, p.lastRowid, res.T);
+    return new QueryResult(res.columns, res.values, res.count ?? res.changes.length, lastInsertRowid(cat, res.inserted ?? []), res.T);
   }
 }

@@ -63,6 +63,12 @@ export interface WriteTarget {
    *   無指定  分からない。同じ shard key の値の全行を範囲にする。
    */
   uniqueReads?: "none" | UniqueRead[];
+  /**
+   * INSERT の宛先が入れる VALUES の行。行の主キーのキー文字列と、文の VALUES の中の位置 (0 から) である。宛先ごとに分けて実行した
+   * INSERT の、入れた行を VALUES の順に並べるのに使う (src/client/db.ts の valuesOrder。文の lastInsertRowid は、最後に入れた行で決まる)。
+   * UPDATE と DELETE にはない。
+   */
+  rows?: { pk: string; at: number }[];
 }
 
 export interface UniqueRead {
@@ -80,7 +86,7 @@ export type Plan =
   /** pragma は、PRAGMA と EXPLAIN の文である。型つきの読みに包めないので、素の列で読む (ScratchDb.pragma)。 */
   | { kind: "meta"; sql: string; params: Value[]; pragma?: true }
   | {
-      kind: "write"; def: TableDef; targets: WriteTarget[]; lastRowid: bigint | null;
+      kind: "write"; def: TableDef; targets: WriteTarget[];
       /** 文が読む全表。サブクエリの表も検証の対象にする。 */
       tables?: TableDef[];
       /**
@@ -92,11 +98,13 @@ export type Plan =
   /**
    * 書き込みの基準経路。走査で行を集め、元の文を Worker の SQLite で実行し、捕捉した変更をシャードへ振り分ける。
    * 文の結果が衝突し得る行は、実行してから集め足す (Txn.wasmWrite)。INSERT は、文が読む行がないので scans が空になる。
-   * lastRowid は、プランナが rowid を採番したときの、最後の値である。
+   * 文の結果の lastInsertRowid は、計画ではなく、実行した SQLite の捕捉が記録した、入れた行から決める (src/client/db.ts の lastInsertRowid)。
    */
-  | { kind: "wasmWrite"; scans: Scan[]; sql: string; params: Value[]; tables: TableDef[]; lastRowid?: bigint | null; returning?: string }
+  | { kind: "wasmWrite"; scans: Scan[]; sql: string; params: Value[]; tables: TableDef[]; returning?: string }
   | {
       kind: "insertSelect"; def: TableDef; select: Plan; head: string; columns: string[] | null; tail: string; tailParams: Value[];
+      /** RETURNING のある文の、元の文面。結果の列名は、これを Worker の SQLite でコンパイルして取る (行を入れなくても列名を返す)。 */
+      returning?: string;
     }
   | { kind: "ddl"; sql: string }
   | { kind: "noop" }
@@ -804,7 +812,8 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
 
   if (body.type !== "values_clause" && body.type !== "default_values") {
     // 行ごとの INSERT は、文として計画し直される (Txn.insertSelect)。RETURNING は、そこで書き換える。
-    return { kind: "insertSelect", def, select: planRead(body, values, cat, ctx.reference), head: prefix, columns: cols, tail: tailSql, tailParams };
+    const original = returningClause(stmt) ? text(stmt) : undefined;
+    return { kind: "insertSelect", def, select: planRead(body, values, cat, ctx.reference), head: prefix, columns: cols, tail: tailSql, tailParams, returning: original };
   }
   // 利用者の RETURNING は、項ごとに要素の式に書き換える (src/sql/returning.ts)。結果の列名は、書き換える前の文から取る。
   const returning = returningOf(stmt, def);
@@ -849,7 +858,6 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   });
   const first = missing.length ? await ctx.nextId(def.name, missing.length) : 0n;
   const assigned = new Map(missing.map((row, i) => [row, first + BigInt(i)]));
-  let last: bigint | null = null;
 
   const outCols = auto && idAt < 0 ? [auto, ...names] : names;
   // 衝突を自分で解決する文で、表にシャードをまたぐ UNIQUE がある。衝突する行が別のシャードにあり得るので、挿入先のシャードの
@@ -858,7 +866,7 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   // ON CONFLICT や RETURNING の中のサブクエリは、表を読む。挿入先のシャードだけでは答えられないので、これも基準経路で実行する。
   let viaWorker = ctx.reference !== undefined || (resolves && def.globalIndexes.length > 0) || tailClauses.some(hasSubquery);
   const skAt = def.shardKey.map((c) => outCols.findIndex((n2) => same(n2, c) || (c === "rowid" && ROWID_NAMES.has(lower(n2)))));
-  type Built = { sk: string; pk: string | null; sql: string; params: Value[]; uniq: UniqueRead[] | null };
+  type Built = { at: number; sk: string; pk: string | null; sql: string; params: Value[]; uniq: UniqueRead[] | null };
   const built: Built[] = [];
   for (const [i, r] of rows.entries()) {
     const id = assigned.get(i);
@@ -905,14 +913,10 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
     }
     // Worker が SQLite と同じに揃えられないキーの値があれば、行の置き場所を決められない。Worker の SQLite に入れさせる (基準経路)。
     if ([...skVals, ...pkVals].some((v) => v === undefined)) viaWorker = true;
-    if (auto) {
-      const v = id ?? given[i];
-      if (typeof v === "bigint") {
-        last = v;
-        if (id === undefined) ctx.sawId(def.name, v);
-      }
-    }
+    // 利用者が明示した rowid を採番に知らせる。
+    if (auto && id === undefined && typeof given[i] === "bigint") ctx.sawId(def.name, given[i] as bigint);
     built.push({
+      at: i,
       // undefined が混じるときは viaWorker なので、この 2 つは使わない。
       sk: keyString(skVals.map((v) => v ?? null)), pk: keyString(pkVals.map((v) => v ?? null)), uniq,
       sql: `(${parts.map((p) => p.sql).join(", ")})`, params: parts.flatMap((p) => p.params),
@@ -923,7 +927,7 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   if (viaWorker) {
     const isDefault = body.type === "default_values" && outCols.length === 0;
     return {
-      kind: "wasmWrite", scans: [], tables: [def], lastRowid: last, returning,
+      kind: "wasmWrite", scans: [], tables: [def], returning,
       sql: `${prefix}${colSql} ${isDefault ? "DEFAULT VALUES" : `VALUES ${built.map((b) => b.sql).join(", ")}`}${tailSql ? ` ${tailSql}` : ""}`,
       params: [...built.flatMap((b) => b.params), ...tailParams],
     };
@@ -961,10 +965,11 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
         pk: chunk.length === 1 ? chunk[0]!.pk : null,
         // UPSERT は、衝突した行を書き換える。書き換えた後の値で、もう一度 UNIQUE の検査が走り得るので、値が決まるとは言えない。
         uniqueReads: chunk.length === 1 && chunk[0]!.uniq && !tailClauses.some((c) => c.type === "upsert_clause") ? chunk[0]!.uniq : undefined,
+        rows: chunk.map((b) => ({ pk: b.pk!, at: b.at })),
       });
     }
   }
-  return { kind: "write", def, targets, lastRowid: last, returning };
+  return { kind: "write", def, targets, returning };
 }
 
 /**
@@ -1016,7 +1021,7 @@ function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog, reference?:
       // DELETE と、UNIQUE の列に触らない UPDATE は、UNIQUE の検査で別の行を読まない。
       const touchesUnique = stmt.type === "update_stmt" && (assigned.length !== (set?.assignments?.items ?? []).length || assigned.some((c) => def.uniques.some((u) => u.some((k) => same(k, c)))));
       const uniqueReads = stmt.type === "delete_stmt" || (!touchesUnique && !def.partialUnique) ? "none" as const : undefined;
-      return { kind: "write", def, tables: defs, lastRowid: null, returning, targets: [{ route: { by: "sk", sks: [key] }, sql, params, write: { sk: key, capture: captureOf(stmt, pk) }, pk, uniqueReads }] };
+      return { kind: "write", def, tables: defs, returning, targets: [{ route: { by: "sk", sks: [key] }, sql, params, write: { sk: key, capture: captureOf(stmt, pk) }, pk, uniqueReads }] };
     }
   }
   return { kind: "wasmWrite", scans: referenceScans(scopes, n, values, reference), sql, params, tables: defs, returning };

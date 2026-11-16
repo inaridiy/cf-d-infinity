@@ -1,4 +1,4 @@
-// 未解決: 2 相コミットの prepare を、シャードの書き込みの守り (src/shard/kernel.ts の claimed) が断ると、Worker はそれを競合として
+// 直した: 2 相コミットの prepare を、シャードの書き込みの守り (src/shard/kernel.ts の claimed) が断ると、Worker はそれを競合として
 // やり直す。
 //
 // 守りの拒否 (`write outside claim:`) は、範囲表が古いのではなく、要求の作り方の誤りである (src/types.ts の WriteOutsideClaim)。
@@ -7,13 +7,16 @@
 // Db.transaction (autocommit の書き込みと batch) は、上限 (12 回) まで同じ取引をやり直し、最後に `conflict: write outside claim:` を返す。
 // 利用者の取引 (Db.begin、SQL の BEGIN) では、やり直してよい競合 (SQLITE_BUSY) に見える。
 // 見つけたのは、書き込みの守りを入れたとき (2026-11-14、計画書の「残り」)。
+//
+// 直し方 (2026-11-16): 確定が断られた理由は、1 シャードのものも 2 相コミットのものも、1 つの関数 (src/client/db.ts の commitRefusal) で
+// 誤りにする。やり直して通り得る理由だけを競合にし、守りの拒否と UNIQUE の違反はやり直さない誤りにする。
 import { afterEach, describe, expect, it } from "vitest";
-import { Db, type Txn } from "../../src/client/db";
-import { keyString } from "../../src/keys";
-import { ownerOf } from "../../src/routing";
-import { tupleOfRow } from "../../src/shard/rows";
-import { ConflictError, type Change } from "../../src/types";
-import { allWriteEscapes, SimCluster } from "../sim";
+import { Db, type Txn } from "../src/client/db";
+import { keyString } from "../src/keys";
+import { ownerOf } from "../src/routing";
+import { tupleOfRow } from "../src/shard/rows";
+import { ConflictError, type Change } from "../src/types";
+import { allWriteEscapes, SimCluster } from "./sim";
 
 /** 表 t、2 シャード。s0 の行 a を書き、s1 には、行 b を名乗って行 b2 のイメージを運ぶ変更 (守りが断る) を溜める。 */
 async function scene() {

@@ -1,4 +1,4 @@
-// 未解決: 取引の中の、複数のシャードを読む文が、読んだ後に 2 つ以上のシャードで行が変わっていると、`read too old` で失敗する。
+// 直した (計画書の未解決の問題 34): 取引の中の、複数のシャードを読む文が、読んだ後に 2 つ以上のシャードで行が変わっていると、`read too old` で失敗する。
 //
 // 取引は、読む行に新しい確定があると、読む時点を先へ進めようとする (src/client/db.ts の Txn.call と advance)。それまでの読みが
 // 変わっていて進められなければ、「スナップショットのまま読み続ける」と決めてある (advance の注釈)。ところが、1 つの文が複数の
@@ -12,10 +12,13 @@
 // Hrana の対話の取引では、要求のたびに取引を組み立て直し、wantsFresh が元に戻るので、文のたびに起きる。
 //
 // 見つけたのは、64 ビットの整数の検査 (test/open/int64.test.ts) の「古い時刻の読み」の場面を、4 シャードで流したとき (2026-11-14)。
+//
+// 直し方 (2026-11-16): 答えを、その要求が運んだ時点と fresh だけで判断する (Txn.call)。fresh を付けて送った要求の `moved at` は、
+// T を進めるか、進められなければ fresh を外してスナップショットで読み直す合図で、並んだ別の要求の答えには依らない。
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { ownerOf } from "../../src/routing";
-import { SimCluster } from "../sim";
+import { Db } from "../src/client/db";
+import { ownerOf } from "../src/routing";
+import { SimCluster } from "./sim";
 
 describe("a transaction that reads several shards after rows on two of them changed", () => {
   it("keeps reading its snapshot", async () => {

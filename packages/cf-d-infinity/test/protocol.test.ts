@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { keyString } from "../src/keys";
 import { SUBSLOTS, type Interval } from "../src/routing";
 import { encode } from "../src/shard/rows";
-import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type ExecReq, type Piece, type PiecePayload, type PieceWant, type Span } from "../src/types";
+import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type ExecReq, type ExecRes, type Piece, type PiecePayload, type PieceWant, type Span } from "../src/types";
 import { encodeTuple } from "../src/value";
 
 /**
@@ -22,12 +22,15 @@ function wireSample(): string {
     sql: "SELECT a, b FROM t WHERE a = ?", params: [5n], columns: ["a", "b"], spans: [{ kind: "pred", table: "t", alias: "t", where: "a = ?", params: [5n, 2.5] }],
     schema: 4, epoch: 7,
   } satisfies Partial<ExecReq>;
+  // 書き込みの応答は、文が入れた行を、入れた順に運ぶ (版 7 から。lastInsertRowid はこれだけから決める)。
+  const written = { changes: [change], inserted: [{ table: "t", pk: keyString([1n]) }], count: 1 } satisfies Partial<ExecRes>;
   return [
     JSON.stringify(values, (_k, x) => (x instanceof Uint8Array ? { u8: [...x] } : typeof x === "bigint" ? { int: String(x) } : typeof x === "number" && !Number.isFinite(x) ? String(x) : x)),
     encode(change),
     keyString(values),
     encode(read),
     moveSample(),
+    encode(written),
   ].join("\n");
 }
 
@@ -56,6 +59,7 @@ const WIRE: Record<number, string> = {
   4: "dfb952441f2824e0",
   5: "9f3b7b3e9eaa9b09",
   6: "3ef766de45822d5c",
+  7: "ada064f16f3fde8e",
 };
 
 describe("protocol version", () => {

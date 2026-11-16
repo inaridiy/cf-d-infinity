@@ -208,6 +208,9 @@ export interface Waiter extends LockOwner {
   wake(): void;
 }
 
+/** 要求の文を実行した結果 (ExecRes の、時刻を除いた部分)。inserted は書き込みの文だけにある。 */
+type Ran = Pick<ExecRes, "columns" | "values" | "changes" | "count" | "bytes" | "over" | "inserted">;
+
 /**
  * 待ちの後で確かめ直すこと。schema は、要求を計画した表定義の epoch が、いまも現行であること。owned は、読む範囲と書く行を、読む時刻で
  * このシャードが持っていること。
@@ -1542,7 +1545,7 @@ export class ShardKernel {
    * 文の意味は SQLite が解釈し、変更行は trigger が捕捉するので、UPSERT や
    * INSERT ... SELECT のような構文でも Worker 側で解析する必要がない。
    */
-  private run(sec: Section<"owned">, req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number; bytes?: number; over?: boolean } {
+  private run(sec: Section<"owned">, req: ExecReq): Ran {
     const out = this.checked(sec, req, () => this.runStatement(req));
     // 取引の文は、ここでは変更を返すだけで、確定のときにもう一度確かめられる (assertWriteSetFits)。
     // ここでも断るのは、COMMIT まで待たずに、文の時点で伝えるためである。
@@ -1663,12 +1666,12 @@ export class ShardKernel {
     return true;
   }
 
-  private runStatement(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number; bytes?: number; over?: boolean } {
+  private runStatement(req: ExecReq): Ran {
     if (!req.write) return { ...this.readLimited(req), changes: [] };
     return imageFits(() => this.runWrite(req));
   }
 
-  private runWrite(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[]; count?: number } {
+  private runWrite(req: ExecReq): Ran {
     const captured = this.runCaptured(req);
     if (captured) return captured;
     // REPLACE が暗黙に消す行は recursive_triggers がないと DELETE trigger を発火しない。
@@ -1678,14 +1681,14 @@ export class ShardKernel {
     // 文が変更した行の数は、SQLite に尋ねる。捕捉した変更の数とは違う。REPLACE が消した行は、SQLite は数えない。
     // 捕捉のための trigger の中の書き込みは、changes() に入らない。
     const count = this.b.exec(`SELECT changes() AS n`)[0]!.n as number;
-    const changes = capturedChanges(this.b, (t) => this.def(t));
+    const { changes, inserted } = capturedChanges(this.b, (t) => this.def(t));
     const sk = req.write!.sk;
     if (sk !== null) {
       for (const c of changes) {
         if (c.sk !== sk) throw new SqlError(`row of shard key ${c.sk} written through shard key ${sk}`);
       }
     }
-    return { ...out, changes, count };
+    return { ...out, changes, count, inserted };
   }
 
   /**
@@ -1757,7 +1760,7 @@ export class ShardKernel {
    * trigger の捕捉は __cap と __cap_on へ書くので、ROLLBACK しても 1 行の文で 2 行が課金される。
    * 文の形が想定と合わなければ、その文だけを巻き戻して null を返す。呼び出し側は trigger の経路に任せる。
    */
-  private runCaptured(req: ExecReq): { columns: string[]; values: Value[][]; changes: Change[] } | null {
+  private runCaptured(req: ExecReq): Ran | null {
     const capture = req.write?.capture;
     const span = req.spans[0];
     // 2 つ目以降の範囲は、同じ表の、UNIQUE の検査で読む行だけである (spans.ts の規則 3)。ほかの表を読む文は、ここでは扱わない。
@@ -1788,7 +1791,8 @@ export class ShardKernel {
             if (c.sk !== sk) throw new SqlError(`row of shard key ${c.sk} written through shard key ${sk}`);
           }
         }
-        return { columns: [], values: [], changes };
+        // RETURNING で捕捉する INSERT は、返った行の全部を入れた (OR 句も UPSERT もない形だけを、ここで扱う)。
+        return { columns: [], values: [], changes, inserted: capture === "insert" ? changes.map((c) => ({ table: c.table, pk: c.pk })) : [] };
       });
     } catch (e) {
       if (e === FALLBACK) return null;
@@ -2921,7 +2925,7 @@ export class ShardKernel {
     if (f.key !== undefined && this.overlapping(req.spans, Number.MAX_SAFE_INTEGER).length > 0) throw new ConflictError("pending intent");
     const hit: { key: string | null } = { key: null };
     const pending: { reason: string | null } = { reason: null };
-    let out: { changes: Change[]; c: Ts } | undefined;
+    let out: { changes: Change[]; inserted: Ran["inserted"]; c: Ts } | undefined;
     try {
       out = this.b.tx(() => {
         const r = this.checked(sec, req, () => this.runCaptured(req));
@@ -2933,14 +2937,14 @@ export class ShardKernel {
         this.assertWriteSetFits(sec, r.changes);
         const c = this.issue();
         if (r.changes.length) this.logChanges(`auto-${c}`, c, r.changes);
-        return { changes: r.changes, c };
+        return { changes: r.changes, inserted: r.inserted, c };
       });
     } catch (e) {
       if (e === FALLBACK) return done(null);
       if (e === PENDING_UNIQUE) throw new ConflictError(pending.reason!);
       if (e !== BLOCKED) throw e;
     }
-    if (out) return done({ columns: [], values: [], changes: out.changes, T: out.c, hlc: this.hlc.value, epoch: this.epoch });
+    if (out) return done({ columns: [], values: [], changes: out.changes, inserted: out.inserted, T: out.c, hlc: this.hlc.value, epoch: this.epoch });
     f.key = hit.key!;
     return wait({ kind: "row", key: f.key, me, deadline: f.deadline! });
   }

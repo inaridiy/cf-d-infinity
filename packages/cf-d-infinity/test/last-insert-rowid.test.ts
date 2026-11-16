@@ -1,8 +1,8 @@
-// 未解決 (問題 46): 文の結果の lastInsertRowid が、文を実行した経路で変わる。
+// 直した (計画書の未解決の問題 46): 文の結果の lastInsertRowid が、文を実行した経路で変わる。
 //
 // 規則 (docs/sql-language.md、test/inserted-rowid.ts): 文が最後に入れた行の rowid。行を入れなかった文は null。REPLACE は入れたことに
 // なり、UPSERT の DO UPDATE と、OR IGNORE が入れなかった行は、ならない。rowid が行のキーでない表の行は数えない。
-// いまは経路ごとに別の数え方をしている。
+// 直す前は、経路ごとに別の数え方をしていた。
 //   - 基準経路 (Txn.wasmWrite) は Worker の SQLite の last_insert_rowid() を読む。UPDATE と DELETE には、捕捉の印の
 //     `INSERT INTO __cap_on VALUES (1)` の rowid 1 が返る。TEXT の主キーの表には、その SQLite が振った隠れた rowid が返る。
 //     利用者が明示した rowid 0 は null になる (`last === 0n ? null : last`)。
@@ -10,11 +10,15 @@
 //     「入れた」ことになる。
 // 見つけたのは、差分の検査に lastInsertRowid の比較を足したとき (2026-11-16。test/typed-diff.test.ts と
 // test/placement-differential.test.ts。直す前に、どちらも上のすべての形で落ちた)。
+//
+// 直し方 (2026-11-16): lastInsertRowid は 1 つの関数 (src/client/db.ts の lastInsertRowid) だけが決める。材料は、文を実行した SQLite
+// の捕捉が記録した、入れた行である (INSERT の trigger の記録、RETURNING で捕捉した INSERT の行。シャードの応答の ExecRes.inserted)。
+// 宛先ごとに分けた INSERT は、計画が持つ VALUES の位置で並べる (valuesOrder)。計画が持っていた lastRowid は消した。
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { insertedRowids } from "../inserted-rowid";
-import { SimCluster } from "../sim";
+import { Db } from "../src/client/db";
+import { insertedRowids } from "./inserted-rowid";
+import { SimCluster } from "./sim";
 
 const SCHEMA = [
   "CREATE TABLE t(id INTEGER PRIMARY KEY, u INTEGER, v INTEGER)",

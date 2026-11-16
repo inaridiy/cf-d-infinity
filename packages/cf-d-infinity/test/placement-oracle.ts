@@ -53,8 +53,9 @@
 //   - PATIENCE_MS は、ロックの待ちの上限とロックの期限 (どちらも 5 秒) より十分に短い。主キーで絞る autocommit の書き込みも、
 //     範囲の autocommit の書き込みも、ロックが空くまで待つ (2026-11-14 に確かめた)。取引が終わるまでの残りの手順は数十 ms で、
 //     待っている文が期限に当たることはない。
-//   - 待たされるのは、悲観的な取引 (SQL の BEGIN、baton) が主キーで絞る書き込みでロックを取った行だけである。範囲の書き込みは
-//     ロックを取らない (test/open/ranged-write-in-begin-takes-no-lock.test.ts)。モデルは、取引の書き込みのロックを仮定しない。
+//   - 待たされるのは、悲観的な取引 (SQL の BEGIN、baton) が書き込みでロックを取った行だけである。主キーで絞る書き込みも、範囲の
+//     書き込み (Worker の SQLite で実行する経路) も、書いた行のロックを取る (2026-11-16 から。test/ranged-write-in-begin-takes-no-lock.test.ts)。
+//     書いた行は文の形と行で決まるので、待たされるかどうかも置き場所に依らない。モデルは、取引の書き込みのロックを仮定しない。
 //   - 文書は、誰が先に行を取るか (wound-wait の年齢をどこで測るか) を約束していない。台本の手順の間に時刻を進めるので、
 //     後から出た autocommit の文は、取引より若い。
 //
@@ -314,19 +315,9 @@ export interface Known {
   matches(step: Step, outcome: Outcome, p: Placement, beforeSplit: boolean): boolean;
 }
 
-export const KNOWN_OPEN: Known[] = [
-  {
-    id: "open problem 34 (read too old after rows on two shards changed)",
-    repro: "test/open/snapshot-read-after-two-shards-changed.test.ts",
-    how: "masked",
-    // 2 つ以上のシャードがあるときの、取引の文の `read too old: moved at`。分割の後のものは、文書にある範囲の床の拒否なので含めない。
-    // この欠陥は、1 つの文が 2 つ以上のシャードへ同時に要求を送るときにだけ起きる。1 つのシャードへ送る読み (主キー、shard key
-    // のグループ) の誤りは別の欠陥なので、伏せない。全部の文を表の丸ごとの走査にする実行 (REFERENCE=full) では、どの読みも全シャードへ送る。
-    matches: (step, o, p, beforeSplit) =>
-      step.conn === "tx" && step.kind === "stmt" && p.shards >= 2 && beforeSplit && o.kind === "error" && /^read too old: moved at/.test(o.message) &&
-      (process.env.REFERENCE === "full" || !["point", "pinned group"].includes(step.shape ?? "")),
-  },
-];
+// 未解決の問題 34 (2 つのシャードで行が変わった後の複数シャードの読みの `read too old`) は、2026-11-16 に直した
+// (test/snapshot-read-after-two-shards-changed.test.ts)。伏せていた間は、取引の文の `read too old: moved at` を見分けて伏せていた。
+export const KNOWN_OPEN: Known[] = [];
 
 const toH = (v: number) => ({ type: "integer" as const, value: String(v) });
 /** lastInsertRowid を、台本の値と同じ JS の数にする (台本の rowid は小さい)。 */

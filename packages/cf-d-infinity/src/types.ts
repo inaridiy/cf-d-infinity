@@ -217,6 +217,12 @@ export interface ExecRes {
    * 無ければ、changes の長さと同じである。
    */
   count?: number;
+  /**
+   * 書き込みの文が入れた行 (表と主キーのキー文字列)。SQLite が入れた順である。捕捉が記録する (src/shard/rows.ts の capturedChanges)。
+   * REPLACE が消してから入れた行を含み、UPSERT の DO UPDATE で更新しただけの行と、OR IGNORE が入れなかった行は含まない。
+   * Worker は、文の結果の lastInsertRowid をこれだけから決める (src/client/db.ts の lastInsertRowid)。読みにはない。
+   */
+  inserted?: Pick<Change, "table" | "pk">[];
   T: Ts;
   hlc: Ts;
   epoch: number;
@@ -593,8 +599,11 @@ export class ReadTooOld extends Error {
 // ExecReq、PrepareReq、CommitReq に epoch を足し、schema の数を DdlEntry.version から表定義の epoch に替えた。syncSchema は
 // { schema } を受け、beginIncoming、fence、PiecePayload の schema も表定義の epoch である。版 5 の要求の schema は意味が違うので、
 // 受け付けない。
-export const PROTOCOL_VERSION = 6;
-export const MIN_PROTOCOL_VERSION = 6;
+// 版 7 (2026-11-16): 書き込みの応答 (ExecRes) が、文が入れた行 (inserted) を運ぶ。Worker は、文の結果の lastInsertRowid を、これだけから
+// 決める (src/client/db.ts の lastInsertRowid)。版 6 のシャードは inserted を返さないので、新しい Worker と話すと、行を入れた文の
+// lastInsertRowid が null になる。新旧が混ざらないように、版 6 の要求は受け付けない。
+export const PROTOCOL_VERSION = 7;
+export const MIN_PROTOCOL_VERSION = 7;
 
 export class VersionSkew extends Error {
   readonly retryable = true;

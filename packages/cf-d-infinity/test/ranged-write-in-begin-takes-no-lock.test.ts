@@ -1,4 +1,4 @@
-// 未解決: SQL の BEGIN の取引の中の、主キーで 1 行に絞らない UPDATE は、行ロックを取らない。
+// 直した (計画書の未解決の問題 36): SQL の BEGIN の取引の中の、主キーで 1 行に絞らない UPDATE は、行ロックを取らない。
 //
 // docs/sql-language.md の「取引」の表は、BEGIN と BEGIN IMMEDIATE のどちらでも「書き込みは文の時点で行ロックを取る」と書く。
 // 主キーで 1 行に絞る文 (計画の write) は、そのとおり、悲観的な DML (Txn.dml) で最新の行に実行してロックを取る。主キーの範囲や
@@ -8,9 +8,13 @@
 // 置き場所には依らない (1 シャードでも同じ)。文の形で決まる。直すのが実装か文書かは、持ち主が決める。
 //
 // 見つけたのは、置き場所の差分の検査 (test/placement-differential.test.ts) の、待たされた文の扱いを決めるための確かめ (2026-11-14)。
+//
+// 直し方 (2026-11-16): 書き込みの文の変更は、どの経路のものも Txn.wrote 1 つを通る。悲観的な取引では、そこでロックのない行の
+// ロックを取る (Txn.lockWritten。BEGIN IMMEDIATE の主キーの読みと同じ、行ロックを取る読み)。シャードで実行した文の行は、シャードが
+// 文の実行でロックを取っているので取らない。
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { SimCluster } from "../sim";
+import { Db } from "../src/client/db";
+import { SimCluster } from "./sim";
 
 describe("a ranged UPDATE inside BEGIN", () => {
   it("locks the rows it changes, so another connection's write to one of them waits for the commit", async () => {
@@ -29,6 +33,7 @@ describe("a ranged UPDATE inside BEGIN", () => {
     expect(wrote).toBe(false);
     await tx.query("COMMIT");
     await other;
-    expect((await new Db(c).query("SELECT id, v FROM t ORDER BY id")).values).toEqual([[1, 1], [2, 3], [3, 104], [4, 5], [5, 5]]);
+    // 値は型のある値で返る (INTEGER は bigint)。
+    expect((await new Db(c).query("SELECT id, v FROM t ORDER BY id")).values).toEqual([[1n, 1n], [2n, 3n], [3n, 104n], [4n, 5n], [5n, 5n]]);
   });
 });

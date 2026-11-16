@@ -333,8 +333,9 @@ const SCENARIOS: Record<string, (r: Run) => Promise<void>> = {
     await r.h(T);
     await fill(r);
     // 読むだけの取引が最初の文で読む時刻を決め、その後に別の接続が行を書き換える。取引の後の読みは、変更ログの行イメージから
-    // 古い行を作って返す。読みは、どれも主キーで 1 行を引く (普通の実行では、1 つのシャードが答える)。複数のシャードを読む文は、
-    // いまは 2 つ以上のシャードで行が変わっていると競合で失敗する (test/open/snapshot-read-after-two-shards-changed.test.ts)。
+    // 古い行を作って返す。読みは、どれも主キーで 1 行を引く (普通の実行では、1 つのシャードが答える)。基準経路だけの実行では
+    // 全シャードから行を集める。2 つ以上のシャードで行が変わっていても、スナップショットを読み続ける
+    // (前は `read too old` で失敗した。未解決の問題 34、test/snapshot-read-after-two-shards-changed.test.ts)。
     const reader = await r.client.transaction("deferred");
     try {
       const point = "SELECT id, v, n FROM t WHERE id = ?";
@@ -357,10 +358,6 @@ const SCENARIOS: Record<string, (r: Run) => Promise<void>> = {
       await r.h("INSERT INTO t(id, v, n) VALUES (?, 'new', ?)", [r.v.MAX - 1n, r.v.MIN]);
       for (const [i, id] of watched.entries()) {
         const again = await read(id);
-        // 基準経路だけの実行は、主キーの読みでも全シャードから行を集める。2 つ以上のシャードで行が変わっているので、いまは
-        // 競合で失敗する (上の未解決の欠陥)。競合は取引の正しい結末の 1 つなので、ここでは認める。答えたなら、古い行でなければならない。
-        // 環境変数 REFERENCE で流すと、「普通」の実行もクラスタの指定で基準経路になる (SimCluster.reference)。
-        if ((r.reference !== undefined || r.c.reference !== undefined) && /"error":"read too old/.test(again)) break;
         expect(again, `the transaction reads id ${id} as it was at its read time`).toBe(before[i]);
       }
     } finally {
