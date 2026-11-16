@@ -1,6 +1,6 @@
 # CatalogEpoch による Meta の一本化の設計
 
-状態：設計。段 1 (列と畳み込み)、段 2 (要求が epoch を運ぶ)、段 3 (DDL の 2 相化) を実装した (2026-11-15 と 16、末尾の「段 1 の結果」から「段 3 の結果」)。段 4 (移動) の実装はまだない。モデルは M21 (`specs/m21_catalog_epoch.qnt`) にあり、結果は [specs/README.md](../specs/README.md) の M21 の節に書いた。持ち主の判断が要ることと決めたことは、「段 1 の結果」の前にまとめた。
+状態：設計。段 1 (列と畳み込み)、段 2 (要求が epoch を運ぶ)、段 3 (DDL の 2 相化)、段 4 (移動) を実装した (2026-11-15 と 16、末尾の「段 1 の結果」から「段 4 の結果」)。モデルは M21 (`specs/m21_catalog_epoch.qnt`) にあり、結果は [specs/README.md](../specs/README.md) の M21 の節に書いた。持ち主の判断が要ることと決めたことは、「段 1 の結果」の前にまとめた。
 作成日：2026-11-14
 前提：[overview.md](./overview.md)、[design-subslots.md](./design-subslots.md)、[specs/README.md](../specs/README.md) の M11 から M15、M18、M19、M5b
 
@@ -1227,3 +1227,151 @@ witness は、取引が、計画の後の関係のない `CREATE TABLE` の comm
 3. **行ロックの TTL**。SQLite との違いの 2 つ目 (5 秒文を実行しない取引の行ロックが切れる) は、表ごとの epoch とは別の、今からある違いである。この設計は変えない。
 4. **取り消させた DDL のやり直し**。書いた取引が別のシャードで書き込み禁止に当たったとき DDL を取り消させる手は、DDL の成否を、取引の行の置き場所で変える (上の「触った表の DDL と SQLite」の 4)。推奨は、進める側が、取り消された DDL を同じ 5 秒の中でやり直す形である。DDL の成否が「取引が 5 秒のうちに確定するか」だけで決まり、置き場所に依らなくなる。入れるなら、`m24_lock` に、進める側のやり直しを足してから入れる (規則 3)。
 5. **段 4 の再生**。決めたこと 6 を commit だけで進める形に改めると、`m21_red_ddl_during_move` と `m21_red_end_early` の今の形 (`servable`) は、反例でなくなる (上の「移動の途中の prepare」)。段 4 でこの 2 つの再生を書くなら、その前に、決めたこと 6 をどちらにするかを決める。
+
+## 段 4 の結果 (2026-11-16)
+
+段 4 で、範囲の移動は、Meta の列の `move-start` と `move-end` の 2 つの記録で進むようになった。
+`move-start` は、範囲表の切り替えであり、親の fence であり、子の受け取りの始まりである。
+分割の枠 (`SplitSlot`)、`fence` と `beginIncoming` の RPC、`switchRange`、`reserveSplit` はなくなった。
+`move-start` の後は、子が自分で移動を進める (決めたこと 4)。
+通信の版は 9、保存の形式は版 6 で、どちらも移行は書かない。
+
+### 記録と、誰が進めるか
+
+| 手 | 誰が | 何をするか |
+|---|---|---|
+| `startMove({ from, to, start, end })` | 進める側 (Autoscaler の `split`) | Meta が `move-start` を記録する。同じ移動 (親、子、区間) がもう開いていれば、記録を足さずに、その epoch を返す (再開)。断るのは `refusal` の 4 つの条件 (下の「排他」) と、slot の境目にない区間である |
+| `move-start` を適用する (`moveRows`、`moveStarted`) | 親と子 (列の適用の中で) | 親は `__fenced` に、子は `__incoming` に、移動の epoch の行を、記録を写しに足すのと同じ取引で書く。親にとって、これが fence である (以後、スナップショットの範囲表が区間を子に渡すので、親はその区間の書き込みと prepare を断る)。子は受け取り始め、応答の後の仕事として移動を進め始め、alarm も予約する |
+| `drain({ start, end, epoch })` | 進める側が子に送る | 子が移動を終えるまで進める手順 (`moveStep`) に合流し、運んだ数を返す。子は epoch まで列を適用してから始めるので、まだ `move-start` を知らない子にも、この要求だけで足りる |
+| 全グループを引き取る (`drainStep`) | 子 | 親の `listGroups` と `pull` に移動の epoch を付ける。親は、その epoch まで列を適用してから答える (`toEpochStep`。M21 の PULL_AT_EPOCH)。範囲の記録だけを先に適用し、手前に表定義の記録があれば列の全部を適用する |
+| 親の `finishMove({ start, end, epoch })` | 子が親に送る | 親は epoch まで適用し、fence に終えた印を付け、時刻 m を発行する |
+| `finishIncoming` | 子 (自分で) | 時計を m まで進め、受け取りの記録に終えた印と m を付ける。以後、子は移動の途中ではない |
+| `endMove(epoch)` | 子が Meta に送る | Meta が `move-end` を記録する。もう閉じていれば、閉じた記録の epoch を返す。子は、受け取り終えた後でだけ送る (M21 の END_AFTER_DRAIN。列からは決まらないので、子の手順の順序が守る) |
+| `move-end` まで写しを進める | 子 | 自分の写しで移動が閉じる。alarm は、もうこの移動を進めない |
+
+子が進める手順は、3 つの入口から同じものに合流する (殻の `drive`。移動の epoch ごとに 1 つ)。`move-start` を適用したときの応答の後の仕事、alarm (`redrive` は、受け取り中の移動と、受け取り終えたが自分の写しで閉じていない移動を進める)、進める側の `drain` である。
+子は、起動のときにも、受け取り中か閉じていない移動があれば alarm を予約する。
+Autoscaler の `split` の手は 2 つ (`startMove`、子の `drain`) になった。Autoscaler の判断は、Meta に開いている移動 (`moves()`) を、子に `drain` を送って再開する (`movesToResume`)。子が `move-start` をまだ知らない移動は、最新の範囲表の要求が子に届くか、この再開で始まる。
+
+「止まったときに誰が終えるか」の表の移動の行は、次のようになった。
+
+| 止まる場所 | 残る状態 | 誰が、どう終えるか |
+|---|---|---|
+| `startMove` の前 | 何もない | やり直す |
+| `startMove` の後、子が知る前 | 親はまだ区間を持ち、答える (親も `move-start` を適用していなければ) | 最新の範囲表の要求が子に届くか (子は記録を適用して受け取り始め、そのまま移動を進める)、Autoscaler が開いている移動を再開する |
+| 子が受け取っている途中 (子が再起動して、応答の後の仕事が消えた) | 主キーを名指しする要求は通る。全表の読みは `migrating:` | 子の alarm が続きを進める |
+| `move-end` の記録の前 (子は受け取り終えている) | 表定義の遷移が開けない | 子の alarm が `endMove` を呼び直す |
+
+### 表定義の遷移と移動の排他
+
+Meta は、記録を足す前に、列を畳んだスナップショットで `refusal` に尋ね、次の 2 つで断る。分割の枠はなくなった。
+
+| 足す記録 | 断る条件 (`refusal` の rule) | 誤り |
+|---|---|---|
+| `prepare` | 移動が開いている (`ddl-waits-move`。M21 の DDL_WAITS_MOVE) | `SchemaBusy` (`schema busy: a shard split of <親> is in progress`)。Worker は待ってやり直す (60 秒) |
+| `move-start` | 表定義の遷移が開いている (`move-waits-ddl`。MOVE_WAITS_DDL) | `SchemaBusy`。Autoscaler の `split` は `split busy: schema busy: ...` にして、次の判断でやり直す |
+
+`move-start` は、ほかに、区間の全体を親が持つこと (`owner`)、開いている移動と区間か親か子が重ならないこと (`moves-overlap`。`split busy:`)、子がほかの区間を持たないこと (`child-owns`) を確かめる。
+どれも、段 1 から `refusal` にあり、`test/catalog-m21.test.ts` が M21 と突き合わせている条件である。
+移動が閉じるのは、子が受け取り終え、親が渡し終えた (`finishMove`) 後なので、`prepare` が記録された後に移動の途中のシャードはない。
+`Db.preparedAll` の、移動の途中のシャードを待って尋ね直す手は消した (段 3 の申し送り)。
+
+### 受け取りの記録を受け取りごとに
+
+所有をスナップショットだけで引くようにした (`notOwned` と、全表の読みの claim。手放した記録 `__fenced` とは比べない) ので、範囲が前の持ち主へ戻れるようになった。
+そこで、移動の記録をどれも、その移動の `move-start` の epoch で分けた (`docs/design-refresh-across-move.md` の「実装がすること」の 5、M23b が段 4 に求めること)。
+
+| 記録 | 段 4 より前 | 段 4 |
+|---|---|---|
+| `__incoming` | 区間ごと。`finishIncoming` の 2 つ目の UPDATE が、同じ区間の、ほかの受け取りの終わった行の m を上げた | 受け取りごとに 1 行 (`epoch` が主キー)。書き換えるのは、いま受け取っている移動の行だけで、受け取り終えた移動にもう一度届いても何もしない (時計だけを進める) |
+| `__arrived` | 主キー `(g, lo, after)`。同じグループの 2 度目の到着は `INSERT OR IGNORE` で捨てられ、`receiveStep` は 2 度目の行を入れなかった (行が消えた) | 主キー `(g, epoch, after)`。この移動でまだ届いていない piece は、前の移動で届いたグループでも新しい到着である |
+| `__moved`、`__moved_txn` | 主キー `(g, lo, after)`。同じグループを 2 度渡すと、2 度目を列挙せず (ack 済みの印が残る)、前の m で渡した | 主キー `(g, epoch, after)`。メモリの印は「渡して、まだ受け取り直していない」グループだけで、範囲が戻ると外す。決着の転送は、いまも渡したままの移動の記録だけをたどる (前の移動の記録をたどると、戻した先と戻ってきた先が互いに転送し合う) |
+| `Piece`、`PiecePayload` | グループ、区間、位置 | 移動の epoch も運ぶ。前の移動の遅れた ack は、受け取り直した後の行を消さない |
+
+### 設計の本文からずれたところ
+
+- 進める側の手は、設計の「今と同じ順に呼んでよい」より少ない。`split` は `startMove` と子の `drain` だけを呼び、`drain` が、子の手順 (引き取り、親の `finishMove`、`finishIncoming`、`endMove`) に合流する。進める側が `finishIncoming` と `endMove` を自分で呼ぶと、子が受け取り終えたかを進める側が知らずに呼ぶことになる。
+- Meta の `startMove` は、slot の境目にない区間を、記録の前に断る (`moving a part of a slot is not supported yet`)。段 4 より前は、シャードの `beginIncoming` が、範囲表を切り替える前に断っていた。記録すると、シャードが進められない移動が開き続け、表定義の変更も止まる。
+- `syncSchema` は `{ schema, epoch? }` を受ける。`syncEpoch` への改名はしていない (RPC の列の比べ合いを読みやすくするため)。
+- 子の受け取りの始まりの表定義の epoch を、Meta は返さない。子は列を順に適用するので、`move-start` を適用した時点の表定義は、親が `move-start` を適用した時点と同じである (移動が開いている間は表定義の記録が足されない)。`receiveStep` の、届いた piece の表定義まで追いつく手は残した (通常は何もしない)。
+- 欠陥のスイッチ `pullWithoutEpoch` は、親の側に置いた。子は epoch を運ぶが、親がそこまで適用せずに (fence の前に) 答える。モデルの「要求が epoch を運ばない」と同じ形で、渡した piece を移動ごとに見分けられるようにするためである。
+- 列の適用 (`applyStep`) は、移動の途中になった後の表定義の記録を、記録ごとに断る (M21 の `movingNow`)。同じ続きの中で `move-start` を適用して移動の途中になることがあるからで、Meta の条件が破れたときだけ起きる。`toEpochStep` は、epoch まで適用できていれば、その先の記録で断られても通る。
+- 転送された決着 (`finalize`、`abort`) が運ぶ piece の移動を、まだ適用していないシャードは、その epoch まで適用してから未着の piece を引き取る。
+- シミュレータの alarm は、今までどおり試験が発火させる (`SimCluster.fireAlarms`)。子は、`move-start` を適用したときから応答の後の仕事で移動を進めるので、ふつうは alarm を待たない。alarm は、子が再起動して仕事が消えたときの続きであり、試験は、子が alarm を予約したことを確かめてから発火させる。タイマーで自動に発火させると、移動のないほかの試験でも、取り残された intent の再駆動が仮想の時刻で起き、RPC の列が変わる。
+- シミュレータの書き込みの検査 (`checkWrites`) の持ち主は、Meta のいまの範囲表と `__fenced`、`__incoming` からではなく、シャードが写した列 (`__epoch`) を畳んだ範囲表と、渡したグループの記録 (`__moved`、`__arrived`) から決める。段 4 から、親は `move-start` を写すまで、移る範囲の行を持ち、書き込みを受けてよい (その行は、写した後に子へ運ばれる) ので、Meta のいまの範囲表とは比べられない。
+
+### 検査
+
+先に、段 4 より前のコード (`9e53efa`) で用意した検査 (規則 2)。
+
+- 分割を進める側を各手の前で止める検査 (`test/split-slot.test.ts`。段 4 の前は `test/open/split-driver-stops.test.ts`)。手は、止めずに流したときに進める側が送った呼び出しの列から取る (`test/ddl-driver.ts` の `driver`。表定義と移動の一覧を読む呼び出しは数えない)。止めた後で、移る行と残る行が、最新の範囲表の接続からも、分割の前の範囲表を持ったままの接続からも、読めて書けること、進める側を再開せずに (応答の後の仕事と、子が予約した alarm だけで) 移動が終わり、Meta の列に開いた移動が残らず、親も子も移動の途中でないこと、表定義の変更が通ること、全表の読みで全部の行が数えられること、進める側を再開しても通り、移動の記録が 1 組だけであることを確かめる。子が受け取りの途中で再起動する場面も足した。段 4 より前のコードの手は `syncSchema` `beginSplit` `beginIncoming` `fence` `switchRange` `drain` `finishMove` `finishIncoming` `endSplit` の 9 つで、子が受け取り始めた後のどの手 (`fence` から `endSplit` までの 6 つ) で止めても、移動は終わらず、表定義の変更は「a shard split of s0 is in progress」で失敗した。`switchRange` の前で止めると、移る行の読みと書きが「not owner: s1」で失敗した (問題 17)。受け取りの途中で再起動した子は、alarm を予約しなかった。
+- 前の持ち主へ戻る範囲の検査 (`test/range-returns.test.ts`)。1 シャードの全部の範囲を s0 から s1、s1 から s0、s0 から s1 へ動かし、移動のたびに全部の行が読めて書けることと、受け取ったシャードが受け取りごとに記録を残すことを確かめる。段 4 より前のコードでは、2 つ目の移動の後、前の持ち主 s0 は戻った範囲を `__fenced` の終わった行で断り続け (「not owner: s1」)、40 行のどれも読めなかった。記録の検査も、2 つの受け取りの m が同じ値になって落ちた (`finishIncoming` の 2 つ目の UPDATE)。
+
+段 4 で、2 つとも通るようになった。
+受け取りの記録の守りを 1 つずつ外して、検査が見つけることを確かめた。2 度目の到着を捨てる形 (`receiveStep` の `fresh` を `!this.arrived.has(g)` に戻す) では、3 つ目の移動の後に 40 行全部が消え、到着の記録も 1 行ずつになった。`finishIncoming` の 2 つ目の UPDATE を戻すと、行は残るが、2 つの受け取りの m が同じになった。
+
+M21 の段 4 の赤の再生は `test/m21-moves.test.ts` (4 つの赤、8 件) と `test/fenced-before-switch.test.ts` にある。どれも、直したコードで正しく終わることと、スイッチを入れると、モデルの反例と同じ不変条件が破れることを確かめる。
+
+| M21 の赤 | スイッチ | スイッチを入れたときの姿 |
+|---|---|---|
+| `m21_red_ddl_during_move` | `ddlDuringMove` (Meta) | 子の受け取りの途中に prepare が記録される。DDL は親で「waiting for a shard split on s0」で失敗して abort され、受け取り中の子は、最新の表定義の epoch の読みを「waiting for a shard split on s1」で断る (`servable`) |
+| `m21_red_move_during_ddl` | `moveDuringDdl` (Meta) | 進める側が prepare の後で止まった遷移の間に移動が開き、期限切れの abort が移動の途中に記録される。受け取り中の子は、それを適用できず、最新の epoch の読みを断る |
+| `m21_red_end_early` | `endBeforeDrained` (子) | 子が受け取り終える前に move-end が記録され、Meta の移動の一覧は空になる。次の DDL の prepare を受け取り中の子が適用できず、DDL は失敗し、子は最新の epoch の読みを断る |
+| `m21_red_pull_unfenced` | `pullWithoutEpoch` (親) | 親が move-start を適用する前に行を渡し、その後に分割の前の範囲表で計画した書き込みを受ける。書いた値は子に届かず、親の行は ack で消える (`moveKeepsWrites`、`readConsistent`)。シミュレータの書き込みの検査も、渡した後の行を親に残す書き込みとして見つける |
+| `m21_red_fence_first` | なし | 段 4 より前の手順そのもの。親だけが move-start を適用し (fence)、子が知らないまま進める側が止まった形で、新しい接続も古い範囲表の接続も、移る行を読み書きできる |
+
+`test/catalog.test.ts` には、表定義の遷移と移動の排他を両方向とも Meta だけで確かめる試験と、スイッチが、それぞれの向きの確かめだけを外すことを確かめる試験を足した。
+
+### 比べたもの
+
+RPC の列。`test/history.test.ts` と `test/replay.test.ts` の既定の seed (61 件) を、段 4 の前 (`9e53efa`) と後 (`ffd3ca2`) で `RPC_TRACE` を付けて流し、送り元、宛先、種類の列を比べた。
+46 件は同じで、15 件が違った。違ったのは、分割のある `history` の試験の全部 (「while shards are added」の seed 21 から 26、「with splits and restarts together」の 31 から 34、「with pessimistic transactions ... with splits and restarts」の 51 から 54、同じ seed が同じ実行になることを確かめる 1 件) で、分割のない `history` と、分割のない `replay` は全部同じだった。
+15 件とも、列は最初の分割の最初の手まで同じで、そこで、前は Autoscaler が親と子の `moves` を尋ね、後は子に `drain` を送る。
+15 件の分割の手を足し合わせると次のようになる。
+
+| 要求 | 前 | 後 |
+|---|---|---|
+| Autoscaler から: `moves` (親と子) | 302 | 0 |
+| Autoscaler から: `syncSchema` (枠を取る前に全シャードへ。最初の CREATE TABLE の後の 64 を含む) | 1,324 | 64 |
+| Autoscaler から: `beginIncoming`、`fence`、`finishMove`、`finishIncoming` | 151 ずつ | 0 |
+| Autoscaler から: `drain` | 151 | 175 |
+| 子から親へ: `finishMove` | 0 | 175 |
+| 子から親へ: `listGroups`、`pull`、`ack` | 235、41、46 | 219、65、65 |
+
+前は 151 回、後は 175 回の分割が終わった。分割 1 回の Autoscaler の要求が、`moves` 2、`syncSchema` がシャードの数だけ、`beginIncoming`、`fence`、`drain`、`finishMove`、`finishIncoming` から、子への `drain` 1 つになり、`finishMove` は子が親に送る。
+分割が速く終わるので、作業負荷が終わる前に、作業負荷の側の上限 (`MAX_SPLITS`、12 回) により近くまで割る。
+分割の時期が変わるので、取引の要求 (`exec`、`prepare`、`commit`、`finalize`、`refresh` など) の数と交わり方も変わる。どの試験も、前後とも通る。
+`syncSchema` と、子から親への `listGroups`、`pull`、`finishMove` が運ぶ epoch による列の適用は、Meta への呼び出し (`epochsSince`) なので、RPC の列には出ない。
+
+### 未解決の問題 17 と 37
+
+問題 17 (親の fence の後、範囲表の切り替えの前に進める側が止まると、移る範囲を誰も答えない) は閉じた。`test/fenced-before-switch.test.ts` を本試験へ移した。
+親の fence は、親が `move-start` を適用することで、そのとき Meta の列には、子を宛先にした範囲表がある。
+試験は、モデルの反例と同じ形 (親だけが `move-start` を適用し、子は何も知らない) を作り、新しい接続も、分割の前の範囲表を持ったままの接続も、移る行を読み書きできることを確かめる。
+分割を進める側を各手の前で止める検査 (`test/split-slot.test.ts`) も、段 4 より前のコードでは、この形で落ちた。
+
+問題 37 (取引が分割をまたげない) の再現 (`test/open/` の `transaction-across-split`、`locking-transaction-commit-after-split`、`baton-own-write-across-split`) は、段 4 の前後で流し、どれも同じ形で落ちた。
+最初の誤りの文は同じで、違うのは `read too old: moved at <m>` の m の値だけである (段 4 の前 `1024003090`、後 `1024000022`。分割の手が少なくなり、移動が仮想の時刻の早くに起きる)。
+段 4 は、37 の 3 つの形のどれも変えない。37 が要るのは、移動をまたぐ確かめ直しの規則 (`docs/design-refresh-across-move.md`) で、段 4 は、その規則が前提にする受け取りの記録 (受け取りごとの `from_id` と m) と、前の持ち主へ戻った範囲に答えることを入れた。
+`test/open/` のほかの再現 (UNIQUE と大文字小文字の段の 7 ファイル 11 件) も、前後で同じ誤りで落ちた。
+
+### 危険と、確かめていないこと
+
+- 親が、`move-start` より前に確定した DDL をまだ適用していないと、子の最初の `listGroups` か `pull` で、親は列の全部を適用する (intent を決着させる)。その間、その親に intent を持つ取引の決着を待つ。段 4 より前は、同じ待ちが、Autoscaler の `fence` の中にあった (`reachStep`)。段 4 では、利用者の要求 (子の on-demand の引き取り) がこの待ちに入ることがある。親に intent を置いた取引が、子への prepare で、親からの引き取りを待つと、決着の待ちの上限 (`SCHEMA_WAIT_MS`、5 秒) まで待ってから、競合で失敗する。再現は作っていない。乱択の検査で、この形が起きた数も数えていない。DDL を確定した Worker は、確定の後に全シャードへ適用させる (`syncAll`) ので、親が遅れるのは、その適用が届かなかったときだけである。
+- 子が移動を進める手順は、応答の後の仕事 (DO では `ctx.waitUntil`) で始まり、続きは alarm (5 秒ごと) が進める。alarm の handler の上限 (15 分) を越える移動は、alarm が `drain` を続きから進める (到着の記録のあるグループは飛ばす)。本物の DO では確かめていない (`test/workerd.test.ts` は、Autoscaler の `drain` が子の手順に合流する形で、移動の全部を通す)。
+- 2 つ以上の移動が同時に開くこと (区間とシャードが重ならないとき) は、Meta の条件 (`moves-overlap`) と `test/catalog.test.ts` の場面だけで確かめた。乱択の検査 (`history`、`elle-sim`、`ddl-concurrent`) の分割は、1 つずつ進む。
+- 範囲が前の持ち主へ戻る形は、`test/range-returns.test.ts` の決まった並び (1 シャードの全部の範囲を 3 回動かす) だけで確かめた。Autoscaler は、範囲を持たないシャードしか子にしないので (`child-owns`)、ふつうの分割では起きない。
+
+### 段 4 の後に要るもの
+
+- 問題 37 の実装 (`docs/design-refresh-across-move.md` の「実装がすること」)。受け取りの記録は、受け取りごとに `__incoming` (`from_id`、m、`epoch`) と `__arrived` (`epoch`) にある。`history` の RPC は、尋ねたシャードが fence の宛先かを `__fenced` の `to` と `epoch` で確かめられる。範囲が前の持ち主へ戻る形 (`m23b_live_red_cycle`) の再生も、いまは書ける。
+- `specs/README.md` の M21 の節の「M15 は段 4 で置き換える」と、M15 の節は、M21 が置き換えたことに直す必要がある (この作業は `specs/` を書かないので、直していない)。`docs/model-coverage.md` は、M15 の行を M21 の行に置き換えた。
+- 決めたこと 6 の、表定義の epoch を commit だけで進める案は、まだ決めていない (段 3 と同じ)。
+- 分割の途中で止まる進め方と、範囲が戻る移動を、乱択の検査の生成器に入れること。いまは決まった並びの試験だけが確かめる (上の「危険と、確かめていないこと」)。
+
+乱択の検査 (`scripts/sweep.mjs`、段 4 の後のコード `ffd3ca2`)。
+
+| 検査 | seed | 組 | 結果 |
+|---|---|---|---|
+| `test/history.test.ts` | 1 から 300 | sim、reference-scans、reference-full | 5,400 件が通り、落ちたものはない (1 プロセス、3 つの組を並べて 3,674 秒) |
+| `test/elle-sim.test.ts` | 1 から 300 | sim、reference-scans、reference-full | 900 件が通り、落ちたものはない (1,621 秒) |
