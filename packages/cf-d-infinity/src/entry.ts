@@ -1,5 +1,7 @@
 // 入口の守り (2026-11-12 の入口の安全の確認、指摘 4 から 8)。HTTP と WebSocket の要求の大きさと件数の上限、hello の期限、
 // トークンの比べ方、管理の入口の入力の検証を、ここで決める。上限は README の Limitations に書く。
+import { toValue } from "./client/d1";
+import type { Value } from "./types";
 
 export const ENTRY_LIMITS = {
   /** 1 回の HTTP の本文の文字数。 */
@@ -51,6 +53,12 @@ export function exactIntegers(_key: string, value: unknown, context?: { source?:
   const big = BigInt(source);
   return big >= INT64_MIN && big <= INT64_MAX ? big : value;
 }
+
+/** HTTP の /sql と /batch の本文の reviver。 */
+export const numberLiterals = exactIntegers;
+
+/** HTTP の /sql と /batch の引数を値にする。 */
+export const jsonParams = (params: unknown): Value[] => ((params ?? []) as unknown[]).map(toValue);
 
 /**
  * 本文を JSON として読む。大きすぎれば 413、JSON でなければ 400 で断る。reviver は、利用者の値を運ぶ本文 (/sql と /batch) にだけ

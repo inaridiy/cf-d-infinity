@@ -6,6 +6,7 @@ import { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 // @ts-expect-error -- JavaScript のモジュール
 import { workerBundle } from "../scripts/esbuild-options.mjs";
+import { HTTP_LITERALS, JS_VALUES, shownValue } from "./entry-values";
 
 let mf: Miniflare;
 let consumerBundle = "";
@@ -182,6 +183,48 @@ describe("64-bit integers and NUL through the binding and HTTP", () => {
     expect(r.lastRow).toMatchObject({ status: 200, changes: 1, lastInsertRowid: "1152921504606846981" });
     expect(r.batch).toMatchObject({ status: 200, results: [{ rows: [{ n: MIN }], changes: 0 }, { rows: [{ s: NUL }], changes: 0 }] });
     expect(r.nul).toMatchObject({ status: 200, rows: [{ s: NUL, h: "610062" }] });
+  });
+});
+
+// 入口の値 (test/entry-values.ts。計画書の未解決の問題 47)。HTTP は JSON の literal の文面で、Service Binding と D1 互換の API は
+// JS の値の型で、INTEGER か REAL かを決める。値でないものは、文を実行する前に利用者の誤りとして断る。
+describe("argument values at every entry, on workerd", () => {
+  // HTTP の結果は intMode "string" の JSON である。INTEGER は 10 進の文字列、REAL は JSON の数。
+  const overHttp = (v: unknown) => (typeof v === "bigint" ? String(v) : v);
+  const row = (want: { t: string; v: unknown }, key: boolean, show: (v: unknown) => unknown) =>
+    key ? { t: want.t, v: show(want.v), tx: want.t, vx: show(want.v) } : { t: want.t, v: show(want.v) };
+
+  it("reads an HTTP JSON number by its text, and a binding or D1 API value by its JS type", async () => {
+    const r = await call("entryValues");
+    for (const [i, [literal, want]] of HTTP_LITERALS.entries()) {
+      const got = r.http[i];
+      for (const step of ["select", "batch", "insert", "key"] as const) {
+        const label = `HTTP ${literal} ${step}`;
+        if ("error" in want) {
+          expect.soft(got[step], label).toMatchObject({ status: 400, error: expect.stringMatching(want.error) });
+        } else if (step !== "insert") {
+          expect.soft(got[step], label).toEqual({ status: 200, row: row(want, step === "key", overHttp) });
+        } else expect.soft(got[step].status, label).toBe(200);
+      }
+    }
+    for (const name of ["binding", "local"] as const) {
+      for (const [i, c] of JS_VALUES.entries()) {
+        const got = r[name][i];
+        if (got === null) continue;
+        for (const step of Object.keys(got)) {
+          const label = `${name} ${c.label} ${step}`;
+          if ("error" in c.want) {
+            expect.soft(got[step], label).toMatchObject({ error: expect.stringMatching(c.want.error) });
+            expect.soft(got[step].name, label).not.toBe("TypeError");
+          } else if (step === "insert") expect.soft(got[step], label).toEqual({ row: null });
+          else expect.soft(got[step], label).toEqual({ row: row(c.want, step === "key", shownValue) });
+        }
+      }
+    }
+    // 断った値の行は、どの入口でも入っていない。
+    const accepted = HTTP_LITERALS.filter(([, w]) => !("error" in w)).length
+      + JS_VALUES.filter((c) => c.rpc !== false && !("error" in c.want)).length + JS_VALUES.filter((c) => !("error" in c.want)).length;
+    expect(r.rows).toBe(String(accepted));
   });
 });
 

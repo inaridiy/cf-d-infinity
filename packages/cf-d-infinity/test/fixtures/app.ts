@@ -3,6 +3,9 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { integer, sqliteTable } from "drizzle-orm/sqlite-core";
 import { connect, drizzleMigrationsTable, type Connection } from "../../src/binding";
+import { D1Compatible } from "../../src/client/d1";
+import { dbFor, type Env as WorkerEnv } from "../../src/worker";
+import { BY_KEY, HTTP_LITERALS, INSERT, JS_VALUES, SELECT, TABLE, shownRow } from "../entry-values";
 
 export { DinfAutoscaler, DinfDatabase, DinfMeta, DinfShard } from "../../src/cloudflare";
 
@@ -187,6 +190,59 @@ const scenarios: Record<string, (db: Connection, env: Env) => Promise<unknown>> 
       batchPlain: await post("/batch", JSON.stringify({ statements: [{ sql: "SELECT n FROM w WHERE id = 2" }] })),
       nul: await post("/sql", JSON.stringify({ sql: "SELECT ? AS s, hex(?) AS h", params: [NUL, NUL] })),
     };
+  },
+  /**
+   * 入口の値 (test/entry-values.ts)。HTTP の /sql と /batch には JSON の literal を文面のまま送り、Service Binding (query、batch、
+   * 取引の execute) と、この Worker の中の D1 互換の API には JS の値を渡す。どれも、表を読まない文と、主キーで読み書きする文で流す。
+   */
+  async entryValues(_db, env) {
+    const post = async (path: string, body: string) => {
+      const r = await (env.DINF_DB as { fetch: typeof fetch }).fetch(`http://dinf.internal${path}`, { method: "POST", body, headers: { authorization: "Bearer data-token" } });
+      const out = (await r.json()) as { rows?: Record<string, unknown>[]; results?: { rows: Record<string, unknown>[] }[]; error?: string };
+      return { status: r.status, row: out.rows?.[0] ?? out.results?.[0]?.rows[0], error: out.error };
+    };
+    const q = (s: string) => JSON.stringify(s);
+    const tried = async (f: () => PromiseLike<Record<string, unknown> | null | undefined>) =>
+      Promise.resolve().then(f).then((row) => ({ row: shownRow(row) }), (e: Error) => ({ error: e.message, name: e.name }));
+    const big = connect(env.DINF_DB, { intMode: "bigint" });
+    await big.prepare(TABLE).run();
+    const http = [];
+    for (const [i, [literal]] of HTTP_LITERALS.entries()) {
+      http.push({
+        select: await post("/sql", `{"sql":${q(SELECT)},"params":[${literal}],"intMode":"string"}`),
+        batch: await post("/batch", `{"statements":[{"sql":${q(SELECT)},"params":[${literal}]}],"intMode":"string"}`),
+        insert: await post("/sql", `{"sql":${q(INSERT)},"params":[${i},${literal}]}`),
+        key: await post("/sql", `{"sql":${q(BY_KEY)},"params":[${i},${literal}],"intMode":"string"}`),
+      });
+    }
+    const binding = [];
+    for (const [i, c] of JS_VALUES.entries()) {
+      if (c.rpc === false) {
+        binding.push(null);
+        continue;
+      }
+      const tx = await big.begin("deferred");
+      const inTx = await tried(async () => (await tx.execute(SELECT, [c.value()])).rows[0]);
+      await tx.rollback();
+      binding.push({
+        select: await tried(() => big.prepare(SELECT).bind(c.value()).first()),
+        batch: await tried(async () => (await big.batch([big.prepare(SELECT).bind(c.value())]))[0]!.results[0] as Record<string, unknown>),
+        tx: inTx,
+        insert: await tried(async () => (await big.prepare(INSERT).bind(100 + i, c.value()).run(), null)),
+        key: await tried(() => big.prepare(BY_KEY).bind(100 + i, c.value()).first()),
+      });
+    }
+    // この Worker の中で、Db を D1 互換の API で包む (src/client/d1.ts)。
+    const d1 = new D1Compatible(await dbFor(env as unknown as WorkerEnv, 0), { intMode: "bigint" });
+    const local = [];
+    for (const [i, c] of JS_VALUES.entries()) {
+      local.push({
+        select: await tried(() => d1.prepare(SELECT).bind(c.value()).first()),
+        insert: await tried(async () => (await d1.prepare(INSERT).bind(200 + i, c.value()).run(), null)),
+        key: await tried(() => d1.prepare(BY_KEY).bind(200 + i, c.value()).first()),
+      });
+    }
+    return { http, binding, local, rows: await big.prepare("SELECT count(*) AS c FROM ev").first("c").then(String) };
   },
 };
 

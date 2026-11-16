@@ -8,11 +8,10 @@ import { MetaCore, type Catalog, type SplitMove } from "./meta";
 import { planSplit, shardsOf, type Interval } from "./routing";
 import { ShardCore } from "./shard/core";
 import { batonSealer, handlePipeline, serveHranaSocket, type BatonSeal, type PipelineReq } from "./client/hrana";
-import { toValue } from "./client/d1";
 import { intModeOf, rowidOut, rowsOut } from "./client/results";
 import { setSqlWasm } from "./sql/scratch";
 import { bindPlain, bindTyped, restoreColumns } from "./value";
-import { BadRequest, checkCount, checkSql, clusterName, ENTRY_LIMITS, exactIntegers, readJson, sameToken, shardCount, shardName } from "./entry";
+import { BadRequest, checkCount, checkSql, clusterName, ENTRY_LIMITS, jsonParams, numberLiterals, readJson, sameToken, shardCount, shardName } from "./entry";
 import { checkProtocol, PROTOCOL_VERSION, type Backend, type Plain, type PlainRow, type ShardApi, type ShardHealth, type Value } from "./types";
 // @ts-expect-error wrangler と esbuild がバンドル時に解決する
 import sqlWasm from "./sql-wasm.wasm";
@@ -701,7 +700,7 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
       return Response.json(await handlePipeline(req, (token) => dbFor(env, token, background), await batonSeal(env)));
     }
     // 引数の数字だけの literal は、64 ビットに収まれば正確に読む (exactIntegers)。
-    const body = (await readJson(request, exactIntegers)) as Statement & { token?: number; statements?: Statement[]; intMode?: unknown };
+    const body = (await readJson(request, numberLiterals)) as Statement & { token?: number; statements?: Statement[]; intMode?: unknown };
     if (body.sql !== undefined) checkSql(body.sql);
     if (body.statements !== undefined) {
       checkCount(body.statements.length, "statements");
@@ -721,14 +720,14 @@ export async function handle(request: Request, env: Env, ctx?: { waitUntil(p: Pr
       // 結果は D1 と同じ形で、INTEGER は本文の intMode の形である。JSON は bigint を書けないので、"number" か "string" だけを受ける
       // (src/client/results.ts)。intMode は文を実行する前に確かめる。
       const mode = intModeOf(body.intMode, true);
-      const r = await db.query(body.sql, (body.params ?? []).map(toValue));
+      const r = await db.query(body.sql, jsonParams(body.params));
       return Response.json({
         columns: r.columns, rows: rowsOut(r.columns, r.values, mode), changes: r.changes, lastInsertRowid: rowidOut(r.lastInsertRowid, mode), token: db.token,
       });
     }
     if (path === "/batch") {
       const mode = intModeOf(body.intMode, true);
-      const out = await db.batch((body.statements ?? []).map((s) => ({ sql: s.sql, params: (s.params ?? []).map(toValue) })));
+      const out = await db.batch((body.statements ?? []).map((s) => ({ sql: s.sql, params: jsonParams(s.params) })));
       const results = out.map((r) => ({ rows: rowsOut(r.columns, r.values, mode), changes: r.changes }));
       return Response.json({ results, token: db.token });
     }
