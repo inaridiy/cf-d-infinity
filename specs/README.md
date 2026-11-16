@@ -893,7 +893,7 @@ witness は 4 つである。`witnessCrossAppliedThenMoved` は、2 つの piece
 実装より先に書いたモデルである。
 設計は [docs/design-catalog-epoch.md](../docs/design-catalog-epoch.md) にある。
 2026-11-15 に設計の段 1 (Meta の `__epoch` の列と、`src/catalog.ts` の畳み込み) が入った。
-2026-11-16 に段 3 (DDL の 2 相化) が入り、Meta は遷移の条件 (開くのは 1 つ、終わり方は 1 つ、全シャードの ok) を列から確かめる。M12 と M14 は M21 が置き換えた。M15 は段 4 で置き換える。
+2026-11-16 に段 3 (DDL の 2 相化) と段 4 (移動を move-start と move-end の記録で進め、子が進める) が入り、Meta は遷移の条件 (開くのは 1 つ、終わり方は 1 つ、全シャードの ok、表定義の遷移と移動の排他) を列から確かめる。M12、M14、M15 は M21 が置き換えた。
 遷移の条件は `src/catalog.ts` の `refusal()` に書き、このモデルの乱択の実行と突き合わせている (`test/catalog-m21.test.ts`) が、Meta が条件として使うのは段 3 と段 4 からである。
 
 いまの Meta は、5 つの版と排他を別々に持っている。
