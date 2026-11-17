@@ -540,6 +540,21 @@ red     $f m24_lock_red_no_wound holderSurvives         # 書き込み禁止に�
 witness $f m24_lock_green witnessDdlAfterTxn
 witness $f m24_lock_green witnessWoundThenCommit
 witness $f m24_lock_green witnessDdlBusy
+# 取り消させた DDL のやり直し (決めた設計。時刻あり。DDL の成否は利用者の時刻だけで決まり、行の置き場所に依らない)
+green   $f m24_retry_green retrySafe                    # 取り消された DDL を、同じ期限の中で、新しい epoch の prepare でやり直す。禁止に当たった取引は、そのシャードの行のロックを取る
+green   $f m24_retry_no_retry_same retrySafe            # やり直さない形でも、行が 1 つのシャードにあれば SQLite と同じ (下の赤と合わせて、成否が置き場所で決まる)
+red     $f m24_retry_red_no_retry asSqlite              # やり直さない (m24_lock の形): 行が 2 つのシャードにあると、DDL が期限より前に失敗する
+red     $f m24_retry_red_restart asSqlite               # やり直すたびに、期限を数え直す
+red     $f m24_retry_red_same_epoch checkSawRows        # やり直しが、取り消された試みの prepare の epoch と ok を使う
+red     $f m24_retry_red_no_hold noReblock              # 禁止に当たった取引に、シャードがロックを与えない: 取り消しとやり直しが繰り返す
+red     $f m24_retry_red_no_wait holderSurvives         # prepare が行ロックを待たない
+red     $f m24_retry_red_no_wound holderNotDelayed      # 取引が DDL を取り消させない: 取引の文が、期限まで DDL を待つ
+witness $f m24_retry_green witnessWoundRetryCommit      # 行が 2 つのシャード。取り消し、やり直し、取引が期限のうちに確定し、DDL が確定する
+witness $f m24_retry_green witnessSplitBusy             # 行が 2 つのシャード。取引が期限を過ぎてロックを持ち、やり直した DDL が期限に失敗する
+witness $f m24_retry_green witnessSameCommit            # 行が 1 つのシャード。DDL は取引を待ち、その確定の後で確定する
+witness $f m24_retry_green witnessSameBusy              # 行が 1 つのシャード。取引が期限を過ぎてロックを持ち、DDL が期限に失敗する
+live    $f m24_retry_green retryLive                    # 活性: 始めた DDL は終わり、時刻は上限まで進み、送られた文は答えを得る
+live_red $f m24_retry_red_no_hold ddlTerminates         # ロックを与えないと、取り消しとやり直しが、同じ刻みの中で限りなく続く
 # 取引の中の DDL (M13 を表ごとにしたもの)
 green   $f m24_boundary_green boundarySafeAll
 red     $f m24_boundary_red_main prefixOfScript
@@ -556,7 +571,10 @@ for m in m24_green_unrelated m24_green_build m24_green_check m24_green_drop m24_
          m24_red_global m24_red_global_commit_only m24_red_prepare_advances m24_red_read_deps m24_red_apply_all m24_red_apply_touched \
          m24_red_index m24_red_write_epoch m24_red_view \
          m24_floor_green m24_floor_red_global m24_floor_red_restore_all m24_floor_red_no_floor \
-         m24_lock_green m24_lock_red_no_wait m24_lock_red_no_wound m24_boundary_green m24_boundary_red_global; do tests $f $m; done
+         m24_lock_green m24_lock_red_no_wait m24_lock_red_no_wound \
+         m24_retry_green m24_retry_no_retry_same m24_retry_red_no_retry m24_retry_red_restart m24_retry_red_same_epoch \
+         m24_retry_red_no_hold m24_retry_red_no_wait m24_retry_red_no_wound \
+         m24_boundary_green m24_boundary_red_global; do tests $f $m; done
 # 決めたこと 6 の確かめ直し: M21 の場面を、epoch を commit だけで進める形で (index の作成と CHECK は、M21 の m21_alt_commit_only_*)
 f=m24b_m21_commit_only.qnt
 green   $f m24_m21_green_split_txns epochSafeCommitOnly
@@ -775,6 +793,45 @@ if [ "${HEAVY:-0}" = "1" ]; then
 fi
 for m in m23c_green_ro_w m23c_green_ro_y m23c_green_w m23c_green_retain m23c_green_empty m23c_base_ro m23c_red_child_below \
          m23c_red_no_merge m23c_red_prev_above m23c_red_no_retain m23c_red_no_epoch m23c_red_worker_routes m23c_red_empty_no_floor; do tests $f $m; done
+
+echo "== M25 txn lock lease (行ロックの寿命を取引のものにする。どの文も、取引の全部のロックを延ばす。実装より先に書いたモデル)"
+f=m25_txn_lock_lease.qnt
+green   $f m25_green leaseSafe                          # 決めた設計 (R = 1)。4 つの置き場所を、同じ利用者の手で並べて動かす
+green   $f m25_green_exact leaseSafe                    # 文ごとに延ばす形 (R = 0)
+green   $f m25_per_shard_same leaseSafe                 # 今の形でも、行が 1 つのシャードにあれば、どの文もロックを延ばす (下の赤と合わせて、置き場所で決まる)
+red     $f m25_red_per_shard outcomeSame                # 今の形: 文を受けたシャードだけが延ばす。y で働く間に、別のシャードの x のロックが切れる
+red     $f m25_red_per_shard stmtKeeps
+red     $f m25_red_local_lease outcomeSame              # 文を受けたシャードが、受けるたびに自分で now + L に延ばす
+red     $f m25_red_no_epoch idleLoses                   # シャードが lease の版を見ない: 延長の再配達で、取り消した取引のロックが延び続ける
+red     $f m25_red_regrant lockProtects                 # 延長が、切れたロックを取り直す
+red     $f m25_red_trust_lease serializable             # COMMIT が lease を信じて検証を省く: 再起動でロックが消えた後の書き込みを失う
+witness $f m25_green witnessBusyKeeps                   # 行が 2 つのシャード。y で働き続ける取引の x のロックは切れず、W が SQLITE_BUSY、取引が確定する
+witness $f m25_green witnessIdleLoses                   # 放っておかれた取引の x のロックが切れて W が書き、COMMIT が競合になる (どの置き場所でも)
+witness $f m25_green witnessRenew                       # 文が触らないシャードへ延長が届き、取引が確定する
+witness $f m25_green witnessLeftover                    # unlock の届かなかったロックは、lease の期限で切れ、待っていた W が書く
+witness $f m25_green witnessRestartCaught               # 再起動で消えたロックの後の W の書き込みを、COMMIT の検証が見つける
+witness $f m25_green_exact witnessBusyKeeps
+green   $f m25_red_per_shard witnessBusyKeeps           # 同じ witness は、今の形では届かない
+live    $f m25_green leaseLive                          # 活性: ロックはいつか全部切れたままになり、待つ W は終わり、時刻は上限まで進む
+live    $f m25_green_exact leaseLive
+live_red $f m25_red_no_epoch locksReleased              # 版を見ないと、再配達で延び続けるロックが、時刻の上限を越えて残る
+for m in m25_green m25_green_exact m25_per_shard_same m25_red_per_shard m25_red_local_lease m25_red_no_epoch m25_red_regrant \
+         m25_red_trust_lease; do tests $f $m; done
+
+echo "== M5c phase 2 while a range returns (範囲が前の持ち主へ戻る間に届く phase 2。未解決の問題 54 と 55。実装より先に書いたモデル)"
+f=m5c_phase2_return.qnt
+green   $f m5c_green m5cSafe                             # 「渡した」印はグループが届いたときに外し、転送はいまの印の移動の記録だけをたどる。移動 2 回
+green   $f m5c_green3 m5cSafe                            # 同上、移動 3 回 (S0 → S2 → S0 → S2)
+red     $f m5c_red_clear_at_start deliveredApplied       # 段 4 のコード: 戻る移動の start で印を外す。前の持ち主が適用も転送もせずに答える
+red     $f m5c_red_clear_at_start noLostWrite            # 同上: 届け終えた記録が消えた後、戻ってきた intent を presumed abort で捨てる
+red     $f m5c_red_follow_stale boundedForwards          # 段 4 より前: 転送の記録を全部たどり、S0 と S2 が互いに転送し合う
+red     $f m5c_red_rehand handsUnderFence                # 問題 55: 終わった移動の遅れた pull に、範囲が戻った親がグループを渡し直す
+red     $f m5c_red_rehand boundedForwards                # 同上: 付け直した印で、S0 の phase 2 が S2 との間を行き来する
+live    $f m5c_green delivers                            # 活性: phase 2 はいつか届け終わる
+live    $f m5c_green3 delivers
+witness $f m5c_green witnessForwardBack                  # 戻る移動の途中で届いた phase 2 が、S2 へ行って S0 へ戻り、S0 で適用される
+witness $f m5c_green witnessAppliedAtS2                  # 転送された phase 2 を、まだ渡していない S2 が適用する
+for m in m5c_green m5c_red_clear_at_start m5c_red_follow_stale m5c_red_rehand; do tests $f $m; done
 
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt

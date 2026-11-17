@@ -1,203 +1,9 @@
-import { writeFileSync } from "node:fs";
-import { expectQuiescent } from "./invariants";
 import { describe, expect, it } from "vitest";
-import { REFERENCE_ONLY, seedsOr, SimCluster, USERS } from "./sim";
-import { checkHistory, type Read, type TxRecord } from "./history";
-import { SqlError, type Faults } from "../src/types";
-import type { Txn } from "../src/client/db";
-import { split } from "../src/autoscaler";
-import { planSplit, shardsOf } from "../src/routing";
+import { REFERENCE_ONLY, seedsOr } from "./sim";
+import { runHistory } from "./history";
+import type { Faults } from "../src/types";
 
-function prng(seed: number) {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 2 ** 32;
-  };
-}
-
-const TENANTS = 6;
-const IDS = 3;
-
-interface RunOpts {
-  seed: number;
-  clients?: number;
-  ops?: number;
-  skewMs?: number;
-  restarts?: boolean;
-  /** 実行中にシャードを増やす。 */
-  splits?: boolean;
-  /** 悲観的な取引で流す。 */
-  pessimistic?: boolean;
-  faults?: Faults;
-}
-
-
-/**
- * 実行が終わらないと見なす上限。仮想の時刻で 10 分、出来事 200 万個。欠陥を入れた実行は、要求を投げ合い続けて終わらないことがある。
- * 上限で、原因の分かる失敗にする (試験の制限時間は、出来事が途切れずに続くと効かないことがある)。
- */
-const STALL_MS = 10 * 60_000;
-const STALL_STEPS = 2_000_000;
-
-async function run(o: RunOpts) {
-  const rnd = prng(o.seed);
-  const skew = new Map<string, number>();
-  const c = new SimCluster({
-    shards: 4,
-    faults: o.faults,
-    seed: o.seed,
-    skewMs: (id) => {
-      if (!skew.has(id)) skew.set(id, Math.floor(rnd() * (o.skewMs ?? 0)));
-      return skew.get(id)!;
-    },
-  });
-  c.net.jitter = () => (rnd() < 0.5 ? 0 : rnd() * 3);
-  return Promise.race([body(o, c, rnd), c.stalled(STALL_MS, STALL_STEPS)]);
-}
-
-async function body(o: RunOpts, c: SimCluster, rnd: () => number) {
-  const admin = c.client();
-  await admin.ddl(USERS);
-
-  const history: TxRecord[] = [];
-  const pick = (n: number) => 1 + Math.floor(rnd() * n);
-  const key = () => ({ t: pick(TENANTS), i: pick(IDS) });
-  const k = (x: { t: number; i: number }) => `${x.t}/${x.i}`;
-  let seq = 0;
-  let unknown = 0;
-
-  const readKey = async (tx: Txn, x: { t: number; i: number }, reads: Read[]) => {
-    // 整数の引数は INTEGER (bigint) で渡す。JS の数は REAL として束縛される (列の型の親和性が整数に戻すので、答えは同じである)。
-    const r = await tx.query("SELECT n FROM users WHERE tenant_id = ? AND id = ?", [BigInt(x.t), BigInt(x.i)]);
-    const value = (r.rows[0]?.n as number | undefined) ?? null;
-    reads.push({ key: k(x), value });
-    return value;
-  };
-  const readTenant = async (tx: Txn, t: number, reads: Read[]) => {
-    const r = await tx.query("SELECT count(*) c, coalesce(sum(n), 0) s FROM users WHERE tenant_id = ?", [BigInt(t)]);
-    reads.push({ tenant: t, value: { count: r.rows[0]!.c, sum: r.rows[0]!.s } });
-  };
-  const put = async (tx: Txn, x: { t: number; i: number }, v: number, writes: TxRecord["writes"]) => {
-    await tx.query("DELETE FROM users WHERE tenant_id = ? AND id = ?", [BigInt(x.t), BigInt(x.i)]);
-    await tx.query("INSERT INTO users(tenant_id, id, n) VALUES (?, ?, ?)", [BigInt(x.t), BigInt(x.i), BigInt(v)]);
-    writes.push({ key: k(x), value: v });
-  };
-
-  const oneTxn = async (client: ReturnType<SimCluster["client"]>) => {
-    const name = `w${seq++}`;
-    const reads: Read[] = [];
-    const writes: TxRecord["writes"] = [];
-    const tx = await client.begin();
-    if (o.pessimistic) {
-      tx.pessimistic = true;
-      tx.lockReads = true;
-    }
-    const kind = rnd();
-    const v = seq * 10 + 1;
-    if (kind < 0.25) {
-      await readKey(tx, key(), reads);
-      await readTenant(tx, pick(TENANTS), reads);
-      await readKey(tx, key(), reads);
-    } else if (kind < 0.5) {
-      const x = key();
-      await readKey(tx, x, reads);
-      await put(tx, x, v, writes);
-    } else if (kind < 0.75) {
-      await readKey(tx, key(), reads);
-      await readKey(tx, key(), reads);
-      await put(tx, key(), v, writes);
-    } else {
-      const a = key();
-      let b = key();
-      while (k(b) === k(a)) b = key();
-      await readTenant(tx, a.t, reads);
-      await put(tx, a, v, writes);
-      await put(tx, b, v + 1, writes);
-    }
-    try {
-      await tx.commit();
-    } catch (e) {
-      await tx.unlockAll();
-      throw e;
-    }
-    const ts = tx.commitTs ?? tx.T;
-    if (ts === undefined) return;
-    history.push({ name, ts, readOnly: writes.length === 0, reads, writes });
-  };
-
-  const worker = async () => {
-    for (let i = 0; i < (o.ops ?? 40); i++) {
-      try {
-        // 取引ごとに別セッションにする。因果トークンが時計のずれを隠さないようにするためである。
-        await oneTxn(c.client());
-      } catch (e) {
-        const m = e instanceof Error ? e.message : String(e);
-        if (/^(conflict|read too old|not owner|migrating)/.test(m) || e instanceof SqlError && /UNIQUE/.test(m)) continue;
-        if (/fenced|rpc dropped/.test(m)) {
-          unknown++;
-          continue;
-        }
-        throw e;
-      }
-    }
-  };
-
-  let stop = false;
-  const chaos = (async () => {
-    while (!stop && o.restarts) {
-      await c.sleep(15);
-      c.restart(c.shardIds[Math.floor(rnd() * c.shardIds.length)]!);
-      await Promise.all([...c.cores.values()].map((core) => core.redrive().catch(() => {})));
-    }
-  })();
-  let splits = 0;
-  // 割る回数に上限を置く。書き手が動いている間ずっと割ると、悲観的な取引の実行のように長く続く実行では数百回割り、分割ごとに
-  // 全シャードへ版を適用させる費用がシャードの数に比例するので、全体で 2 乗に膨らむ (seed 207690027 で 581 回、RPC 17 万回。
-  // 計画書の未解決の問題 13)。本物の Autoscaler は、負荷の閾値を超えたときにしか割らない。
-  const MAX_SPLITS = 12;
-  const grower = (async () => {
-    let next = c.shardIds.length;
-    while (!stop && o.splits && splits < MAX_SPLITS) {
-      await c.sleep(25);
-      const { routing } = await c.catalog();
-      const list = shardsOf(routing);
-      const parent = list[Math.floor(rnd() * list.length)]!;
-      const range = planSplit(routing, parent);
-      if (!range) continue;
-      const child = `s${next++}`;
-      // 再起動で途中で失敗しても、同じ範囲で最初からやり直せる。
-      for (let attempt = 0; attempt < 50; attempt++) {
-        try {
-          await split(c, parent, child, { range });
-          splits++;
-          break;
-        } catch (e) {
-          if (!/fenced|dropped/.test(String(e))) throw e;
-          await c.sleep(2);
-        }
-      }
-    }
-  })();
-  await Promise.all(Array.from({ length: o.clients ?? 6 }, worker));
-  stop = true;
-  await chaos;
-  await grower;
-  await c.settle();
-  for (const core of c.cores.values()) await core.redrive();
-  await c.settle();
-  // 欠陥を入れていない実行では、後始末が済んでいることも確かめる。
-  if (!o.faults) await expectQuiescent(c);
-  // 失敗した seed を調べるための書き出し。SIM_DUMP=<ファイル> で、取引の記録と RPC の記録を JSON で残す。
-  if (process.env.SIM_DUMP) {
-    const plain = (_k: string, x: unknown) => (x instanceof Uint8Array ? [...x] : x);
-    writeFileSync(process.env.SIM_DUMP, JSON.stringify({ seed: o.seed, history, rpc: c.net.log }, plain));
-  }
-  return { history, violations: checkHistory(history), unknown, c, splits };
-}
+const run = runHistory;
 
 describe("history checker on the real shard code", () => {
   for (const seed of seedsOr([1, 2, 3, 4, 5, 6])) {
@@ -251,6 +57,48 @@ describe("history checker with pessimistic transactions", () => {
       expect(violations.slice(0, 3)).toEqual([]);
     }, 60000);
   }
+});
+
+// 段 4 から、子が自分で移動を進める (move-start を適用したときの応答の後の仕事と、5 秒ごとの alarm)。ここでは、移動の手順の要求の前に
+// 子か親を乱択で再起動し、進める側 (Autoscaler の split) を、ときどき startMove の後で止めるか、再起動で失敗した drain をやり直さずに
+// 離れさせる。子は、alarm で続きを進める (シミュレータの alarm は仮想の時計で発火する)。取引の間に待ちを置き、作業負荷を alarm が何度か
+// 発火するまで続ける。phase 2 と移動の手順の要求の配送を遅らせ、tenant を多くし、移動を詰めて流す (test/move-returns.test.ts と同じ値で、
+// 移動の選び方だけが Autoscaler と同じ半分の分割である)。確かめるのは、履歴の直列化可能性と、最後の読み (失われた書き込み)、移動の後の
+// 確定して届け終えた取引の intent の残り (history.ts の strandedIntents)、受け取り終える前の move-end (END_AFTER_DRAIN)、移動が閉じた後の
+// 行の置き場所、後始末である。
+// 遅らせない値 (4 シャード、tenant 6、移動の間に最大 800 ms) では、欠陥のスイッチ pullWithoutEpoch を seed 1 から 40 で 1 度も見つけず、
+// phase 2 を遅らせるだけで 8、ここの値で 28 になった (tenant を 40 にするだけ、移動を詰めるだけでは 1 のまま。2026-11-16)。
+describe("history checker while the shards of a move restart and its driver stops", () => {
+  const memo = new Map<number, ReturnType<typeof runHistory>>();
+  const once = (seed: number) => {
+    if (!memo.has(seed)) {
+      memo.set(seed, run({
+        seed, shards: 3, tenants: 40, slowPhase2Ms: 2_000, skewMs: 20, ops: 40, thinkMs: 400,
+        moves: { kind: "split", restarts: true, stops: true, slowMoveRpcMs: 60, paceMs: 200 },
+      }));
+    }
+    return memo.get(seed)!;
+  };
+  const defaults = [61, 62, 63, 64];
+  for (const seed of seedsOr(defaults)) {
+    it(`stays serializable, and every move finishes (seed ${seed})`, async () => {
+      const r = await once(seed);
+      expect(r.counts.moves).toBeGreaterThan(0);
+      // 全部の文を基準経路で実行する組 (REFERENCE=full) では、どの読みも全表の読みで、移動の途中の親と子は、それを migrating で断る。
+      // 子が再起動すると、alarm (5 秒後) が続きを進めるまで受け取り中なので、その間の取引はほとんど断られる (seed 1 から 300 の 15 個で、
+      // 確定した書き込みの取引が 20 以下だった。seed 2 は 240 のうち 15)。その組では、確定した取引の数を求めない。
+      expect(r.history.filter((h) => !h.readOnly).length).toBeGreaterThan(process.env.REFERENCE === "full" ? 0 : 20);
+      expect(r.violations.slice(0, 3)).toEqual([]);
+      expect(r.problems.slice(0, 5)).toEqual([]);
+    }, 120_000);
+  }
+  // 検査が何も確かめていない実行にならないこと。子と親は移動の途中で再起動し、進める側の drain が完了を返さないまま閉じる移動がある。
+  // 既定の seed で数える (SEEDS で 1 つの seed だけを流しても、この試験は変わらない)。
+  it("restarts children and parents mid-move, and some moves finish without their driver", async () => {
+    const all = await Promise.all(defaults.map(once));
+    const sum = (f: (r: Awaited<ReturnType<typeof runHistory>>) => number) => all.reduce((a, r) => a + f(r), 0);
+    expect({ restarts: sum((r) => r.counts.restarts) > 0, byChild: sum((r) => r.counts.byChild) > 0 }).toEqual({ restarts: true, byChild: true });
+  }, 240_000);
 });
 
 // 範囲の移動で時計を渡さない欠陥 (finishWithoutClock) は、この作業負荷では見つからない (2026-11-12 に seed 1 から 1000 で 0 件。

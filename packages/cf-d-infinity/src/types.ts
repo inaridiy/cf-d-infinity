@@ -491,6 +491,11 @@ export interface Faults {
    * 渡す (M21 の m21_red_pull_unfenced。モデルでは、要求が epoch を運ばない形)。親は、渡した後も、古い範囲表の書き込みを受ける。
    */
   pullWithoutEpoch?: boolean;
+  /**
+   * 範囲を前の持ち主へ戻す移動の move-start を適用したところで、その範囲のグループの「渡した」印を外す (段 4 のコード。specs/m5c_phase2_return.qnt
+   * の m5c_red_clear_at_start、未解決の問題 54)。グループが届く前に来た phase 2 を、適用も転送もせずに受け取ったと答える。
+   */
+  unmarkOnReturn?: boolean;
   /** autocommit の書き込みが、他の取引の intent との UNIQUE を照合しない (2026-11 のレビューで見つかった欠陥)。 */
   autoIgnoresUniqueIntents?: boolean;
   /**

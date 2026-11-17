@@ -4,11 +4,14 @@
 import { writeFileSync } from "node:fs";
 import { asNumbers, SimCluster, logRows, type Rpc } from "./sim";
 import { checkHistory, type Read, type TxRecord, type Violation } from "./history";
+import { driver } from "./ddl-driver";
 import { Db, type ClientFaults, type Txn } from "../src/client/db";
 import { split } from "../src/autoscaler";
 import { ownerOf, planSplit, shardsOf } from "../src/routing";
 import { fold, type EpochRecord } from "../src/catalog";
+import { LEASE_MS, type Catalog } from "../src/meta";
 import { decode, encode } from "../src/shard/rows";
+import { isInternalName } from "../src/sql/ddl";
 import { decodeElem } from "../src/value";
 import type { Change, Faults, Row } from "../src/types";
 
@@ -175,6 +178,19 @@ export async function duplicates(c: SimCluster, table = "acct", col = "v"): Prom
 }
 
 /**
+ * acct の、シャードをまたぐ UNIQUE の index の列 (どれも 1 列) で重複している組。index がなければ v の重複である。
+ * 2026-11-16 までは、いつも v の重複を見ていた。n への UNIQUE の index (新しい場面の uniqueN) がある実行で、v の重複 (v には index が
+ * なく、重複してよい) を、UNIQUE の index のある表の重複と数えた (検査の誤り)。
+ */
+export async function indexedDuplicates(c: SimCluster): Promise<string[]> {
+  const cols = [...new Set(((await c.catalog()).tables.acct?.globalIndexes ?? []).map((g) => g.columns[0]!))];
+  if (cols.length === 0) return duplicates(c);
+  const out: string[] = [];
+  for (const col of cols) out.push(...(await duplicates(c, "acct", col)));
+  return out;
+}
+
+/**
  * 各シャードが適用した表定義の epoch (シャードの __epoch の写しを畳んだ Snapshot.schema) と、Meta の表定義の epoch。
  * 最新の表定義を持つ読み取りを全シャードへ送った後で呼ぶ。
  * 期限切れで取り消された index の版などは、シャードへ押し出されないので、送る前は遅れていてよい。
@@ -214,6 +230,57 @@ export async function stuckWork(c: SimCluster): Promise<string[]> {
     }
   }
   return [...new Set(out)].sort();
+}
+
+/**
+ * catalog の表定義と、各シャードと Meta の SQLite の表が合わない。利用者の表 (isInternalName でない表) の有無と、列の名前と順、
+ * グローバル index の表の有無、シャード内の index の有無を比べる。全シャードに最新の表定義を適用させた後 (touchAll の後) で呼ぶ。
+ * 表定義の遷移が重なると (欠陥のスイッチ overlappingTransitions)、後で確定した遷移の表定義が、先に確定した遷移の列か index を
+ * catalog から消し、シャードと Meta の SQLite には残る (M21 の m21_red_two_open)。
+ */
+export async function schemaDrift(c: SimCluster): Promise<string[]> {
+  const cat = await c.catalog();
+  const out: string[] = [];
+  const user = Object.values(cat.tables).filter((d) => !isInternalName(d.name));
+  const gidx = new Set(user.flatMap((d) => d.globalIndexes.map((g) => g.table)));
+  const local = Object.entries(cat.indexes).filter(([, i]) => !i.global).map(([n]) => n);
+  const places: [string, SimCluster["metaBackend"]][] = [...shardsOf(cat.routing).map((id) => [id, c.backends.get(id)!] as [string, SimCluster["metaBackend"]]), ["meta", c.metaBackend]];
+  for (const [where, b] of places) {
+    const tables = b.exec(`SELECT name FROM sqlite_master WHERE type = 'table'`).map((r) => r.name as string);
+    for (const d of user) {
+      if (!tables.includes(d.name)) {
+        out.push(`${where}: no table ${d.name}`);
+        continue;
+      }
+      const cols = b.exec(`SELECT name FROM pragma_table_info(?)`, d.name).map((r) => r.name as string);
+      if (cols.join(",") !== d.columns.join(",")) out.push(`${where}: ${d.name} has the columns (${cols.join(", ")}), the catalog has (${d.columns.join(", ")})`);
+    }
+    for (const t of tables) if (!isInternalName(t) && !cat.tables[t]) out.push(`${where}: table ${t} is not in the catalog`);
+    for (const g of gidx) if (!tables.includes(g)) out.push(`${where}: no index table ${g}`);
+    for (const t of tables) if (/^__gidx_/.test(t) && !gidx.has(t)) out.push(`${where}: index table ${t} is not in the catalog`);
+    const indexes = b.exec(`SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL`).map((r) => r.name as string).filter((n) => !isInternalName(n));
+    for (const n of local) if (!indexes.includes(n)) out.push(`${where}: no index ${n}`);
+    for (const n of indexes) if (!cat.indexes[n]) out.push(`${where}: index ${n} is not in the catalog`);
+  }
+  return out;
+}
+
+/**
+ * 完了を返した DDL のうち、最後の catalog に効いていないもの。足した列と、作った index を見る (場面は、それを消す DDL を出さない)。
+ * 表そのものを後で消した DDL は見ない。
+ */
+export function ddlLost(ddls: Env["ddls"], cat: Catalog): string[] {
+  const out: string[] = [];
+  for (const d of ddls) {
+    if (d.out !== "ok") continue;
+    const col = /^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)/i.exec(d.sql);
+    if (col && cat.tables[col[1]!] && !cat.tables[col[1]!]!.columns.includes(col[2]!)) out.push(`${d.sql} returned ok, but ${col[1]} has no column ${col[2]}`);
+    const ix = /^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+(\w+)\s+ON\s+(\w+)/i.exec(d.sql);
+    if (ix && cat.tables[ix[2]!] && !cat.indexes[ix[1]!] && !cat.tables[ix[2]!]!.globalIndexes.some((g) => g.name === ix[1])) {
+      out.push(`${d.sql} returned ok, but there is no index ${ix[1]}`);
+    }
+  }
+  return out;
 }
 
 /** 範囲表の持ち主でないシャードに載っている行。 */
@@ -294,11 +361,41 @@ export function checkIndexReads(
 export interface Env {
   c: SimCluster;
   rnd: () => number;
+  /**
+   * 作業負荷の乱数 (rnd) とは別の流れの乱数。DDL を出す側が、文の種類、間合い、進める側を止める手を選ぶのに使う。rnd から引くと、
+   * 作業負荷の取引の列が変わる。
+   */
+  pick: () => number;
   admin: Db;
   /** 終わった操作の割合が frac に達するまで待つ。 */
   at(frac: number): Promise<void>;
-  /** DDL を 1 文実行する。失敗は記録して返す。 */
-  ddl(sql: string): Promise<string>;
+  /**
+   * DDL を 1 文実行する。失敗は記録して返す。db は出す接続 (既定は admin)。重なる DDL の場面は、出し手ごとに別の接続を渡す。
+   * stopAt を渡すと、進める側を、その番号の手の前で止める (test/ddl-driver.ts の driver。手は prepare、renew、シャードごとの prepared、
+   * mode ごとの仕事、commit、commit の後の syncSchema の順で、DDL ごとに 5 から 15 ほどある。番号が手の数以上なら止まらない)。
+   * 止まった後の呼び出しは、期限を延ばす呼び出しも含めて全部が失敗するので、開いた遷移は期限 (Scenario.leaseMs) で abort される。
+   * 返る文は「driver stopped before <手>」で、文が効いたかどうかは、遷移が閉じた後の catalog で決まる (closed)。
+   */
+  ddl(sql: string, o?: { db?: Db; stopAt?: number | null }): Promise<string>;
+  /** 表定義の遷移が閉じる (commit か abort が記録される) まで待ち、そのときの catalog を返す。 */
+  closed(): Promise<Catalog>;
+  /** 作業負荷と同じ作りの、新しい接続。 */
+  connect(): Db;
+  /**
+   * 表定義を読み終えた接続を n 個作る。DROP TABLE side の前に作り、DROP が完了を返した後で writeDropped に渡す。古い表定義のまま、
+   * 消した表へ書く接続である。
+   */
+  stale(n: number): Promise<Db[]>;
+  /**
+   * 古い表定義の接続から、消した表 side へ 1 行ずつ、同時に書く。DROP TABLE が完了を返した後に始めた書き込みなので、どれも失敗しなければ
+   * ならない (M21 の m21_red_drop_missing_ack: prepare を適用しなかったシャードが受けた書き込みは、後で DROP に消される)。成功した
+   * 書き込みは Report.staleWrites に入る。
+   */
+  writeDropped(dbs: Db[]): Promise<void>;
+  /** 場面が数えたいことを数える (Report.notes)。 */
+  note(name: string): void;
+  /** DDL ごとの記録。begun と acked は出来事の通し番号 (tick) である。 */
+  ddls: { sql: string; out: string; begun: number; acked: number }[];
   /**
    * 作業負荷を一時停止し、実行中の操作と後始末が終わってから index と表を比べる。
    * 最後の状態だけを見ると、その後の書き込みが index を直してしまい、途中の欠落が見えない。
@@ -350,6 +447,17 @@ export interface Scenario {
   clientFaults?: ClientFaults;
   /** 欠陥の注入。検査が失敗し得ることを確かめるためだけに使う。 */
   inject?(c: SimCluster): void;
+  /**
+   * 表定義の遷移の書き込み禁止の期限 (ms。SimOptions.leaseMs)。進める側を止める場面で、開いた遷移が期限で abort されるまでを短くする。
+   * 既定は meta.ts の LEASE_MS (5 秒)。
+   */
+  leaseMs?: number;
+  /**
+   * 分割を進める側 (Autoscaler) が、ときどき startMove の後で止まる (子に drain を送らない)。子は、最新の範囲表の要求が届けば自分で
+   * 移動を進める。Autoscaler の次の判断は、開いたままの移動を再開する (movesToResume)。開いた移動は、作業負荷の後と checkpoint の前に
+   * 閉じさせる。乱数は Env.pick の流れから引く。
+   */
+  splitStops?: boolean;
 }
 
 export interface Report {
@@ -388,6 +496,16 @@ export interface Report {
   };
   /** ADD COLUMN の後で extra が既定値でも書いた値でもない行。 */
   badExtra: string[];
+  /** 完了を返した DDL のうち、最後の catalog に効いていないもの (ddlLost)。 */
+  ddlLost: string[];
+  /** catalog の表定義と、シャードと Meta の SQLite の表が合わないところ (schemaDrift)。 */
+  schemaDrift: string[];
+  /** DROP TABLE が完了を返した後に、古い表定義の接続が始めて成功した、消した表への書き込み (Env.writeDropped)。 */
+  staleWrites: string[];
+  /** Env.writeDropped が試した書き込みの数。0 なら staleWrites は何も確かめていない。 */
+  staleTried: number;
+  /** 場面が数えたこと (Env.note)。 */
+  notes: Record<string, number>;
   commits: number;
   splits: number;
   ddlLog: string[];
@@ -407,7 +525,7 @@ export async function runScenario(seed: number, s: Scenario): Promise<Report> {
   const rnd = prng(seed);
   const sched = prng(seed ^ 0x5bd1e995);
   // backoff と sync の乱数、txn id の乱数部分は、クラスタの実行環境が同じ seed から作る。
-  const c = new SimCluster({ shards: s.shards ?? 3, faults: s.faults, clientFaults: s.clientFaults, seed });
+  const c = new SimCluster({ shards: s.shards ?? 3, faults: s.faults, clientFaults: s.clientFaults, seed, ...(s.leaseMs ? { leaseMs: s.leaseMs } : {}) });
   // 終わらない実行は、実時間の制限を待たずに、原因の分かる失敗にする。普通の実行は、仮想の時刻で 1 秒ほど、出来事は数万個で終わる。
   const report = await Promise.race([runSeeded(c, seed, s, rnd, sched), c.stalled(STALL_MS, STALL_STEPS)]);
   if (process.env.SIM_STATS) console.info(`seed ${seed}: ${c.runtime.now() - 1_000_000} ms simulated, ${c.net.log.length} RPCs`);
@@ -442,21 +560,63 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   let active = 0;
   const checkpoints: Report["checkpoints"] = [];
   const snapshots: unknown[] = [];
+  // 新しい場面の DDL を出す側と、止まる分割の進め方 (splitStops) だけが引く乱数。作業負荷の乱数 (rnd) と遅延の乱数 (sched) の列を変えない。
+  const ddlRnd = prng(seed ^ 0x2545f491);
+  const notes: Record<string, number> = {};
+  const staleWrites: string[] = [];
+  let staleTried = 0;
+  let staleId = 0;
   const env: Env = {
-    c, rnd, admin,
+    c, rnd, pick: ddlRnd, admin,
     at: async (frac) => {
       while (done < frac * total) await c.sleep(1);
     },
-    ddl: async (sql) => {
+    ddl: async (sql, o = {}) => {
       let out = "ok";
+      const begun = env.tick();
+      const db = o.stopAt === undefined || o.stopAt === null ? (o.db ?? admin) : new Db(driver(c, o.stopAt).cluster, { idPrefix: `s${seed}d${nextClient++}` });
       try {
-        await admin.query(sql);
+        await db.query(sql);
       } catch (e) {
         out = e instanceof Error ? e.message : String(e);
       }
       env.ddlLog.push(`${sql.replace(/\s+/g, " ").slice(0, 60)} => ${out}`);
+      env.ddls.push({ sql, out, begun, acked: env.tick() });
       return out;
     },
+    closed: async () => {
+      // 進める側が止まった遷移は、期限 (Scenario.leaseMs) で Meta が abort する。Meta の入口が期限を確かめるので、catalog を取り直せばよい。
+      for (let waited = 0; ; waited += 20) {
+        const cat = await c.catalog();
+        if (!cat.open) return cat;
+        if (waited > 10 * 60_000) throw new Error(`a schema transition stayed open: ${JSON.stringify(cat.open).slice(0, 200)}`);
+        await c.sleep(20);
+      }
+    },
+    connect: () => client(),
+    stale: async (n) => {
+      const dbs = Array.from({ length: n }, () => client());
+      for (const db of dbs) await db.catalog();
+      return dbs;
+    },
+    writeDropped: async (dbs) => {
+      await Promise.all(dbs.map(async (db) => {
+        const t = 1 + Math.floor(ddlRnd() * tenants);
+        const id = 100_000 + ++staleId;
+        const n = 10_000_000 + staleId;
+        sideAttempts.add(`${t}/${id}/${n}`);
+        staleTried++;
+        const begun = env.tick();
+        try {
+          await db.query("INSERT INTO side(tenant_id, id, n) VALUES (?, ?, ?)", [t, id, n]);
+          staleWrites.push(`side ${t}/${id} (begun at ${begun}, acknowledged at ${env.tick()})`);
+        } catch {
+          // 消した表への書き込みは失敗する。
+        }
+      }));
+    },
+    note: (name) => void (notes[name] = (notes[name] ?? 0) + 1),
+    ddls: [],
     checkpoint: async (label) => {
       paused = true;
       // 途中で失敗しても、作業負荷を止めたままにしない。止めたままだと、失敗が記録されるだけで、実行が終わらなくなる。
@@ -465,6 +625,8 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
         // 見せないことがあり、index と表が合わないように見えた (検査の誤り。2026-11-13 の一晩分の試験の seed 903321。
         // データベースを通した読み (wrongRead) は正しかった)。
         while (active > 0 || splitting) await c.sleep(1);
+        // 進める側が止まった分割 (splitStops) は、閉じさせてから調べる。
+        if (s.splitStops) await closeMoves();
         await c.settle();
         for (const core of c.cores.values()) await core.redrive().catch(() => {});
         await c.settle();
@@ -475,7 +637,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
           for (const n of names) index.push(...(await rawRows(c, n)));
           snapshots.push({ label, at: c.net.log.length, rows: await rawRows(c, "acct"), index });
         }
-        checkpoints.push({ label, ...(await indexAgreementAll(c)), duplicates: await duplicates(c) });
+        checkpoints.push({ label, ...(await indexAgreementAll(c)), duplicates: await indexedDuplicates(c) });
       } finally {
         paused = false;
       }
@@ -709,19 +871,44 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   };
 
   let stop = false;
+  /** 作業負荷が止まった時刻 (仮想の時計の ms)。止まった後の分割が、表定義の遷移の枠を待つ上限を決める。 */
+  let stoppedAt = Infinity;
   let splits = 0;
   /** 分割を進めている最中か。checkpoint は、これが終わるのを待ってから表を調べる。 */
   let splitting = false;
+  /**
+   * 開いたままの移動を閉じさせる (splitStops)。子が移動を知っていれば、子が自分で進めているので待つ。知らないままなら (進める側が startMove の
+   * 後で止まり、最新の範囲表の要求も届いていない)、Autoscaler の次の判断と同じく、子に drain を送る。
+   */
+  const closeMoves = async () => {
+    for (let waited = 0; ; waited += 20) {
+      const open = await c.moves();
+      if (open.length === 0) return;
+      if (waited > 10 * 60_000) throw new Error(`moves stayed open: ${open.map((m) => `${m.from}->${m.to}`).join(", ")}`);
+      if (waited % 1000 === 0) for (const m of open) await split(c, m.from, m.to, { range: m }).catch(() => undefined);
+      await c.sleep(20);
+    }
+  };
   const grower = (async () => {
     let next = c.shardIds.length;
     while (!stop && s.splits && next < c.shardIds.length + 5) {
       await c.sleep(40);
+      if (s.splitStops) {
+        // Autoscaler の次の判断は、開いたままの移動を再開する (movesToResume)。
+        for (const m of await c.moves()) if (ddlRnd() < 0.5) await split(c, m.from, m.to, { range: m }).catch(() => undefined);
+      }
       const { routing } = await c.catalog();
       const list = shardsOf(routing);
       const parent = list[Math.floor(rnd() * list.length)]!;
       const range = planSplit(routing, parent);
       if (!range) continue;
       const child = `s${next++}`;
+      if (s.splitStops && ddlRnd() < 0.4) {
+        // 進める側が startMove の後で止まる。表定義の遷移と重なれば (schema busy)、記録されないまま終わる。
+        while (paused) await c.sleep(1);
+        await c.startMove({ from: parent, to: child, ...range }).then(() => void splits++, () => undefined);
+        continue;
+      }
       for (let attempt = 0; attempt < 20; attempt++) {
         while (paused) await c.sleep(1);
         splitting = true;
@@ -731,8 +918,20 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
           break;
         } catch (e) {
           const m = e instanceof Error ? e.message : String(e);
+          // 進める側が止まった移動が、まだ開いている (splitStops)。この分割は諦め、次の判断に回す。
+          if (s.splitStops && /already handing|still receiving|unfinished move|already owns|^split busy: a move/.test(m)) break;
           // 表定義の変更 (index の作成など) が、保守の操作の枠を持っている。終わるまで待つ。待つ回数には数えない。
           if (/^split busy:/.test(m) && !stop) {
+            attempt--;
+            await c.sleep(50);
+            continue;
+          }
+          // 作業負荷が止まった後の split busy は、上で待たずに回数に数える (5 ms ずつ 20 回)。進める側が止まった表定義の遷移は、期限
+          // (Scenario.leaseMs、既定は meta.ts の LEASE_MS) で Meta が abort するまで枠を持つので、20 回では足りないことがある
+          // (splitStops の seed 231。CREATE INDEX の進める側が commit の前で止まり、1 s の期限の前に 100 ms で諦めて、誤りにした。
+          // 待てば遷移は abort され、分割は通る)。最後の回でも枠が空いていなければ、期限の 3 倍まで待ってから誤りにする。
+          // それまでの回は前と同じに進めるので、前に通った実行の RPC の列は変わらない。
+          if (attempt === 19 && /^split busy:/.test(m) && c.time - stoppedAt < 3 * (s.leaseMs ?? LEASE_MS)) {
             attempt--;
             await c.sleep(50);
             continue;
@@ -749,10 +948,12 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   const ddl = s.ddl(env).catch((e) => void errors.push(`ddl actor: ${e instanceof Error ? e.message : String(e)}`));
   await Promise.all(Array.from({ length: clients }, worker));
   stop = true;
+  stoppedAt = c.time;
   await ddl;
   await grower;
 
   // ---- 後始末と検査 ----
+  if (s.splitStops) await closeMoves().catch((e) => void errors.push(`closeMoves: ${e instanceof Error ? e.message : String(e)}`));
   const stuck = await stuckWork(c);
   await touchAll(c).catch((e) => void errors.push(`touchAll: ${e instanceof Error ? e.message : String(e)}`));
   const schema = await schemaVersions(c);
@@ -796,6 +997,8 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
 
   const misplaced = await misplacedRows(c);
   const badExtra = await extraViolations(c, extraWritten);
+  const drift = await schemaDrift(c);
+  const lost = ddlLost(env.ddls, await c.catalog());
 
   const sideExists = cat.tables.side !== undefined;
   const sideRows = sideExists ? (await rawRows(c, "side")).map(({ row }) => row.n as number) : [];
@@ -827,10 +1030,15 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
     schema,
     index: await indexAgreementAll(c),
     checkpoints,
-    duplicates: await duplicates(c),
+    duplicates: await indexedDuplicates(c),
     misplaced,
     side,
     badExtra,
+    ddlLost: lost,
+    schemaDrift: drift,
+    staleWrites,
+    staleTried,
+    notes,
     commits,
     splits,
     ddlLog: env.ddlLog,
