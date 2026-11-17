@@ -1044,13 +1044,15 @@ describe("the checks are not vacuous", () => {
 // ならない)。答えた数と断った数は、最後に 1 行で出す。
 describe("7. A read whose T was picked before a move, answered after the move and an ADD COLUMN", () => {
   const outcomes = new Map<string, number>();
+  let plannedAfterDdl = 0;
   afterAll(() => {
-    if (outcomes.size > 0) console.info(`old reads after a move and ADD COLUMN: ${[...outcomes].map(([k, n]) => `${k} x${n}`).join(", ")}`);
+    if (outcomes.size > 0) console.info(`old reads after a move and ADD COLUMN: ${[...outcomes].map(([k, n]) => `${k} x${n}`).join(", ")}; planned after the DDL and sent at the old T: ${plannedAfterDdl}`);
   });
   for (const seed of seedsOr([1, 2, 3, 4, 5, 6, 7, 8])) {
     it(`answers the snapshot at its T or refuses (seed ${seed})`, async () => {
       const r = await oldReadAfterDdl(seed);
       outcomes.set(r.outcome, (outcomes.get(r.outcome) ?? 0) + 1);
+      if (r.plannedAfterDdl) plannedAfterDdl++;
       expect(r.wrong, r.shape).toEqual([]);
     });
   }
@@ -1062,16 +1064,21 @@ describe("7. A read whose T was picked before a move, answered after the move an
 // かもしれない (M23j)。RENAME TO の後の名前の読みは、T の時点の行を全部返し、作り直した表の読みは、前の表の行を 1 つも返さない。
 // 行を 1 つのシャードの範囲にだけ入れる実行 (確定を持たないシャードは、表定義の変更の床を置かない) も混ぜる。foundation-4 (517b674) の
 // コードは、移動の後の古い読みを、範囲の床か表定義の変更の床で断る (答えたなら、正しくなければならない)。答えた数と断った数は、最後に 1 行で出す。
+// 表ごとの epoch (5808b08) からは、t の DDL は、o だけを読んだ取引を古くしない。読み手の最初の文が DDL の前のスナップショットで答えれば、
+// 取引はそのスナップショットのまま続き、RENAME TO の後の名前 u を知らない (`no such table: u`。docs/sql-language.md の「取引の中の DDL」)。
+// 取引のスナップショットに u がないときだけ、その誤りを受け入れる (kept its snapshot)。
 describe("7b. A read whose T was picked before a move, answered after the move and a RENAME TO or a table re-created (generator 7)", () => {
   const outcomes = new Map<string, number>();
+  let plannedAfterDdl = 0;
   afterAll(() => {
-    if (outcomes.size > 0) console.info(`generator 7, old reads after a move and RENAME TO or re-create: ${[...outcomes].map(([k, n]) => `${k} x${n}`).join(", ")}`);
+    if (outcomes.size > 0) console.info(`generator 7, old reads after a move and RENAME TO or re-create: ${[...outcomes].map(([k, n]) => `${k} x${n}`).join(", ")}; planned after the DDL and sent at the old T: ${plannedAfterDdl}`);
   });
   for (const kind of ["rename", "recreate"] as const) {
     for (const seed of seedsOr([1, 2, 3, 4, 5, 6, 7, 8])) {
       it(`${kind}: answers the table at its T or refuses (seed ${seed})`, async () => {
         const r = await oldReadAfterDdl(seed, { kind });
         outcomes.set(`${kind} ${r.outcome}`, (outcomes.get(`${kind} ${r.outcome}`) ?? 0) + 1);
+        if (r.plannedAfterDdl) plannedAfterDdl++;
         expect(r.wrong, r.shape).toEqual([]);
       });
     }

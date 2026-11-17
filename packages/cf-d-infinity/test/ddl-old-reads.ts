@@ -19,6 +19,7 @@
 // 比べる。いまのコードは、移動の後の古い読みを、範囲の床で断る (何も読んでいない取引は、T を進めて読み直す)。
 import { Db } from "../src/client/db";
 import { keyString } from "../src/keys";
+import type { Catalog } from "../src/meta";
 import { regionsOf, SUBSLOTS, tokenOf, type Interval } from "../src/routing";
 import { decode, imageColumns } from "../src/shard/rows";
 import type { Change, Faults } from "../src/types";
@@ -29,16 +30,25 @@ import { logRows, SimCluster } from "./sim";
 export interface OldReadRun {
   /**
    * 古い読みが、決めた T のまま答えたか、T を進めて答えたか (何も読んでいない取引は、`moved at` で T を進めて読み直せる。Txn.call)、
-   * 断られたか。断られたなら、その誤りの文。
+   * 断られたか。断られたなら、その誤りの文。kept its snapshot は、取引が DDL の前のスナップショットのまま続き、後の名前の表を
+   * 知らなかった (`no such table`) ことである (docs/sql-language.md の「取引の中の DDL」。SQLite の WAL でも同じ)。
    */
-  outcome: "answered at its T" | "answered at a later T" | `refused: ${string}`;
+  outcome: "answered at its T" | "answered at a later T" | `refused: ${string}` | `kept its snapshot: ${string}`;
   /** 答えと T の時点の表の違い。空なら一致した。 */
   wrong: string[];
   /** 実行の形 (失敗したときに読む)。 */
   shape: string;
+  /**
+   * 読み手が、DDL の後の表定義で計画した後の表の読みを、DDL の前に決めた T のまま送ったか。シャードは、その読みに、表の床
+   * (M23j の m23j_exact_*。表の、変更ログにある確定の時刻の最大) で答えるか断るかを決める。DDL がなかった実行では false である。
+   */
+  plannedAfterDdl: boolean;
 }
 
 const REFUSED = /^(read too old|conflict|not owner|migrating|the schema changed)/;
+
+/** 読み手の Db が開いている取引の表定義 (取引が最初に読むか書くかしたときのスナップショット。Txn.catalog)。試験だけが覗く。 */
+const openSnapshot = (conn: Db): Catalog | undefined => (conn as unknown as { current: { catalog: Catalog } | null }).current?.catalog;
 const key = (id: number) => keyString([BigInt(id)]);
 const token = (id: number) => tokenOf(key(id), key(id));
 
@@ -139,11 +149,17 @@ export async function oldReadAfterDdl(seed: number, o: { faults?: Faults; noImag
   let holding = true;
   let caught = 0;
   let T0: number | undefined;
+  /** 止めるのをやめた後に Worker が送った exec の、時刻と頼るもの (plannedAfterDdl を決める)。 */
+  const sent: { T?: number; deps: { name: string; epoch: number }[] }[] = [];
   c.net.gate = (m) => {
-    if (holding && m.from === "client" && m.method === "exec") {
-      caught++;
-      T0 ??= (m.req as { T?: number }).T;
-      return held;
+    if (m.from === "client" && m.method === "exec") {
+      const req = m.req as { T?: number; deps?: { name: string; epoch: number }[] };
+      if (holding) {
+        caught++;
+        T0 ??= req.T;
+        return held;
+      }
+      sent.push({ T: req.T, deps: req.deps ?? [] });
     }
     return undefined;
   };
@@ -181,6 +197,8 @@ export async function oldReadAfterDdl(seed: number, o: { faults?: Faults; noImag
     if (again.length > 0) await db.query(`INSERT INTO t VALUES ${again.map((i) => `(${i}, ${-i}, 'new')`).join(", ")}`);
     shape.push(`DROP TABLE t, CREATE TABLE t, ${again.length} new rows`);
   }
+  // 後の表の、DDL の後の読みの epoch。読み手の要求が、これ以上の epoch で後の表に頼れば、DDL の後の表定義で計画した文である。
+  const laterEpoch = kind !== "add column" || ddl ? (await c.catalog()).objects[later]?.read : undefined;
   if (rnd() < 0.3) await write();
   // 表定義の変更を適用していないシャード (範囲表から外れて、参加者でなくなった前の持ち主) と、そこに残る渡した行の数 (__handed のある版だけ)。
   const epoch = (await c.catalog()).epoch;
@@ -193,12 +211,20 @@ export async function oldReadAfterDdl(seed: number, o: { faults?: Faults; noImag
   if (behind.length > 0) shape.push(`behind epoch ${epoch}: ${behind.join(", ")}`);
   release();
   const r = await read.then((q) => q, (e: Error) => e);
+  const snapshot = openSnapshot(conn);
   await conn.query("ROLLBACK").catch(() => undefined);
   c.net.gate = () => undefined;
   await c.settle();
+  const plannedAfterDdl = laterEpoch !== undefined && sent.some((s) => s.T === T0 && s.deps.some((d) => d.name === later && d.epoch >= laterEpoch));
   if (r instanceof Error) {
-    if (!REFUSED.test(r.message)) return { outcome: `refused: ${r.message}`, wrong: [`unexpected error: ${r.message}`], shape: shape.join(" | ") };
-    return { outcome: `refused: ${r.message.replace(/\d+/g, "#").slice(0, 60)}`, wrong: [], shape: shape.join(" | ") };
+    // 読み手の最初の文 (o の読み) が、RENAME の前のスナップショットで答えた。取引は、そのスナップショットのまま続くので、後の名前 u は
+    // ない (docs/sql-language.md の「取引の中の DDL」の「後から作られた表は見えない」。SQLite の WAL でも、読み始めた取引から、後の
+    // RENAME の名前は見えない)。取引のスナップショットに u があるのに、この誤りになったなら、誤りである。
+    if (kind === "rename" && /^no such table: u$/.test(r.message) && snapshot && !snapshot.tables.u) {
+      return { outcome: "kept its snapshot: no such table: u", wrong: [], shape: `${shape.join(" | ")} | the transaction's snapshot has no table u`, plannedAfterDdl };
+    }
+    if (!REFUSED.test(r.message)) return { outcome: `refused: ${r.message}`, wrong: [`unexpected error: ${r.message}`], shape: shape.join(" | "), plannedAfterDdl };
+    return { outcome: `refused: ${r.message.replace(/\d+/g, "#").slice(0, 60)}`, wrong: [], shape: shape.join(" | "), plannedAfterDdl };
   }
 
   // T の時点の表。各行の、T 以下で最後に確定した値を、全部のシャードの変更ログから引く。
@@ -209,7 +235,7 @@ export async function oldReadAfterDdl(seed: number, o: { faults?: Faults; noImag
     const old = r.rows.filter((row) => row.w !== "new");
     const wrong = old.length > 0 ? [`the recreated table read ${old.length} rows of the dropped table at T ${T}: ${JSON.stringify(old.slice(0, 3))}`] : [];
     if (T === T0 && r.rows.length > 0) wrong.push(`the recreated table read ${r.rows.length} rows at T ${T}, before it was created`);
-    return { outcome, wrong, shape: `${shape.join(" | ")} | answered at T ${T}` };
+    return { outcome, wrong, shape: `${shape.join(" | ")} | answered at T ${T}`, plannedAfterDdl };
   }
   const def = (await c.catalog()).tables[later]!;
   const vAt = imageColumns(def).indexOf("v");
@@ -238,5 +264,5 @@ export async function oldReadAfterDdl(seed: number, o: { faults?: Faults; noImag
     const w = want.get(row.id as number);
     if (w !== text(row)) wrong.push(`row ${text(row)} at T ${T}, expected ${w ?? "no row"}`);
   }
-  return { outcome, wrong: wrong.slice(0, 5), shape: `${shape.join(" | ")} | answered at T ${T}` };
+  return { outcome, wrong: wrong.slice(0, 5), shape: `${shape.join(" | ")} | answered at T ${T}`, plannedAfterDdl };
 }
