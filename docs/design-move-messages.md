@@ -1,12 +1,12 @@
 # 移動の要求と応答が、その移動より後に届くときの規則
 
-状態：設計。`foundation-4` に実装はまだない。モデルは M5d (`specs/m5d_move_messages.qnt`) である。実装より先に書いた (計画書の規則 3)。
+状態：実装した (2026-11-17。下の「実装の結果」)。モデルは M5d (`specs/m5d_move_messages.qnt`) で、実装より先に書いた (計画書の規則 3)。
 作成日：2026-11-17
 前提：[design-catalog-epoch.md](./design-catalog-epoch.md) の「移動の遷移」、[design-refresh-across-move.md](./design-refresh-across-move.md) の「3 回目の実装の規則」、[specs/README.md](../specs/README.md) の M5b、M5c、M5d の節。
 
 今のコードについての記述は、`5808b08` のコードを読んだ結果である。
 この作業では、試験を走らせていない。
-類の場面は、読み直しが `5808b08` で試験にしたものである (類の 1 は `test/open/late-pull-after-range-returned.test.ts`。ほかは、読み直しの手元にある)。
+類の場面は、読み直しが `5808b08` で試験にしたものである (`test/late-pull-*.test.ts`。実装の前は `test/open/` にあった)。
 `src/` と `test/` は `packages/cf-d-infinity/` の下を指す。
 
 ## この文書が扱う類
@@ -96,11 +96,11 @@ TLC は、`m5d_code_return` の `deliveredApplied` の反例として、類の 1
 |---|---|---|---|
 | 1 と 2 の親の側。親は、生きた fence の下の pull でだけ渡す (`PARENT_RULE`) | `m5d_red_rehand` | `handsUnderFence` (規則だけ) と `noFailedWrite` (類の 3 の、UNIQUE の失敗)。行、intent、印は壊れない (`m5dData` は緑) | `rehandFinished` |
 | 同上。親は、生きた fence の下の ack でだけ消す (`ACK_RULE`) | `m5d_red_late_ack` | `handsUnderFence` (規則だけ)。害はない (`m5dOutcome` は緑) | なし (下の「ack」) |
-| 1 と 2 の子の側。子は、受け取り中の移動の応答でだけ受け取る (`CHILD_RULE`) | `m5d_red_child_stale` | `ownerHasTruth`、`receivesUnderIncoming`。`ownerHasTruth` を破る道は 2 つある。類の 6 (run の `member6Test`。消した行が戻る) と、移動 1 の遅れた「渡し終えた」が、同じ範囲の移動 3 の受け取りを終える道 (`closeEarlyTest`。TLC の反例はこちら) である | `childAcceptsStale` |
+| 1 と 2 の子の側。子は、受け取り中の移動の応答でだけ受け取る (`CHILD_RULE`) | `m5d_red_child_stale` | `ownerHasTruth`、`receivesUnderIncoming`。`ownerHasTruth` を破る道は 2 つある。類の 6 (run の `member6Test`。消した行が戻る) と、移動 1 の遅れた「渡し終えた」が、同じ範囲の移動 3 の受け取りを終える道 (`closeEarlyTest`。TLC の反例はこちら) である | `childAcceptsStale` (`member6Test`) と `finishIncomingByInterval` (`closeEarlyTest`)。実装では、応答の種類ごとに分けた |
 | 3。「渡し終えた」は答えである (`FINISHED_ANSWERS`) | `m5d_red_finished_refusal` | `noMoveRefusal` (行のないグループの文が `group not arrived` で断られる)。行と印は壊れない | `finishedAsRefusal` |
 | 4。印は、記録の書き込みの後で付ける (`MARKS` = 2 が外した形) | `m5d_red_mark_before_write` (親の規則も外す) | `markMatchesRecord` (類の 3 の、メモリだけの印)、`deliveredApplied` | `markBeforeWrite` |
 | 4。動いている間も、起動のときと同じ関数で印を作る (`MARKS` = 1 が外した形) | `m5d_red_boot_differs` (親の規則も外す) | `marksDerived`、`deliveredApplied` (類の 1)。`markMatchesRecord` は緑 | `bootMarksDiffer` |
-| 5。捨てられた答えの後で尋ね直す (`ASK_AGAIN`) | `m5d_red_ask_once` | `noMoveRefusal`。行と印は壊れない | なし (下の「規則にない条件」) |
+| 5。捨てられた答えの後で尋ね直す (`ASK_AGAIN`) | `m5d_red_ask_once` | `noMoveRefusal`。行と印は壊れない | `askOnce` |
 
 ### 条件を 1 つだけ入れた形
 
@@ -178,6 +178,19 @@ TLC は、印の関数だけの形 (`m5d_code_derived_return`) で、表にな�
 
 行の番号は `5808b08` のものである。
 
+8 つとも実装した (2026-11-17)。項目ごとのコミットは次のとおりである。入れ方と、ここから変えたことは、下の「実装の結果」に書く。
+
+| 項目 | 状態 | コミット |
+|---|---|---|
+| 1. 記録を書く関数の入口 | 実装した | `bf45f0d` |
+| 2. `epoch` を必須にする | 実装した | `4027ff1` |
+| 3. 「渡し終えた」の答え | 実装した | `bf45f0d` |
+| 4. 印の関数 | 実装した | `8499167` (関数 `remark`)、`bb93952` (記録を書く関数からの呼び出しを `marked` の 1 か所にした) |
+| 5. 尋ね直し | 実装した | `cb589c5` |
+| 6. 捨てた応答に ack を送らない | 実装した | `bf45f0d` |
+| 7. スイッチ | 実装した。`askOnce` と `finishIncomingByInterval` を足して、7 つである | `cb589c5` (`askOnce`)、`bb93952` |
+| 8. 試験 | 実装した | `cb589c5`、`bb93952`、`068a223` (生成器 10 の伏せを外した) |
+
 1. **記録を書く関数の入口**。渡す側と受け取る側に、入口を 1 つずつ置く。同期区間の `enter()` と `Section` (`kernel.ts:242`、`:1215`) と同じ形で、入口だけが印 (型の値) を作り、記録を書く関数は、その印を引数に取る。
    - 渡す側の入口は、移動の epoch を受け取り、その epoch の `__fenced` が done = 0 なら印を返し、done = 1 なら「渡し終えた」を返す。印を取る関数は、グループを渡すこと (`pullPieces` の `__moved` と `__moved_txn` への書き込み、`:2931`)、ack で行と intent を消すこと (`ack`、`:1325`)、渡し終えた印を付けること (`finishHanding`、`:1344`) である。
    - 受け取る側の入口は、移動の epoch を受け取り、その epoch の `__incoming` が done = 0 なら印を返し、そうでなければ何も返さない。印を取る関数は、行と intent を入れて `__arrived` を書くこと (`receiveStep`、`:3005`) と、受け取り終えること (`finishIncoming`、`:1365`) である。
@@ -191,7 +204,148 @@ TLC は、印の関数だけの形 (`m5d_code_derived_return`) で、表にな�
 5. **尋ね直し** (`arriveStep`、`:2845`)。pull の答えが返った後、頼んだグループのうち、受け取り中の範囲にあって、まだ届いていないものがあれば、もう一度 pull を出す。なければ進む。
 6. **子が捨てた応答に ack を送らない** (`fetchStep`、`:2973`)。入れたか、もう届いていた piece にだけ ack を送る。モデルは、捨てた応答にも ack を送る形で緑なので、これは安全のためではなく、要らない要求を減らすためである。
 7. **スイッチ**。`rehandFinished`、`childAcceptsStale`、`finishedAsRefusal`、`markBeforeWrite`、`bootMarksDiffer` を足す。`markBeforeWrite` と `bootMarksDiffer` は、入口を通らずに印を書き換える枝で、`rehandFinished` と一緒に入れて落ちることを確かめる。
-8. **試験**。モデルの run を、決まった順の試験にする (計画書の規則 2)。類の 1 は `test/open/late-pull-after-range-returned.test.ts` にあり、通るようになったら `test/` へ移す。読み直しは、ほかの類と、行のないグループの窓 (`windowTest`) の試験を手元に持っている。尋ね直しの場面 (`askAgainTest`) と、区間で引く `finishIncoming` の場面 (`closeEarlyTest`) は、このモデルが見つけたもので、試験がまだない。
+8. **試験**。モデルの run を、決まった順の試験にする (計画書の規則 2)。類の 1 は `test/late-pull-after-range-returned.test.ts` にある (通るようになったので、`test/open/` から移した)。読み直しは、ほかの類と、行のないグループの窓 (`windowTest`) の試験を手元に持っている。尋ね直しの場面 (`askAgainTest`) と、区間で引く `finishIncoming` の場面 (`closeEarlyTest`) は、このモデルが見つけたもので、試験がまだない。
+
+## 実装の結果
+
+2026-11-17 に実装した。
+基は `foundation-4` の `3a7d0d2` で、コミットは上の表のとおりである。
+`src/` と `test/` は `packages/cf-d-infinity/` の下を指す。
+
+### 入れた形
+
+- **入口と印**。`src/shard/kernel.ts` の `handing` が渡す側の入口、`receiving` が受け取る側の入口である。
+  入口だけが、印の `Handing` と `Receiving` を作る (`Section` と同じく、コンストラクタは private で、作る関数は、ファイルの外へ出さない鍵でしか呼べない)。
+  渡した記録を書く `handGroup`、`dropHanded`、`markHanded` は `Handing` を、受け取った記録を書く `storePieces`、`markReceived` は `Receiving` を引数に取る。
+  印は frame に入れない (`test/determinism.test.ts` が、frame の宣言に印の型が現れないことを確かめる)。
+- **要求と応答** (`src/types.ts`)。`listGroups`、`pull`、`finishMove` の `epoch` は省けない。`fenceOf` はなくなり、fence は入口が epoch で引く。
+  `pull` の応答は `PullRes` で、piece の組 (`{ pieces }`) か、「渡し終えた」と親の時刻 (`{ finished: { epoch, m } }`) である。
+  `finishIncoming` の要求は `{ epoch, m }` である。
+  通信の版は 11 にした。記録の形は変えていないので、保存の形式の版は 7 のままである。
+- **印の関数**。`remark` が、グループの印を記録から作る。`moved` と `arrived` を書き換えるのは、この関数だけである (ほかに書くのは、スイッチ `bootMarksDiffer` と `markBeforeWrite` の枝だけで、`marked` の中にある)。
+  起動のときは、記録にある全部のグループを作る。記録を書いた後は、書いたグループを作り直す。受け取り終えたときは、その範囲の、「渡した」印のあるグループを作り直す (終えた記録が変えるのは、その印だけである)。
+- **尋ね直し**。`arriveStep` は、頼んだグループが、受け取り中の範囲にあって届いていない間、いまの移動で頼み直す。
+
+### 設計から変えたこと
+
+1. **「渡し終えた」は、piece の欄ではなく、応答の型にした** (項目 3)。
+   試作は `PiecePayload` に `finished` を足し、頼まれたグループごとに、行のない piece を返した。
+   「渡し終えた」の答えは piece を運ばないので、応答を 2 つの形の和 (`PullRes`) にした。
+   子の drain は、この答えで終わる (親に、引き取るものは残っていない)。文の引き取りは、その範囲の残りを引き取らずに終わる。
+2. **スイッチは 7 つである** (項目 7 は 5 つだった)。
+   `askOnce` は、設計で名前のなかった条件 5 のスイッチである。
+   `finishIncomingByInterval` は、M5d の `CHILD_RULE` を外したときの 2 つの害のうち、`closeEarlyTest` のほうである。
+   実装の入口は、piece を運ぶ応答と、受け取り終える答えを、同じ `receiving` で、種類を分けて確かめるので、モデルの 1 つの条件が、2 つのスイッチになった (`childAcceptsStale` は piece、`finishIncomingByInterval` は答え)。
+3. **尋ね直す回数の決め方** (項目 5)。
+   同じ移動で 2 回頼んでも届かないグループは、もう頼まない。
+   殻 (`src/shard/core.ts` の `pullGroups`) は、引き取りをグループの名前でまとめるので、1 回目は、前の移動の間に始まった引き取りに合流していることがある。その答えは捨てられる。
+   2 回目の引き取りは、その引き取りが終わった後に始まるので、いまの移動のものである。
+   この決め方がないと、スイッチ `finishedAsRefusal` を入れたときに、頼み直しが終わらない。
+4. **受け取り中でない移動の `finishIncoming` は、時計も進めない**。
+   前は、受け取りを引く前に、時計を m まで進めていた。規則の 2 (状態を変えずに答える) に合わせた。
+5. **ack は、移動ごとに入口を通す**。
+   終わった fence の下の ack は数えない。親が渡し終える直前に渡した、行のないグループは、ack を受けないまま (`__moved.acked` = 0) 残ることがある。消す行はなく、印は、範囲が戻って受け取り終えたときに外れる。
+6. **`listGroups` は、生きた fence がなければ、挙げるものがないと答える** (上の表のとおり)。
+   終わった移動の遅れた列挙から始まる drain は、何も引き取らずに終わる。前は、範囲が戻った後の持ち主の行を挙げていた。
+
+### スイッチと、その再生
+
+どのスイッチも、決まった順の再生が、M5d の赤の run の手順をたどり、スイッチを入れると、規則の下の答えにならないことを確かめる。
+生成器 10 の欄は、スイッチを入れて流した seed 1 から 100 のうち、落ちた実行の数である (戻る形は `test/move-returns.test.ts` の「generator 10」、鎖は `test/move-chains.test.ts`。`scripts/fault-table.mjs` の `--harness move-returns,move-chains --name "generator 10"` で数えた)。
+
+| スイッチ | 外す条件 (M5d の赤) | 決まった順の再生 | 生成器 10 (戻る形) | 生成器 10 (鎖) |
+|---|---|---|---|---|
+| なし | | | 0 | 0 |
+| `rehandFinished` | 親の規則 (`m5d_red_rehand`) | `test/late-pull-after-range-returned.test.ts` (渡した記録が、終わった移動に付く)、`test/late-pull-of-carried-group.test.ts` (記録の書き込みが、内部の UNIQUE の誤りで失敗する) | 63 | 41 |
+| `childAcceptsStale` | 子の規則のうち piece (`m5d_red_child_stale` の `member6Test`) | `test/late-pull-reply-after-received-again.test.ts` (消した行が戻る) | 6 | 8 |
+| `finishIncomingByInterval` | 子の規則のうち、受け取り終える答え (同 `closeEarlyTest`) | `test/move-messages.test.ts` (移動 1 の答えが、移動 3 の受け取りを終える) | 0 | 0 |
+| `finishedAsRefusal` | 「渡し終えた」は答え (`m5d_red_finished_refusal`) | `test/empty-group-after-parent-finished.test.ts` (`group not arrived` で断る) | 31 | 24 |
+| `askOnce` | 尋ね直し (`m5d_red_ask_once`) | `test/move-messages.test.ts` (`group not arrived` で断る) | 0 | 0 |
+| `markBeforeWrite` | 印は、書き込みの後で付ける (`m5d_red_mark_before_write`) | `test/late-pull-of-carried-group.test.ts` (これだけでは、何も変わらない) | 0 | 0 |
+| `bootMarksDiffer` | 印は、1 つの関数で作る (`m5d_red_boot_differs`) | `test/late-pull-after-range-returned.test.ts` (これだけでは、何も変わらない) | 0 | 0 |
+| `rehandFinished` と `markBeforeWrite` | 同上 | 同 (メモリだけの印が残り、後の取引が適用されない) | 63 | 41 |
+| `rehandFinished` と `bootMarksDiffer` | 同上 | 同 (渡し直しの印が残り、後の取引が適用されない) | 63 | 41 |
+
+**生成器 10 は、`finishIncomingByInterval` と `askOnce` を見つけない** (どちらの作業負荷でも、100 のうち 0)。
+スイッチは、環境変数から核に届いている (同じ入れ方で、決まった順の緑の試験が落ちる)。
+どちらの害も、前の移動の答えが、同じシャードが同じ範囲をもう一度受け取っている間に届く場面 (0 → 1 → 0 → 1) でだけ起きる。
+鎖では、範囲が戻らないので、起きない。
+戻る形の seed 1 から 100 では、その状態 (終わった移動の「渡し終えた」が、同じ区間の後の移動の受け取り中に届く) は 1 回で、文の尋ね直しは 0 回だった。
+この 2 つを見つけるのは、決まった順の再生だけである。
+生成器に足すなら、止めた pull を、その送り手が同じ範囲をもう一度受け取っている間に届ける条件である (いまの条件は、後の移動が閉じた後か、後の移動が 1 つ始まった直後に届ける)。
+
+**印のスイッチは、`rehandFinished` と組でだけ害になる**。
+それだけでは、どちらの作業負荷でも 0 である。
+組にすると、落ちる実行の数は `rehandFinished` だけのときと同じである (渡した記録の検査が、どの実行でも先に当たる)。
+違うのは、報告される害である。
+戻る形の seed 1 から 100 で、報告のあった実行を数えた (1 つの実行の報告は、最初の 20 件までを数えている)。
+
+| 戻る形で報告されたこと | `rehandFinished` だけ | と `bootMarksDiffer` | と `markBeforeWrite` |
+|---|---|---|---|
+| 終わった移動に、渡した記録を足した | 56 | 56 | 54 |
+| 内部の UNIQUE の誤り | 22 | 20 | 18 |
+| phase 2 を届け終えたのに、intent が残っている | 0 | 6 | 13 |
+| 確定した取引の書き込みを、適用できない | 0 | 5 | 13 |
+| メモリの印が、記録から作り直した印と違う | 0 | 8 | 13 |
+
+`rehandFinished` だけでは、破れるのは規則そのものと記録の書き込みで、行と intent と印は壊れない (M5d の `m5d_red_rehand` の `m5dData` は緑)。
+鎖では、組にしても、報告は「渡した記録を足した」だけである (41。渡し直した親は、もうその範囲の持ち主ではない)。
+
+### 乱択の検査
+
+伏せを外した生成器 10 と、`test/history.test.ts` の、移動か再起動を含む seed ごとの試験を流した。
+
+| 検査 | seed | 結果 |
+|---|---|---|
+| `test/move-returns.test.ts` の生成器 10 | 1 から 300 | 300 通り、落ちたものはない |
+| `test/move-chains.test.ts` | 1 から 300 | 300 通り、落ちたものはない |
+| `test/history.test.ts` の「live splits」の 2 節 (seed ごとの試験 4 つ、組 3 つ) | 1 から 200 | 2,400 通り、落ちたものはない |
+| `test/history.test.ts` の、再起動を含む seed ごとの試験 4 つ (移動の途中の再起動の節を含む。組 3 つ) | 1 から 200 | 2,400 通り、落ちたものはない |
+
+直す前 (`5808b08`) は、伏せを外すと、seed 1 から 200 のうち、戻る形の 138 と、鎖の 88 が落ちた。
+「group not arrived」の断りは、どの実行でも 0 である (検査が、0 でなければ落とす)。
+この 4 つを流したのは、`b33d1e9` に上のコミットを載せた木である。`3a7d0d2` との違いは `docs/model-coverage.md` と `specs/` だけで、`src/` と `test/` は同じである。
+スイッチの数えと、全部の試験は、`3a7d0d2` に載せた木で流した。
+全部の試験 (`npx vitest run --maxWorkers=2`) は、4 つの組 (sim の 137 ファイル、reference-scans の 34、reference-full の 34、workerd の 14) で、2,590 の試験が通り、落ちたものはない (ほかの 92 は、環境で飛ばす試験で、移動の試験ではない)。型の検査も通る。
+
+### RPC の列の違い
+
+既定の seed (`test/history.test.ts`、`test/replay.test.ts`、`test/move-returns.test.ts`、`test/move-chains.test.ts` の 109 の試験) の RPC の列を、`RPC_TRACE` で、基 (`b33d1e9`) と比べた。
+比べたのは、生成器 10 の伏せを外す前の木どうしである (外した後の生成器 10 の実行は、届けるメッセージが違うので、比べられない)。
+
+- 項目 2 (`epoch` を必須にする) と項目 4 (印の関数) までは、109 とも同じである。
+- 項目 1、3、6 を入れると、25 が変わる。項目 5 とスイッチを入れても、それ以上は変わらない。
+- 変わった 25 は、どれも、規則が答えを変えるメッセージを含む。届いた数を、受け手の側で数えた。
+
+| 規則が答えを変えるメッセージ | 前の答え | いまの答え | 含む列 (25 のうち) |
+|---|---|---|---|
+| 親が渡し終えた後、子が受け取り終える前に届いた pull | 渡し直し、子は到着を記録して ack を送る | 「渡し終えた」。子は受け取り終え、ack は送らない | 11 |
+| 子も受け取り終えた後に届いた pull | 同上 | 「渡し終えた」。子は捨てる | 10 |
+| 生きた fence の下の応答が、子が受け取り終えた後に届く | 子は到着を記録して ack を送る | 子は捨て、ack は送らない | 4 |
+| 終わった fence への `listGroups` (上の 3 つを含まない列) | 範囲のグループを挙げる | 挙げるものがないと答える | 2 |
+
+- 列が同じなのに、これらのメッセージを含む実行が 12 ある。11 は、終わった fence への `listGroups` だけで、前も挙げるものがなかった。残りの 1 つ (`test/move-returns.test.ts` の最初の節の seed 7) は、1 つ目の行の pull の答えが、再起動で捨てられた instance に届いた (その instance は、前も今も、記録を書けず、ack を送らない)。
+- 尋ね直しは、既定の seed では 1 度も起きない。
+
+### 見つけたこと
+
+- **生成器 10 は、範囲が戻って、もう一度同じ子へ出る場面に届かない** (上の「スイッチと、その再生」)。
+  条件 5 (尋ね直し) と、受け取り終える答えを epoch で引くことは、決まった順の再生だけが守っている。
+- **印の関数は、作り直すグループがなければ、記録を読まない**。
+  項目 4 を入れた最初の形は、グループがなくても `__incoming` を読み、既定の seed の 1 つの列が変わった。
+  再起動で捨てられた instance (シミュレータでは、続きが走る) が、もう届いた piece の応答を受け取ると、前は SQL を 1 つも実行せずに ack を送り、最初の形は、その読みで失敗して ack を送らなかった。
+  本物の Durable Object では、捨てられた instance は走らないので、欠陥ではない。読まない形にして、109 の列が基と同じになることを確かめた。
+- **移動を知らない子へ、試験が応答を直に届ける場面**。
+  `test/migration.test.ts` の M5b の反例の試験は、move-start を適用していない子に、pull の応答を直に受け取らせる。
+  子は、応答を受け取る前に、親の表定義の epoch まで列を適用するので、そこで move-start も適用して受け取り始め、応答を受け取る。試験の意味は変わらない。受け取ったことを、到着の記録で確かめる行を足した。
+- 直していない欠陥は、見つけていない。
+
+### 確かめていないこと
+
+- モデル (TLC と Quint) は流していない。`specs/` は変えていない。
+- `scripts/check.sh` は流していない。流したのは、型の検査と、`npx vitest run` の 4 つの組である。
+- 本物の Cloudflare では試していない (`scripts/cloudflare-check.sh`)。
+- `5808b08` のコードの全体は、7 つのスイッチを全部入れた形である。その組を流す再生はない (`docs/model-coverage.md` の `m5d_code_chain`、`m5d_code_parent_rule`、`m5d_code_derived_return` の行は、直した後のコードだけを再生する)。
 
 ## M5d が確かめていないこと
 

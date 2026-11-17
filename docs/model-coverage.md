@@ -10,10 +10,10 @@ Test references are `packages/cf-d-infinity/test/<file>.test.ts:<line>` or a tes
 counterexample.
 
 Categories:
-- A: the implementation has the guard, and a deterministic replay exists (116 rows; every row with a guard).
-  Of these, 98 also have a fault switch, and the replay checks that the switch produces the violation. 13 have no switch,
-  and 5 have a switch whose replay runs only the fixed code; for those 18 the replay checks the fixed code on the
-  model's ordering, not that removing the guard breaks it. (On 2026-11-17, M24c's five reds added five rows, each with a switch. Before that, the same day, after per-table epochs gave rows to 21 reds of M24, the lock lease to 5 reds of M25, and the DDL floor to M23j's `m23j_always_rename`: 111 rows, 93, 13 and 5. On 2026-11-16, after catalog epoch stage 4 replaced the 5 rows of M15 by 5 rows of M21: 84 rows, 66, 13 and 5. After stage 3, the same day: 83 rows, 63, 15 and 5; on 2026-11-15: 78 rows, 53, 19 and 6.)
+- A: the implementation has the guard, and a deterministic replay exists (132 rows; every row with a guard).
+  Of these, 110 also have a fault switch, and the replay checks that the switch produces the violation. 14 have no switch,
+  and 8 have a switch whose replay runs only the fixed code; for those 22 the replay checks the fixed code on the
+  model's ordering, not that removing the guard breaks it. (On 2026-11-17, the move-message rule gave rows to 16 modules of M5d: 12 with a switch whose replay produces the violation, 1 without a switch and 3 with switches whose replay runs only the fixed code. Before that, the same day, M24c's five reds added five rows, each with a switch: 116 rows, 98, 13 and 5. Before that, the same day, after per-table epochs gave rows to 21 reds of M24, the lock lease to 5 reds of M25, and the DDL floor to M23j's `m23j_always_rename`: 111 rows, 93, 13 and 5. On 2026-11-16, after catalog epoch stage 4 replaced the 5 rows of M15 by 5 rows of M21: 84 rows, 66, 13 and 5. After stage 3, the same day: 83 rows, 63, 15 and 5; on 2026-11-15: 78 rows, 53, 19 and 6.)
 - D: a design alternative the implementation never had or no longer has, or a variant another mechanism already covers; no switch needed (13 rows, M16 and M17 included).
 - P: models for a mechanism that is designed but not in the code yet, so there is no guard to switch off. M18
   (`specs/m18_subslot_split.qnt`), M19 (`m19_claim_resplit.qnt`) and M20 (`m20_unique_piecewise.qnt`) model moving one
@@ -82,20 +82,22 @@ Categories:
   M5d (`m5d_move_messages.qnt`, 2026-11-17) models move requests and responses that outlive their move: a pull, a pull
   response or an ack that arrives after the move finished, after the range moved on, or after it came back (problems 54,
   55 and 58, and the seven orderings a review listed; [design-move-messages.md](./design-move-messages.md)). The rule it
-  checks is not in the code: a shard changes its handing and receiving records only for a request or response that names
-  a move epoch it holds a live record for, the parent answers "finished handing" otherwise and the child finishes
-  receiving on that answer, and the in-memory marks are derived from the records by one function. Its 16 modules with a
-  `red` line get rows, switches and replays with the implementation. `m5d_code_return`, `m5d_code_chain` and
-  `m5d_code_return3` are today's code (`5808b08`); their runs `member1Test` to `member7Test` are the seven orderings, and
-  `test/open/late-pull-after-range-returned.test.ts` replays the first. `m5d_code_parent_rule*`, `m5d_code_child_rule*`
-  and `m5d_code_derived_*` put one condition into today's code and show which orderings remain. The reds that remove one
-  condition, with the switch that should put it back: `m5d_red_rehand` (`rehandFinished`), `m5d_red_child_stale`
-  (`childAcceptsStale`), `m5d_red_finished_refusal` (`finishedAsRefusal`, the withdrawn attempt `89d99c8`),
-  `m5d_red_mark_before_write` (`markBeforeWrite`) and `m5d_red_boot_differs` (`bootMarksDiffer`); `m5d_red_late_ack` and
-  `m5d_red_ask_once` have no switch name yet. `markBeforeWrite` and `bootMarksDiffer` break nothing while the parent and
-  child rules hold (`m5d_marks_*` are green), so those two reds also remove the parent rule, and their replays have to
-  switch `rehandFinished` on as well. `m5d_red_rehand` and `m5d_red_late_ack` break only the rule itself
-  (`handsUnderFence`) and, for the former, a failed record write; a replay has to assert on the records, not on rows.
+  checks is in the code since 2026-11-17 (plan invariant 15): a shard changes its handing and receiving records only for a
+  request or response that names a move epoch it holds a live record for, the parent answers "finished handing" otherwise
+  and the child finishes receiving on that answer, and the in-memory marks are derived from the records by one function.
+  Its 16 modules with a `red` line have rows below. `m5d_code_return`, `m5d_code_chain` and `m5d_code_return3` are the code
+  before the rule (`5808b08`); their runs `member1Test` to `member7Test` are the seven orderings, replayed by
+  `test/late-pull-*.test.ts`. `m5d_code_parent_rule*`, `m5d_code_child_rule*` and `m5d_code_derived_*` put one condition
+  into that code and show which orderings remain. Seven switches each remove one condition: `rehandFinished`
+  (`m5d_red_rehand`), `childAcceptsStale` and `finishIncomingByInterval` (the two runs of `m5d_red_child_stale`; the
+  implementation checks pieces and "finished" answers separately, so the model's one condition became two switches),
+  `finishedAsRefusal` (`m5d_red_finished_refusal`, the withdrawn attempt `89d99c8`), `askOnce` (`m5d_red_ask_once`),
+  `markBeforeWrite` (`m5d_red_mark_before_write`) and `bootMarksDiffer` (`m5d_red_boot_differs`). The last two break
+  nothing while the parent and child rules hold (`m5d_marks_*` are green; their replays check that too), so their reds
+  also remove the parent rule and their replays switch `rehandFinished` on as well. `m5d_red_rehand` breaks only the
+  rule itself (`handsUnderFence`) and a record write; its replays assert on the records and on the failed request, not on
+  rows. `m5d_red_late_ack` has no switch: an ack goes through the same entry as a pull, so `rehandFinished` removes both.
+  The code of `5808b08` as a whole is all seven switches together; no replay runs that combination.
   M5d replaces M5c's "refuse the late pull" (`m5c_red_rehand`) by "answer finished handing".
 
 | module | flaw modelled | fault switch | deterministic replay | cat |
@@ -224,6 +226,22 @@ Categories:
 | m24c_red_gap | the retry's prepare is recorded after the wound's abort, by the driver; between the two a shard neither fences nor waits, and a transaction that waited behind the DDL takes its lock | woundWithoutRestart | ddl-busy-by-writer-during-its-wait ("put back ... woundWithoutRestart", two shards against one) | A |
 | m24c_red_holder_here | a waiting shard serves only transactions that hold a lock on that shard, so a holder's write on another waiting shard is stopped like a newcomer's | holdsOnlyHere | ddl-busy-by-writer-during-its-wait ("put back ... holdsOnlyHere", two shards against one) | A |
 | m23j_always_rename | the floor is put at the time the shard applied the schema change, so a read between the table's last commit before the change and the apply is refused although every image it restores has the new shape (no wrong answer; breaks `floorNeeded`) | ddlFloorAtApply | table-floors ("put back (ddlFloorAtApply) ...") | A |
+| m5d_code_return | the code of `5808b08` on a range that returns (0 → 1 → 0): a late pull of the finished move is answered by handing the group again. Its mark stops a later transaction's phase 2 (ordering 1), the ack of the re-hand deletes a row the owner committed (2), or the record write fails on the internal UNIQUE index and leaves a mark in memory only (3) | rehandFinished with bootMarksDiffer (1) or markBeforeWrite (3) | late-pull-after-range-returned ("put back (rehandFinished and bootMarksDiffer)", `member1Test`), late-pull-of-carried-group ("put back (rehandFinished and markBeforeWrite)", `member3Test`); late-pull-deletes-owner-row replays `member2Test` on the fixed code only | A |
+| m5d_code_chain | the same code on a forward chain (0 → 1 → 2): the late answer to a pull of move 1 is taken as an arrival and removes the child's mark of move 2, so phase 2 is neither applied nor forwarded (4, 7), or the ack of move 2 is not counted and the move stays open (5) | rehandFinished, childAcceptsStale and bootMarksDiffer together (no replay runs them) | late-pull-forward-chain (rows 4 and 5) and late-pull-reply-after-finished (7); fixed | A |
+| m5d_code_return3 | the same code on 0 → 1 → 0 → 1: the answer to a pull of move 1, given under a live fence, arrives after the child received the group again in move 3 and deleted its row; the row comes back (6) | childAcceptsStale | late-pull-reply-after-received-again ("put back (childAcceptsStale)", `member6Test`) | A |
+| m5d_code_parent_rule | the parent rule alone: the parent hands only under a live fence, but the child still takes a late answer, so ordering 7 remains | childAcceptsStale and bootMarksDiffer together (no replay runs them) | late-pull-reply-after-finished; fixed | A |
+| m5d_code_parent_rule3 | the parent rule alone on 0 → 1 → 0 → 1: ordering 6 remains (the parent handed correctly, under a live fence) | childAcceptsStale | late-pull-reply-after-received-again ("put back (childAcceptsStale)": the parent rule is in place) | A |
+| m5d_code_child_rule | the child rule alone: the parent still hands under a finished fence, so orderings 1 and 3 remain. Ordering 2 also remains in the model because the child of `5808b08` acks an answer it discarded; the implementation never acks a discarded piece and has no switch for it | rehandFinished with bootMarksDiffer (1) or markBeforeWrite (3) | late-pull-after-range-returned and late-pull-of-carried-group (the two "put back" pairs above: the child rule is in place) | A |
+| m5d_code_derived_return | the mark function alone: the owner's row is no longer deleted, but the re-handed row lands on the former child (2), and two orderings outside the seven remain (a re-handed row reaches the parent of a move that is still open; two re-hands in a row bring back a deleted row) | rehandFinished and childAcceptsStale together (no replay runs them) | late-pull-deletes-owner-row; fixed | A |
+| m5d_code_derived_return3 | the mark function alone on 0 → 1 → 0 → 1: ordering 6 remains | childAcceptsStale | late-pull-reply-after-received-again ("put back (childAcceptsStale)": the marks are derived) | A |
+| m5d_red_rehand | the parent hands again under a finished fence: a handing record appears in a move that is over (`handsUnderFence`), or its write fails (`noFailedWrite`). Rows, intents and marks stay right | rehandFinished | late-pull-after-range-returned ("put back (rehandFinished)", `rehandTest`: asserts on `__moved`) and late-pull-of-carried-group ("put back (rehandFinished)", `collideTest`: the pull and the statement that waited fail with the internal UNIQUE error) | A |
+| m5d_red_late_ack | the parent counts an ack under a finished fence (the prototype's form). No harm in the model: such a mark is left only by an empty group | none (an ack and a pull go through the same entry, `handing`) | late-move-ack (a late ack of an earlier move deletes nothing; fixed) | A |
+| m5d_red_child_stale | the child changes its receiving records for an answer of a move it no longer receives: it takes a late piece (`member6Test`), or a late "finished" of move 1 finishes its receive of move 3 of the same range, found by interval (`closeEarlyTest`) | childAcceptsStale (pieces); finishIncomingByInterval ("finished" answers) | late-pull-reply-after-received-again ("put back (childAcceptsStale)"); move-messages ("put back (finishIncomingByInterval)": the child answers without the row the owner committed) | A |
+| m5d_red_finished_refusal | the child reads "finished handing" as a refusal and skips it (the withdrawn attempt `89d99c8`): after the parent finished and before the child did, a statement on a group without rows is refused with `group not arrived` | finishedAsRefusal | empty-group-after-parent-finished ("put back (finishedAsRefusal)", `windowTest`) | A |
+| m5d_red_ask_once | a statement that waited for a pull does not ask again after the answer was discarded: the pull was sent in move 1, the answer arrives while the shard receives move 3 of the same range, and the statement is refused with `group not arrived` | askOnce | move-messages ("put back (askOnce)", `askOnceTest`; the green also covers a second statement that joins the held pull) | A |
+| m5d_red_boot_differs | the marks are rewritten step by step while running and derived only at boot; with the parent rule removed as well, the mark of a re-hand stays until a restart and a committed write is not applied | bootMarksDiffer with rehandFinished | late-pull-after-range-returned ("put back (rehandFinished and bootMarksDiffer)", `member1Test`; "bootMarksDiffer alone changes nothing") | A |
+| m5d_red_mark_before_write | the handed mark is set before the record write and stays when the write fails; with the parent rule removed as well, a mark that exists in memory only stops a later phase 2 | markBeforeWrite with rehandFinished | late-pull-of-carried-group ("put back (rehandFinished and markBeforeWrite)", `member3Test`; "markBeforeWrite alone changes nothing") | A |
+| m5d_prototype_return3 | the review's prototype (the parent rule on pulls, the child rule, "finished" as an answer) with a statement that asks once: refused with `group not arrived` on 0 → 1 → 0 → 1 | askOnce | move-messages ("put back (askOnce)") | A |
 | m25_red_per_shard | each shard extends only its own locks when it runs a lock-taking statement (the form until 2026-11-17) | perShardLockTtl | lock-lease-placement ("put back ... perShardLockTtl", on two shards and, as `m25_per_shard_same`, on one) | A |
 | m25_red_local_lease | the shard that receives a statement extends by its own clock instead of the request's lease | localLockLease | lock-lease-placement ("put back ... localLockLease") | A |
 | m25_red_no_epoch | the shard extends on a lease epoch it has already seen, so a redelivered renewal extends a rolled-back transaction's lock | leaseIgnoresEpoch | lock-lease-placement ("put back ... leaseIgnoresEpoch"; the test sends the recorded renew again) | A |
