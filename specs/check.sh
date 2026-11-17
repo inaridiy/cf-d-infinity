@@ -794,6 +794,37 @@ fi
 for m in m23c_green_ro_w m23c_green_ro_y m23c_green_w m23c_green_retain m23c_green_empty m23c_base_ro m23c_red_child_below \
          m23c_red_no_merge m23c_red_prev_above m23c_red_no_retain m23c_red_no_epoch m23c_red_worker_routes m23c_red_empty_no_floor; do tests $f $m; done
 
+echo "== M23d old reads keep the versions they overlay (古い読みに重ねる自分の版を、変更ログの切り詰めで失わない。実装より先に書いたモデル)"
+f=m23d_old_read_retention.qnt
+green   $f m23d_green m23dSafe                           # 受け持ち始める前の c の版を残し、logLowWater が m 以上になってから消す。書き手 Y
+green   $f m23d_green_w m23dSafe                         # 同上、書き手 Y と W
+red     $f m23d_red_log_only readAtT                     # 重ねる版を変更ログからだけ取る (1 回目の実装): 切り詰めで消えた版を落とす
+red     $f m23d_red_keep_until_c readAtT                 # 残した版を、logLowWater が c 以上になったら消す
+witness $f m23d_green witnessKeptUsed                    # 古い読みが、変更ログから消えた自分の版を、残した版から答える
+for m in m23d_green m23d_red_log_only m23d_red_keep_until_c; do tests $f $m; done
+
+echo "== M23e lock carry (範囲の移動で、行ロックを新しい持ち主へ運ぶ。寿命は M25 の取引の lease。実装より先に書いたモデル)"
+f=m23e_lock_carry.qnt
+green   $f m23e_green m23eSafe                          # 運び、lease をそのまま持ち、延長と unlock を転送し、先に届いた転送を覚える。動く置き場所と動かない置き場所で結果が同じ
+green   $f m23e_green endReleases                       # 記録を保存していれば、親が再起動した後も、取引が終わればロックは残らない
+green   $f m23e_memory_record m23eSafe                  # 記録をメモリにだけ持つ形でも、M25 の性質は破れない
+red     $f m23e_memory_record endReleases               # 同上: 親が再起動した後に終わった取引の、運んだロックが残る (lease の期限で切れる)
+red     $f m23e_red_no_carry outcomeSame                # 運ばない: lease は取引のものでも、W は、動く置き場所でだけ、待たずに書く
+red     $f m23e_red_regrant lockProtects                # 運ばず、延長が届いたら与え直す: 取引は、読んだ後に書かれた行のロックを持つ (M25 の m25_red_regrant と同じ欠陥)
+red     $f m23e_red_regrant outcomeSame
+red     $f m23e_red_fresh_lease idleLoses               # 受け取った側が新しい期限を与える: 放っておかれた取引のロックが L より長く残る
+red     $f m23e_red_no_forward_renew stmtKeeps          # 親が延長を転送しない: 運んだロックが、取引が働く間に切れる
+red     $f m23e_red_no_forward_renew outcomeSame
+red     $f m23e_red_no_forward_unlock outcomeSame       # 親が unlock を転送しない: ROLLBACK の後も、W は、動く置き場所でだけ待つ
+red     $f m23e_red_no_early outcomeSame                # 受け取る側が、先に届いた転送を覚えない: 飛んでいる間の ROLLBACK の後に、ロックが届く
+live    $f m23e_live leaseLive                          # 活性: ロックはいつか全部切れ、待つ W は終わる
+witness $f m23e_green witnessCarriedBusy                # 運んだロックが転送された延長で延び、W はどちらの置き場所でも SQLITE_BUSY、取引が確定する
+witness $f m23e_green witnessEarlyRenew                 # pull の応答が飛んでいる間の延長を、届いたロックに当てる
+witness $f m23e_green witnessEarlyUnlock                # 飛んでいる間に ROLLBACK した取引のロックを入れず、W がどちらの置き場所でも書く
+witness $f m23e_memory_record witnessLeftover           # 親の再起動の後に取引が終わり、運んだロックが残る
+for m in m23e_green m23e_memory_record m23e_red_no_carry m23e_red_regrant m23e_red_fresh_lease m23e_red_no_forward_renew \
+         m23e_red_no_forward_unlock m23e_red_no_early; do tests $f $m; done
+
 echo "== M23f statement snapshot (Worker の 1 つの文の要求は、どれも、その試みを計画した範囲表で区間を切る。実装より先に書いたモデル)"
 f=m23f_statement_snapshot.qnt
 green   $f m23f_green stmtSafe                          # 送る前に確かめ、取引の範囲表が試みのスナップショットでなければ計画し直す。移動 1 回
