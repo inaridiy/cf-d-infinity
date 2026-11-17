@@ -132,7 +132,8 @@ describe("a split whose driver stops before any of its steps", () => {
         throw new Error("meta unreachable");
       };
       const ran = await outcome(split(c, "s0", "s1", { range: s.range }));
-      expect({ refused, ran }).toEqual({ refused: 1, ran: "meta unreachable" });
+      // 再起動すると、進める側の要求は、Meta の誤りを待たずに、再起動で失敗する (シミュレータは、再起動した instance に届いていた要求を失敗させる)。
+      expect({ refused, ran: restart && /^fenced instance/.test(ran) ? "fenced instance" : ran }).toEqual({ refused: 1, ran: restart ? "fenced instance" : "meta unreachable" });
       // 子は受け取り終えている。移動は Meta で開いたままで、表定義の遷移は開けない。
       expect(await Promise.all(["s0", "s1"].map((id) => c.shard(id).moves({})))).toEqual(expected.shards);
       expect((await c.moves()).length).toBe(1);

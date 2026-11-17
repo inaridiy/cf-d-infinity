@@ -703,7 +703,14 @@ export class SimCluster implements Cluster {
     return this.cores.get(id)!;
   }
 
+  /**
+   * instance ごとの、届いていて、まだ答えていない要求を失敗させる関数。再起動 (restart) が、古い instance の分を全部呼ぶ。
+   * 答えた要求は、自分で抜ける。
+   */
+  private inflight = new Map<string, Set<(e: Error) => void>>();
+
   private boot(id: string): void {
+    this.inflight.set(id, new Set());
     this.cores.set(id, new ShardCore({
       id,
       backend: this.backends.get(id)!,
@@ -879,6 +886,7 @@ export class SimCluster implements Cluster {
   restart(id: string): void {
     const old = this.backends.get(id)!;
     old.fenced = true;
+    for (const fail of [...(this.inflight.get(id) ?? [])]) fail(new Error("fenced instance: the shard restarted while the request was in flight"));
     old.dropUnsynced();
     const fresh = new SqliteBackend(old.db);
     fresh.rt = this.runtime;
@@ -902,9 +910,21 @@ export class SimCluster implements Cluster {
           else await new Promise((r) => (delay > 0 ? setTimeout(r, delay) : setImmediate(r)));
           // JSON を通して、DO の RPC と同じく参照を共有しないようにする。
           const core = this.core(to);
-          const out = await (core[method] as (r: unknown) => Promise<unknown>).call(core, structuredClone(req)).catch((e: unknown) => {
-            this.net.failed.push({ m, message: e instanceof Error ? e.message : String(e) });
-            throw e;
+          // シャードが再起動すると、その instance に届いていた要求は、答えを待たずに失敗する (DO の再起動と同じ。test/workerd-restart.test.ts)。
+          // 古い instance の中で行ロックを待っている要求が、待ちの期限 (5 秒) まで、取ったロックを持ったまま残らないようにする
+          // (elle-sim の seed 253。2026-11-16)。古い instance の続きは走ったままで、ほかのシャードを呼べる (本物の DO では届かない)。
+          // 答えを待つ Promise の段の数は、前の書き方 (call.catch) と同じにする。Promise.race で包むと 1 段増え、再起動のない実行でも、
+          // 同じ seed の RPC の列が変わる。
+          const inflight = this.inflight.get(to)!;
+          const call = (core[method] as (r: unknown) => Promise<unknown>).call(core, structuredClone(req));
+          const out = await new Promise<unknown>((resolve, reject) => {
+            const fail = (e: unknown) => {
+              if (!inflight.delete(fail)) return; // もう答えたか、再起動で失敗させた
+              this.net.failed.push({ m, message: e instanceof Error ? e.message : String(e) });
+              reject(e);
+            };
+            inflight.add(fail);
+            call.then((v) => void (inflight.delete(fail) && resolve(v)), fail);
           });
           const hold = this.net.reply(m);
           if (hold) await hold;
