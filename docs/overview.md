@@ -251,6 +251,15 @@ or validation of a key in the range at an earlier time. It has no history of the
 the parent emptied before the fence is not copied either, and without the floor the child would answer "no rows" for
 it at a time when the rows still existed.
 
+A request or an answer of a move can arrive after the move is over, because messages between shards have no deadline;
+by then the range may have moved on or come back. A shard changes what it recorded about a move only for a message
+that names a move it is still handing or still receiving. For any other move the parent changes nothing and answers
+that it has finished handing, with its clock. A child that still receives that move finishes receiving on the answer,
+so a statement on a shard key without rows is served instead of refused; any other child discards it, and a statement
+that waited for it asks again in the move its shard receives now. What a shard keeps in memory about handed and
+arrived groups is rebuilt from those records by one function, at boot and after every write. Model M5d; see
+[design-move-messages.md](./design-move-messages.md).
+
 Ownership moves before the data does, which sheds load from a hot parent immediately instead of making it also pay
 for a bulk copy first. A Worker whose range table predates the split is told so: a request for a moved shard key, and
 a whole-table read that still believes the parent owns the moved slots, both get `NotOwner`, and the Worker refetches

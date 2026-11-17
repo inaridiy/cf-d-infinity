@@ -10,7 +10,8 @@
 // 未解決の問題 54 (範囲が前の持ち主へ戻る途中に届いた phase 2) は、2026-11-17 に直した (test/phase2-during-return.test.ts、M5c)。
 // それまで伏せていた MoveChaos.hide54 は外した。
 //
-// 問題 55 (終わった移動の遅れた pull) は、54 の直しで渡した印がグループの戻るまで残るので起きない (test/stale-pull-after-return.test.ts)。
+// 問題 55 (終わった移動の遅れた pull) は、親が、渡し終えた移動の pull に「渡し終えた」と答えるので起きない (計画書の不変条件 15。
+// test/stale-pull-after-return.test.ts。その前は、54 の直しで、渡した印がグループの戻るまで残ることに頼っていた)。
 // それまで伏せていた MoveChaos.hideStalePull も外した (2026-11-17。シミュレータの再起動が飛んでいる要求を失敗させる形で、OPEN=1 の
 // seed 1 から 300 が通った)。
 import { describe, expect, it } from "vitest";

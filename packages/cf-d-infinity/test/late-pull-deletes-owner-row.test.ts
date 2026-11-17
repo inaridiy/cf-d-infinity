@@ -12,8 +12,8 @@
 //
 // 不変条件 (計画書の不変条件 15): シャードは、生きた記録 (親なら終わっていない fence、子なら受け取り中の __incoming) を持つ移動の epoch を
 // 名指しする要求と応答でだけ、渡しと受け取りの記録 (__moved、__moved_txn、__arrived) を変える。メモリの印 (moved、arrived) は、その記録から
-// 導く。ここでは、親 s0 が、終わった fence (移動 1) の pull で、渡しの記録を足した。持ち主は、シャードの移動の手順 (src/shard/kernel.ts の
-// pullPieces と fenceOf。渡し直しの ack を受ける ack)。
+// 導く。直す前は、親 s0 が、終わった fence (移動 1) の pull で、渡しの記録を足した。持ち主は、渡した記録の入口 (src/shard/kernel.ts の
+// handing と、印を取る handGroup と dropHanded。前は pullPieces と fenceOf と ack だった)。
 import { describe, expect, it } from "vitest";
 import { Db } from "../src/client/db";
 import { keyString } from "../src/keys";
