@@ -836,6 +836,18 @@ witness $f m23g_green_read witnessThreeHops             # 3 つの期間をさ�
 witness $f m23g_green_validate witnessConflictAfterReask   # 尋ね直した確かめが、ほかの期間の確定を見つけて、取引が競合になる
 for m in m23g_green_read m23g_green_validate m23g_red_no_recheck m23g_red_no_recheck_validate m23g_red_no_window m23g_red_held_overlaid; do tests $f $m; done
 
+echo "== M23i guard across move (取引が読んだ表を DROP する前の確かめを、範囲の移動をまたいで通す。実装より先に書いたモデル)"
+f=m23i_guard_across_move.qnt
+green   $f m23i_green m23iSafe                          # 確かめをいまの持ち主へ送り、持ち主が前の持ち主に尋ね、自分の記録を読んだ時刻から確かめる
+red     $f m23i_red_no_rehome placementIndependent      # いまのコード: 確かめを読んだシャードへ送る。移動だけで DROP が失敗する
+green   $f m23i_red_no_rehome noLostWrite               # 同上でも、書き込みは失わない (断る側に倒れている)
+red     $f m23i_red_no_ask noLostWrite                  # 持ち主が前の持ち主に尋ねない: 移動の前に、読んだシャードで確定した書き込みを失う
+red     $f m23i_red_from_arrival noLostWrite            # 持ち主が自分の記録を到着の m から確かめる: pull に乗った intent の、m より小さい c の確定を失う
+witness $f m23i_green witnessDroppedAcrossMove          # 読んだ後に範囲が動いても、変更がなければ DROP が commit される
+witness $f m23i_green witnessRefusedByFormerOwner       # 前の持ち主への尋ねが、移動の前の書き込みを見つける
+witness $f m23i_green witnessRefusedByCarriedIntent     # 持ち主の確かめが、受け持ち始める前の c で適用した確定を見つける
+for m in m23i_green m23i_red_no_rehome m23i_red_no_ask m23i_red_from_arrival; do tests $f $m; done
+
 echo "== M25 txn lock lease (行ロックの寿命を取引のものにする。どの文も、取引の全部のロックを延ばす。実装より先に書いたモデル)"
 f=m25_txn_lock_lease.qnt
 green   $f m25_green leaseSafe                          # 決めた設計 (R = 1)。4 つの置き場所を、同じ利用者の手で並べて動かす

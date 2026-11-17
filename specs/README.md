@@ -1745,6 +1745,73 @@ witness は 4 つで、どれも到達した。
 - 受け取りの記録の選び方。範囲は 1 本の道を動くので、尋ねられたシャードの記録は、移動の順で決まる。時刻で選ぶ規則は M23b (`m23b_live_red_cycle`) が確かめた。
 - 4 回以上の移動、時計のずれ。
 
+### M23i `m23i_guard_across_move.qnt` — 取引が読んだ表を DROP する前の確かめを、範囲の移動をまたいで通す (未解決の問題 37 の続き)
+
+2026-11-17 に書いた。
+実装より先に書いたモデルである。
+設計は [docs/design-refresh-across-move.md](../docs/design-refresh-across-move.md) の「3 回目の実装の規則」にある。
+
+取引の中で表を作り直すとき、DROP は、写す取引が古い表を読んだ後に、別の接続がその表へ書いていないことを確かめる (M14、M21 の DROP の場面)。
+DROP の prepare が表を書き込み禁止にし、シャードは prepare を適用した後で、読んだ範囲に、読んだ時刻より後の変更がないかを答える。
+写す取引が読んだ後に、読んだ範囲が別のシャードへ動いていると、いまのコードは、確かめを読んだシャードへ送り、渡したシャードが `NotOwner` で断って、DROP が競合になる。
+答えは誤らないが、移動だけで DROP が失敗する (規則 4)。
+M21 の DROP の場面 (`m21_green_drop`、`m21_guard_green`) に移動はなく、M23 と M23b の確定の検証は、この入口を通らない。
+
+規則は、確定の検証と同じである。
+
+- `REHOME`: Worker は、読んだ範囲を、DROP の範囲表 (prepare の epoch のスナップショット) の持ち主へ分け直して送る。prepare から commit までの間は移動が開かない (M21) ので、この範囲表は変わらない。
+- `ASK`: 持ち主は、prepare を適用した後で、読んだ時刻が受け持ち始めた時刻より前なら、前の持ち主に (読んだ時刻, 到着の m] を尋ねる。
+- `OWN_FROM_T`: 持ち主は、自分の記録を、読んだ時刻から確かめる。到着の m からではない。
+
+モデルは、M21 の `m21_guard_core` の DROP の進み (prepare の記録、シャードの適用、確かめ、commit の記録、期限切れ) に、移動を 1 回足したものである。
+古い表の行のグループが 1 つあり、シャード P から C へ動く (`pull` と `recv`。prepare の前だけ)。
+時計は 1 つである。
+写す取引の確定の検証は、M23 の規則で正しく答えるものとして 1 手にした。
+別の接続の書き込みは、autocommit の W (2 回まで) と、2 相の Y である。
+確かめは、送る (`gSend`)、前の持ち主が答える (`gAnswer`)、持ち主が同期区間に入る (`gEnter`) の 3 手に分けた。
+
+`m23iSafe` は次の 3 つである。
+
+- `noLostWrite`: DROP が commit されたなら、写す取引が読んだ後の、別の接続の確定はない。
+- `guardHolds`: 持ち主が「変わっていない」と答えた後、commit までの間に、読んだ範囲は変わらない。
+- `placementIndependent`: DROP が abort になるのは、読んだ後に別の接続の確定があったときか、期限が切れたときだけである。
+
+| 条件 (定数) | 外したインスタンス | 反例 |
+|---|---|---|
+| 確かめを、いまの持ち主へ送る (`REHOME`) | `m23i_red_no_rehome` (いまのコード) | 写す取引が P で読んで確定し、範囲が C へ動く。確かめは P へ行き、P が `NotOwner` で断って、DROP が abort になる。別の接続は何も書いていない (`placementIndependent`)。書き込みは失わない (`noLostWrite` は破れない) |
+| 持ち主が、前の持ち主に尋ねる (`ASK`) | `m23i_red_no_ask` | 写す取引が読んだ後、W が P で確定し、範囲が C へ動く。C の記録に W はなく、DROP が commit される |
+| 持ち主が、自分の記録を読んだ時刻から確かめる (`OWN_FROM_T`) | `m23i_red_from_arrival` | 写す取引が確定した後、Y が P で prepare する。intent が pull に乗り (m = 3)、C が c = 2 で適用する。C は自分の記録を m から見るので、Y を見ない。P の記録にも Y はなく、DROP が commit される |
+
+| インスタンス | 性質 | 定数 | 到達状態数 (distinct) | 結果 |
+|---|---|---|---|---|
+| `m23i_green` | `m23iSafe` | 規則のとおり。書き手 W 2 つと Y | 5,681 | No violation |
+| `m23i_red_no_rehome` | `placementIndependent` | 条件を 1 つ外す | 411 で反例 | 反例 |
+| `m23i_red_no_rehome` | `noLostWrite` | 同上 | 4,491 | No violation |
+| `m23i_red_no_ask` | `noLostWrite` | 条件を 1 つ外す | 2,246 で反例 | 反例 |
+| `m23i_red_from_arrival` | `noLostWrite` | 条件を 1 つ外す | 4,486 で反例 | 反例 |
+
+witness は 3 つで、どれも `m23i_green` で到達した。
+
+| witness | 内容 | 到達状態数 |
+|---|---|---|
+| `witnessDroppedAcrossMove` | 写す取引が読んだ後に範囲が動き、持ち主が前の持ち主に尋ねて、DROP が commit される | 2,708 |
+| `witnessRefusedByFormerOwner` | 移動の前に、読んだシャードで確定した書き込みを、前の持ち主への尋ねが見つけて、DROP が abort になる | 2,404 |
+| `witnessRefusedByCarriedIntent` | pull に乗った intent を、持ち主が受け持ち始める前の c で適用した確定を、持ち主の確かめが見つけて、DROP が abort になる | 3,920 |
+
+決定的な run は、`m23i_green` に 2 本 (移動をまたいで DROP が通る順序と、前の持ち主への尋ねが W を見つける順序)、各赤に反例の 1 本がある。
+
+わかったこと。
+
+- この入口に要る規則は、確定の検証 (M23 の `m23_red_prepare_alone`、`m23_red_child_from_arrival`) と同じ 2 つと、Worker が確かめの宛先を決め直すことである。新しい仕組みは要らない。
+- 尋ねてから同期区間に入るまでに、受け取りの記録は変わらない。prepare から commit までの間は移動が開かないからである。M23g の入口の確かめは、ここでは働かないが、同じ入口を通るので、外さない。
+- 持ち主が prepare を適用してから確かめること、intent の決着を待つこと、commit が禁止の唯一の終わり方であることは、M21 が外して確かめている (`m21_red_drop_check_early`、`m21_red_drop_no_drain`、`m21_red_drop_untied`)。ここでは設計どおりに固定した。
+
+モデルにないもの。
+
+- 移動と表定義の遷移が重なること (M21 の `m21_red_ddl_during_move`、`m21_red_move_during_ddl`)。
+- 読んだ範囲の一部だけが動くこと、2 回以上の移動 (尋ねる列は M23b)。
+- 時計のずれ。確かめが比べる時刻 (読んだ時刻であって、確定の時刻ではない) は、M21 の `m21_guard_red_commit_ts` が確かめている。
+
 ### M24 `m24_table_epochs.qnt` — 表ごとの epoch。DDL が取引を古くするのは、取引が頼る表を変えて確定したときだけ (未解決の問題 53)
 
 2026-11-16 に書いた。
