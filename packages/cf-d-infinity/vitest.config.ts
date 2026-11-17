@@ -27,7 +27,7 @@ const oracles = [
   "admission", "unique-reads", "export-import", "replay", "history", "elle-sim", "typed-diff", "storage-class", "key-affinity", "key-conversions", "shard-limits", "wide-integers",
   "contextual-words", "join-word-before-comment", "placement-differential", "unique-diff",
   "last-insert-rowid", "insert-select-returning", "ranged-write-in-begin-takes-no-lock", "snapshot-read-after-two-shards-changed", "shared-rowid-block-rollback",
-  "txn-across-ddl",
+  "txn-across-ddl", "ddl-waits-for-row-locks",
 ].map((name) => `test/${name}.test.ts`);
 
 export default defineConfig({

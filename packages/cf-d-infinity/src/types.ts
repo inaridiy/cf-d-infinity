@@ -212,6 +212,13 @@ export interface LockOwner {
   /** 開始時刻。古い取引が優先される (wound-wait)。 */
   start: Ts;
   /**
+   * 取引が行ロックを持つ表 (小文字の名前)。Worker が、取引の文に付ける。この文が、挙げた表の書き込み禁止 (表定義の遷移の fence) に
+   * 当たったら、シャードは、文を TableLocked で断るときに、文が書こうとした行のロックを取引に与える (書かずに。M24 の HOLD)。やり直しの
+   * prepare は、ほかの行ロックと同じく、そのロックを待つ。与えないと、やり直しの prepare が、取引の書き込みより先に適用され得て、取引は、
+   * また禁止に当たる (docs/design-catalog-epoch.md の「触った表の DDL と SQLite」)。
+   */
+  holds?: string[];
+  /**
    * autocommit の書き込みの待ち手である。シャードが自分で付け、値はその書き込みに発行した時刻である。Worker は付けない。
    * 同じ開始時刻なら、autocommit はどの取引よりも若い (src/shard/kernel.ts の older)。
    */
@@ -567,6 +574,16 @@ export interface Faults {
    */
   applyRefusesTouched?: boolean;
   /**
+   * シャードが、fence の表に行ロックがあっても、待たずに prepare を適用する (段 3 の形。M24 の m24_lock_red_no_wait、
+   * m24_retry_red_no_wait)。行を書いた取引の COMMIT が、DDL の後で、古い計画として断られる。
+   */
+  prepareIgnoresLocks?: boolean;
+  /**
+   * 書き込み禁止に当たった、ロックを持つ取引の文を断るときに、シャードが、その行のロックを取引に与えない (M24 の m24_retry_red_no_hold)。
+   * やり直しの prepare が、取引の書き込みより先に適用され、取引は、また禁止に当たる。
+   */
+  noLockAtFence?: boolean;
+  /**
    * 表定義の変更の床を、シャードに 1 つだけ持つ (段 3 の形。M24 の m24_floor_red_global)。どの DDL の commit も、全部の表の、床より古い
    * 時刻の読み戻しと refresh と述語の検証を断る。
    */
@@ -739,11 +756,13 @@ export class NotOwner extends Error {
  * 何も書かずに断るので、競合と同じくやり直せる。Worker は表定義が変わるのを待ってやり直し、待ち切れなければ、この誤りを利用者へ返す。
  */
 export class TableLocked extends ConflictError {
+  /** 禁止に当たった書き込みの行。シャードの中でだけ使う (RPC を越えると落ちる)。 */
+  rows: Pick<Change, "table" | "pk">[] = [];
   /**
    * epoch は、禁止を掛けている遷移の prepare の epoch。held は、断るときに、その行のロックを取引に与えた印である (M24 の HOLD。
    * 要求が、取引がその表の行ロックを持つと運んだとき)。
    */
-  constructor(table: string, by: string, epoch: number, held = false) {
+  constructor(readonly table: string, readonly by: string, readonly epoch: number, held = false) {
     super(`locked: table ${table} is being changed by a schema change (${by}) of epoch ${epoch}${held ? ", which now waits for this transaction's row locks" : ""}; retry when it has finished`);
     this.name = "TableLocked";
   }

@@ -21,16 +21,22 @@ import { depsFor, SimCluster } from "./sim";
 const locks = (c: SimCluster) => [...c.cores.values()].reduce((n, core) => n + (core as unknown as { locks: Map<string, unknown> }).locks.size, 0);
 const outcome = (p: Promise<unknown>) => p.then(() => "ok", (e) => (e instanceof Error ? e.message : String(e)));
 
-/** 取引 X が行のロックを持つ。別の接続が列を足す。新しい表定義の autocommit の書き込み W が、その行を待つ。X が COMMIT する。 */
+/**
+ * 取引 X が表 t の行のロックを持ち、表 u を読んでいる。別の接続が u に列を足す (t の行ロックを持つ取引を待つのは、t の DDL だけである)。
+ * autocommit の書き込み W が、t の行を待つ。X が COMMIT する。X は、読んだ表 u の古い計画なので、シャードが例外で断る。
+ */
 async function refusedCommitWithWaiter(unlockArrives: boolean) {
   const c = new SimCluster({ shards: 1 });
   await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
+  await new Db(c).ddl("CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
   await new Db(c).query("INSERT INTO t VALUES (1, 0)");
+  await new Db(c).query("INSERT INTO u VALUES (1, 0)");
   const x = new Db(c, { retries: 0 });
   await x.query("BEGIN");
+  await x.query("SELECT n FROM u WHERE id = 1");
   await x.query("UPDATE t SET n = 1 WHERE id = 1");
   await c.sleep(5); // X を、後から来る書き込みより古い取引にする (同じ時刻に始まると、ID の順で W が X のロックを奪うことがある)
-  await new Db(c).ddl("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 5");
+  await new Db(c).ddl("ALTER TABLE u ADD COLUMN extra INTEGER DEFAULT 5");
   const w = outcome(new Db(c).query("UPDATE t SET n = 2 WHERE id = 1"));
   await c.sleep(20); // W が行を待ち始める
   if (!unlockArrives) c.net.drop = (m) => m.method === "unlock"; // Worker が、確定の失敗の後で消えた

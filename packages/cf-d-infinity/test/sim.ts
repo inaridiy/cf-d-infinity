@@ -392,6 +392,7 @@ const CLIENT_FAULTS = new Set([
   "publishBeforeBackfill", "checkBeforePrepare", "scanSkipsEmpty", "guardFromCommitTs",
   "lockedReadsSkipValidation", "secondDmlNewSince", "secondDmlNewSpanSince",
   "globalSchemaEpoch", "viewDepsOnly", "writeDepsOnlyWritten", "doomOnSchemaChange",
+  "noWound", "noRetryAfterWound", "retryRestartsBudget", "retrySameEpoch",
 ]);
 /**
  * Worker と Meta の両方が読むスイッチの名前。1 つの欠陥を、2 つの守りを外して戻す (commitWithoutAcks は、Worker が 1 つのシャードの

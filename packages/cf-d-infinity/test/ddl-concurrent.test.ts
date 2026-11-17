@@ -600,24 +600,51 @@ describe("known bugs, as deterministic interleavings", () => {
    *   syncSchema が版を進めても、起きた後は版を確かめ直さずに書く。Worker は index のない計画 (db.ts:938-940 の高速経路)
    *   で送ったので、index の項目は誰も書かない。
    */
-  /** BUG-3 の台本。古い catalog の autocommit の UPDATE が、行ロックを待っている間に index が作られる。 */
+  /**
+   * BUG-3 の台本。古い catalog の autocommit の UPDATE が、シャードの中で待っている間に index が作られる。
+   * 2026-11-17 から、表 t の行ロックを持つ取引がいる間は、t の DDL のほうが待つ (docs/design-catalog-epoch.md の「触った表の DDL と
+   * SQLite」)。だから、UPDATE が t の行ロックを待つ間に、t の index が出来上がることはない。待ちの間に index が出来上がるのは、UPDATE が、
+   * 読む別の表 u の intent の決着を待つときである (t の記録の適用は、u の intent を待たない)。u の s0 の行に、確定済みで未適用の intent を
+   * 残し、s0 からの決着の問い合わせを止めておく。
+   */
   const lockWaitAcrossIndex = async (faults?: Faults) => {
-    const { c, db, A } = await two(faults);
+    const { c, db, A, B } = await two(faults);
+    await db.ddl("CREATE TABLE u(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER, PRIMARY KEY (tenant_id, id))");
     await db.query("INSERT INTO t VALUES (?, 1, 7, 0)", [A]);
-    const holder = new Db(c);
-    await holder.query("BEGIN");
-    await holder.query("UPDATE t SET n = 1 WHERE tenant_id = ? AND id = 1", [A]);
+    await db.query("INSERT INTO u VALUES (?, 1, 0)", [A]);
+    await db.query("INSERT INTO u VALUES (?, 1, 0), (?, 2, 0)", [B, B]);
+    // s0 への finalize と、s0 から出る最初の queryTxn を止める。
+    let releaseFinalize!: () => void;
+    const finalizeHeld = new Promise<void>((r) => (releaseFinalize = r));
+    let releaseAsk!: () => void;
+    const askHeld = new Promise<void>((r) => (releaseAsk = r));
+    let asked!: () => void;
+    const askReached = new Promise<void>((r) => (asked = r));
+    let asks = 0;
+    c.net.gate = (m) => {
+      if (m.method === "finalize" && m.to === "s0") return finalizeHeld;
+      if (m.method === "queryTxn" && m.from === "s0" && asks++ === 0) {
+        asked();
+        return askHeld;
+      }
+      return undefined;
+    };
+    // 2 つのシャードの u に書く取引。s1 で 1 行余分に読むので、anchor は s1 になる。確定の後、s0 には u の intent が残る。
+    await db.transaction(async (tx) => {
+      await tx.query("SELECT n FROM u WHERE tenant_id = ? AND id = 2", [B]);
+      await tx.query("UPDATE u SET n = 1 WHERE tenant_id = ? AND id = 1", [A]);
+      await tx.query("UPDATE u SET n = 1 WHERE tenant_id = ? AND id = 1", [B]);
+    });
     const stale = new Db(c);
     await stale.query("SELECT 1 FROM t WHERE tenant_id = ?", [A]); // index のない catalog を持たせる
-    const waited = hold(c, "gate", (m) => m.method === "syncSchema"); // UPDATE がロック待ちに入ってから DDL を進める
-    const update = outcome(stale.query("UPDATE t SET v = 99 WHERE tenant_id = ? AND id = 1", [A]));
-    const ddl = outcome(db.ddl("CREATE UNIQUE INDEX ix ON t(v)"));
-    await waited.reached;
-    await c.sleep(20);
-    waited.release();
-    expect(await ddl).toBe("ok");
-    await holder.query("ROLLBACK");
+    // t の行を書き、u を読む。シャードは版を確かめ (この時点では一致)、u の intent の決着を待つ。
+    const update = outcome(stale.query("UPDATE t SET v = 99 WHERE tenant_id = ? AND id = 1 AND EXISTS (SELECT 1 FROM u WHERE tenant_id = ?)", [A, A]));
+    await askReached;
+    expect(await outcome(db.ddl("CREATE UNIQUE INDEX ix ON t(v)"))).toBe("ok");
+    releaseAsk();
+    releaseFinalize();
     expect(await update).toBe("ok");
+    c.net.gate = () => undefined;
     await c.settle();
     const ix = await indexAgreement(c, "t", "ix");
     return { table: await tableRows(c), read: await byIndex(c, 99), missing: ix.missing, dangling: ix.dangling, A };

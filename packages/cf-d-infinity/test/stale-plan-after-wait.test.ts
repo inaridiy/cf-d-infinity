@@ -10,6 +10,8 @@
 //
 // 2 つ目の場面は、行ロックの待ちである。悲観的な取引の文が行を待っている間に版が進む。以前は、起こされた文が古い計画のまま
 // 実行され、取引は COMMIT で断られた。いまは、文の時点で断る。
+// 待っている行の表の DDL は、その行ロックを持つ取引を待つので (docs/design-catalog-epoch.md の「触った表の DDL と SQLite」)、待ちの間に
+// 進む版は、文が読む別の表のものである。文は、表 t の行を書き、表 u を読む。t の行を待つ間に、u に列が足される。
 //
 // 核 (src/shard/kernel.ts) の 1 歩は、待ちの後で先頭から呼び直され、文を実行する同期区間に入るたびに版を確かめる (enter)。
 // 欠陥のスイッチ noSchemaRecheck は、その確かめを外す。
@@ -77,29 +79,31 @@ async function readAcrossRecreate(faults?: Faults) {
 }
 
 /**
- * 取引 H が行 A/1 のロックを持つ。悲観的な取引 X の UPDATE が、その行を待つ。待っている間に、別の接続が列を足す。
- * H が ROLLBACK して、X の文が起こされる。
+ * 取引 H が表 t の行 A/1 のロックを持つ。悲観的な取引 X の UPDATE (t の行を書き、表 u を読む) が、その行を待つ。待っている間に、
+ * 別の接続が u に列を足す。H が ROLLBACK して、X の文が起こされる。
  */
 async function lockWaitAcrossAddColumn(faults?: Faults) {
   const c = new SimCluster({ shards: 2, faults });
   const db = new Db(c);
   await db.ddl(T);
+  await db.ddl("CREATE TABLE u(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (tenant_id, id))");
   const A = await tenantOn(c, "s0");
   await db.query("INSERT INTO t VALUES (?, 1, 1)", [A]);
+  await db.query("INSERT INTO u VALUES (?, 1)", [A]);
   const holder = new Db(c);
   await holder.query("BEGIN");
   await holder.query("UPDATE t SET n = 10 WHERE tenant_id = ? AND id = 1", [A]);
   const waiter = new Db(c, { retries: 0 });
   await waiter.query("BEGIN");
   await waiter.query("SELECT n FROM t WHERE tenant_id = ? AND id = 2", [A]); // 読んだ取引は、表定義を取り替えない
-  const update = outcome(waiter.query("UPDATE t SET n = n + 1 WHERE tenant_id = ? AND id = 1", [A]));
+  const update = outcome(waiter.query("UPDATE t SET n = n + (SELECT count(*) FROM u WHERE tenant_id = ?) WHERE tenant_id = ? AND id = 1", [A, A]));
   await c.sleep(20); // 行を待ち始める
-  await new Db(c).ddl("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 5");
+  await new Db(c).ddl("ALTER TABLE u ADD COLUMN extra INTEGER DEFAULT 5");
   await holder.query("ROLLBACK");
   const statement = await update;
   const commit = await waiter.query("COMMIT").then(() => "committed", (e: Error) => e.message);
   await c.settle();
-  const row = (await new Db(c).query("SELECT n, extra FROM t WHERE tenant_id = ? AND id = 1", [A])).rows[0];
+  const row = (await new Db(c).query("SELECT n FROM t WHERE tenant_id = ? AND id = 1", [A])).rows[0];
   return { statement, commit, row };
 }
 
@@ -116,10 +120,10 @@ describe("a statement that waited inside the shard while the shard applied a new
     expect(r).toEqual({ first: [{ n: 2 }], answer: [] });
   });
 
-  it("a statement of a transaction that waited for a row lock while a column was added is refused at the statement", async () => {
+  it("a statement of a transaction that waited for a row lock while a column was added to a table it reads is refused at the statement", async () => {
     const r = await lockWaitAcrossAddColumn();
-    expect(r.statement).toMatch(/^not owner: stale schema/);
+    expect(r.statement).toMatch(/^not owner: stale schema: u /);
     // 断られた文は、何も書いていない。取引に残っているのは読みだけなので、COMMIT は通り、行はもとのままである。
-    expect({ commit: r.commit, row: r.row }).toEqual({ commit: "committed", row: { n: 1, extra: 5 } });
+    expect({ commit: r.commit, row: r.row }).toEqual({ commit: "committed", row: { n: 1 } });
   });
 });

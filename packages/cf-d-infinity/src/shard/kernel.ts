@@ -208,6 +208,11 @@ const LOCK_WAIT_MS = 5000;
 export const WOUND_DELAY_MS = 200;
 /** DDL の適用が、進行中の取引の決着を待つ上限。超えたら再試行できる誤りを返す。 */
 const SCHEMA_WAIT_MS = 5000;
+/** prepare の適用が、fence の表の行ロックが空いたかを見直す間隔。 */
+const LOCK_POLL_MS = 10;
+/** その待ちの間に、遷移が閉じたかを Meta の列で確かめる間隔 (最初と、上限)。確かめるたびに 2 倍にする。 */
+const LOCK_REFETCH_MS = 50;
+const LOCK_REFETCH_MAX_MS = 400;
 
 export interface RowLock extends LockOwner {
   expires: number;
@@ -329,6 +334,11 @@ export interface ApplyFrame {
   got?: Logged[];
   /** intent の決着を待つ期限 (実時間)。 */
   deadline?: number;
+  /**
+   * prepare の適用が、fence の表の行ロックが空くのを待っている。待つ間に、その遷移が閉じることがある (ロックを持つ取引が取り消させる、
+   * 進める側が止まって期限が切れる)。Meta の列を、ときどき取り直して確かめる。refetchAt は次に取り直す時刻 (実時間)、every は、その間隔。
+   */
+  lockWait?: { refetchAt: number; every: number };
 }
 
 /** catchUp (範囲の記録だけを適用する) の frame。 */
@@ -2065,12 +2075,51 @@ export class ShardKernel {
    * 書き込む表が、開いている表定義の遷移の fence にないか (docs/design-catalog-epoch.md の「要求ごとの確かめ」の書き込み禁止)。
    * 禁止は、このシャードが prepare を適用したときから、commit か abort を適用するまで続く。
    */
-  private assertUnlocked(writes: Pick<Change, "table">[]): void {
+  private assertUnlocked(writes: Pick<Change, "table" | "pk">[]): void {
     if (this.faults.ignoreTableLock || this.snap.opens.length === 0) return;
     for (const w of writes) {
       const by = fencedBy(this.snap, w.table);
-      if (by) throw new TableLocked(w.table, describeOpen(by), by.epoch);
+      if (!by) continue;
+      const refused = new TableLocked(w.table, describeOpen(by), by.epoch);
+      refused.rows = writes.filter((x) => fencedBy(this.snap, x.table) !== null).map((x) => ({ table: x.table, pk: x.pk }));
+      throw refused;
     }
+  }
+
+  /**
+   * ロックを持つ取引の文が、書き込み禁止に当たった (docs/design-catalog-epoch.md の「表ごとの epoch」の「シャード」、M24 の HOLD)。
+   * 要求が、取引がその表の行ロックを (ほかのシャードに) 持つと運んでいれば、文を断るときに、文が書こうとした行のロックを取引に与える。
+   * 行は書かない。そのロックは、ほかの行ロックと同じく、やり直しの prepare を待たせ、取引の COMMIT か ROLLBACK で放され、期限で切れる。
+   * ほかの取引がロックか intent を持つ行は、与えない。1 つでも与えたら、与えた印の付いた誤りを返す。
+   */
+  private heldAtFence(e: TableLocked, me: LockOwner): TableLocked {
+    if (this.faults.noLockAtFence || !me.holds || me.holds.length === 0) return e;
+    const holds = new Set(me.holds);
+    let granted = false;
+    for (const r of e.rows) {
+      if (!holds.has(objectKey(r.table)) || this.blockedBy([r], me) !== null) continue;
+      this.grant(this.lockKey(r.table, r.pk), me);
+      granted = true;
+    }
+    if (!granted) return e;
+    const held = new TableLocked(e.table, e.by, e.epoch, true);
+    held.rows = e.rows;
+    return held;
+  }
+
+  /**
+   * 表 tables のどれかに、生きている行ロックがあれば、その表の名前。なければ null。表の prepare は、その表の行ロックがある間は
+   * 適用しない (M24 の WAIT_LOCKS)。
+   */
+  private lockedTable(tables: readonly string[]): string | null {
+    if (this.locks.size === 0 || tables.length === 0) return null;
+    const wanted = new Set(tables.map(objectKey));
+    for (const key of [...this.locks.keys()]) {
+      if (!this.liveLock(key)) continue;
+      const table = key.slice(0, key.indexOf("\0"));
+      if (wanted.has(objectKey(table))) return table;
+    }
+    return null;
   }
 
   /** 主キーが違っても衝突し得る表か。UNIQUE index のある表である。 */
@@ -2381,6 +2430,33 @@ export class ShardKernel {
       if (stale && isDdlRecord(rec)) {
         this.resnap();
         stale = false;
+      }
+      // 表の prepare は、その表 (fence) に行ロックがある間は適用しない (M24 の WAIT_LOCKS)。行を書いた取引がロックを持つ間、その表の DDL の
+      // ほうが待つ。SQLite で、書いた取引が書き込みのロックを持つ間、ほかの接続の DDL が busy_timeout まで待つのと同じである。
+      // 待つのは、prepare の記録が運ぶ DDL の待ちの期限 (waitUntil) までで、過ぎれば適用せずに断る (進める側の DDL が SQLITE_BUSY で失敗する)。
+      // 待つ間、要求は通す (ロックを持つ取引の、その後の文と COMMIT を待たせない)。取ってきた続きで、もう閉じている prepare は、待たない
+      // (遅れたシャードが prepare と abort を続けて適用するときに、ロックの持ち主が追いつきを止めないように)。
+      if (rec.kind === "prepare" && !this.faults.prepareIgnoresLocks && !f.got.some((y) => (y.rec.kind === "abort" || y.rec.kind === "commit") && y.rec.of === x.epoch)) {
+        const held = this.lockedTable(rec.fence);
+        if (held !== null) {
+          if (stale) this.resnap();
+          const now = this.rt.now();
+          if (rec.waitUntil === undefined || now >= rec.waitUntil) {
+            throw new ConflictError(`a transaction holds row locks on table ${held}, and the schema change (${describeOpen(rec)}) of epoch ${x.epoch} did not get the table within its wait`);
+          }
+          const w = (f.lockWait ??= { refetchAt: now + LOCK_REFETCH_MS, every: LOCK_REFETCH_MS });
+          let effect: Effect = { kind: "sleep", ms: Math.max(1, Math.min(LOCK_POLL_MS, rec.waitUntil - now)) };
+          let into: "got" | undefined;
+          if (now >= w.refetchAt) {
+            // その遷移が、待っている間に閉じたかもしれない。列の続きを取り直して、先頭から見直す。
+            w.every = Math.min(LOCK_REFETCH_MAX_MS, w.every * 2);
+            w.refetchAt = now + w.every;
+            effect = { kind: "meta", method: "epochsSince", args: [this.applied] };
+            into = "got";
+          }
+          return { done: false, wait: effect, ...(into ? { into } : {}), ...(forks.length > 0 ? { forks } : {}) };
+        }
+        f.lockWait = undefined;
       }
       // この記録が変える表の intent を、先に決着させる。決着を待つ間は、その表に頼る新しい文を入口で待たせる (applying)。
       // 待ちの後は、この 1 歩を先頭から呼び直し、intent がなくなったことを確かめた同じ 1 歩の中で、記録を適用する。
@@ -3027,7 +3103,13 @@ export class ShardKernel {
         if (overlay.length) setBasedRestore(this.b, (t) => this.def(t), overlay);
         return this.run(sec, req);
       });
+      // 書いた行のロックを取る読み (Worker の SQLite で実行した文の、Txn.lockWritten) は、行を書かないので、文の実行では書き込み禁止に
+      // 当たらない。書き込みとして頼る表 (Dep.write) の行のロックは、その表が書き込み禁止なら、ここで断る。断らないと、文は通り、取引の
+      // COMMIT が禁止に当たる。文をシャードで実行する経路では文が断られるので、成否が、文の経路で変わる。
+      this.assertUnlocked((req.lockRows ?? []).filter((r) => req.deps.some((d) => d.write === true && d.name === objectKey(r.table))));
     } catch (e) {
+      // 書き込み禁止に当たった。取引がその表の行ロックを持つなら、断る前に、書こうとした行のロックを与える (heldAtFence)。
+      if (e instanceof TableLocked) throw this.heldAtFence(e, me);
       if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner || e instanceof ShardLimit) throw e;
       // 文は F の状態を読んだうえで失敗した。読んだ時刻を付けて返し、呼び出し側に範囲を記録させる (ExecRes.error)。
       return done({ columns: [], values: [], changes: [], error: asSqlError(e).message, F, T: req.T ?? F, hlc: this.hlc.value, epoch: this.epoch });
