@@ -297,21 +297,25 @@ module m5b_core {
   // 親に行がないグループには、一度も書かれていないグループと、書かれた後で空にされたグループ (del) がある。どちらも、最新の版が
   // 「行なし」である。子は、どちらも履歴なしで受け持つ (行なしの版だけ)。削除がなければ、この条件は hist == initVers と同じである。
   // RANGE_FLOOR なら、子は受け取った時刻 m を床として残す。全部のグループが pull された範囲でも、終えるときに床を残す。
+  // (2026-11-17、M5d に合わせて緩めた) 親は、行と intent が残っていなければ渡し終える。空のグループを渡した応答が飛んでいても (届いていなくても) 終える。
+  // 子は、届いていないグループを全部、到着なしで受け持ち、飛んでいる応答を捨てる (M5d の規則)。
   action finishRange = all {
-    fenced, route == C, pullMsg.g == 0,
-    GROUPS.exists(g => moved.get(g) == 0) or (RANGE_FLOOR and not(finished)),
-    GROUPS.forall(g => moved.get(g) > 0 or
-      (latest(hist.get(P).get(g)).writer == 0 and not(intent.where == P and groupOf(X) == g))),
-    GROUPS.forall(g => moved.get(g) == 0 or arrived.get(g) > 0),
+    fenced, route == C,
+    val handedEmpty = GROUPS.filter(g => moved.get(g) > 0 and arrived.get(g) == 0 and not(open.contains(g))
+      and latest(hist.get(P).get(g).filter(v => v.writer != TOMB)).writer == 0 and not(intent.where == P and groupOf(X) == g))
+    val rest = GROUPS.filter(g => moved.get(g) == 0).union(handedEmpty)
     val m = hlc.get(P) + 1
-    val rest = GROUPS.filter(g => moved.get(g) == 0)
     all {
+      rest != Set() or (RANGE_FLOOR and not(finished)),
+      GROUPS.forall(g => moved.get(g) > 0 or
+        (latest(hist.get(P).get(g)).writer == 0 and not(intent.where == P and groupOf(X) == g))),
+      GROUPS.forall(g => moved.get(g) == 0 or arrived.get(g) > 0 or open.contains(g) or handedEmpty.contains(g)),
       hlc' = hlc.set(P, m).set(C, if (FINISH_CARRIES_CLOCK) max(hlc.get(C), m) else hlc.get(C)),
       moved' = GROUPS.mapBy(g => if (rest.contains(g)) m else moved.get(g)),
       open' = open.union(rest),
       hist' = hist.set(C, GROUPS.mapBy(g => if (rest.contains(g)) initVers else hist.get(C).get(g))),
       floor' = if (RANGE_FLOOR) m else floor, finished' = true, pfloor' = pfloor, hops' = hops,
-      arrived' = arrived, fenced' = fenced, route' = route, pullMsg' = pullMsg,
+      arrived' = arrived, fenced' = fenced, route' = route, pullMsg' = noPull,
       pending' = pending, truth' = truth, cAccepted' = cAccepted, dual' = dual, lateWrite' = lateWrite, pendingDel' = pendingDel,
       cache' = cache, intent' = intent, keepRead
     }
@@ -469,6 +473,9 @@ module m5b_core {
   val witnessIntentMovedThenApplied = not(intent.where == 3 and intent.preparedAt == P and arrived.get(groupOf(X)) > 0
                                           and latest(hist.get(C).get(groupOf(X))).writer == X)
   val witnessOpenWritten = not(open != Set() and cAccepted.intersect(open) != Set())
+  // (2026-11-17、M5d に合わせて緩めた) 親が空のまま渡した (親の履歴に delete@m がある) グループを、子が到着なしで受け持ち、そこへ書き込みを受理した
+  val witnessHandedEmptyOpen = not(GROUPS.exists(g => open.contains(g) and arrived.get(g) == 0
+    and hist.get(P).get(g).exists(v => v.writer == TOMB) and cAccepted.contains(g)))
   // 親が移動の前に空にしたグループ (削除の版が、範囲の移動を終えた時刻より前にある) を、子が到着なしで受け持っている
   def emptiedThenOpen(g: int): bool =
     open.contains(g) and truth.get(g).exists(v => v.writer == 0 and v.ver > 0 and v.ver < moved.get(g))
