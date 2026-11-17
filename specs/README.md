@@ -1812,6 +1812,124 @@ witness は 3 つで、どれも `m23i_green` で到達した。
 - 読んだ範囲の一部だけが動くこと、2 回以上の移動 (尋ねる列は M23b)。
 - 時計のずれ。確かめが比べる時刻 (読んだ時刻であって、確定の時刻ではない) は、M21 の `m21_guard_red_commit_ts` が確かめている。
 
+### M23j `m23j_ddl_retained_images.qnt` — 残した行イメージと表定義の変更。表ごとの epoch の下で、古い読みが表定義の変更をまたぐ (未解決の問題 37 と 53 の境目)
+
+2026-11-17 に書いた。
+実装より先に書いたモデルである。
+設計は [docs/design-refresh-across-move.md](../docs/design-refresh-across-move.md) の「3 回目の実装の規則」にある。
+
+古い読み (M23c) のために、シャードは行イメージを 2 か所に残す。
+渡した行 (前の持ち主が、手放した区間の行を残す) と、残した版 (持ち主が、受け持ち始める前の c で適用した確定の after-image を残す。M23d) である。
+どちらも、表定義の変更の前の形のイメージであり得る。
+変更ログの行イメージも前の形だが、これは表定義の変更の床が守る。床より前の T の読みは、前の形の before-image を新しい形の表に戻すことになるので、断る (M24 の `m24_floor`)。
+2 回目の実装 (main に入れていない) は、床を緩めた。
+変更ログに確定のないシャードは、表定義の変更の commit を適用しても床を上げない。
+分割で生まれた子が、生まれたときに表定義の記録を全部適用して床を上げ、生まれる前の T の読みを、どれも断ったからである。
+緩めた後は、残したイメージに、床を通らずに届く読みがある。
+
+表定義の版の規則は M24 のものを、次の形で置いた。
+表は読みの epoch を持ち、その表の読みが返すものを変える DDL の commit でだけ進む。
+要求は、計画が頼る表の epoch を運ぶ。
+シャードは、要求のほうが新しければ commit を適用してから答え、古ければ断る。
+取引の読み取り時刻 T は、計画の epoch と別に決まる。
+T は、取引の最初の読みを受けたシャードの時計なので、DDL の後の計画の取引が、別のシャードが commit を適用した時刻より小さい T を持つことは、時計のずれだけで起きる。
+モデルの T は、今の時計以下の任意の値である。
+
+確かめた規則は 3 つである。
+
+- `RESHAPE`: シャードは、表定義の変更の commit を、本体の表と同じ書き込みで、渡した行と残した版にも当てる (RENAME TO は名前を付け替え、DROP TABLE は行を消し、ADD COLUMN は既定の値を足す)。
+- `CHAIN_EPOCH`: 持ち主から前の持ち主への尋ねも、計画が頼る表の epoch を運ぶ。前の持ち主は、Worker の要求と同じく、自分が古ければ commit を適用してから答え、要求が古ければ断る。
+- `FLOOR`: commit を適用したシャードが、その表の床を置く値。1 は 2 回目の実装の規則で、変更ログにその表の確定がなければ置かず、あれば適用した時刻に置く。3 は、変更ログにあるその表の確定の時刻の最大に置く (なければ置かない)。0 (いつも、適用した時刻) と 2 (置かない) は赤である。
+
+床を見るのは、行を T まで戻すシャードである。
+前の持ち主は、尋ねられたらいつも見る。
+本体の表の読みは、T より後の確定があるときだけ見る。
+古い読みの持ち主は、その区間の行を戻さない (残した版を重ねるだけ) ので、見ない。
+
+モデルの舞台は、表 A の行が 1 つと、シャード P、C である。
+行は P から C へ動くことがある (`pull` と `recv`)。
+DDL は 1 つで、`KIND` で選ぶ。RENAME TO (1)、DROP TABLE の後に同じ名前で CREATE TABLE (2)、ADD COLUMN (3) である。
+DDL は、Meta が prepare を記録し、各シャードが (intent を決着させてから) 適用して書き込みを止め、Meta が commit を記録し、各シャードが commit を、それぞれの時刻に適用する。
+移動と DDL の遷移は重ならず (M21)、子は、行を受け取るときに、親の表定義に追いつく。
+書き手 W は autocommit で、持ち主の行を、シャードのいまの表定義で書く。
+Y は、DDL の前に P で prepare する 2 相の取引で、intent は pull に乗り、持ち主が受け持ち始める前の c で適用することがある。
+取引 X は読むだけで、計画の epoch (DDL の commit の前か後) と T を決め、行を 1 回読む。
+行イメージ、変更ログの行、確定した版は、形の印 (前か後か) を持つ。RENAME TO では、名前の違うイメージは、読みに見つからない。作り直しでは、後の計画が読むのは新しい表で、前の表の行は 1 つも見えてはならない。
+
+不変条件は 5 つである。`m23jSafe` は初めの 4 つで、`m23jExact` は、それに `floorNeeded` を足したものである。
+
+- `readAtT`: 答えた読みは、X の計画の表の、時刻 T の値である。
+- `noRestoreAcross`: 表定義の変更の前の形の before-image を、後の形の計画の読みに戻さない (逆も)。
+- `imagesMatch`: 読みに使った残したイメージの形は、X の計画の形である。
+- `staleOnlyAfterCommit`: 計画が古いという理由で断られるのは、DDL の commit の前の計画が、commit の後に読んだときだけである。
+- `floorNeeded`: 床が読みを断るのは、その読みが、計画と違う形の before-image を戻すことになるときだけである。
+
+| 条件 (定数) | 外したインスタンス | 反例 |
+|---|---|---|
+| 残したイメージに変更を当てる (`RESHAPE`)。RENAME TO | `m23j_red_no_reshape_rename` | 行が C へ動いた後で RENAME TO が commit される。P は変更ログに確定がないので床を置かず、渡した行は前の名前のままである。DDL の後の計画の、移動の前の T の読みを C が P に尋ね、P は後の名前の行を見つけず、行なしと答える |
+| 同上。作り直し | `m23j_red_no_reshape_recreate` | 同じ順序で、消した表の渡した行が P に残る。新しい表の読みに、前の表の行が出てくる |
+| 同上。残した版 | `m23j_red_no_reshape_kept` | Y の intent が pull に乗り、C が受け持ち始める前の c で適用する。RENAME TO の後、C が重ねる版は前の名前のままで、見つからない |
+| 同上。ADD COLUMN | `m23j_addcol_no_reshape` | 答えは変わらない (`readAtT` は破れない)。短いイメージの残りの列は既定の値になるからである。破れるのは `imagesMatch` だけである |
+| 尋ねが表の epoch を運ぶ (`CHAIN_EPOCH`) | `m23j_red_no_chain_epoch` | 2 通りある。(1) C は commit を適用したが、P はまだである。DDL の後の計画の読みを C が P に尋ね、P は前の名前の行しか持たない。(2) P は commit を適用したが、C はまだである。commit の前の計画の読みを C が受け、P は、付け替えた行しか持たない |
+| 床を置く (`FLOOR` ≠ 2) | `m23j_red_no_floor` | W が前の形で確定する。RENAME TO の後、DDL の後の計画の、W より前の T の読みが、W の before-image (前の形) を戻す (M24 の `m24_floor_red_no_floor` と同じ欠陥) |
+
+床の置き方は、答えを誤らせないが、断る読みを変える。
+
+| `FLOOR` | インスタンス | `m23jSafe` | `floorNeeded` | 断る読み |
+|---|---|---|---|---|
+| 0 (いつも、適用した時刻) | `m23j_always_rename` | 破れない | 破れる | 変更ログに確定のないシャード (行を受け取って生まれた子、確定せずに渡した前の持ち主) も、適用した時刻より前の T を断る。床を置かなかった前の持ち主が古い読みに答える道 (`witnessFormerBelowApply`) は、この形にはない |
+| 1 (確定がなければ置かない。2 回目の実装) | `m23j_green_rename` ほか | 破れない | 破れる | 変更ログに確定のあるシャードが、前の形の最後の確定から、適用までの間の T を断る。戻す before-image は、後の形のものだけである |
+| 3 (確定の時刻の最大) | `m23j_exact_rename`、`m23j_exact_recreate` | 破れない | 破れない | 前の形の before-image を戻すことになる読みだけ |
+
+| インスタンス | 性質 | 定数 | 到達状態数 (distinct) | 結果 |
+|---|---|---|---|---|
+| `m23j_green_rename` | `m23jSafe` | RENAME TO。`FLOOR` = 1。書き手 W 2 つ、変更ログの切り詰め 1 回 | 34,871 | No violation |
+| `m23j_green_rename_y` | `m23jSafe` | 同上で、書き手 Y も | 181,766 | No violation |
+| `m23j_green_recreate` | `m23jSafe` | 作り直し。書き手 W 2 つと Y、切り詰め 1 回 | 181,766 | No violation |
+| `m23j_green_addcol` | `m23jSafe` | ADD COLUMN。同じ書き手 | 181,766 | No violation |
+| `m23j_exact_rename` | `m23jExact` | RENAME TO。`FLOOR` = 3。書き手 W 2 つ、切り詰め 1 回 | 34,711 | No violation |
+| `m23j_exact_recreate` | `m23jExact` | 作り直し。`FLOOR` = 3。書き手 W 2 つと Y、切り詰め 1 回 | 180,356 | No violation |
+| `m23j_always_rename` | `m23jSafe` | RENAME TO。`FLOOR` = 0 | 32,849 | No violation |
+| `m23j_always_rename` | `witnessFormerBelowApply` | 同上 | 32,849 | No violation (届かない) |
+| `m23j_always_rename` | `floorNeeded` | 同上 | 2,915 で反例 | 反例 |
+| `m23j_green_rename` | `floorNeeded` | `FLOOR` = 1 | 4,454 で反例 | 反例 |
+| `m23j_red_no_reshape_rename` | `readAtT` | 条件を 1 つ外す | 11,254 で反例 | 反例 |
+| `m23j_red_no_reshape_recreate` | `readAtT` | 同上 | 8,332 で反例 | 反例 |
+| `m23j_red_no_reshape_kept` | `readAtT` | 同上 (`FLOOR` = 3、書き手 Y だけ) | 956 で反例 | 反例 |
+| `m23j_addcol_no_reshape` | `readAtT` | 同上 (ADD COLUMN) | 4,620 | No violation |
+| `m23j_addcol_no_reshape` | `imagesMatch` | 同上 | 3,653 で反例 | 反例 |
+| `m23j_red_no_chain_epoch` | `readAtT` | 条件を 1 つ外す | 6,253 で反例 | 反例 |
+| `m23j_red_no_floor` | `noRestoreAcross` | 条件を 1 つ外す | 2,157 で反例 | 反例 |
+
+`check.sh` の M23j の節は 30 件で、267 秒かかった (測り方は M23f と同じ)。
+
+witness は 5 つで、どれも到達した。
+
+| witness | インスタンス | 内容 | 到達状態数 |
+|---|---|---|---|
+| `witnessHandedAcrossDdl` | `m23j_green_rename` | DDL の後の計画の古い読みが、変更を当てた渡した行で答えられる | 8,061 |
+| `witnessKeptAcrossDdl` | `m23j_green_rename_y` | 同上、残した版で | 84,328 |
+| `witnessFormerBelowApply` | `m23j_green_rename` | 床を置かなかった前の持ち主が、自分が commit を適用した時刻より前の T の古い読みに答える | 5,128 |
+| `witnessStaleAtFormerOwner` | `m23j_green_rename` | commit の前の計画の読みを、commit を適用していない持ち主が受け、適用した前の持ち主が断る | 6,870 |
+| `witnessFloorRefuses` | `m23j_exact_rename` | 前の形の before-image を戻すことになる読みを、床が断る | 2,131 |
+
+決定的な run は、`m23j_green_rename` に 2 本 (渡した行で答える順序と、この規則に残る要らない断り)、`m23j_exact_rename` に 1 本、`m23j_red_no_chain_epoch` に 2 本、ほかの赤と `m23j_addcol_no_reshape`、`m23j_always_rename` に 1 本ずつある。
+
+わかったこと。
+
+- 床を緩める規則 (変更ログに確定がなければ置かない) は、表ごとの epoch の下でも、答えを誤らせない。ただし、2 つの条件に頼る。残したイメージに表定義の変更を当てることと、前の持ち主への尋ねが表の epoch を運ぶことである。床を緩める前は、床が、残したイメージに届く読みを先に断っていたので、どちらも表に出なかった。
+- 残したイメージで答えを変えるのは、RENAME TO と DROP TABLE である。ADD COLUMN は答えを変えない。答えを比べる乱択の検査は、ADD COLUMN の当て忘れを見つけられない (行イメージの形の検査だけが見る)。
+- 前の持ち主が、要求より先に commit を適用していることがある。そのとき、持ち主が受けた古い計画の読みは、前の持ち主が断る。これは、頼る表を変える DDL が、計画の後に commit されたときだけに起き、置き場所では決まらない (`staleOnlyAfterCommit`、`witnessStaleAtFormerOwner`)。
+- 床を、適用した時刻ではなく、変更ログにあるその表の確定の時刻の最大に置けば (`FLOOR` = 3)、床は、前の形の before-image を戻す読みだけを断る。2 回目の実装の規則は、その特別な場合 (確定がなければ置かない) である。適用した時刻に置く形では、DDL の後の計画の取引が、commit を適用したばかりのシャードを読むと、T より後の確定が 1 つでもあれば、T が適用の時刻より小さいので断られ、T を進める確かめに回る。M24 の `m24_floor` は適用した時刻を床にしているので、この選び方は持ち主の判断が要る (設計の文書の「持ち主の判断が要ること」)。
+
+モデルにないもの。
+
+- 表が 2 つ以上あること。表ごとの床と、関係のない表の DDL が読みを断らないことは、M24 の `m24_floor` が確かめている。ここでは、表は 1 つである。
+- 同じシャードの、ほかの行。実装の本体の表の読みは、シャードのどの行でも、T より後の確定があれば床を見る。
+- prepare でも epoch が進む形 (段 3 の実装)。M24 の規則 (commit だけで進む) を置いた。
+- 2 回以上の移動、範囲が前の持ち主へ戻る形 (受け持った期間は M23g)。
+- 取り消された DDL、2 つ以上の DDL。
+
 ### M24 `m24_table_epochs.qnt` — 表ごとの epoch。DDL が取引を古くするのは、取引が頼る表を変えて確定したときだけ (未解決の問題 53)
 
 2026-11-16 に書いた。

@@ -848,6 +848,33 @@ witness $f m23i_green witnessRefusedByFormerOwner       # 前の持ち主への�
 witness $f m23i_green witnessRefusedByCarriedIntent     # 持ち主の確かめが、受け持ち始める前の c で適用した確定を見つける
 for m in m23i_green m23i_red_no_rehome m23i_red_no_ask m23i_red_from_arrival; do tests $f $m; done
 
+echo "== M23j retained images across DDL (残した行イメージと表定義の変更。表ごとの epoch の下で、古い読みが表定義の変更をまたぐ。実装より先に書いたモデル)"
+f=m23j_ddl_retained_images.qnt
+green   $f m23j_green_rename m23jSafe                   # RENAME TO。残したイメージに変更を当て、尋ねが表の epoch を運ぶ。床は、変更ログに確定がなければ置かない
+green   $f m23j_green_rename_y m23jSafe                 # 同上、書き手 Y (残した版) も
+green   $f m23j_green_recreate m23jSafe                 # DROP TABLE の後に、同じ名前で CREATE TABLE
+green   $f m23j_green_addcol m23jSafe                   # ADD COLUMN
+green   $f m23j_exact_rename m23jExact                  # 床を、変更ログにある確定の時刻の最大にする形。床は、前の形の before-image を戻す読みだけを断る
+green   $f m23j_exact_recreate m23jExact
+red     $f m23j_red_no_reshape_rename readAtT           # 渡した行に RENAME TO を当てない: 後の名前の古い読みが、行を見つけない
+red     $f m23j_red_no_reshape_recreate readAtT         # 渡した行に DROP TABLE を当てない: 消した表の行が、新しい表の古い読みに出てくる
+red     $f m23j_red_no_reshape_kept readAtT             # 残した版に RENAME TO を当てない: 持ち主が重ねる版が見つからない
+green   $f m23j_addcol_no_reshape readAtT               # ADD COLUMN は、当てなくても答えが変わらない
+red     $f m23j_addcol_no_reshape imagesMatch           # 同上: 違うのはイメージの形だけ (答えの検査では見えない)
+red     $f m23j_red_no_chain_epoch readAtT              # 前の持ち主への尋ねが表の epoch を運ばない: commit を適用していない (か、先に適用した) 前の持ち主が、違う名前の行で答える
+red     $f m23j_red_no_floor noRestoreAcross            # 床を置かない: 前の形の before-image を、後の形の計画の読みに戻す
+green   $f m23j_always_rename m23jSafe                  # 床を、いつも適用した時刻に置く形 (1 回目の実装より前) も、答えは誤らない
+red     $f m23j_always_rename floorNeeded               # 同上: 変更ログに確定のないシャードが、適用した時刻より前の T を断る
+green   $f m23j_always_rename witnessFormerBelowApply   # 同上: 前の持ち主が、適用した時刻より前の T の古い読みに答える道はない
+red     $f m23j_green_rename floorNeeded                # 2 回目の実装の規則に残る、要らない断り: 確定のあるシャードが、最後の確定から適用までの間の T を断る
+witness $f m23j_green_rename witnessHandedAcrossDdl     # DDL の後の計画の古い読みが、変更を当てた渡した行で答えられる
+witness $f m23j_green_rename_y witnessKeptAcrossDdl     # 同上、残した版で
+witness $f m23j_green_rename witnessFormerBelowApply    # 床を置かなかった前の持ち主が、適用した時刻より前の T の古い読みに答える
+witness $f m23j_green_rename witnessStaleAtFormerOwner  # commit の前の計画の読みを、commit を適用した前の持ち主が断る (DDL で決まる失敗)
+witness $f m23j_exact_rename witnessFloorRefuses        # 前の形の before-image を戻すことになる読みは、床が断る
+for m in m23j_green_rename m23j_exact_rename m23j_red_no_reshape_rename m23j_red_no_reshape_recreate m23j_addcol_no_reshape \
+         m23j_red_no_chain_epoch m23j_red_no_floor m23j_always_rename; do tests $f $m; done
+
 echo "== M25 txn lock lease (行ロックの寿命を取引のものにする。どの文も、取引の全部のロックを延ばす。実装より先に書いたモデル)"
 f=m25_txn_lock_lease.qnt
 green   $f m25_green leaseSafe                          # 決めた設計 (R = 1)。4 つの置き場所を、同じ利用者の手で並べて動かす
