@@ -413,7 +413,8 @@ module m5d_core {
       if (via == Set()) e == 0 else via.contains(e),
       row' = if (local) row.set((d, yg), 1) else row,
       intent' = if (local) intent.set((d, yg), false) else intent,
-      base' = if (local) base.set(yg, 1) else base,
+      // Y の書き込みは 1 つである。持ち主でないシャードに入った写しを後から適用しても、確定した値は変わらない
+      base' = if (local and not(applied)) base.set(yg, 1) else base,
       applied' = (applied or local),
       reqs' = if (e == 0 or full) reqs.replaceAt(r, reqs[r].with("st", DONE))
               else reqs.replaceAt(r, reqs[r].with("st", WAITING).with("child", reqs.length())).append({ at: dst(e), pieces: e, st: PENDING, child: -1 }),
@@ -440,10 +441,12 @@ module m5d_core {
   action resolve(d: int): bool = all {
     tg > 0, intent.get((d, yg)), mark.get((d, yg)).e == 0,
     row' = if (record) row.set((d, yg), 1) else row,
-    base' = if (record) base.set(yg, 1) else base,
+    base' = if (record and not(applied)) base.set(yg, 1) else base,
     intent' = intent.set((d, yg), false),
     applied' = (applied or record),
-    lost' = (lost or not(record)),
+    // 失ったと数えるのは、どこにも適用していない書き込みの intent を捨てたときである。適用した後に残った写し (持ち主でないシャードに
+    // 入った intent) を捨てるのは、失ったことにならない (その写しは rowsOnlyAtOwner が見る)
+    lost' = (lost or (not(record) and not(applied))),
     tg' = tg, reqs' = reqs, record' = record, overflow' = overflow,
     keepMeta, keepRecs, keepMarks, keepMsgs, keepSeen, keepBoot,
   }
@@ -470,7 +473,10 @@ module m5d_core {
   val receivesUnderIncoming = not(staleRecv)
   val rowsOnlyAtOwner = KEYS.forall(k =>
     k._1 == owner or not(holds(k._1, k._2)) or (started > 0 and src(started) == k._1 and not(pdone.get(started))))
-  val ownerHasTruth = GROUPS.forall(g => not(serves(owner, g)) or row.get((owner, g)) == base.get(g))
+  // 持ち主が Y の intent をまだ持っている間は、持ち主でないシャードに入った写しが先に適用されていても、数えない (読み手は、持ち主の
+  // intent を決着させてから読む。持ち主でないシャードの行は rowsOnlyAtOwner が見る)
+  val ownerHasTruth = GROUPS.forall(g => not(serves(owner, g)) or row.get((owner, g)) == base.get(g)
+    or (g == tg and intent.get((owner, g)) and base.get(g) == 1))
   val ackWillLand = HANDS.forall(k =>
     not(liveFence(k._1) and arr.get((dst(k._1), k._2)) == k._1 and holds(src(k._1), k._2))
       or (mark.get((src(k._1), k._2)).e == k._1 and not(mark.get((src(k._1), k._2)).acked)))
@@ -673,24 +679,27 @@ module m5d_green_return3 {
 }
 
 // グループ 2 つ (1 は初めに行があり、2 は空)。「渡し終えた」の答えは範囲の全部を受け取り終えさせるので、ほかのグループが届いている
-// ことを確かめる。持ち主の書き込みと再起動は置かない (置いた形は HEAVY の m5d_green_groups_full)
+// ことを確かめる。持ち主の書き込みと再起動は置かない (持ち主の書き込みを置いた形は HEAVY の m5d_green_groups_owner)
 module m5d_green_groups {
   import m5d_core(PARENT_RULE = true, ACK_RULE = true, CHILD_RULE = true, FINISHED_ANSWERS = true, MARKS = 0, ASK_AGAIN = true,
     ROUTE = [0, 1, 0], GROUPS_N = 2, FULL = Set(1), TXN = true, OWNER_OPS = false, RESTARTS = 0).*
 }
 
-// HEAVY
+// ---- HEAVY=1 で流す、大きい形 ----
+// 0 → 1 → 0 → 1 に、取引を足す (再起動なし)
 module m5d_green_return3_txn {
   import m5d_core(PARENT_RULE = true, ACK_RULE = true, CHILD_RULE = true, FINISHED_ANSWERS = true, MARKS = 0, ASK_AGAIN = true,
     ROUTE = [0, 1, 0, 1], GROUPS_N = 1, FULL = Set(), TXN = true, OWNER_OPS = true, RESTARTS = 0).*
 }
+// 列の先で、最初の持ち主へ戻る (0 → 1 → 2 → 0。再起動なし)
 module m5d_green_chain_back {
   import m5d_core(PARENT_RULE = true, ACK_RULE = true, CHILD_RULE = true, FINISHED_ANSWERS = true, MARKS = 0, ASK_AGAIN = true,
     ROUTE = [0, 1, 2, 0], GROUPS_N = 1, FULL = Set(), TXN = true, OWNER_OPS = true, RESTARTS = 0).*
 }
-module m5d_green_groups_full {
+// グループ 2 つに、持ち主の書き込みを足す (取引と再起動なし)
+module m5d_green_groups_owner {
   import m5d_core(PARENT_RULE = true, ACK_RULE = true, CHILD_RULE = true, FINISHED_ANSWERS = true, MARKS = 0, ASK_AGAIN = true,
-    ROUTE = [0, 1, 0], GROUPS_N = 2, FULL = Set(1), TXN = true, OWNER_OPS = true, RESTARTS = 1).*
+    ROUTE = [0, 1, 0], GROUPS_N = 2, FULL = Set(1), TXN = false, OWNER_OPS = true, RESTARTS = 0).*
 }
 
 // ============================================================================================================

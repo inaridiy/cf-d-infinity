@@ -972,12 +972,16 @@ green   $f m5d_green_return3 m5dSafe                     # 戻って、もう一
 green   $f m5d_green_groups m5dSafe                      # グループ 2 つ (行のあるものと、ないもの)。持ち主の書き込みと再起動なし
 live    $f m5d_green_return m5dLive                      # 活性: どの移動も閉じ、始めた取引の phase 2 は届け終わる
 live    $f m5d_green_chain m5dLive
-if [ "${HEAVY:-0}" = "1" ]; then                         # 大きい形 (合わせて 10 分ほど)
+if [ "${HEAVY:-0}" = "1" ]; then                         # 大きい形と、既定から外した緑
   live  $f m5d_green_return3 m5dLive
   green $f m5d_green_return3_txn m5dSafe                 # 0 → 1 → 0 → 1 に、取引を足す (再起動なし)
   green $f m5d_green_chain_back m5dSafe                  # 0 → 1 → 2 → 0 (再起動なし)
-  green $f m5d_green_groups_full m5dSafe                 # グループ 2 つに、持ち主の書き込みと再起動を足す
+  green $f m5d_green_groups_owner m5dSafe                # グループ 2 つに、持ち主の書き込みを足す (取引と再起動なし)
+  green $f m5d_marks_chain m5dSafe                       # 親の規則と子の規則があれば、印を 5808b08 のとおりに書き換えても破れない
   green $f m5d_marks_return3 m5dSafe
+  green $f m5d_red_late_ack m5dOutcome                   # ack の規則を外しても、害はない
+  green $f m5d_red_boot_differs markMatchesRecord        # 書き込みの後で付ける印は、記録と合う
+  green $f m5d_prototype_return3 m5dData                 # 試作は、範囲が戻ってもう一度出る列でも、行と印は壊さない
 fi
 # 5808b08 のコード: 類の 1 から 7
 red     $f m5d_code_return deliveredApplied              # 類の 1 と 3: 渡し直した印が、後の取引の phase 2 を適用させない
@@ -1000,24 +1004,20 @@ green   $f m5d_code_derived_chain m5dData                # 印の関数だけ: �
 red     $f m5d_red_rehand handsUnderFence                # 親の規則を外す (スイッチ rehandFinished)
 red     $f m5d_red_rehand noFailedWrite                  # 同上: 類の 3 の、UNIQUE の失敗
 green   $f m5d_red_rehand m5dData                        # 同上: 子の規則と印の関数があるので、行も印も壊れない
-red     $f m5d_red_late_ack handsUnderFence              # ack の規則を外す (試作の形)
-green   $f m5d_red_late_ack m5dOutcome                   # 同上: 害はない
-red     $f m5d_red_child_stale ownerHasTruth             # 子の規則を外す (スイッチ childAcceptsStale): 類の 6 と、遅れた「渡し終えた」が、いまの受け取りを終える場面
+red     $f m5d_red_late_ack handsUnderFence              # ack の規則を外す (試作の形)。害がないことは HEAVY で確かめる
+red     $f m5d_red_child_stale ownerHasTruth            # 子の規則を外す (スイッチ childAcceptsStale): 類の 6 と、遅れた「渡し終えた」が、いまの受け取りを終える場面
 red     $f m5d_red_child_stale receivesUnderIncoming
 red     $f m5d_red_finished_refusal noMoveRefusal        # 「渡し終えた」を断りとして読む (スイッチ finishedAsRefusal。取り下げた 89d99c8)
 red     $f m5d_red_ask_once noMoveRefusal                # 捨てた答えの後で、尋ね直さない (規則にない条件)
 red     $f m5d_red_boot_differs marksDerived             # 印を手ごとに書き換える (スイッチ bootMarksDiffer)。親の規則も外す
 red     $f m5d_red_boot_differs deliveredApplied         # 同上: 類の 1
-green   $f m5d_red_boot_differs markMatchesRecord        # 同上: 書き込みの後で付ける印は、記録と合う
 red     $f m5d_red_mark_before_write markMatchesRecord   # 印を書き込みより前に付ける (スイッチ markBeforeWrite)。親の規則も外す: 類の 3
 # 親の規則と子の規則があれば、印を 5808b08 のとおりに書き換えても破れない
 green   $f m5d_marks_return m5dSafe
-green   $f m5d_marks_chain m5dSafe
 # 読み直しの試作: 親の規則 (pull だけ)、子の規則、「渡し終えた」は答え。ack と尋ね方は 5808b08 のまま
 green   $f m5d_prototype_return m5dOutcome
 red     $f m5d_prototype_return3 noMoveRefusal           # 範囲が戻ってもう一度出ると、1 回だけ尋ねる文が group not arrived で断られる
-green   $f m5d_prototype_return3 m5dData                 # 同上: 行と印は壊れない
-witness $f m5d_green_return witnessLateAfterNext         # 終わった移動の遅れた pull に、範囲が戻った後で、親が「渡し終えた」と答える
+witness $f m5d_green_return witnessLateAfterNext        # 終わった移動の遅れた pull に、範囲が戻った後で、親が「渡し終えた」と答える
 witness $f m5d_green_chain witnessLateAfterNext          # 同上、次の移動が閉じた後
 witness $f m5d_green_return witnessFinishedInWindow      # 親が渡し終えた後、子が受け取り終える前の pull に「渡し終えた」と答える
 witness $f m5d_green_return3 witnessLateResponse         # 生きた fence の下の応答が、子が受け取り終えた後も飛んでいる

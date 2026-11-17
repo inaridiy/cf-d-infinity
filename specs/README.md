@@ -60,6 +60,15 @@ red と green は同じ core モジュールを `const` フラグで切り替え
 | M5c `m5c_red_clear_at_start` | `deliveredApplied` / `noLostWrite` | 段 4 のコード: 戻る移動の start で「渡した」印を外す | 49 / 112 で反例 | | 反例 (2 本とも) |
 | M5c `m5c_red_follow_stale` | `boundedForwards` | 段 4 より前のコード: 転送の記録を全部たどる | 100 で反例 | | 反例 |
 | M5c `m5c_red_rehand` | `handsUnderFence` / `boundedForwards` | 問題 55: 終わった移動の遅れた pull に、範囲が戻った親がグループを渡し直す | 68 / 158 で反例 | | 反例 (2 本とも) |
+| M5d `m5d_green_return` / `_chain` / `_return3` / `_groups` | `m5dSafe` (`_return` と `_chain` は `m5dLive` (時相) も) | シャード 3、範囲 1 つ。移動の列は 0 → 1 → 0 / 0 → 1 → 2 / 0 → 1 → 0 → 1 (取引なし) / 0 → 1 → 0 でグループ 2 つ (持ち主の書き込みと再起動なし)。ほかは、グループ 1 つ、取引 1 つ、持ち主の書き込みと削除、再起動 1 回 | 137,091 / 141,993 / 101,154 / 319,104 | 32 / 32 / 36 / 40 | No violation |
+| M5d `m5d_code_return` / `_chain` / `_return3` | `deliveredApplied`、`ownerHasTruth`、`markMatchesRecord` / `deliveredApplied`、`ackWillLand`、`movesClose` (時相) / `ownerHasTruth` | `5808b08` のコード: 親の規則も子の規則もなく、印は手ごとに書き換える (類の 1 から 7) | 反例 | | 反例 (7 本すべて) |
+| M5d `m5d_code_parent_rule` / `_parent_rule3` / `m5d_code_child_rule` / `m5d_code_derived_return` / `_derived_return3` | `deliveredApplied` / `ownerHasTruth` / `deliveredApplied`、`ownerHasTruth` / `rowsOnlyAtOwner` / `ownerHasTruth` | `5808b08` のコードに、親の規則だけ / 子の規則だけ / 印の関数だけを入れる | 反例 | | 反例 (6 本すべて) |
+| M5d `m5d_code_child_rule_chain` / `m5d_code_derived_chain` | `m5dData` | 同上で、戻らない列 (0 → 1 → 2)。子の規則だけ / 印の関数だけ | 86,509 / 84,009 | | No violation |
+| M5d `m5d_red_rehand` / `m5d_red_late_ack` | `handsUnderFence`、`noFailedWrite` / `handsUnderFence` | 緑から、親の規則 (pull) / ack の規則だけを外す | 反例 | | 反例。`m5d_red_rehand` の `m5dData` (178,031) と `m5d_red_late_ack` の `m5dOutcome` (177,129。HEAVY) は No violation |
+| M5d `m5d_red_child_stale` / `m5d_red_finished_refusal` / `m5d_red_ask_once` | `ownerHasTruth`、`receivesUnderIncoming` / `noMoveRefusal` / `noMoveRefusal` | 緑から、子の規則 / 「渡し終えた」は答え / 尋ね直しを外す | 反例 | | 反例 (4 本すべて) |
+| M5d `m5d_red_boot_differs` / `m5d_red_mark_before_write` | `marksDerived`、`deliveredApplied` / `markMatchesRecord` | 印を手ごとに書き換える / 書き込みより前に付ける。どちらも、親の規則も外す | 反例 | | 反例。`m5d_red_boot_differs` の `markMatchesRecord` (356,402。HEAVY) は No violation |
+| M5d `m5d_marks_return` / `_chain` (HEAVY) | `m5dSafe` | 親の規則と子の規則があり、印は `5808b08` のとおりに書き換える | 137,091 / 141,993 | | No violation |
+| M5d `m5d_prototype_return` / `_return3` | `m5dOutcome` / `noMoveRefusal`、`m5dData` (HEAVY) | 読み直しの試作: 親の規則 (pull だけ)、子の規則、「渡し終えた」は答え。ack と文の尋ね方は `5808b08` のまま | 177,129 / 反例、318,128 | | `m5dOutcome` と `m5dData` は No violation。`noMoveRefusal` は反例 |
 | M7 `m7_green` | `restoreCorrect` | shard 2、APPROX 1、MARGIN 1、now 0..4、write 2/shard | 46,114,036 (生成 1.5 億、123 s) | 26 | No violation |
 | M7 `m7_red` | `restoreCorrect` | 同上 | 反例 | | 反例 |
 
@@ -654,6 +663,146 @@ witness は 2 つで、どちらも到達した。`witnessForwardBack` は、戻
 - 再起動。印は、起動のときに表から同じ規則で作り直す (`__moved` と、それより後の `__arrived` と、終えた `__incoming`)。
 - 断られた pull を待っていた子の要求。子は断りを読み飛ばす。行か intent のあるグループは届いているので、そのまま進む。空のグループで、子がまだ受け取り終えていなければ、所有の確かめが「届いていない」の競合で断る (やり直してよい誤り)。
 - 取引が 2 つ以上あること、anchor の再駆動 (同じ phase 2 を何度も送る)。
+
+### M5d `m5d_move_messages.qnt` — 移動の要求と応答が、その移動より後に届く (問題 54、55、58 の類)
+
+2026-11-17 に書いた。実装より先に書いたモデルである (計画書の規則 3)。
+規則、類の 7 つの場面、欠陥のスイッチ、実装がすることは [docs/design-move-messages.md](../docs/design-move-messages.md) にある。
+
+シャードの間の要求と応答には期限がない。
+3 日の間に、3 つの欠陥 (問題 54、55、58) が、移動の要求か応答がその移動より後に届いたことで起きた。
+M5c は、その 1 つ (終わった移動の遅れた pull) を 1 手 (`stalePull`) で置いた。
+子の側がなく、移動を終える手が 1 つで、グループはいつも運ばれ、シャードは 2 つで、再起動がない (上の「モデルにないもの」)。
+M5d は、M5c の状態に、それらを足した。
+M5c の「緑では、終わった移動の pull を断る」は、M5d では「渡し終えたと答える」に替わる。断ると、行のないグループを待っていた文が失敗する (下の `m5d_red_finished_refusal`)。
+
+確かめる規則は、次のとおりである。
+シャードは、自分が生きた記録を持つ移動の epoch を名指しする要求か応答でだけ、渡した記録と受け取った記録を変える (親では `__fenced` の done = 0、子では `__incoming` の done = 0 が、生きた記録である)。
+ほかの epoch には、状態を変えずに答える。親は「渡し終えた」と時計を答え、子は応答を捨てる。
+子は「渡し終えた」を、断りではなく答えとして受け取り、そこで受け取り終える。
+メモリの印 (`moved`、`arrived`) は、記録から 1 つの関数で作り、起動のときも、動いている間も、同じ関数を使う。
+
+舞台は、シャード 3 つと、範囲 1 つである。
+移動の列は、インスタンスごとに決める (0 → 1 → 0、0 → 1 → 2、0 → 1 → 0 → 1)。移動は重ならない。
+グループは 1 つ (`m5d_green_groups` では 2 つ) で、行も intent もなければ運ばれない。
+シャードは、記録 (`__fenced` と `__incoming` の done、`__moved`、`__moved_txn`、`__arrived`) と、メモリの印を、別々に持つ。
+pull の要求、pull の応答、ack は集合に置き、届けても消さない。同じ pull を出す文はいくつもあり得るので、どれも、移動の後のいつでも、何度でも届く。
+移動を終える手は 3 つである (親が渡し終える、子が受け取り終える、Meta が move-end を記録する)。親が渡し終えるのは、範囲に行も intent も残っていないときである。
+持ち主は、行を書き、消す。取引 Y は、いつでも、そのときの持ち主で intent を置いて確定する (M5c の Y は、移動の前に始める場合である)。phase 2、anchor の記録の gc、intent の決着は、M5c と同じ形である。
+再起動は、印を記録から作り直す。そのシャードへの応答は消え、そのシャードが送った pull は、親には届くが、応答の届け先がない。回数は 1 回までにした (応答を消す再起動を繰り返すと、移動が閉じないのは当然なので)。
+
+`m5dSafe` は、次の不変条件である。`m5dData` は行と intent と印のもの (下の 1 から 4 と 6)、`m5dOutcome` はそれに 5 を足したものである。
+
+1. M5c の `deliveredApplied`、`noLostWrite`、`finalValue`、`boundedForwards`。
+2. `rowsOnlyAtOwner`。行と intent は、持ち主か、終わっていない fence の親にだけある。
+3. `ownerHasTruth`。持ち主が答えるグループの行は、確定した書き込みのとおりである (消した行が戻らない。確定した行が消えない)。
+4. `ackWillLand`。子に届いたグループの行を親がまだ持っているなら、親は、その移動の、ack を待つ印を持っている。
+5. `noMoveRefusal` と `noFailedWrite`。移動だけが原因で、文が `group not arrived` で断られない。移動の記録と、運んだ行の書き込みが失敗しない (`__moved` の UNIQUE にも、行の主キーにも当たらない)。
+6. `marksDerived`。メモリの印は、記録から関数で作ったものに等しい。
+7. `handsUnderFence` (M5c) と `receivesUnderIncoming`。親と子が記録を変えるのは、その移動の生きた記録の下だけである。規則そのもので、見るための印 (ghost) で確かめる。
+
+時相の性質 `m5dLive` は、どの移動も閉じることと、始めた取引の phase 2 が届け終わることである。
+公平性は、移動を進める側の手にだけ置いた (親が挙げるグループの pull、生きた移動の要求と応答と ack の配送、移動を終える手、phase 2 の手)。遅れた要求と応答の配送、再起動、持ち主の書き込み、取引の開始には置いていない。
+
+| 条件 (定数) | 外したインスタンス | 破れるもの |
+|---|---|---|
+| 親は、生きた fence の下の pull でだけ、グループを渡す (`PARENT_RULE`) | `m5d_red_rehand` | `handsUnderFence` と、`noFailedWrite` (運ばれて戻ってきたグループを渡し直すと、`__moved` への書き込みが UNIQUE で失敗する)。`m5dData` は破れない |
+| 親は、生きた fence の下の ack でだけ、行と intent を消す (`ACK_RULE`) | `m5d_red_late_ack` | `handsUnderFence` だけ。`m5dOutcome` は破れない (終わった fence の下で ack を待つ印が残るのは、渡し終える直前に空のグループを渡したときだけで、消す行がない) |
+| 子は、受け取り中の移動の応答でだけ、受け取った記録を変える (`CHILD_RULE`) | `m5d_red_child_stale` | `ownerHasTruth` (移動 1 の応答が、移動 3 で受け取り直して消した行を戻す) と `receivesUnderIncoming`。「渡し終えた」の答えも、区間で引くと、同じ範囲のいまの受け取りを終えてしまう (`closeEarlyTest`) |
+| 子は「渡し終えた」を答えとして受け取る (`FINISHED_ANSWERS`) | `m5d_red_finished_refusal` | `noMoveRefusal`。親が渡し終えた後、子が受け取り終える前に、行のないグループの文が来ると、`group not arrived` で断られる (取り下げた直し `89d99c8`) |
+| pull の答えを待っていた文は、答えが捨てられたら、いまの受け取り中の移動で尋ね直す (`ASK_AGAIN`) | `m5d_red_ask_once` | `noMoveRefusal`。上の規則にはない条件で、このモデルが見つけた (下の「規則が閉じない場面」) |
+| 印は、記録から 1 つの関数で作る (`MARKS` = 0)。1 は、動いている間は手ごとに書き換える。2 は、さらに、書き込みより前に付けて、失敗しても残す (`5808b08`) | `m5d_red_boot_differs` (`MARKS` = 1) と `m5d_red_mark_before_write` (`MARKS` = 2)。どちらも、親の規則も外す | `marksDerived` と `deliveredApplied` / `markMatchesRecord`。親の規則と子の規則があれば、`MARKS` = 2 でも何も破れない (`m5d_marks_return`、`m5d_marks_chain`、`m5d_marks_return3`。状態数も緑と同じ) |
+
+類の 7 つは、`5808b08` のコードの条件 (`m5d_code_return`、`m5d_code_chain`、`m5d_code_return3`) で、どれも起きる。
+run の `member1Test` から `member7Test` が、その手順である。緑の同じ名前の run が、同じ手順への、規則の下での答えである。
+TLC は、`m5d_code_return` の `deliveredApplied` の反例として、類の 1 (問題 58) の手順を見つけた。
+`m5d_code_chain` の `movesClose` の反例は、類の 5 である (ack を待つ印が消え、行が親と子の両方に残ったまま、進む手がなくなる)。
+
+`5808b08` のコードに、条件を 1 つだけ入れた形も流した。
+
+| 入れた条件 | インスタンス | 起きなくなる類 | 残る類 |
+|---|---|---|---|
+| 親の規則 | `m5d_code_parent_rule`、`_parent_rule_return`、`_parent_rule3` | 1 から 5 | 6 と 7。親の側の規則だけでは止まらない。類の 4 と 5 の害 (phase 2 が転送されない、ack が数えられない) も、7 の道 (生きた fence の下で渡した空のグループの応答が遅れる) から起きる |
+| 子の規則 | `m5d_code_child_rule`、`_child_rule_chain`、`_child_rule3` | 4 から 7 (戻らない列は `m5dData` が緑) | 1、2、3。2 が残るのは、子が、捨てた応答にも ack を送るからである (`fetchStep` の形) |
+| 印の関数 | `m5d_code_derived_return`、`_derived_chain`、`_derived_return3` | 1、4、5 (戻らない列は `m5dData` が緑)。7 は、到着の記録が後から付くが、印は消えない | 6。2 は、持ち主の行は消えないが、行が前の子にも入る。3 は、書き込みの失敗だけが残る。TLC は、類の 7 つにない順序も見つけた (下) |
+
+類の 7 つは、類の全部ではない。
+印の関数だけの形 (`m5d_code_derived_return`) で、TLC は、類にない順序を 2 つ見つけた。
+`ackWillLand` の反例は、類の 2 の pull が、戻る移動 (移動 2) がまだ閉じていない間に届く順序である。
+0 は、移動 2 で届いたグループに行を書いた後で、その行を移動 1 の子 (1) へ渡し直す。1 は移動 2 の親で、もう ack を受けているので、入った行は消されず、移動 2 は閉じない。
+`ownerHasTruth` の反例は、渡し直しが 2 回続く順序である。0 が、書いた行を 1 へ渡し直す。1 は、移動 2 の遅れた pull に、その行を 0 へ渡し直す。その間に 0 が行を消していると、消した行が 0 に戻る。
+緑は、これらの順序も含めて、全部の順序を探索している。
+
+読み直しの試作 (`m5d_prototype_*`。親の規則は pull だけ、子の規則、「渡し終えた」は答え、印は手ごとに書き換えて書き込みの後で付ける、文は 1 回だけ尋ねる) は、移動 2 回の列では `m5dOutcome` を破らない。
+範囲が戻ってもう一度出る列では、`noMoveRefusal` を破る (`m5dData` は破らない)。
+
+#### 規則が閉じない場面
+
+文が pull の答えを待っている間に、範囲が戻って、もう一度出ると (0 → 1 → 0 → 1)、移動 1 の遅れた pull の答えは、1 が移動 3 を受け取っている間に届く。
+1 は、受け取り中でない移動の答えを捨てる。
+`5808b08` の `arriveStep` は 1 回だけ尋ねるので、待っていた文は、移動 3 のグループが届いていないまま同期区間に入り、`group not arrived` で断られる (`m5d_red_ask_once` の `askOnceTest`。TLC の反例も同じ手順である)。
+行と印は壊れない。
+閉じるのは `ASK_AGAIN` である。文は、答えを受けた後も、受け取り中の範囲のグループが届いていなければ、いまの移動で尋ね直す (`m5d_green_return3` の `askAgainTest`)。
+受け取り中の移動の答えは、いつもグループを届かせるか、受け取り終えさせるので (緑の `noMoveRefusal`)、尋ね直す回数は移動の数で抑えられる。
+この場面は、コードでは走らせていない。
+
+#### M5b の前提
+
+M5b の `finishRange` と `nextHop` は、飛んでいる pull がないこと (`pullMsg.g == 0`) を条件にし、`finishRange` は、渡したグループが全部届いていること、`pull` は、子が到着なしで受け持ったグループには出ないことを条件にしている。
+子は、再起動の前の自分や、ほかの文が出した pull を知らないので、コードはこの条件を守れない。
+M5d の規則が、その代わりになる。終わった移動の pull は「渡し終えた」と答えられて何も変えず、その応答は捨てられるので、「飛んでいない」のと同じである。
+だから、M5b の `nextHop` (元の親はモデルから消える) と、開いたグループに `pull` が出ないことは、変えなくてよい。
+
+変える必要があるのは、`finishRange` の「渡したグループが全部届いている」である。
+親が渡し終える直前に、on-demand の pull が空のグループを渡すと、親は、その応答が子に届く前に渡し終える。
+規則の下では、子は、この応答を捨て、グループを到着の記録なしで受け持つ。
+M5b は、この形を置いていない。
+`finishRange` を、渡したが届いていない空のグループも子が到着なしで受け持ち、飛んでいる応答を捨てる形に緩めた写しを、手元で流した (M5b の本体は書き換えていない)。
+`m5b_green_range` の `migrationSafe` は 8,488,781 状態 (元は 8,306,186)、`m5b_green_floor_clock` の `floorSafe` は 4,374,286 状態 (元は 4,150,998)、`m5b_green_floor_resplit` の `floorSafe` は 7,835,054 状態 (元は 6,127,304) で、どれも成り立った。
+緩めた道を通った後で、子がそのグループに書き込みを受理する状態にも届く (写しに足した、見るための印で確かめた)。
+`m5b_red_range` (`noWriteBelowRead`) と `m5b_red_floor_no_clock` (`readConsistent`) は、緩めた写しでも赤のままである。
+だから、M5b の時計と床の性質は、この形でも保たれる。M5b の本体に入れるなら、`finishRange` の条件と `rest` を、この形に直す。
+
+#### 結果
+
+TLC を 1 本ずつ、4 workers、heap 2.5 GB で流した。
+緑の状態数は、`m5d_green_return` が 137,091 (生成 129 万、深さ 32)、`m5d_green_chain` が 141,993 (生成 133 万、深さ 32)、`m5d_green_return3` が 101,154 (生成 96 万、深さ 36)、`m5d_green_groups` が 319,104 (生成 388 万、深さ 40) である。
+`m5dLive` は、`m5d_green_return` と `m5d_green_chain` で成り立つ。
+赤の状態数は、反例を見つけた時点の数なので、流すたびに少し変わる。
+
+`HEAVY=1` は、次を足す。どれも 2026-11-17 に流して、成り立った。
+
+| インスタンス | 性質 | 定数 | 状態数 |
+|---|---|---|---|
+| `m5d_green_return3` | `m5dLive` (時相) | 既定と同じ | 101,154 |
+| `m5d_green_return3_txn` | `m5dSafe` | 0 → 1 → 0 → 1 に、取引を足す。再起動なし | 806,156 |
+| `m5d_green_chain_back` | `m5dSafe` | 0 → 1 → 2 → 0。取引あり、再起動なし | 805,725 |
+| `m5d_green_groups_owner` | `m5dSafe` | グループ 2 つに、持ち主の書き込みを足す。取引と再起動なし | 564,326 |
+| `m5d_marks_chain` / `m5d_marks_return3` | `m5dSafe` | 親の規則と子の規則があり、印は `5808b08` のとおり | 141,993 / 101,154 |
+| `m5d_red_late_ack` | `m5dOutcome` | ack の規則だけを外す | 177,129 |
+| `m5d_red_boot_differs` | `markMatchesRecord` | 印を手ごとに書き換え、親の規則も外す | 356,402 |
+| `m5d_prototype_return3` | `m5dData` | 読み直しの試作、0 → 1 → 0 → 1 | 318,128 |
+
+witness は 5 つ (`check.sh` の行は 6 本) で、どれも到達した。
+
+| witness | インスタンス | 内容 |
+|---|---|---|
+| `witnessLateAfterNext` | `m5d_green_return`、`m5d_green_chain` | 移動 1 の遅れた pull に、次の移動が閉じた後で (範囲が戻った後か、先へ進んだ後で)、親が「渡し終えた」と答える |
+| `witnessFinishedInWindow` | `m5d_green_return` | 親が渡し終えた後、子が受け取り終える前の pull に、「渡し終えた」の答えが出る (子は、この答えで受け取り終える) |
+| `witnessLateResponse` | `m5d_green_return3` | 生きた fence の下で渡したグループの応答が、子が受け取り終えた後も飛んでいる |
+| `witnessUncarriedWritten` | `m5d_green_return` | 運ばれなかったグループを、子が到着の記録なしで受け持ち、そこに行を書く |
+| `witnessForwarded` | `m5d_green_chain` | phase 2 が転送されて、いまの持ち主で適用される |
+
+遅れた応答を子が捨てることと、遅れた ack を親が数えないことは、状態には現れないので、run で確かめた (捨てる手が取れて、その後の状態が変わっていないこと。`m5d_green_return3` の `member6Test` など)。
+決定的な run は、21 のインスタンスに 47 本ある。
+
+モデルにないもの。
+
+- 時計。pull の m、「渡し終えた」が運ぶ親の時計、範囲の床は、M5b が扱う。
+- `listGroups`。状態を変えないので、要求として置かず、drain が親を読む述語にした。
+- 表定義と、epoch の列の適用 (M21)。move-start は、親と子が同時に適用するものとして置いた。
+- phase 2 の要求の喪失と再送、取引が 2 つ以上あること、abort の転送。piece を運ぶ phase 2 の要求は、受け取り中でグループが届いていなければ、届くまで待つものとして置いた (M5c と同じ)。コードの `arriveStep` は 1 回だけ尋ねて進む。
+- グループを piece に分けて運ぶ形 (M18、M19)。
 
 ### M7 `m7_restore.qnt` — W への同時点復元 (S6)
 
