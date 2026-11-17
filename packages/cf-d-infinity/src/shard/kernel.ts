@@ -785,13 +785,12 @@ export class ShardKernel {
       this.arrived.set(r.g as string, { m: r.m as Ts, epoch: r.epoch as number });
       this.maxArrived = Math.max(this.maxArrived, r.m as Ts);
     }
-    for (const [g, a] of this.arrived) if ((this.moved.get(g)?.epoch ?? -1) < a.epoch) this.moved.delete(g);
-    // 渡した後に、そのグループを含む範囲を受け取り直していれば、グループはまたこのシャードのものである (行のないまま戻ったグループには、
-    // 到着の記録がない)。起動の後も、moveStarted と同じに印を外す。
-    const received = b.exec(`SELECT lo, hi, epoch FROM __incoming`).map((r) => ({ start: r.lo as number, end: r.hi as number, epoch: r.epoch as number }));
-    if (received.length > 0) {
-      for (const [g, k] of this.moved) if (received.some((r) => r.epoch > k.epoch && overlaps(blockOf(g), r))) this.moved.delete(g);
-    }
+    // 「渡した」印は、そのグループが届き直したとき (到着の記録) か、そのグループを含む範囲を受け取り終えたとき (終えた __incoming) に
+    // 外す (unmarked)。起動の後も、動いている間と同じ規則で作り直す。
+    // 欠陥のスイッチ unmarkOnReturn は、段 4 のコードのとおり、受け取り始めただけの範囲でも外す。
+    const received = b.exec(`SELECT lo, hi, epoch FROM __incoming ${this.faults.unmarkOnReturn ? "" : "WHERE done = 1"}`)
+      .map((r) => ({ start: r.lo as number, end: r.hi as number, epoch: r.epoch as number }));
+    for (const [g, k] of this.moved) if (this.unmarked(g, k.epoch, received)) this.moved.delete(g);
     this.epoch = ((this.metaGet("epoch") as number) ?? 0) + 1;
     this.metaSet("epoch", this.epoch);
     this.ceiling = (this.metaGet("ceiling") as number) ?? 0;
@@ -993,6 +992,19 @@ export class ShardKernel {
   /** グループ g が、受け取り中の移動 range で、もう届いたか。前の移動で届いて、その後に渡したグループは、届いていない。 */
   private arrivedIn(g: string, range: IncomingRange): boolean {
     return this.arrived.get(g)?.epoch === range.epoch;
+  }
+  /**
+   * 移動 epoch で渡したグループ g の「渡した」印 (moved) を外してよいか。印のある間、g の intent はここでは適用せず、phase 2 は渡した先へ
+   * 転送する (localIntents、forwards)。外すのは、g がその後の移動で届き直したとき (到着の記録) か、g を含む範囲をその後の移動で受け取り
+   * 終えたとき (received。行も intent もないグループは運ばれず、到着の記録がない) だけである。範囲を受け取り始めただけでは外さない。
+   * 外すと、g が届く前に来た phase 2 を、ここでは intent がないので何もせず、印がないので転送もせずに、受け取ったと答える。anchor は
+   * 届け終えた印を付け、記録を消した後は、届いた intent を presumed abort で捨てる (未解決の問題 54、specs/m5c_phase2_return.qnt の
+   * m5c_red_clear_at_start。不変条件: 参加者は、intent を適用したか、いまの持ち主へ転送した後でだけ、phase 2 を受け取ったと答える)。
+   * 起動のときも、動いている間 (receiveStep、finishIncoming) も、この規則で外す。
+   */
+  private unmarked(g: string, epoch: number, received: (Interval & { epoch: number })[]): boolean {
+    if ((this.arrived.get(g)?.epoch ?? -1) > epoch) return true;
+    return received.some((r) => r.epoch > epoch && overlaps(blockOf(g), r));
   }
   /** 子として進める移動の epoch。受け取り中の移動と、受け取り終えたが、自分の写しでまだ閉じていない (move-end を記録させていない) 移動である。 */
   private childMoves(): number[] {
@@ -1293,6 +1305,8 @@ export class ShardKernel {
     this.b.exec(`UPDATE __incoming SET done = 1, m = ? WHERE epoch = ? AND done = 0`, req.m, cur.epoch);
     this.incoming = this.incoming.filter((x) => x !== cur);
     this.raiseFloor(intervalOf(req), req.m);
+    // 範囲が前の持ち主へ戻ったとき、運ばれなかった (行も intent もない) グループの「渡した」印は、受け取り終えたここで外す (unmarked)。
+    for (const [g, k] of [...this.moved]) if (this.unmarked(g, k.epoch, [cur])) this.moved.delete(g);
   }
 
   health(_req: Record<string, never>): ShardHealth {
@@ -2340,8 +2354,8 @@ export class ShardKernel {
   /**
    * moveRows を書いた取引の後で、メモリの記録を足す。子なら、自分で移動を進め始める (決めたこと 4)。応答の後の仕事ですぐに始め、
    * DO が落ちて仕事が消えても続くように、alarm も予約する。返す fork を、手続きの 1 歩の結果に付ける。
-   * 範囲が前の持ち主へ戻ったときは、その範囲のグループの「渡した」印を外す。グループは、またこのシャードのもの (まだ届いていなければ、
-   * 届くのを待つもの) である。印が残ると、そのグループの新しい intent を、ここで適用しなくなる (localIntents)。
+   * 範囲が前の持ち主へ戻るときも、その範囲のグループの「渡した」印は、ここでは外さない。グループが届くか、受け取り終えたときに外す
+   * (unmarked)。欠陥のスイッチ unmarkOnReturn は、段 4 のコードのとおり、ここで外す。
    */
   private moveStarted(x: Logged): Fork[] {
     const rec = x.rec;
@@ -2350,7 +2364,7 @@ export class ShardKernel {
     if (rec.from === this.id) this.fenced.push({ ...range, to: rec.to, done: 0, epoch: x.epoch });
     if (rec.to !== this.id) return [];
     this.incoming.push({ ...range, from_id: rec.from, epoch: x.epoch });
-    for (const g of [...this.moved.keys()]) if (overlaps(blockOf(g), range)) this.moved.delete(g);
+    if (this.faults.unmarkOnReturn) for (const g of [...this.moved.keys()]) if (overlaps(blockOf(g), range)) this.moved.delete(g);
     this.deps.scheduleRedrive?.("move");
     return [{ kind: "background", effect: { kind: "move", epoch: x.epoch } }];
   }
@@ -2576,8 +2590,8 @@ export class ShardKernel {
       }
       if (out.length > 0 && bytes + size > req.maxBytes) break;
       bytes += size;
-      // この移動で、もう渡したグループなら、同じ m で渡し直す (応答が失われた子の再送)。前の移動で渡した印は、範囲が戻ったときに外して
-      // いる (moveStarted) ので、ここにあるのは、この移動の印か、行のないまま戻ったグループの古い印である。
+      // この移動で、もう渡したグループなら、同じ m で渡し直す (応答が失われた子の再送)。前の移動で渡した印は、範囲が戻って、グループが
+      // 届くか受け取り終えたときに外している (unmarked)。範囲を送り出すのは受け取り終えた後だけなので、ここにあるのは、この移動の印である。
       let known = this.moved.get(g);
       if (!known || known.epoch !== f.epoch) {
         known = { m: this.issue(), to: req.to, acked: false, epoch: f.epoch };
