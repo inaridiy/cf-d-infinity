@@ -1,7 +1,7 @@
 import { compoundTerms, depthOf, SHARD_LIMITS } from "../src/shard-limits";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { Db, type ClientFaults, type Cluster } from "../src/client/db";
+import { Db, depsOf, type ClientFaults, type Cluster } from "../src/client/db";
 import { keyString } from "../src/keys";
 import { fold, type EpochRecord, type Move } from "../src/catalog";
 import { MetaCore, type Catalog } from "../src/meta";
@@ -10,7 +10,7 @@ import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
 import { ShardCore, type SpanEscape, type WriteCheck } from "../src/shard/core";
 import { imageColumns } from "../src/shard/rows";
-import { isWideSpan, type Backend, type Change, type ExecReq, type Faults, type Plain, type PlainRow, type ShardApi, type Span, type TableDef, type Ts, type Value } from "../src/types";
+import { isWideSpan, type Backend, type Change, type Dep, type ExecReq, type Faults, type Plain, type PlainRow, type ShardApi, type Span, type TableDef, type Ts, type Value } from "../src/types";
 import { bindPlain, bindTyped, decodeElem, restoreColumns, type Tuple } from "../src/value";
 
 /**
@@ -391,6 +391,7 @@ const CLIENT_FAULTS = new Set([
   "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
   "publishBeforeBackfill", "checkBeforePrepare", "scanSkipsEmpty", "guardFromCommitTs",
   "lockedReadsSkipValidation", "secondDmlNewSince", "secondDmlNewSpanSince",
+  "globalSchemaEpoch", "viewDepsOnly", "writeDepsOnlyWritten", "doomOnSchemaChange",
 ]);
 /**
  * Worker と Meta の両方が読むスイッチの名前。1 つの欠陥を、2 つの守りを外して戻す (commitWithoutAcks は、Worker が 1 つのシャードの
@@ -588,7 +589,7 @@ export function withOverrides(c: SimCluster, over: Partial<Cluster>): Cluster {
  */
 export const delivers = (m: Pick<Rpc, "method" | "req">, version: number): boolean =>
   (m.method === "prepared" && (m.req as { epoch: number }).epoch === version) ||
-  (m.method === "syncSchema" && (m.req as { schema: number }).schema === version);
+  (m.method === "syncSchema" && (m.req as { atLeast: number }).atLeast >= version);
 
 /** 行イメージの検査を、いまの試験の間だけ止めているか (SimOptions の noImageCheck)。test/setup.ts が試験ごとに戻す。 */
 export const imageCheckOff = { now: false };
@@ -946,14 +947,17 @@ export class SimCluster implements Cluster {
   catalog() {
     return this.meta.catalog();
   }
-  prepare(sql: string, opts: { guard?: string[] } = {}, basedOn?: number) {
+  catalogAt(schema: number) {
+    return this.meta.catalogAt(schema);
+  }
+  prepare(sql: string, opts: { guard?: string[]; waitUntil?: number } = {}, basedOn?: number) {
     return this.meta.prepare(sql, opts, basedOn);
   }
   commit(epoch: number, acks: string[], at?: Ts) {
     return this.meta.commit(epoch, acks, at);
   }
-  abort(epoch: number, reason: string) {
-    return this.meta.abort(epoch, reason);
+  abort(epoch: number, reason: string, wound?: boolean) {
+    return this.meta.abort(epoch, reason, wound);
   }
   renew(epoch: number) {
     return this.meta.renew(epoch);
@@ -970,8 +974,7 @@ export class SimCluster implements Cluster {
    */
   async moveAt(parent: string, child: string, range: Interval, tell: string[] = []): Promise<{ epoch: number }> {
     const { epoch } = await this.meta.startMove({ from: parent, to: child, ...range });
-    const { schema } = await this.catalog();
-    for (const id of tell) await this.shard(id).syncSchema({ schema, epoch });
+    for (const id of tell) await this.shard(id).syncSchema({ atLeast: epoch });
     return { epoch };
   }
   /**
@@ -1001,6 +1004,13 @@ export class SimCluster implements Cluster {
     return new Db(this);
   }
 }
+
+/**
+ * 試験が要求を手で作るときの、頼るもの (ExecReq.deps)。スナップショット cat の表 tables に、読みの epoch で頼る。write に挙げた表には、
+ * 書き込みの epoch で頼る。
+ */
+export const depsFor = (cat: Catalog, tables: string[], write: string[] = []): Dep[] =>
+  depsOf(cat, {}, [...tables, ...write].map((table) => ({ kind: "table" as const, table })), { write });
 
 /** シャードの変更ログを commit_ts の昇順で全部読む (テスト用)。 */
 export function logRows(b: SqliteBackend): PlainRow[] {

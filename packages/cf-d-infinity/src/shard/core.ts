@@ -261,7 +261,7 @@ export class ShardCore implements ShardApi {
   prepare(req: PrepareReq): Promise<PrepareRes> {
     return this.start("prepare", { req });
   }
-  unchanged(req: { spans: Span[]; from: Ts; schema: number }): Promise<{ ok: boolean; reason?: string }> {
+  unchanged(req: { spans: Span[]; from: Ts; atLeast?: number }): Promise<{ ok: boolean; reason?: string }> {
     return this.start("unchanged", { req });
   }
   prepared(req: { epoch: number; early?: true }): Promise<{ ok: boolean; reason?: string }> {
@@ -292,7 +292,7 @@ export class ShardCore implements ShardApi {
   drain(req: Interval & { epoch: number }): Promise<{ groups: number; rows: number; bytes: number }> {
     return this.drive(req.epoch);
   }
-  syncSchema(req: { schema: number; epoch?: number }): Promise<{ moving: boolean }> {
+  syncSchema(req: { atLeast: number }): Promise<{ moving: boolean }> {
     return this.start("syncSchema", { req });
   }
   /** alarm の本体。未完了の仕事が残っていれば true を返す。呼び出し側 (DO の alarm) は true なら次の alarm を予約する。 */

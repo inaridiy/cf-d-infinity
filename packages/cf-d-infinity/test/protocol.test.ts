@@ -17,10 +17,11 @@ function wireSample(): string {
   // 行イメージは、表定義の列の順のタプルである (版 4 から)。
   const change = { table: "t", pk: keyString([1n]), sk: keyString(["a"]), before: null, after: encodeTuple(values) };
   // 読みの要求は、結果の列名を運ぶ (版 5 から)。条件の範囲の引数には bigint が入る。
-  // 要求は、Worker のスナップショットの epoch と、表定義の epoch を運ぶ (版 6 から。schema の数は DdlEntry.version ではない)。
+  // 要求は、Worker のスナップショットの epoch (版 6 から) と、頼るものごとの epoch を運ぶ (版 10 から。docs/design-catalog-epoch.md の
+  // 「表ごとの epoch」)。遷移の仕事の要求は、prepare の epoch を atLeast で運ぶ。
   const read = {
     sql: "SELECT a, b FROM t WHERE a = ?", params: [5n], columns: ["a", "b"], spans: [{ kind: "pred", table: "t", alias: "t", where: "a = ?", params: [5n, 2.5] }],
-    schema: 4, epoch: 7,
+    deps: [{ name: "t", epoch: 4 }, { name: "u", epoch: 6, write: true }], epoch: 7, atLeast: 9,
   } satisfies Partial<ExecReq>;
   // 書き込みの応答は、文が入れた行を、入れた順に運ぶ (版 7 から。lastInsertRowid はこれだけから決める)。
   const written = { changes: [change], inserted: [{ table: "t", pk: keyString([1n]) }], count: 1 } satisfies Partial<ExecRes>;
@@ -69,6 +70,7 @@ const WIRE: Record<number, string> = {
   7: "ada064f16f3fde8e",
   8: "edeccd61efb19a77",
   9: "4e20b5834a72831a",
+  10: "24801bf6c6dc931b",
 };
 
 describe("protocol version", () => {

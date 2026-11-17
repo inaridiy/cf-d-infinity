@@ -11,12 +11,12 @@
 // 取引の形は 3 つである。SQL の BEGIN (悲観)、Worker の中の Db.begin() (楽観)、接続をまたぐ取引 (Hrana の baton。文ごとに書き出して
 // 組み立て直す)。欠陥のスイッチを渡すと、同じ場面が、モデルの赤の再生になる。
 import { describe, expect, it } from "vitest";
-import { split } from "../../src/autoscaler";
-import { Db, type ClientFaults, type QueryResult, type Txn } from "../../src/client/db";
-import { ownerOf, planSplit, tokenOf } from "../../src/routing";
-import type { Faults } from "../../src/types";
-import { tenantOn } from "../ddl-harness";
-import { SimCluster } from "../sim";
+import { split } from "../src/autoscaler";
+import { Db, type ClientFaults, type QueryResult, type Txn } from "../src/client/db";
+import { ownerOf, planSplit, tokenOf } from "../src/routing";
+import type { Faults } from "../src/types";
+import { tenantOn } from "./ddl-harness";
+import { REFERENCE_ONLY, SimCluster } from "./sim";
 
 /** Hrana が SQLITE_BUSY にする誤り (src/client/hrana.ts)。 */
 export const BUSY = /^(conflict|read too old|not owner|migrating|upgrading)/;
@@ -216,9 +216,25 @@ describe("an open transaction and another connection's schema change", () => {
     });
   }
 
+  // 取引が溜めた書き込みは、文に付けてシャードへ送る (overlay)。送るのは、文の範囲が名指す表の書き込みだけである。ほかの表の書き込みまで
+  // 送ると、その表に列が足された後で、古い形の行イメージが、頼ると名乗っていない表へ適用される (test/setup.ts の行イメージの検査が、
+  // test/ddl-concurrent.test.ts の 6 の seed 2 で見つけた)。
+  it("Db.begin(): after ADD COLUMN on a table it wrote, a statement on another table on the same shard is still answered", async () => {
+    const s = await scene();
+    const tx = await open(s.c, "Db.begin()");
+    await tx.run("UPDATE a SET v = v + 1 WHERE tenant_id = ? AND id = 1", [s.A]);
+    expect(await s.ddl("ALTER TABLE a ADD COLUMN x INTEGER")).toBe("ok");
+    expect(await outcome(tx.run("SELECT v FROM b WHERE tenant_id = ? AND id = 1", [s.A]))).toBe("ok");
+    expect(await outcome(tx.run("SELECT v FROM a WHERE tenant_id = ? AND id = 1", [s.A]))).toBe("busy");
+    expect(await outcome(tx.commit())).toBe("busy");
+    expect(await s.value("a", s.A)).toBe(1);
+  });
+
   // 取引が触らない行の範囲が動き、関係のない DDL が確定する。取引は、範囲表だけを取り替えて続く (Txn.reroute、Txn.load)。
+  // 表の全行を集める実行 (REFERENCE=full) では、取引の読みが、分割で動く範囲を含む。分割の前に動いた範囲を読んだ取引が、分割を
+  // またげないのは、DDL がなくても同じで、未解決の問題 37 である (test/open/transaction-across-split.test.ts)。
   for (const kind of ["Db.begin()", "baton"] as Kind[]) {
-    it(`${kind}: crosses an unrelated DDL and a split that moves none of its rows, and commits`, async () => {
+    it.skipIf(process.env.REFERENCE === "full")(`${kind}: crosses an unrelated DDL and a split that moves none of its rows, and commits`, async () => {
       const s = await scene();
       const { routing } = await s.c.catalog();
       const range = planSplit(routing, "s0")!;
@@ -249,4 +265,64 @@ describe("an open transaction and another connection's schema change", () => {
       expect([await s.value("a", stay), await s.value("a", moved), await s.value("a", s.B)]).toEqual([11, writesMoved ? 6 : 1, 2]);
     });
   }
+});
+
+/** 取引が b を読んだ後で、別の接続が a を消して作り直し、行を入れる。取引が、view を通して a を読む。 */
+export async function viewAfterRecreate(clientFaults?: ClientFaults) {
+  const s = await scene(undefined, clientFaults);
+  await s.ddl("CREATE VIEW va AS SELECT tenant_id, id, v FROM a");
+  const tx = await open(s.c, "Db.begin()", clientFaults);
+  await tx.run("SELECT v FROM b WHERE tenant_id = ? AND id = 1", [s.A]);
+  const recreated = [await s.ddl("DROP TABLE a"), await s.ddl(table("a"))];
+  await new Db(s.c).query("INSERT INTO a VALUES (?, 9, 99)", [s.A]);
+  const read = await tx.run("SELECT v FROM va ORDER BY v").then((r) => r.rows as unknown, (e: Error) => (BUSY.test(e.message) ? "busy" : e.message));
+  return { recreated, read };
+}
+
+/** 取引が b を読んだ後で、別の接続が a を消して作り直し、行を入れる。取引が、a を読んで b に書く文を実行して、確定する。 */
+export async function writeReadingRecreated(clientFaults?: ClientFaults) {
+  const s = await scene(undefined, clientFaults);
+  const tx = await open(s.c, "Db.begin()", clientFaults);
+  await tx.run("SELECT v FROM b WHERE tenant_id = ? AND id = 2", [s.A]);
+  const recreated = [await s.ddl("DROP TABLE a"), await s.ddl(table("a"))];
+  await new Db(s.c).query("INSERT INTO a VALUES (?, 1, 99)", [s.A]);
+  const write = await outcome(tx.run("UPDATE b SET v = (SELECT v FROM a WHERE tenant_id = ? AND id = 1) WHERE tenant_id = ? AND id = 1", [s.A, s.A]));
+  const commit = await outcome(tx.commit());
+  return { recreated, write, commit, b: await s.value("b", s.A) };
+}
+
+// モデル M24 の赤の再生。欠陥のスイッチを 1 つ入れると、上の場面が、モデルの反例と同じ形で破れる。場面は、文を 1 シャードへ送る経路の
+// 要求の並びで組んであるので、基準経路だけの実行では流さない。
+describe.skipIf(REFERENCE_ONLY)("put back: the conditions of per-table epochs, one at a time", () => {
+  it("globalSchemaEpoch (m24_red_global, m24_red_global_commit_only): an unrelated CREATE TABLE makes the transaction stale", async () => {
+    for (const kind of KINDS) {
+      expect(await acrossUnrelated(kind, undefined, { globalSchemaEpoch: true })).toMatchObject({ created: "ok", readAfter: "busy", commit: "busy" });
+    }
+  });
+
+  it("epochOnPrepare (m24_red_prepare_advances): a failed DDL on a table the transaction read makes it stale", async () => {
+    for (const kind of KINDS) {
+      expect(await acrossFailedOnTouched(kind, { epochOnPrepare: true })).toMatchObject({ failed: expect.stringMatching(/UNIQUE constraint failed/), readAfter: "busy" });
+    }
+  });
+
+  it("doomOnSchemaChange (the Worker side of m24_red_global): a baton transaction fails after an unrelated DDL", async () => {
+    expect(await acrossUnrelated("baton", undefined, { doomOnSchemaChange: true })).toMatchObject({ created: "ok", readAfter: "busy", writeAfter: "busy", commit: "busy" });
+  });
+
+  it("indexAsObject (m24_red_index): a transaction that wrote a table commits after a CREATE INDEX on it committed", async () => {
+    const { tx, steps } = await afterCommitted("Db.begin()", "CREATE INDEX ai ON a(v)", { wroteA: true, faults: { indexAsObject: true } });
+    expect(steps).toEqual({ ddl: "ok", readB: "ok", readA: "ok" });
+    expect(await outcome(tx.commit())).toBe("ok");
+  });
+
+  it("viewDepsOnly (m24_red_view): a read through a view answers from a table that was created after the transaction's snapshot", async () => {
+    expect(await viewAfterRecreate()).toEqual({ recreated: ["ok", "ok"], read: "busy" });
+    expect(await viewAfterRecreate({ viewDepsOnly: true })).toEqual({ recreated: ["ok", "ok"], read: [{ v: 99 }] });
+  });
+
+  it("writeDepsOnlyWritten (m24_red_read_deps): a write that reads another table runs on a table created after the transaction's snapshot", async () => {
+    expect(await writeReadingRecreated()).toEqual({ recreated: ["ok", "ok"], write: "busy", commit: "ok", b: 1 });
+    expect(await writeReadingRecreated({ writeDepsOnlyWritten: true })).toEqual({ recreated: ["ok", "ok"], write: "ok", commit: "ok", b: 99 });
+  });
 });

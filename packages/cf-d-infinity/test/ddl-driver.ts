@@ -63,7 +63,7 @@ export async function twoShards(): Promise<{ c: SimCluster; db: Db; bad: number;
 export async function settled(c: SimCluster): Promise<{ applied: string[]; errors: (string | null)[] }> {
   const cat = await c.catalog();
   const ids = shardsOf(cat.routing);
-  const applied = await Promise.all(ids.map((id) => outcome(c.shard(id).syncSchema({ schema: cat.schema }))));
+  const applied = await Promise.all(ids.map((id) => outcome(c.shard(id).syncSchema({ atLeast: cat.epoch }))));
   const health = await Promise.all(ids.map((id) => c.shard(id).health({})));
   return { applied, errors: health.map((h) => h.schemaError ?? null) };
 }

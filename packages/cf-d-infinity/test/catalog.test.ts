@@ -2,14 +2,16 @@
 //
 // 段 1 と段 2 の間は、段 1 より前の Meta (test/meta-old.ts) と答えを比べる乱択の検査がここにあった。段 3 で表定義の変更が 2 相に
 // なり、比べる入口 (applyDdl、revokeDdl、publishIndex、lockTables、finishLock、renewLock) が新しい Meta にない。残る入口
-// (catalog、分割の枠) の答えも、表定義の版の数と取り消しの印がなくなり、表定義の epoch が prepare と abort でも進むので、比べられない。
+// (catalog、分割の枠) の答えも、表定義の版の数と取り消しの印がなくなったので、比べられない。
 // 古い Meta の写しは消した。表定義の遷移の条件は、M21 と突き合わせる test/catalog-m21.test.ts と、下の試験が確かめる。
+// 表定義の epoch は、表と view ごとに持ち、commit の記録でだけ進む (設計書の「表ごとの epoch」、M24。2026-11-17)。
 import { describe, expect, it } from "vitest";
 import { movesToResume, split } from "../src/autoscaler";
-import { fold, refusal, type Logged } from "../src/catalog";
+import { fold, refusal, type Logged, type ObjectEpochs } from "../src/catalog";
 import { Db } from "../src/client/db";
 import { MetaCore, readEpochs } from "../src/meta";
 import { planSplit, REGION_TOKENS } from "../src/routing";
+import { parseDdl, type SchemaView } from "../src/sql/ddl";
 import { driver } from "./ddl-driver";
 import { SimCluster, SqliteBackend, VirtualRuntime } from "./sim";
 
@@ -52,8 +54,10 @@ describe("the epoch log", () => {
     expect(during.routing.version).toBe(2);
     expect(during.moves).toEqual([{ epoch: 3, from: "s0", to: "s2", ...range }]);
     expect(fold(readEpochs(b), 4).moves).toEqual([]);
-    // 表定義の epoch は、表定義の記録 (prepare、commit、abort) でだけ進む (設計書の決めたこと 6)。
-    expect([1, 2, 3, 4, 5, 6].map((e) => fold(readEpochs(b), e).schema)).toEqual([1, 2, 2, 2, 5, 6]);
+    // 表定義の epoch は、commit の記録でだけ進む (設計書の「決めたこと 6 を改める」)。prepare と、移動の記録では進まない。
+    expect([1, 2, 3, 4, 5, 6].map((e) => fold(readEpochs(b), e).schema)).toEqual([0, 2, 2, 2, 2, 6]);
+    // 欠陥のスイッチ epochOnPrepare は、段 3 の形に戻す (prepare と abort でも進む。M24 の m24_red_prepare_advances)。
+    expect([1, 2, 3, 4, 5, 6].map((e) => fold(readEpochs(b), e, { epochOnPrepare: true }).schema)).toEqual([1, 2, 2, 2, 5, 6]);
     // commit された文だけが、Worker の SQLite で再生する履歴に入る。
     expect(fold(readEpochs(b), 5).ddl).toEqual(["CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT)"]);
   });
@@ -80,14 +84,98 @@ describe("the epoch log", () => {
     // 取引が読んだ表の DROP は mode guard で、abort で禁止が解ける。abort の後の commit は通らない (M21 の ONE_EXIT)。
     const guard = await meta.prepare("DROP TABLE t", { guard: ["t"] });
     expect({ mode: guard.mode, open: guard.catalog.open }).toEqual({ mode: "guard", open: { epoch: 5, mode: "guard", fence: ["t"] } });
-    expect(await meta.abort(5, "changed")).toEqual({ reason: "changed" });
+    expect(await meta.abort(5, "changed")).toEqual({ reason: "changed", wound: false });
     const s = fold(readEpochs(b));
     expect({ open: s.open, aborted: s.aborted, t: s.tables.t !== undefined }).toEqual({ open: null, aborted: { of: 5, reason: "changed" }, t: true });
     expect(await outcome(() => meta.commit(5, ["s0", "s1"]))).toBe("throws SqlError: changed");
     // もう abort された遷移の abort は、記録せずに、記録した理由を返す。commit された遷移は取り消せない。
-    expect(await meta.abort(5, "later")).toEqual({ reason: "changed" });
+    expect(await meta.abort(5, "later")).toEqual({ reason: "changed", wound: false });
     expect(await outcome(() => meta.abort(3, "late"))).toMatch(/^throws SqlError: cannot withdraw: the schema change of epoch 3 was already committed/);
     expect(readEpochs(b).length).toBe(7);
+  });
+
+  // 表ごとの epoch (設計書の「表ごとの epoch」の「規則」、M24)。進むのは commit だけで、進むのは、その DDL が変えたものだけである。
+  it("keeps a read epoch and a write epoch per table and an epoch per view, advanced only by the commit of a DDL that changes it", async () => {
+    const b = new SqliteBackend();
+    const meta = new MetaCore(b, ["s0", "s1"], { runtime: new VirtualRuntime(1) });
+    const at = async (): Promise<Record<string, ObjectEpochs | undefined>> => {
+      const { objects } = await meta.catalog();
+      return Object.fromEntries(["a", "b", "v", "a2", "__gidx_au", "*"].map((k) => [k, objects[k]]));
+    };
+    const rw = (read: number, write = read): ObjectEpochs => ({ read, write });
+    await ddl(meta, "CREATE TABLE A(id INTEGER PRIMARY KEY, x TEXT)"); // epoch 1, 2
+    await ddl(meta, "CREATE TABLE b(id INTEGER PRIMARY KEY, x TEXT)"); // epoch 3, 4
+    // 名前は、大文字と小文字を区別しない。関係のない表の CREATE TABLE は、a の epoch を進めない。
+    expect(await at()).toMatchObject({ a: rw(2), b: rw(4), "*": rw(4) });
+    // prepare は、どの epoch も進めない。abort も進めない (失敗した DDL は、触った表の取引も古くしない)。
+    const failing = await meta.prepare("ALTER TABLE A ADD COLUMN y INTEGER"); // epoch 5
+    expect(await at()).toMatchObject({ a: rw(2), "*": rw(4) });
+    await meta.abort(failing.epoch!, "the rows refused it"); // epoch 6
+    expect(await at()).toMatchObject({ a: rw(2), b: rw(4), "*": rw(4) });
+    expect((await meta.catalog()).schema).toBe(4);
+    // 列を足す commit は、その表の読みの epoch と書き込みの epoch を進める。
+    await ddl(meta, "ALTER TABLE A ADD COLUMN y INTEGER"); // epoch 7, 8
+    expect(await at()).toMatchObject({ a: rw(8), b: rw(4), "*": rw(8) });
+    // 列だけの一意でない index は、その表の書き込みの epoch だけを進める。消すときも同じである。
+    await ddl(meta, "CREATE INDEX ax ON A(x)"); // epoch 9, 10
+    expect(await at()).toMatchObject({ a: rw(8, 10), b: rw(4) });
+    await ddl(meta, "DROP INDEX ax"); // epoch 11, 12
+    expect(await at()).toMatchObject({ a: rw(8, 12), b: rw(4) });
+    // view は epoch を 1 つ持つ。view の DDL は、元の表の epoch を進めない。
+    await ddl(meta, "CREATE VIEW v AS SELECT id FROM A"); // epoch 13, 14
+    expect(await at()).toMatchObject({ a: rw(8, 12), v: rw(14) });
+    // シャードをまたぐ UNIQUE の index は、表の書き込みの epoch だけを進める。index の表だけは、prepare の epoch で生まれる。
+    const build = await meta.prepare("CREATE UNIQUE INDEX au ON A(x)"); // epoch 15
+    expect(await at()).toMatchObject({ a: rw(8, 12), __gidx_au: rw(15) });
+    await meta.commit(build.epoch!, ["s0", "s1"], 1); // epoch 16
+    expect(await at()).toMatchObject({ a: rw(8, 16), __gidx_au: rw(15) });
+    // index を消すと、その index の表の epoch も進む (消した名前も、消した epoch を持ち続ける)。
+    await ddl(meta, "DROP INDEX au"); // epoch 17, 18
+    expect(await at()).toMatchObject({ a: rw(8, 18), __gidx_au: rw(18) });
+    // 名前を変えると、古い名前と新しい名前の両方の epoch が進む。
+    await ddl(meta, "ALTER TABLE A RENAME TO a2"); // epoch 19, 20
+    expect(await at()).toMatchObject({ a: rw(20), a2: rw(20), b: rw(4) });
+    // 消した名前は、消した epoch を持ち続け、作り直した表は、より新しい epoch になる。
+    await ddl(meta, "DROP TABLE b"); // epoch 21, 22
+    expect(await at()).toMatchObject({ b: rw(22) });
+    await ddl(meta, "CREATE TABLE b(id INTEGER PRIMARY KEY)"); // epoch 23, 24
+    expect(await at()).toMatchObject({ b: rw(24), a2: rw(20), v: rw(14), "*": rw(24) });
+    // 取引の表定義を名指す epoch まで畳んだ表定義 (接続をまたぐ取引の組み立て直し)。範囲表は、いまのものである。
+    const then = await meta.catalogAt(8);
+    expect({ schema: then.schema, tables: Object.keys(then.tables), a: then.objects.a, epoch: then.epoch }).toEqual({ schema: 8, tables: ["A", "b"], a: rw(8), epoch: 24 });
+    expect(await outcome(() => meta.catalogAt(7))).toMatch(/^throws SqlError: schema epoch 7 is not an epoch at which a schema change committed/);
+  });
+
+  // 実装の一覧の 1。DDL ごとの、変えるもの。
+  it("names what each DDL changes: tables whose reads change, tables whose index set changes, and views", () => {
+    const tables: SchemaView["tables"] = {};
+    const schema: SchemaView = { tables, views: {}, indexes: {} };
+    const apply = (sql: string) => {
+      const p = parseDdl(sql, schema);
+      for (const d of p.defs) tables[d.name] = d;
+      for (const n of p.drops) delete tables[n];
+      Object.assign(schema.views, p.views);
+      for (const n of p.dropViews ?? []) delete schema.views[n];
+      Object.assign(schema.indexes, p.indexes);
+      for (const n of p.dropIndexes ?? []) delete schema.indexes[n];
+      return p.changes;
+    };
+    const c = (read: string[], write: string[] = [], views: string[] = []) => ({ read, write, views });
+    expect(apply("CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, a TEXT, e TEXT UNIQUE, PRIMARY KEY (tenant_id, id))")).toEqual(c(["t", "__gidx_t_0_key"]));
+    expect(apply("ALTER TABLE t ADD COLUMN b INTEGER")).toEqual(c(["t"]));
+    expect(apply("CREATE INDEX ta ON t(a)")).toEqual(c([], ["t"]));
+    // 行で失敗し得る index (シャード内の UNIQUE、式か WHERE のある index) は、読みの epoch も進める。
+    expect(apply("CREATE UNIQUE INDEX tu ON t(tenant_id, a)")).toEqual(c(["t"]));
+    expect(apply("CREATE INDEX te ON t(lower(a))")).toEqual(c(["t"]));
+    expect(apply("CREATE INDEX tp ON t(a) WHERE b > 0")).toEqual(c(["t"]));
+    expect(apply("CREATE UNIQUE INDEX tg ON t(a)")).toEqual(c([], ["t"]));
+    expect(apply("DROP INDEX ta")).toEqual(c([], ["t"]));
+    expect(apply("DROP INDEX tg")).toEqual(c(["__gidx_tg"], ["t"]));
+    expect(apply("CREATE VIEW tv AS SELECT a FROM t")).toEqual(c([], [], ["tv"]));
+    expect(apply("DROP VIEW tv")).toEqual(c([], [], ["tv"]));
+    expect(apply("ALTER TABLE t RENAME TO u")).toEqual(c(["t", "u"]));
+    expect(apply("DROP TABLE u")).toEqual(c(["__gidx_t_0_key", "u"]));
+    expect(parseDdl("CREATE TABLE IF NOT EXISTS x(id INTEGER PRIMARY KEY)", { tables: { x: {} as never }, views: {}, indexes: {} }).changes).toBeUndefined();
   });
 
   it("aborts a transition whose lease lapsed, and refuses a late renewal and a late commit", async () => {

@@ -7,7 +7,7 @@ import { REGION_TOKENS, ownerOf } from "../src/routing";
 import { GROUP_MAX_BYTES } from "../src/shard/core";
 import { MAX_WRITE_SET_BYTES } from "../src/types";
 import { quiescentProblems } from "./invariants";
-import { DO_MAX_BOUND_PARAMS, DO_MAX_VALUE_BYTES, SimCluster, SqliteBackend } from "./sim";
+import { DO_MAX_BOUND_PARAMS, DO_MAX_VALUE_BYTES, depsFor, SimCluster, SqliteBackend } from "./sim";
 
 const DOCS = `CREATE TABLE docs(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, body TEXT, PRIMARY KEY (tenant_id, id))`;
 async function tenantOn(c: SimCluster, shard: string): Promise<number> {
@@ -63,7 +63,7 @@ describe("the size of a result", () => {
       return { columns: r.columns, rows: (function* () { for (const row of r.rows) { logRows++; yield row; } })() };
     };
     await expect(c.shard("s0").exec({
-      sql: "SELECT count(*) FROM docs", columns: ["count(*)"], params: [], spans: [{ kind: "table", table: "docs" }], T: old, minTs: 0, schema: cat.schema, epoch: cat.epoch,
+      sql: "SELECT count(*) FROM docs", columns: ["count(*)"], params: [], spans: [{ kind: "table", table: "docs" }], T: old, minTs: 0, deps: depsFor(cat, ["docs"]), epoch: cat.epoch,
     })).rejects.toThrow(/delta exceeds K/);
     // 300 件の変更のうち、上限 (50 行) を超えたと分かるところまでしか読まない。
     expect(logRows).toBeLessThan(80);

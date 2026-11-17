@@ -3,7 +3,7 @@ import { parseDdl, type DdlMode, type IndexInfo, type ParsedDdl } from "./sql/dd
 import { systemRuntime, type Runtime } from "./runtime";
 import { CAPTURE_TABLES } from "./shard/rows";
 import { checkInterval, initialRouting, rangeText, sameInterval, slotAligned, type Interval, type Routing } from "./routing";
-import { describeOpen, fold, refusal, type EpochRecord, type Logged, type Move, type OpenDdl, type OpenMove, type Snapshot } from "./catalog";
+import { describeOpen, fold, refusal, type EpochRecord, type Logged, type Move, type ObjectEpochs, type OpenDdl, type OpenMove, type Snapshot } from "./catalog";
 
 /**
  * 表定義の遷移の期限 (docs/design-catalog-epoch.md の「期限」)。prepare から commit か abort までの間、fence の表への書き込みが止まる。
@@ -13,6 +13,13 @@ import { describeOpen, fold, refusal, type EpochRecord, type Logged, type Move, 
  */
 export const LEASE_MS = 5_000;
 export const TRANSITION_MAX_MS = 300_000;
+
+/**
+ * DDL の待ちの期限 (docs/design-catalog-epoch.md の「表ごとの epoch」の「Worker」)。DDL を始めてから、この時間までは、表の行ロックを持つ
+ * 取引を待つ。SQLite の busy_timeout に相当する 5 秒で、行ロックの待ちの上限 (src/shard/kernel.ts の LOCK_WAIT_MS) と同じである。
+ * 遷移ごとの期限 (LEASE_MS) とは別のもので、DDL を進める側が持つ。取り消させられた DDL のやり直しも、この時間を数え直さない。
+ */
+export const DDL_WAIT_MS = 5_000;
 
 /**
  * 表定義の epoch が、呼び出し側の見た epoch から進んでいた。表定義を取り直してやり直す。
@@ -46,12 +53,17 @@ export interface Catalog {
    * 自分のスナップショットで自分のものでなければ、列を適用してから所有を確かめ直す (段 2)。
    */
   epoch: number;
-  /** 表定義が最後に変わった epoch。要求が運び (ExecReq.schema)、シャードは自分の表定義の epoch と等しいことを確かめる (段 2)。 */
+  /**
+   * どれかの DDL が最後に確定した epoch (commit の記録でだけ進む)。取引は、これで自分の表定義を名指す (TxnDump.schema、MetaCore.catalogAt)。
+   * 要求が運ぶのは、これではなく、頼るものごとの epoch (objects から作る ExecReq.deps) である。
+   */
   schema: number;
+  /** 表と view の epoch (src/catalog.ts の Snapshot.objects)。鍵は小文字の名前。 */
+  objects: Record<string, ObjectEpochs>;
   /** 開いている表定義の遷移。fence の表への書き込みは、シャードが TableLocked で断る。 */
   open?: OpenTransition;
-  /** 最後の表定義の記録が abort なら、その遷移と理由。 */
-  aborted?: { of: number; reason: string };
+  /** 最後の表定義の記録が abort なら、その遷移と理由。wound は、行ロックを持つ取引が取り消させた印。 */
+  aborted?: { of: number; reason: string; wound?: true };
 }
 
 /** prepare の答え。epoch は記録した prepare の epoch で、何もしない DDL (IF NOT EXISTS など) なら null (何も記録しない)。 */
@@ -66,7 +78,7 @@ export interface Prepared {
 
 /** スナップショットを、Worker とシャードに渡す形 (Catalog) にする。 */
 function catalogOf(s: Snapshot): Catalog {
-  const cat: Catalog = { tables: s.tables, views: s.views, indexes: s.indexes, ddl: s.ddl, routing: s.routing, epoch: s.epoch, schema: s.schema };
+  const cat: Catalog = { tables: s.tables, views: s.views, indexes: s.indexes, ddl: s.ddl, routing: s.routing, epoch: s.epoch, schema: s.schema, objects: s.objects };
   if (s.open) {
     const o: OpenTransition = { epoch: s.open.epoch, mode: s.open.mode, fence: s.open.fence };
     if (s.open.mode === "build") o.index = Object.keys(s.open.ddl.indexes ?? {})[0]!;
@@ -198,7 +210,7 @@ export class MetaCore {
    * 控えを共有しない。畳んだ結果を覚えるのは、自分の写しを持つシャードである (kernel.ts の snap)。
    */
   private snapshot(): Snapshot {
-    return fold(readEpochs(this.b));
+    return fold(readEpochs(this.b), undefined, this.faults);
   }
 
   /** 最初の範囲表を、まだなければ epoch 0 に書く。範囲表を最初に引いたときに作る。 */
@@ -359,6 +371,28 @@ export class MetaCore {
   }
 
   /**
+   * 表定義の epoch が schema だったときの表定義に、いまの範囲表を合わせたスナップショット (設計書の「表ごとの epoch」の「Worker」)。
+   * 接続をまたぐ取引 (Hrana の baton) は、最初に読むか書くかしたときの表定義の epoch を運ぶ。Worker は、取引を組み立て直すとき、
+   * その後に別の DDL が確定していても、取引を失敗させずに、列をその epoch まで畳んだ表定義で計画する。範囲表と、開いている遷移は、
+   * いまのものである。schema が、どれかの DDL が確定した epoch でなければ、断る (baton が、この DB のものでない)。
+   */
+  async catalogAt(schema: number): Promise<Catalog> {
+    this.expire();
+    const now = this.current();
+    if (schema === now.schema) return catalogOf(now);
+    const then = fold(readEpochs(this.b), schema, this.faults);
+    if (!Number.isSafeInteger(schema) || schema < 0 || schema > now.schema || then.schema !== schema) {
+      throw new SqlError(`schema epoch ${schema} is not an epoch at which a schema change committed`);
+    }
+    const { open: _o, aborted: _a, ...cat } = catalogOf(then);
+    const fresh = catalogOf(now);
+    return {
+      ...cat, routing: fresh.routing, epoch: fresh.epoch,
+      ...(fresh.open ? { open: fresh.open } : {}), ...(fresh.aborted ? { aborted: fresh.aborted } : {}),
+    };
+  }
+
+  /**
    * 列の、epoch が after より後の記録を、昇順で返す。シャードは、これを自分の写し (__epoch) に足し、同じ fold で畳む (段 2)。
    * 最初の範囲表 (epoch 0) は、まだなければここで書く。写しの先頭は、いつも epoch 0 である。
    */
@@ -388,9 +422,11 @@ export class MetaCore {
    * 表定義の遷移を開く (prepare を記録する)。basedOn は、呼び出し側が文を解釈した表定義の epoch で、最新と違えば SchemaMoved で断る
    * (取り消しがないので、意味は「文を解釈した表定義が最新である」ことだけである)。遷移か移動が開いていれば SchemaBusy。
    * guard は、取引が読んだ表の DROP で、その取引が読んだ表である (mode guard。読んだ範囲は、進める側が commit の前に確かめる)。
+   * waitUntil は DDL の待ちの期限 (進める側の時計の時刻) で、prepare の記録が運ぶ。シャードは、fence の表に行ロックがある間、
+   * その時刻まで prepare の適用を待つ。
    * 何もしない DDL (IF NOT EXISTS で表がある、など) は、何も記録せずに epoch: null を返す。
    */
-  async prepare(sql: string, opts: { guard?: string[] } = {}, basedOn?: number): Promise<Prepared> {
+  async prepare(sql: string, opts: { guard?: string[]; waitUntil?: number } = {}, basedOn?: number): Promise<Prepared> {
     this.expire();
     const s = this.current();
     if (basedOn !== undefined && basedOn !== s.schema) throw new SchemaMoved(s.schema);
@@ -407,7 +443,9 @@ export class MetaCore {
     }
     this.tryShadow(parsed);
     const { mode: _m, fence: _f, staging, ...ddl } = parsed;
-    const rec: EpochRecord = { kind: "prepare", mode, ddl, fence, ...(staging ? { staging } : {}) };
+    const rec: EpochRecord = {
+      kind: "prepare", mode, ddl, fence, ...(staging ? { staging } : {}), ...(opts.waitUntil === undefined ? {} : { waitUntil: opts.waitUntil }),
+    };
     const now = this.rt.now();
     const epoch = this.b.tx(() => {
       const e = this.record(rec);
@@ -472,22 +510,25 @@ export class MetaCore {
 
   /**
    * 表定義の遷移を取り消す (abort を記録する)。禁止を解き、prepare が作った内部の表を消させるだけで、利用者の表に触る文を持たない。
-   * その遷移が、もう abort されていれば (期限切れ)、記録せずに、その理由を返す。呼び出し側は、自分の理由と違えば、そちらを利用者へ返す。
-   * もう commit された遷移は取り消せない (M21 の ONE_EXIT)。
+   * その遷移が、もう abort されていれば (期限切れか、取り消させる手)、記録せずに、その理由を返す。呼び出し側は、自分の理由と違えば、
+   * そちらを利用者へ返す。もう commit された遷移は取り消せない (M21 の ONE_EXIT)。
+   * wound は、fence の表の行ロックを持つ取引が、書き込み禁止に当たって取り消させる手である (M24 の WOUND)。記録に印を付ける。答えの
+   * wound は、記録された (か、もう記録されていた) abort がその手のものか、である。DDL を進める側は、それを見て、やり直すかを決める。
    */
-  async abort(epoch: number, reason: string): Promise<{ reason: string }> {
+  async abort(epoch: number, reason: string, wound = false): Promise<{ reason: string; wound: boolean }> {
     this.expire();
     const s = this.snapshot();
     if (refusal(s, { kind: "abort", of: epoch, reason }) === null) {
       this.b.tx(() => {
-        this.record({ kind: "abort", of: epoch, reason });
+        this.record({ kind: "abort", of: epoch, reason, ...(wound ? { wound: true as const } : {}) });
         this.setLease(epoch, null);
       });
-      return { reason };
+      return { reason, wound };
     }
     const why = this.closedReason(epoch);
     if (/was already committed|is not open/.test(why)) throw new SqlError(`cannot withdraw: ${why}`);
-    return { reason: why };
+    const recorded = readEpochs(this.b).find((x) => x.rec.kind === "abort" && x.rec.of === epoch)?.rec as Extract<EpochRecord, { kind: "abort" }> | undefined;
+    return { reason: why, wound: recorded?.wound === true };
   }
 
   /** rowid を n 個採番する。min は利用者が明示した値で、これより大きい値から続ける。 */

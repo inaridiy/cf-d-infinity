@@ -10,6 +10,11 @@
 //
 // 数を固定する (PINNED)。数が変わったら、この試験が落ちる。意図した変更なら、出力の UNIQUE-ROWCOST の行を見て PINNED を書き直し、
 // 段 3 の比べ方 (設計書の「段 0 の結果」) にも書く。
+//
+// 2026-11-17 に 2 つの数が減った (global: insert が 15 から 14.5、global: update the UNIQUE value が 20.95 から 20.5)。取引が溜めた
+// 書き込みのうち、文に付けてシャードへ送る分 (overlay) を、文の範囲が名指す表の書き込みだけにしたからである (src/client/db.ts の
+// Txn.overlay。docs/design-catalog-epoch.md の「表ごとの epoch」の実装の結果)。index の表を引く読みが、同じシャード宛の表 gu の書き込みを、
+// 適用して巻き戻さなくなった。
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { Miniflare } from "miniflare";
@@ -94,8 +99,8 @@ const PINNED: Record<string, { written: Pin; parts: Record<string, Pin> }> = {
   "local: INSERT OR REPLACE that displaces a row": { written: 11, parts: { "INSERT lu": 8, "DELETE lu": 1, "INSERT __cap_on": 1, "INSERT __log": 1 } },
   "local: upsert on the UNIQUE": { written: 6, parts: { "INSERT lu": 2, "UPDATE lu": 2, "INSERT __cap_on": 1, "INSERT __log": 1 } },
   "local: delete": { written: 2, parts: { "DELETE lu": 1, "INSERT __log": 1 } },
-  "global: insert": { written: 15, parts: { "INSERT gu": 4.5, "INSERT __intents": 3, "INSERT __gidx_gu_0_key": 2, "INSERT __log": 1.75, "DELETE __intents": 1.5, "INSERT __txn": 1.5, "UPDATE __txn": 0.75 } },
-  "global: update the UNIQUE value": { written: 20.95, parts: { "INSERT __intents": 5.4, "UPDATE gu": 4, "DELETE __intents": 2.7, "INSERT __log": 2.45, "INSERT __gidx_gu_0_key": 2, "INSERT __txn": 1.8, "DELETE __gidx_gu_0_key": 1.25, "UPDATE __txn": 0.9, "INSERT gu": 0.3, "DELETE gu": 0.15 } },
+  "global: insert": { written: 14.5, parts: { "INSERT gu": 4, "INSERT __intents": 3, "INSERT __gidx_gu_0_key": 2, "INSERT __log": 1.75, "DELETE __intents": 1.5, "INSERT __txn": 1.5, "UPDATE __txn": 0.75 } },
+  "global: update the UNIQUE value": { written: 20.5, parts: { "INSERT __intents": 5.4, "UPDATE gu": 4, "DELETE __intents": 2.7, "INSERT __log": 2.45, "INSERT __gidx_gu_0_key": 2, "INSERT __txn": 1.8, "DELETE __gidx_gu_0_key": 1.25, "UPDATE __txn": 0.9 } },
   "global: update another column": { written: 4, parts: { "UPDATE gu": 3, "INSERT __log": 1 } },
   "global: INSERT OR IGNORE that conflicts": { written: 0, parts: {} },
   "global: INSERT OR IGNORE that does not conflict": { written: 12.5, parts: { "INSERT __intents": 3, "INSERT __gidx_gu_0_key": 2, "INSERT gu": 2, "INSERT __log": 1.75, "DELETE __intents": 1.5, "INSERT __txn": 1.5, "UPDATE __txn": 0.75 } },

@@ -47,11 +47,16 @@ const SHARD = [
   "commitAfterAbort", "commitWithoutAcks", "overlappingTransitions", "ddlDuringMove", "moveDuringDdl",
   // 子が移動を進める手順のスイッチ (段 4)。
   "endBeforeDrained", "pullWithoutEpoch",
+  // 表ごとの epoch のスイッチ (docs/design-catalog-epoch.md の「表ごとの epoch」、M24)。epochOnPrepare と indexAsObject は、畳み込みが読む。
+  "epochOnPrepare", "indexAsObject", "writeComparesRead", "applyRefusesAll", "applyRefusesTouched",
+  "globalDdlFloor", "restoreAllTables", "noFloorOnChange",
 ];
 const OTHER = [
   "rowSpanDespiteUnique", "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
   "publishBeforeBackfill", "checkBeforePrepare", "scanSkipsEmpty", "guardFromCommitTs",
   "lockedReadsSkipValidation", "secondDmlNewSince", "secondDmlNewSpanSince",
+  // 表ごとの epoch の、Worker の側のスイッチ (M24)。
+  "globalSchemaEpoch", "viewDepsOnly", "writeDepsOnlyWritten", "doomOnSchemaChange",
 ];
 const FAULTS = ["none", ...(only ?? [...SHARD, ...OTHER])];
 const ALL_HARNESSES = ["test/replay.test.ts", "test/history.test.ts", "test/ddl-concurrent.test.ts"];

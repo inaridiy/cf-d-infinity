@@ -492,14 +492,17 @@ SQLite が断る DDL は比べない。`Db.ddl` は、記録の前に Worker の
 
 | 操作 | シャードの中の UNIQUE (tenant_id, code) | シャードをまたぐ UNIQUE (email) |
 |---|---|---|
-| INSERT | 4 | 15 |
-| UNIQUE の値を変える UPDATE | 7 | 20.95 |
+| INSERT | 4 | 14.5 (2026-11-17 まで 15) |
+| UNIQUE の値を変える UPDATE | 7 | 20.5 (2026-11-17 まで 20.95) |
 | ほかの列を変える UPDATE | 2 | 4 |
 | 衝突する INSERT OR IGNORE | 1 | 0 |
 | 衝突しない INSERT OR IGNORE | 9 | 12.5 |
 | 行を置き換える INSERT OR REPLACE | 11 | 19.35 から 20.35 (測った値は 19.55 から 19.9) |
 | UNIQUE の upsert (衝突して UPDATE) | 6 | 9 から 11.25 (測った値は 10.05 から 10.5) |
 | DELETE | 2 | 11.5 |
+
+2026-11-17 に、シャードをまたぐ UNIQUE の 2 つの数が減った。取引が溜めた書き込みのうち、文に付けてシャードへ送る分 (overlay) を、文の範囲が名指す表の書き込みだけにしたからである (`docs/design-catalog-epoch.md` の「表ごとの epoch の実装の結果」)。
+index の表を引く読みが、同じシャード宛の表の書き込みを、適用して巻き戻さなくなった。
 
 シャードの中の UNIQUE の値を変える UPDATE (7 行) と衝突しない INSERT OR IGNORE (9 行) は、捕捉の trigger の下書きと巻き戻しの分が大きい (内訳の `UPDATE lu` 5 行と `INSERT lu` 7 行)。
 段 3 で試適用と下書きが減り、キーの行が足される。

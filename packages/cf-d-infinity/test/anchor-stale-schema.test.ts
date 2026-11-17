@@ -49,9 +49,12 @@ async function commitAcrossIndex(faults?: Faults) {
 }
 
 describe("a cross-shard commit whose anchor applied a newer schema while the participants prepared", () => {
-  it("is aborted by the anchor as stale, and the rows stay as they were", async () => {
+  // 表定義の epoch は commit でだけ進む (docs/design-catalog-epoch.md の「表ごとの epoch」)。参加者の intent が DDL の prepare を待たせて
+  // いる間、anchor は prepare を適用していて、表 t への書き込みを断る。取引は、まだ古い計画ではないが、書き込み禁止で中止される
+  // (楽観の取引は行ロックを持たないので、DDL を待たせない)。
+  it("is aborted by the anchor, whose table the schema change has fenced, and the rows stay as they were", async () => {
     const r = await commitAcrossIndex();
-    expect(r.committed).toMatch(/stale schema/);
+    expect(r.committed).toMatch(/locked: table t is being changed by a schema change/);
     expect({ created: r.created, rows: r.rows, state: r.state, broken: r.broken })
       .toEqual({ created: "ok", rows: [`${r.A}/1 v=7`, `${r.B}/1 v=8`].sort(), state: "public", broken: [] });
   });

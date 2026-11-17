@@ -412,7 +412,9 @@ describe("a write to a table locked by a schema change", () => {
     // 禁止を掛けた側は延長しないので、期限を長くしておく。
     const c = new SimCluster({ shards: 2, leaseMs: 120_000 });
     await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)");
-    await c.prepare("DROP TABLE t", { guard: ["t"] });
+    const p = await c.prepare("DROP TABLE t", { guard: ["t"] });
+    // 禁止は、シャードが prepare を適用したときから掛かる。進める側が、全シャードに適用させたところで止まった形にする。
+    for (const id of c.shardIds) expect(await c.shard(id).prepared({ epoch: p.epoch! })).toEqual({ ok: true });
     const t0 = c.time;
     const r = await outcome(new Db(c).query("INSERT INTO t VALUES (1, 1)"));
     expect(r).toMatch(/^conflict: locked: table t is being changed by a schema change/);

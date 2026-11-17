@@ -49,6 +49,24 @@ export interface ParsedDdl {
    * abort を適用したシャードは、defs の名前で表を消す。利用者の表には触らない。
    */
   staging?: { sql: string[]; defs: TableDef[] };
+  /**
+   * この DDL が、確定したときに変えるもの (docs/design-catalog-epoch.md の「表ごとの epoch」の「規則」)。畳み込み (src/catalog.ts の fold) が、
+   * commit の記録で、挙げたものの epoch を進める。要求は、頼るものの epoch を運び、シャードは、それを自分の epoch と比べる。
+   *   read   読みの epoch と書き込みの epoch が進む表。その表の読みが返すもの (列、行の形、表があるか) か、シャードが古い時刻の行を
+   *          その表に読み戻せるかを変える DDL が挙げる。作る表、消す表、名前を変える表 (古い名前と新しい名前)、列を足す表、行で失敗し得る
+   *          index (シャード内の UNIQUE、式か WHERE のある index) を作る表、消える内部の表 (__gidx_<index>)。
+   *   write  書き込みの epoch だけが進む表。index を作るか消すだけの DDL が、その表を挙げる (index の名前ではない)。その表を読むだけの
+   *          計画は、古いままでよい。読みの経路は index と UNIQUE の情報を使わないからである。
+   *   views  epoch が進む view。作る view と消す view。
+   * 何もしない DDL にはない。
+   */
+  changes?: DdlChanges;
+}
+
+export interface DdlChanges {
+  read: string[];
+  write: string[];
+  views: string[];
 }
 
 /** 内部の表は `__` で始まる。利用者の表と名前が衝突すると、内部の状態を利用者の SQL で書き換えられる。 */
@@ -290,7 +308,10 @@ function createTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
       defs.push(t.def);
     } else def.uniques.push(cols);
   });
-  return { sql, defs: [def, ...defs], drops: [], user: source, indexes, mode: "plain", fence: [] };
+  return {
+    sql, defs: [def, ...defs], drops: [], user: source, indexes, mode: "plain", fence: [],
+    changes: { read: [name, ...defs.map((d) => d.name)], write: [], views: [] },
+  };
 }
 
 function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
@@ -324,9 +345,12 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
     // 行で失敗し得る index (UNIQUE、式、WHERE) は、表への書き込みを止めて、各シャードで試してから確定する。列だけの一意でない index は、
     // どの行でも作れるので、書き込みを止めない。
     const trial = unique || !plain || partial;
+    // 行で失敗し得る index は、表の読みの epoch も進める。古い時刻の読みが前の行を読み戻すと、新しい UNIQUE や式で失敗し得るからである。
+    // 列だけの一意でない index は、書き込みの epoch だけを進める。
     return {
       sql: [text(stmt)], defs: [def], drops: [], user: source, indexes: { [name]: { table, global: false } },
       mode: trial ? "trial" : "plain", fence: trial ? [table] : [],
+      changes: trial ? { read: [def.name], write: [], views: [] } : { read: [], write: [def.name], views: [] },
     };
   }
   const collatedCol = unique ? cols.find((c) => (def.collation[c] ?? "BINARY") !== "BINARY") : undefined;
@@ -338,14 +362,16 @@ function createIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl 
   const ix: GlobalIndexDef = { name, table: `__gidx_${name}`, columns: cols };
   const t = globalIndexTable(ix);
   def.globalIndexes.push(ix);
+  // シャードをまたぐ UNIQUE は、読みの経路に使わない。表の書き込みの epoch だけを進める。index の表 (staging) は、prepare の epoch で生まれる。
   return {
     sql: [rowIndexSql(ix, table)], defs: [def, t.def], drops: [], user: source, indexes: { [name]: { table, global: true } },
     mode: "build", fence: [table], staging: { sql: [t.sql], defs: [t.def] },
+    changes: { read: [], write: [def.name], views: [] },
   };
 }
 
 function dropTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
-  const out: ParsedDdl = { sql: [], defs: [], drops: [], user: source, dropIndexes: [], mode: "plain", fence: [] };
+  const out: ParsedDdl = { sql: [], defs: [], drops: [], user: source, dropIndexes: [], mode: "plain", fence: [], changes: { read: [], write: [], views: [] } };
   for (const t of stmt.tables.items) {
     const name = ident(t.type === "member_expr" ? t.property : t);
     const def = existingTable(schema, name);
@@ -364,6 +390,8 @@ function dropTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
     out.fence!.push(name);
     for (const [i, info] of Object.entries(schema.indexes)) if (info.table === name) out.dropIndexes!.push(i);
   }
+  // 消した表と、一緒に消える index の表。消した名前も、消した epoch を持ち続ける。
+  out.changes!.read.push(...out.drops);
   return out.drops.length ? out : NOOP;
 }
 
@@ -374,13 +402,15 @@ function dropIndex(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
     if (stmt.ifExistsKw) return NOOP;
     throw new SqlError(`no such index: ${name}`);
   }
-  if (!info.global) return { sql: [text(stmt)], defs: [], drops: [], user: source, dropIndexes: [name], mode: "plain", fence: [] };
+  if (!info.global) {
+    return { sql: [text(stmt)], defs: [], drops: [], user: source, dropIndexes: [name], mode: "plain", fence: [], changes: { read: [], write: [info.table], views: [] } };
+  }
   const def = structuredClone(schema.tables[info.table]!);
   const ix = def.globalIndexes.find((g) => g.name === name)!;
   def.globalIndexes = def.globalIndexes.filter((g) => g.name !== name);
   return {
     sql: [`DROP TABLE IF EXISTS ${q(ix.table)}`, `DROP INDEX IF EXISTS ${q(rowIndexName(ix))}`], defs: [def], drops: [ix.table], user: source, dropIndexes: [name],
-    mode: "plain", fence: [],
+    mode: "plain", fence: [], changes: { read: [ix.table], write: [info.table], views: [] },
   };
 }
 
@@ -402,7 +432,7 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       sql.push(...captureDdl(def));
       const indexes: Record<string, IndexInfo> = {};
       for (const [i, info] of Object.entries(schema.indexes)) if (info.table === name) indexes[i] = { ...info, table: to };
-      return { sql, defs: [def], drops: [name], user: source, indexes, mode: "plain", fence: [name] };
+      return { sql, defs: [def], drops: [name], user: source, indexes, mode: "plain", fence: [name], changes: { read: [name, to], write: [], views: [] } };
     }
     case "alter_action_add_column": {
       const col = action.column;
@@ -423,7 +453,7 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       // CHECK や NOT NULL、STRICT の表の型は既存の行で検査されるので、行のあるシャードでだけ失敗し得る。どの ADD COLUMN も、表への
       // 書き込みを止めて、各シャードで試してから確定する (SQLite の ADD COLUMN は表の形を書き換えるだけで、試すのは安い)。
       sql.push(...captureDdl(def));
-      return { sql, defs: [def], drops: [], user: source, mode: "trial", fence: [name] };
+      return { sql, defs: [def], drops: [], user: source, mode: "trial", fence: [name], changes: { read: [name], write: [], views: [] } };
     }
     case "alter_action_rename_column": {
       // 列の名前や数を変える DDL は、未決着の intent と変更ログの行イメージの形を変える。分割と重なる場合も含めて
@@ -462,7 +492,7 @@ function alterTable(source: string, stmt: Node, schema: SchemaView): ParsedDdl {
       throw new SqlError(`unsupported ALTER TABLE action: ${action.type}`);
   }
   sql.push(...captureDdl(def));
-  return { sql, defs: [def], drops: [], user: source, mode: "trial", fence: [name] };
+  return { sql, defs: [def], drops: [], user: source, mode: "trial", fence: [name], changes: { read: [name], write: [], views: [] } };
 }
 
 export function parseDdl(source: string, schema: SchemaView): ParsedDdl {
@@ -494,7 +524,7 @@ export function parseDdl(source: string, schema: SchemaView): ParsedDdl {
         throw new SqlError(`view ${name} already exists`);
       }
       assertFree(schema, name);
-      return { sql: [], defs: [], drops: [], user: clean, views: { [name]: clean }, mode: "plain", fence: [] };
+      return { sql: [], defs: [], drops: [], user: clean, views: { [name]: clean }, mode: "plain", fence: [], changes: { read: [], write: [], views: [name] } };
     }
     case "drop_view_stmt": {
       const name = ident(stmt.views.items[0]);
@@ -502,7 +532,7 @@ export function parseDdl(source: string, schema: SchemaView): ParsedDdl {
         if (stmt.ifExistsKw) return NOOP;
         throw new SqlError(`no such view: ${name}`);
       }
-      return { sql: [], defs: [], drops: [], user: clean, dropViews: [name], mode: "plain", fence: [] };
+      return { sql: [], defs: [], drops: [], user: clean, dropViews: [name], mode: "plain", fence: [], changes: { read: [], write: [], views: [name] } };
     }
     default:
       throw new SqlError(`unsupported statement: ${stmt.type}`);

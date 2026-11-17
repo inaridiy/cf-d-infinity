@@ -9,7 +9,9 @@
 //   知らない表を読んだ後:              「no such table」で表定義を取り直し、取引の版も取り替えた。
 //
 // どちらも、index を知らずに計画した書き込みが、index を知っている版の番号で確定した。項目のない行ができた。
-// いまは、読むか書くかした取引は版を取り替えない。表定義が変わっていたら、取引は競合として失敗する。
+// いまは、読むか書くかした取引は表定義を取り替えない。取引は、自分の表定義のまま続き、要求は、頼る表の epoch を運ぶ。index が出来た表に
+// 書いた取引の COMMIT は、その表の書き込みの epoch が進んでいるので、シャードが断る (docs/design-catalog-epoch.md の「表ごとの epoch」。
+// 段 3 までは、表定義全体の epoch が変わっていれば、Worker が取引を失敗させた)。
 //
 // 見つけたのは、index を書き込みを止めて作る設計のモデルを、実装と突き合わせたときである (2026-11-11)。不変条件 7。
 // モデルは specs/m13_txn_schema_boundary.qnt の m13_green と m13_red_repin。
@@ -46,7 +48,7 @@ describe("a transaction that planned a write before a UNIQUE index existed", () 
 
   it("does not commit the write under the new version when it continues on another connection", async () => {
     const r = await continued();
-    expect(r.commit).toMatch(/^conflict: the schema changed while the transaction was open/);
+    expect(r.commit).toMatch(/^not owner: stale schema: t is at write epoch/);
     expect(r.holders).toBe(1);
   });
 
@@ -75,11 +77,14 @@ describe("a transaction that planned a write before a UNIQUE index existed", () 
     const tx = await client.transaction("write");
     await tx.execute({ sql: "INSERT INTO t VALUES (?, 1, 7)", args: [A] });
     await new Db(c).ddl("CREATE UNIQUE INDEX u ON t(v)");
-    const failed = await tx.execute("SELECT 1").then(() => "ok", (e: Error) => e.message);
+    // 表 t に書く文は、index が出来た後は断られる。断られた後も、取引は古い表定義のままで、COMMIT も断られる。
+    const failed = await tx.execute({ sql: "UPDATE t SET v = 7 WHERE tenant_id = ? AND id = 1", args: [A] }).then(() => "ok", (e: Error) => e.message);
+    const unrelated = await tx.execute("SELECT 1").then(() => "ok", (e: Error) => e.message);
     const commit = await tx.commit().then(() => "committed", (e: Error) => e.message);
-    expect({ failed, commit }).toEqual({
-      failed: expect.stringMatching(/the schema changed while the transaction was open/),
-      commit: expect.stringMatching(/the schema changed while the transaction was open/),
+    expect({ failed, unrelated, commit }).toEqual({
+      failed: expect.stringMatching(/stale schema: t is at write epoch/),
+      unrelated: "ok",
+      commit: expect.stringMatching(/stale schema: t is at write epoch/),
     });
     expect(await holders(c)).toBe(1);
   });

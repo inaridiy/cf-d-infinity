@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Db } from "../src/client/db";
 import { spanFaults } from "../src/client/spans";
 import type { Faults } from "../src/types";
-import { allSpanEscapes, allWriteEscapes, SimCluster } from "./sim";
+import { allSpanEscapes, allWriteEscapes, depsFor, SimCluster } from "./sim";
 
 const P = `CREATE TABLE p(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, code TEXT, PRIMARY KEY (tenant_id, id))`;
 
@@ -74,11 +74,11 @@ describe("the span check", () => {
     await db.ddl(`CREATE TABLE q(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (tenant_id, id))`);
     await db.query("INSERT INTO p VALUES (1, 1, 'a')");
     await db.query("INSERT INTO q VALUES (1, 1)");
-    const { schema, epoch } = await c.catalog();
+    const cat = await c.catalog();
     // 文は q も読むのに、範囲には p の 1 行しか入れていない。
     await c.shard("s0").exec({
       sql: "SELECT code, (SELECT count(*) FROM q WHERE tenant_id = 1) AS n FROM p WHERE tenant_id = 1 AND id = 1", params: [], columns: ["code", "n"],
-      spans: [{ kind: "pk", table: "p", pk: "[1,1]", sk: "[1]" }], schema, epoch,
+      spans: [{ kind: "pk", table: "p", pk: "[1,1]", sk: "[1]" }], deps: depsFor(cat, ["p", "q"]), epoch: cat.epoch,
     });
     expect(c.spanEscapes.length).toBe(1);
     // 同じ文を Db から出すと、q も範囲に入る。

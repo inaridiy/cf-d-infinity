@@ -266,8 +266,8 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
           first ??= shard;
           return c.shard(shard);
         },
-        runtime: c.runtime, reference: c.reference, catalog: () => c.catalog(), prepare: (q, o, b) => c.prepare(q, o, b),
-        commit: (e, a, at) => c.commit(e, a, at), abort: (e, r) => c.abort(e, r), renew: (e) => c.renew(e), startMove: (m) => c.startMove(m), moves: () => c.moves(), allocate: (t, n, m) => c.allocate(t, n, m),
+        runtime: c.runtime, reference: c.reference, catalog: () => c.catalog(), catalogAt: (s) => c.catalogAt(s), prepare: (q, o, b) => c.prepare(q, o, b),
+        commit: (e, a, at) => c.commit(e, a, at), abort: (e, r, w) => c.abort(e, r, w), renew: (e) => c.renew(e), startMove: (m) => c.startMove(m), moves: () => c.moves(), allocate: (t, n, m) => c.allocate(t, n, m),
       };
       if (rnd() < 0.4) {
         // 取引の外の 1 文。
@@ -292,7 +292,7 @@ async function run(seed: number, o: RunOptions = {}): Promise<RunResult> {
             // 接続をまたぐ取引。状態を書き出し、別の接続で組み立て直して続ける。その接続は、そのときの最新の表定義を持つ。
             if (o.ddl && rec.statements.length > 0 && rnd() < 0.3) {
               const other = new Db(seen, { retries: 0, faults: o.clientFaults });
-              tx = Txn.load(other, await other.catalog(), tx.dump());
+              tx = await Txn.load(other, await other.catalog(), tx.dump());
             }
             // 取引を長くして、index を作る作業をまたぎやすくする。
             if (o.ddl && rnd() < 0.3) await c.sleep(rnd() * 40);

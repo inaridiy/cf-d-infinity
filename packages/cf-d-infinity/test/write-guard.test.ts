@@ -17,7 +17,7 @@ import { tupleOfRow } from "../src/shard/rows";
 import type { Change, Span } from "../src/types";
 import { isWriteOutsideClaim } from "../src/types";
 import { rawRows } from "./ddl-harness";
-import { allWriteEscapes, SimCluster } from "./sim";
+import { allWriteEscapes, depsFor, SimCluster } from "./sim";
 
 afterEach(() => {
   allWriteEscapes.length = 0; // ここで見つけたものは、この試験が確かめた。全体の検査には渡さない
@@ -49,7 +49,7 @@ describe("the shard's write guard on a multi-row INSERT planned before two split
     const row = (id: number): Span => ({ kind: "pk", table: "t", pk: keyString([id]), sk: keyString([id]) });
     const req = (id: number) => ({
       sql: "INSERT INTO t VALUES (?, 1), (?, 2)", params: [BigInt(a), BigInt(b)], columns: [], spans: [row(id)],
-      schema: cat.schema, epoch: cat.epoch, write: { sk: null, capture: "insert" as const },
+      deps: depsFor(cat, [], ["t"]), epoch: cat.epoch, write: { sk: null, capture: "insert" as const },
     });
     return Promise.all([
       c.shard("s1").execAuto(req(a)).then(() => "ok", (e: Error) => e.message),
@@ -109,7 +109,7 @@ describe("the shard's write guard on each path that runs user SQL or takes a tra
     await db.ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
     const cat = await c.catalog();
     const row1: Span = { kind: "pk", table: "t", pk: keyString([1]), sk: keyString([1]) };
-    const req = { sql: "INSERT INTO t VALUES (1, 10), (2, 20)", params: [], columns: [], spans: [row1], schema: cat.schema, epoch: cat.epoch };
+    const req = { sql: "INSERT INTO t VALUES (1, 10), (2, 20)", params: [], columns: [], spans: [row1], deps: depsFor(cat, [], ["t"]), epoch: cat.epoch };
     return { c, cat, req };
   }
 
@@ -157,9 +157,9 @@ describe("the shard's write guard on each path that runs user SQL or takes a tra
     // 行 5 を名乗り、行 7 のイメージを運ぶ変更。持ち主の確かめ (enter) は行 5 について済むが、本体に入るのは行 7 である。
     const forged: Change = { table: "t", pk: keyString([5]), sk: keyString([5]), before: null, after: tupleOfRow(def, { id: 7, v: 1 }) };
     const T = await c.shard("s0").now({});
-    await expect(c.shard("s0").commitLocal({ txn: "t1", T, writes: [forged], spans: [], schema: cat.schema, epoch: cat.epoch }))
+    await expect(c.shard("s0").commitLocal({ txn: "t1", T, writes: [forged], spans: [], deps: depsFor(cat, [], ["t"]), epoch: cat.epoch }))
       .rejects.toThrow(/^write outside claim: a change for t row \[5\] on shard s0 carries the image of t row \[7\]/);
-    const prepared = await c.shard("s0").prepare({ txn: "t2", T, writes: [forged], spans: [], anchor: "s0", schema: cat.schema, epoch: cat.epoch });
+    const prepared = await c.shard("s0").prepare({ txn: "t2", T, writes: [forged], spans: [], anchor: "s0", deps: depsFor(cat, [], ["t"]), epoch: cat.epoch });
     expect(prepared).toEqual({ ok: false, reason: expect.stringMatching(/^write outside claim: a change for t row \[5\]/) });
     expect(c.backends.get("s0")!.exec(`SELECT count(*) AS n FROM __intents`)[0]!.n).toBe(0);
     expect(await stored(c)).toEqual([]);
@@ -176,7 +176,7 @@ describe("the shard's write guard on each path that runs user SQL or takes a tra
     const [mine, gone] = [on("s0"), on("s1")];
     const row: Span = { kind: "pk", table: "t", pk: keyString([mine]), sk: keyString([mine]) };
     await expect(c.shard("s0").execAuto({
-      sql: "INSERT INTO t VALUES (?, 1), (?, 2)", params: [BigInt(mine), BigInt(gone)], columns: [], spans: [row], schema: cat.schema, epoch: cat.epoch, write: { sk: null, capture: "insert" },
+      sql: "INSERT INTO t VALUES (?, 1), (?, 2)", params: [BigInt(mine), BigInt(gone)], columns: [], spans: [row], deps: depsFor(cat, [], ["t"]), epoch: cat.epoch, write: { sk: null, capture: "insert" },
     })).rejects.toThrow(new RegExp(`^write outside claim: shard s0 does not own t row \\[${gone}\\] \\(not owner: s1\\)`));
     expect(await stored(c)).toEqual([]);
     expect(c.writeEscapes.map((e) => e.row)).toEqual([`t [${gone}]`]);
@@ -198,7 +198,7 @@ describe("the shard's write guard on each path that runs user SQL or takes a tra
     const pick = (inside: boolean) => { for (let i = 1; ; i++) { const t = tokenOfId(i); if (ownerOf(cat.routing, keyString([i])) === "s0" && (t < cut) === inside) return i; } };
     const [mine, theirs] = [pick(true), pick(false)];
     const wide: Span = { kind: "table", table: "t", claim };
-    const req = { sql: "INSERT INTO t VALUES (?, 1)", columns: [], schema: cat.schema, epoch: cat.epoch, write: { sk: null } };
+    const req = { sql: "INSERT INTO t VALUES (?, 1)", columns: [], deps: depsFor(cat, [], ["t"]), epoch: cat.epoch, write: { sk: null } };
     await c.shard("s0").execAuto({ ...req, params: [BigInt(mine)], spans: [wide] });
     await expect(c.shard("s0").execAuto({ ...req, params: [BigInt(theirs)], spans: [wide] }))
       .rejects.toThrow(new RegExp(`^write outside claim: the statement wrote t row \\[${theirs}\\]`));

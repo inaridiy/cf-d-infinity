@@ -986,7 +986,8 @@ describe("the checks are not vacuous", () => {
     const { c } = await two();
     await c.applyDdl("CREATE TABLE lagging(id INTEGER PRIMARY KEY)");
     const lagging = await schemaVersions(c);
-    expect(Object.values(lagging.shards).every((v) => v === lagging.meta - 1)).toBe(true);
+    // シャードは prepare までを適用している。表定義の epoch は commit でだけ進むので、シャードの epoch は、まだ前の commit のものである。
+    expect(Object.values(lagging.shards).every((v) => v < lagging.meta)).toBe(true);
     await touchAll(c);
     const done = await schemaVersions(c);
     expect(Object.values(done.shards).every((v) => v === done.meta)).toBe(true);
