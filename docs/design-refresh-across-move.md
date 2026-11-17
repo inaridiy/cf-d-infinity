@@ -572,6 +572,33 @@ M23j が置いたのは、M24 の規則のうち、変えた表の読みの epoc
 2 から 4 を入れる前のコードは、断る側に倒れている。
 途中の形で main に入れるなら、答える経路を、対応する規則が全部入るまで開けない。
 
+### 生成器の結果 (2026-11-17)
+
+5 を除く 7 つの生成器を足した。
+5 は、Meta が範囲を持つシャードを子にする移動を断るので、まだ作れない。
+どれも、foundation-4 では通る (答えられない場面は、`read too old`、`not owner`、競合で断る)。
+2 回目の実装の枝の写しでは、どの生成器も、目当てのスイッチか、その枝がスイッチなしで持つ欠陥を、少なくとも 1 つ見つけた。
+
+| 生成器 | 置き場所 | foundation-4 で危ない形に届いた数 (既定の seed) | 2 回目の枝の写しで見つけたもの |
+|---|---|---|---|
+| 1、2 | `test/history.test.ts` の、全表の読みと分割の作業負荷 | 全表の読み 351 (移動をまたぐもの 132)。2 回以上に分けて送った文 249 (送る間に移動があったもの 40)。計画の途中の読み 201 | 問題 56 を、スイッチなしで 40 中 39 (生成器 1) と 35 (生成器 2) |
+| 3 | `test/old-reads-after-log-truncation.test.ts` | 60 中 8 (どれも `read too old`) | `keptLogOnly`、`keptUntilC` をそれぞれ 60 中 8 |
+| 4 | `test/move-returns.test.ts` の、尋ねる要求を遅らせる実行 | 戻る移動 22、それをまたぐ取引 70 (読むだけ 42、書く 28) | `historyForgetsSource`、`prepareAlone`、`childAlone`、`parentAnswersMoved`、`unmarkOnReturn`、`historyNewestRecord` (尋ね合いが終わらない) |
+| 6 | `test/rebuild-across-split.ts` (ddl-concurrent の 8 節) | 16 中 16 が、写す範囲を動かす | `parentAnswersMoved` を 40 中 35 |
+| 7 | `test/ddl-old-reads.ts` (ddl-concurrent の 7b 節) | RENAME TO と作り直しで、元の T のまま答えたものは 0 | `keptOldShape` を 120 中 21。`historyIgnoresSchema` の形は、その枝がスイッチなしで持つ |
+| 8 | `test/lock-across-split.ts` (placement-differential) | 分割した置き方だけの違い 25 (未解決の問題 37 のロック。既定では数えて伏せ、`OPEN=1` で報告する) | `locksStayOnMove` 19、`freshCarriedLease` 12、`noEarlyUnlock` 4、`unlockNotForwarded` 2、`carriedInMemory` 1 (48 の seed) |
+
+次のスイッチは、2 回直しても、どの生成器でも落ちないか、seed 1 つでしか落ちない。
+`wideReadIgnoresClaim` (生成器 1)、`historyStopsAtFirst`、`historyFromArrival`、`rehandFinished`、`heldOverlaid`、`childFromArrival`、`childFromFloor` (生成器 4 と 6)。
+3 回目の実装は、これらの規則の答える経路を開ける前に、モデルの反例の手順をそのまま流す決まった順の試験を足し、それが落ちることを確かめる (計画書の規則 2 の oracle)。
+乱択の生成器でも見つかるようにするのは、その後の課題である。
+(新) のスイッチ (`keepAnswersOnReplan`、`wideReadNoWait`、`recheckResendsOnly`、`historyAllPeriods`、`enterSkipsRecordCheck`、`noDdlFloor`、`ddlFloorAtApply`、`relockOnRenew`、`renewNotForwarded`) は、どの木にもまだないので、3 回目の実装がスイッチを作るときに、上の生成器で落ちることを確かめる。
+
+foundation-4 そのものでも、規則 4 に反する失敗が 1 つ見つかった (`test/open/rebuild-across-split.test.ts`)。
+表を作り直す 1 つの取引 (CREATE、INSERT…SELECT、DROP、RENAME) で、写した範囲が DROP の前に分割されると、誰もその表に書いていなくても、DROP が `not owner` で失敗する。
+写した読みの確かめが、範囲を渡した親へ行くからである。
+不変条件 D に当たり、M23i の `m23i_red_no_rehome` が今のコードの形である。
+
 ### 確かめていないこと (2026-11-17)
 
 - 3 回以上の移動での、古い読みと確かめ。M23g は 3 回の移動を扱うが、行は 1 つである。
