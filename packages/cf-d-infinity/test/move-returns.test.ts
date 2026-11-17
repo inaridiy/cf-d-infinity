@@ -7,11 +7,8 @@
 // 再起動し、進める側をときどき止め、phase 2 と移動の手順の要求の配送を遅らせる。tenant を多くして、取引の intent を読み手が決着させる
 // 前に、範囲が動くようにする。
 //
-// 伏せているもの (MoveChaos.hide54)。未解決の問題 54 (test/open/phase2-during-return.test.ts): 範囲が前の持ち主へ戻る途中に届いた phase 2 を、
-// 前の持ち主が、intent を適用も転送もせずに受け取ったと答える。この生成器は、戻る移動を始める前に、どのシャードにも、宛先が前に渡した取引の
-// intent が残っていないことを求め、残っていれば、その移動を後回しにする。54 の窓 (宛先が move-start を適用してから、その intent の
-// グループを引き取るまで) より広く外す。OPEN=1 で外す。外すと、確定して届け終えた取引の intent の残り (history.ts の strandedIntents) で
-// 54 が見つかる (seed 8)。54 が直ったら、伏せるのをやめる。
+// 未解決の問題 54 (範囲が前の持ち主へ戻る途中に届いた phase 2) は、2026-11-17 に直した (test/phase2-during-return.test.ts、M5c)。
+// それまで伏せていた MoveChaos.hide54 は外した。
 //
 // 伏せているもの (MoveChaos.hideStalePull)。終わった移動の遅れた pull が、範囲が戻ってきた前の親に届くと、親は、終わった移動の fence で
 // グループを渡し直そうとし、内部の誤り (UNIQUE constraint failed: __moved...) で答え、その pull を待っていた利用者の文も失敗する
@@ -29,7 +26,7 @@ const run = (seed: number) => {
   if (!memo.has(seed)) {
     memo.set(seed, runHistory({
       seed, shards: 3, tenants: 40, skewMs: 20, ops: 40, thinkMs: 400, slowPhase2Ms: 2_000,
-      moves: { kind: "returns", restarts: true, stops: true, hide54: HIDE_OPEN, hideStalePull: HIDE_OPEN, slowMoveRpcMs: 60, paceMs: 200 },
+      moves: { kind: "returns", restarts: true, stops: true, hide54: false, hideStalePull: HIDE_OPEN, slowMoveRpcMs: 60, paceMs: 200 },
     }));
   }
   return memo.get(seed)!;
