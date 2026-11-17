@@ -3,7 +3,7 @@
 import { writeFileSync } from "node:fs";
 import { split } from "../src/autoscaler";
 import { fold, type EpochRecord } from "../src/catalog";
-import type { Txn } from "../src/client/db";
+import { Db, type Txn } from "../src/client/db";
 import { keyString } from "../src/keys";
 import { readEpochs } from "../src/meta";
 import { initialRouting, overlaps, ownerOf, planSplit, regionsOf, shardsOf, slotOf, type Interval } from "../src/routing";
@@ -16,6 +16,11 @@ export interface Read {
   key?: Key;
   /** tenant 内の述語読み。行数と合計を比べる。 */
   tenant?: number;
+  /**
+   * 全表の読み (生成器 1 と 2)。agg は全行の行数と合計 ({ count, sum })、rows は全行の [tenant, id, n] を主キーの順に並べたもの。
+   * 主キーでも shard key でも絞れない文で読む。
+   */
+  all?: "agg" | "rows";
   value: unknown;
 }
 export interface TxRecord {
@@ -35,6 +40,15 @@ export interface Violation {
 
 function evalRead(state: Map<Key, number>, r: Read): unknown {
   if (r.key !== undefined) return state.get(r.key) ?? null;
+  if (r.all === "rows") {
+    const rows = [...state].map(([k, v]) => [...k.split("/").map(Number), v] as number[]);
+    return rows.sort((a, b) => a[0]! - b[0]! || a[1]! - b[1]!);
+  }
+  if (r.all === "agg") {
+    let sum = 0;
+    for (const v of state.values()) sum += v;
+    return { count: state.size, sum };
+  }
   let count = 0;
   let sum = 0;
   for (const [k, v] of state) {
@@ -100,6 +114,68 @@ export interface MoveChaos {
   slowMoveRpcMs?: number;
   /** 移動と移動の間の待ちの上限 (ms)。既定は、thinkMs があればその 2 倍、なければ 60。 */
   paceMs?: number;
+  /**
+   * 生成器 4 (docs/design-refresh-across-move.md の「乱択の検査に足す生成器」)。持ち主が前の持ち主へ尋ねる要求 (ASK_RPCS) の配送と
+   * 応答を、ときどき最大この ms だけ遅らせる。その間に、範囲が前の持ち主へ戻る。乱数は、作業負荷とも移動とも別の流れ (r3) から引く。
+   */
+  slowAsksMs?: number;
+}
+
+/**
+ * 持ち主が、受け持ち始める前の窓を前の持ち主へ尋ねる要求 (shard から shard)。2 回目の実装の枝 (eba3354) の名前である
+ * (history は確かめの窓、historyRead は古い読み)。`foundation-4` のコードは尋ねないので、この名前の要求は流れず、遅らせる手は効かない。
+ * 3 回目の実装で名前が変わったら、ここを合わせる (合わせないと、生成器 4 は黙って何も遅らせない。RunResult.across.delayedAsks が 0 になる)。
+ */
+export const ASK_RPCS = new Set(["history", "historyRead"]);
+
+/**
+ * 全表の読みを、範囲の分割と並べる (生成器 1 と 2。docs/design-refresh-across-move.md の「乱択の検査に足す生成器」)。
+ * 取引は、まず主キーで 1 行を読み (T を決め、範囲を記録する)、待ってから、主キーでも shard key でも絞れない文で全表を読む。その間に、
+ * 分割 (RunOpts.splits) が読む範囲を動かし、ほかの接続が書く。Worker の refresh と exec の要求の配送を遅らせ、分割が文の途中に入る
+ * 実行を増やす。判定は、履歴の検査 (行の数と和、全行の値) と、どの試験にも掛かる全表の読みの区間の検査 (test/sim.ts の checkTiling) である。
+ * 乱数は、作業負荷 (rnd) とも移動 (r2) とも別の流れ (r3) から引く。この選択肢のない実行の乱数の列と RPC の列は、足す前と同じである。
+ */
+export interface WideOpts {
+  /** 取引のうち、全表の読みをする取引の割合。 */
+  share: number;
+  /** 最初の読みと全表の読みの間の待ちの上限 (ms)。 */
+  thinkMs: number;
+  /** Worker の refresh と exec の要求の配送を、ときどき最大この ms だけ遅らせる。 */
+  holdMs: number;
+  /**
+   * 生成器 2。1 つの文が要求を 2 回に分けて送る形にする。集める予算 (Db の limits.bytes) を bytes にし、一部の tenant の行を大きくする
+   * (行の多いシャードが取り分を超え、予算の残りで 2 回目を送る。ReadScope.budgeted)。2 つの表を集める文 (表ごとに 1 回ずつ送る。
+   * ReadScope.collect) も混ぜる。
+   */
+  rounds?: { bytes: number };
+}
+
+/** 生成器 1 と 2 の数え (RunResult.wide)。検査が危険な形を作ったかを、試験が確かめるのに使う。 */
+export interface WideCounts {
+  /** 全表の読みの文の数。 */
+  statements: number;
+  /** 1 つのシャードだけに送った文と、2 つ以上に送った文 (最初の送信の宛先の数)。 */
+  oneShard: number;
+  manyShards: number;
+  /** 取引の最初の読みから、全表の読みの文が終わるまでに、範囲の移動が始まった文 (生成器 1 の危険な形)。 */
+  acrossMove: number;
+  /** 要求を 2 回以上に分けて送った文 (予算の 2 回目、2 つ目の表)。 */
+  rounds: number;
+  /** そのうち、送る回の間に範囲の移動が始まった文 (生成器 2 の危険な形)。 */
+  roundsAcrossMove: number;
+  /** 移動をまたいだ文の結末。answered か、断った誤りの文の頭。 */
+  outcomes: Record<string, number>;
+}
+
+/** 生成器 4 の数え (RunResult.across)。 */
+export interface AcrossCounts {
+  /** 取引の間に、範囲が前の持ち主へ戻る移動が始まった取引 (生成器 4 の危険な形)。読むだけの取引と、書く取引。 */
+  readOnly: number;
+  writing: number;
+  /** その結末。committed か、断った誤りの文の頭。 */
+  outcomes: Record<string, number>;
+  /** 遅らせた、前の持ち主への尋ねの要求と応答 (ASK_RPCS)。 */
+  delayedAsks: number;
 }
 
 export interface RunOpts {
@@ -126,6 +202,14 @@ export interface RunOpts {
   slowPhase2Ms?: number;
   /** tenant の数。既定は 6。多いほど、取引の intent を読み手が決着させる前に、範囲が動く。 */
   tenants?: number;
+  /** 生成器 1 と 2 (WideOpts)。 */
+  wide?: WideOpts;
+  /**
+   * 取引の文と文の間に置く待ちの上限 (ms)。取引が範囲の移動 (と、前の持ち主へ戻る移動) をまたぐ実行を作る (生成器 4)。乱数は r3 から引く。
+   */
+  innerThinkMs?: number;
+  /** splits の分割と分割の間の待ちに、最大この ms を足す。分割を作業負荷の全体に散らす。乱数は r3 から引く。 */
+  splitPaceMs?: number;
 }
 
 /**
@@ -151,6 +235,10 @@ export interface RunResult {
   problems: string[];
   /** moves の実行の数え。検査が何かを確かめたかを、試験が確かめるのに使う。 */
   counts: MoveCounts;
+  /** wide の実行の数え。 */
+  wide: WideCounts;
+  /** innerThinkMs の実行の、範囲が戻る移動をまたいだ取引の数え。 */
+  across: AcrossCounts;
 }
 
 export interface MoveCounts {
@@ -195,7 +283,44 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
   let unknown = 0;
   // moves と thinkMs の実行だけが引く乱数。作業負荷の乱数 (rnd) の列を変えない。
   const r2 = prng(o.seed ^ 0x6a09e667);
-  const moves = o.moves ? startMoves(o, o.moves, c, r2) : null;
+  // 生成器 1、2、4 の選択肢 (wide、innerThinkMs、splitPaceMs、MoveChaos.slowAsksMs) だけが引く乱数。rnd と r2 の列を変えない。
+  const r3 = prng(o.seed ^ 0x3c6ef372);
+  if (o.wide?.rounds) {
+    // 2 つの表を集める文のための、書かない表。どの tenant の行もある。
+    await admin.ddl("CREATE TABLE tags(tenant_id INTEGER PRIMARY KEY)");
+    await admin.query(`INSERT INTO tags VALUES ${Array.from({ length: TENANTS }, (_v, i) => `(${i + 1})`).join(", ")}`);
+  }
+  const across: AcrossCounts = { readOnly: 0, writing: 0, outcomes: {}, delayedAsks: 0 };
+  const moves = o.moves ? startMoves(o, o.moves, c, r2, r3, across) : null;
+  const wide: WideCounts = { statements: 0, oneShard: 0, manyShards: 0, acrossMove: 0, rounds: 0, roundsAcrossMove: 0, outcomes: {} };
+  if (o.wide?.holdMs) {
+    // Worker の refresh と exec の配送を遅らせる。分割が、文の送信と送信の間、確かめの最中に入る実行を増やす。
+    const hold = o.wide.holdMs;
+    const prior = c.net.gate;
+    c.net.gate = (x) => {
+      const p = prior(x);
+      if (p) return p;
+      if (x.from === "client" && (x.method === "refresh" || x.method === "exec") && r3() < 0.3) return c.sleep(r3() * hold);
+      return undefined;
+    };
+  }
+  /** Meta が記録した移動の数 (move-start)。Meta の SQLite を直に読む (RPC の列を変えない)。 */
+  const moveStarts = () => readEpochs(c.metaBackend).filter((x) => x.rec.kind === "move-start").length;
+  /** Meta の epoch の列で、epoch from より後に始まった、範囲を前の持ち主へ戻す移動の数。 */
+  const returnsAfter = (from: number) => {
+    const log = readEpochs(c.metaBackend).flatMap((x) => (x.rec.kind === "move-start" ? [{ epoch: x.epoch, rec: x.rec }] : []));
+    return log.filter((x) => x.epoch > from && log.some((y) => y.epoch < x.epoch && y.rec.from === x.rec.to && overlaps(y.rec, x.rec))).length;
+  };
+  const lastEpoch = () => readEpochs(c.metaBackend).at(-1)?.epoch ?? -1;
+  const head = (e: unknown) => {
+    const m = e instanceof Error ? e.message : String(e);
+    return /^(conflict|read too old|not owner|migrating)/.exec(m)?.[1] ?? `error: ${m.slice(0, 60)}`;
+  };
+  const tally = (into: Record<string, number>, what: string) => (into[what] = (into[what] ?? 0) + 1);
+  /** 取引の文と文の間の待ち (innerThinkMs)。選択肢がなければ待たない (await も挟まない)。 */
+  const innerThink = o.innerThinkMs ? () => c.sleep(r3() * o.innerThinkMs!) : null;
+  /** 生成器 2 の、大きい行の tenant。行の多いシャードが、予算の取り分を超える。 */
+  const padOf = (t: number) => (t === 1 ? "x".repeat(1500) : "");
 
   const readKey = async (tx: Txn, x: { t: number; i: number }, reads: Read[]) => {
     // 整数の引数は INTEGER (bigint) で渡す。JS の数は REAL として束縛される (列の型の親和性が整数に戻すので、答えは同じである)。
@@ -210,8 +335,65 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
   };
   const put = async (tx: Txn, x: { t: number; i: number }, v: number, writes: TxRecord["writes"]) => {
     await tx.query("DELETE FROM users WHERE tenant_id = ? AND id = ?", [BigInt(x.t), BigInt(x.i)]);
-    await tx.query("INSERT INTO users(tenant_id, id, n) VALUES (?, ?, ?)", [BigInt(x.t), BigInt(x.i), BigInt(v)]);
+    if (o.wide?.rounds) await tx.query("INSERT INTO users(tenant_id, id, n, name) VALUES (?, ?, ?, ?)", [BigInt(x.t), BigInt(x.i), BigInt(v), padOf(x.t)]);
+    else await tx.query("INSERT INTO users(tenant_id, id, n) VALUES (?, ?, ?)", [BigInt(x.t), BigInt(x.i), BigInt(v)]);
     writes.push({ key: k(x), value: v });
+  };
+
+  /**
+   * 全表の読み (生成器 1 と 2)。主キーでも shard key でも絞れない文にする (n はいつも 1 以上なので、n > 0 は全行である)。rounds の実行では、
+   * 大きい行の列 (name) も集める文と、2 つの表を集める文を混ぜる。
+   */
+  const readAll = async (tx: Txn, reads: Read[]) => {
+    const shapes = o.wide?.rounds ? ["padded", "joined", "count", "rows"] as const : ["count", "filtered", "rows"] as const;
+    const shape = shapes[Math.floor(r3() * shapes.length)]!;
+    const agg = (r: { rows: Record<string, unknown>[] }) => reads.push({ all: "agg", value: { count: r.rows[0]!.c, sum: r.rows[0]!.s } });
+    const rows = (r: { rows: Record<string, unknown>[] }) =>
+      reads.push({ all: "rows", value: r.rows.map((x) => [Number(x.tenant_id), Number(x.id), Number(x.n)]) });
+    if (shape === "count") agg(await tx.query("SELECT count(*) c, coalesce(sum(n), 0) s FROM users"));
+    else if (shape === "filtered") agg(await tx.query("SELECT count(*) c, coalesce(sum(n), 0) s FROM users WHERE n > ?", [0n]));
+    else if (shape === "rows") rows(await tx.query("SELECT tenant_id, id, n FROM users WHERE n > ? ORDER BY tenant_id, id", [0n]));
+    else if (shape === "padded") rows(await tx.query("SELECT tenant_id, id, n, name FROM users WHERE n > ? ORDER BY tenant_id, id", [0n]));
+    else agg(await tx.query("SELECT count(*) c, coalesce(sum(u.n), 0) s FROM users u JOIN tags g ON g.tenant_id = u.tenant_id WHERE u.n > ?", [0n]));
+  };
+
+  /**
+   * 全表の読みの文を 1 つ実行し、送り方を数える (WideCounts)。取引の、複数のシャードの答えをまとめる口 (ReadScope.budgeted。test/setup.ts が
+   * 区間の検査を掛けた prototype のもの) を、この文の間だけ、取引の上で包む。包みは同じ Promise を返し、送る要求ごとに、Meta が記録した
+   * 移動の数を覚えるだけである (RPC の列を変えない)。
+   */
+  const countedReadAll = async (tx: Txn, reads: Read[], since: number) => {
+    type Read1 = (t: unknown, maxBytes: number) => Promise<unknown>;
+    const scope = tx as unknown as { budgeted: (targets: unknown[], budget: number, read: Read1) => Promise<unknown> };
+    const real = scope.budgeted;
+    const sends: number[] = [];
+    let first = -1;
+    scope.budgeted = (targets, budget, read) => {
+      if (first < 0) first = targets.length;
+      return real.call(tx, targets, budget, (t, maxBytes) => {
+        sends.push(moveStarts());
+        return read(t, maxBytes);
+      });
+    };
+    let outcome = "answered";
+    try {
+      await readAll(tx, reads);
+    } catch (e) {
+      outcome = head(e);
+      throw e;
+    } finally {
+      delete (scope as Partial<typeof scope>).budgeted;
+      wide.statements++;
+      if (first === 1) wide.oneShard++;
+      else if (first > 1) wide.manyShards++;
+      const crossed = moveStarts() > since;
+      if (crossed) wide.acrossMove++;
+      if (sends.length > Math.max(first, 0)) {
+        wide.rounds++;
+        if (new Set(sends).size > 1) wide.roundsAcrossMove++;
+      }
+      if (crossed) tally(wide.outcomes, outcome);
+    }
   };
 
   const oneTxn = async (client: ReturnType<SimCluster["client"]>) => {
@@ -223,34 +405,62 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
       tx.pessimistic = true;
       tx.lockReads = true;
     }
-    const kind = rnd();
+    // 生成器 4 の数え。取引の間に、範囲が前の持ち主へ戻る移動が始まったか。
+    const epoch0 = innerThink ? lastEpoch() : 0;
+    const settle = (outcome: string) => {
+      if (!innerThink || returnsAfter(epoch0) === 0) return;
+      if (writes.length === 0) across.readOnly++;
+      else across.writing++;
+      tally(across.outcomes, outcome);
+    };
+    // 全表の読みの取引 (生成器 1 と 2)。wide のない実行は r3 を引かず、rnd の列も変えない。
+    const wideTxn = o.wide !== undefined && r3() < o.wide.share;
+    const kind = wideTxn ? Number.NaN : rnd();
     const v = seq * 10 + 1;
-    if (kind < 0.25) {
-      await readKey(tx, key(), reads);
-      await readTenant(tx, pick(TENANTS), reads);
-      await readKey(tx, key(), reads);
-    } else if (kind < 0.5) {
-      const x = key();
-      await readKey(tx, x, reads);
-      await put(tx, x, v, writes);
-    } else if (kind < 0.75) {
-      await readKey(tx, key(), reads);
-      await readKey(tx, key(), reads);
-      await put(tx, key(), v, writes);
-    } else {
-      const a = key();
-      let b = key();
-      while (k(b) === k(a)) b = key();
-      await readTenant(tx, a.t, reads);
-      await put(tx, a, v, writes);
-      await put(tx, b, v + 1, writes);
-    }
     try {
-      await tx.commit();
+      if (wideTxn) {
+        await readKey(tx, key(), reads);
+        const since = moveStarts();
+        if (o.wide!.thinkMs) await c.sleep(r3() * o.wide!.thinkMs);
+        await countedReadAll(tx, reads, since);
+        if (r3() < 0.4) await put(tx, key(), v, writes);
+      } else if (kind < 0.25) {
+        await readKey(tx, key(), reads);
+        if (innerThink) await innerThink();
+        await readTenant(tx, pick(TENANTS), reads);
+        if (innerThink) await innerThink();
+        await readKey(tx, key(), reads);
+      } else if (kind < 0.5) {
+        const x = key();
+        await readKey(tx, x, reads);
+        if (innerThink) await innerThink();
+        await put(tx, x, v, writes);
+      } else if (kind < 0.75) {
+        await readKey(tx, key(), reads);
+        if (innerThink) await innerThink();
+        await readKey(tx, key(), reads);
+        if (innerThink) await innerThink();
+        await put(tx, key(), v, writes);
+      } else {
+        const a = key();
+        let b = key();
+        while (k(b) === k(a)) b = key();
+        await readTenant(tx, a.t, reads);
+        if (innerThink) await innerThink();
+        await put(tx, a, v, writes);
+        await put(tx, b, v + 1, writes);
+      }
+      try {
+        await tx.commit();
+      } catch (e) {
+        await tx.unlockAll();
+        throw e;
+      }
     } catch (e) {
-      await tx.unlockAll();
+      settle(head(e));
       throw e;
     }
+    settle("committed");
     const ts = tx.commitTs ?? tx.T;
     if (ts === undefined) return;
     history.push({ name, ts, readOnly: writes.length === 0, reads, writes });
@@ -261,7 +471,8 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
       if (o.thinkMs) await c.sleep(r2() * o.thinkMs);
       try {
         // 取引ごとに別セッションにする。因果トークンが時計のずれを隠さないようにするためである。
-        await oneTxn(c.client());
+        // 生成器 2 の実行は、集める予算を小さくした接続を使う。
+        await oneTxn(o.wide?.rounds ? new Db(c, { limits: { bytes: o.wide.rounds.bytes } }) : c.client());
       } catch (e) {
         const m = e instanceof Error ? e.message : String(e);
         if (/^(conflict|read too old|not owner|migrating)/.test(m) || e instanceof SqlError && /UNIQUE/.test(m)) continue;
@@ -290,7 +501,7 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
   const grower = (async () => {
     let next = c.shardIds.length;
     while (!stop && o.splits && splits < MAX_SPLITS) {
-      await c.sleep(25);
+      await c.sleep(25 + (o.splitPaceMs ? r3() * o.splitPaceMs : 0));
       const { routing } = await c.catalog();
       const list = shardsOf(routing);
       const parent = list[Math.floor(rnd() * list.length)]!;
@@ -342,7 +553,7 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
     writeFileSync(process.env.SIM_DUMP, JSON.stringify({ seed: o.seed, history, rpc: c.net.log }, plain));
   }
   const counts = moves?.counts ?? { moves: 0, returns: 0, byChild: 0, restarts: 0, deferred: 0 };
-  return { history, violations: checkHistory(history), unknown, c, splits, problems, counts };
+  return { history, violations: checkHistory(history), unknown, c, splits, problems, counts, wide, across };
 }
 
 // ---- 範囲の移動の乱択 ----
@@ -408,7 +619,7 @@ async function placement(c: SimCluster): Promise<string[]> {
  * finish は、作業負荷が終わった後で、開いた移動が閉じるのを待ち (子が自分で終える。子が移動を知らないままなら、Autoscaler が再開する)、
  * 見つけた問題を返す。
  */
-function startMoves(o: RunOpts, m: MoveChaos, c: SimCluster, r2: () => number) {
+function startMoves(o: RunOpts, m: MoveChaos, c: SimCluster, r2: () => number, r3: () => number, across: AcrossCounts) {
   const counts: MoveCounts = { moves: 0, returns: 0, byChild: 0, restarts: 0, deferred: 0 };
   const problems: string[] = [];
   /** 進める側の split が完了を返した移動 (move-start の epoch)。 */
@@ -430,8 +641,19 @@ function startMoves(o: RunOpts, m: MoveChaos, c: SimCluster, r2: () => number) {
   // instance に返り、その手順は失敗する)。phase 2 と、移動の手順の要求の配送を、ときどき遅らせる。
   /** 配送したが、まだ応答も失敗も返っていない pull (hideStalePull)。 */
   const pulls = new Set<Rpc>();
-  c.net.reply = (x) => void pulls.delete(x);
+  /** 前の持ち主への尋ねの要求か応答を、遅らせるか (MoveChaos.slowAsksMs。生成器 4)。選択肢がなければ r3 を引かない。 */
+  const slowAsk = (x: Rpc): Promise<void> | undefined => {
+    if (!m.slowAsksMs || !ASK_RPCS.has(x.method) || r3() >= 0.5) return undefined;
+    across.delayedAsks++;
+    return c.sleep(r3() * m.slowAsksMs);
+  };
+  c.net.reply = (x) => {
+    pulls.delete(x);
+    return slowAsk(x);
+  };
   c.net.gate = (x) => {
+    const asked = slowAsk(x);
+    if (asked) return asked;
     if (x.method === "pull") pulls.add(x);
     if (m.restarts && MOVE_RPCS.has(x.method) && r2() < 0.12) {
       const who = x.from === "client" || r2() < 0.5 ? x.to : x.from;

@@ -101,6 +101,68 @@ describe("history checker while the shards of a move restart and its driver stop
   }, 240_000);
 });
 
+// ---- 生成器 1 と 2 (docs/design-refresh-across-move.md の「乱択の検査に足す生成器」) ----
+//
+// 1. 全表の集計と、範囲の分割。前の文で行を読んだ取引が、主キーでも shard key でも絞れない文で、全行の数と和か、全行の値を読む。
+//    その間に、分割が読む範囲を動かし、ほかの接続が書く。Worker の refresh と exec の配送を遅らせ、分割が文の途中に入る実行を増やす。
+//    宛先が 1 つの形 (1 シャードから始める実行の、最初の分割の前) と、2 つ以上の形を混ぜる。
+// 2. 1 つの文が、要求を 2 回に分けて送る形。集める予算を小さくし、1 つの tenant の行を大きくして、行の多いシャードが取り分を超え、
+//    予算の残りで 2 回目を送る (ReadScope.budgeted)。2 つの表を集める文 (表ごとに送る。ReadScope.collect) も混ぜる。
+// 判定は、履歴の検査 (数と和、全行の値) と、どの試験にも掛かる全表の読みの区間の検査 (test/sim.ts の checkTiling) である。
+// どの組 (sim、reference-scans、reference-full) でも、全表の読みは全表の経路を通る。
+// foundation-4 (517b674) のコードは、移動をまたいだ全表の読みを、範囲の床 (read too old) か、範囲表を取り替えた後の競合で断る。断るのは
+// 許す (worker が数えて飛ばす)。答えたなら、正しくなければならない。数えた形は、最後の試験が確かめ、1 行で出す。
+describe("history checker with whole-table reads across live splits (generators 1 and 2)", () => {
+  const memo = new Map<string, ReturnType<typeof runHistory>>();
+  const once = (rounds: boolean, seed: number) => {
+    const key = `${rounds}/${seed}`;
+    if (!memo.has(key)) {
+      memo.set(key, run({
+        seed, skewMs: 20, splits: true, splitPaceMs: 120, ops: 30, tenants: 20, shards: seed % 2 === 1 ? 1 : 3,
+        wide: { share: 0.5, thinkMs: 60, holdMs: 40, ...(rounds ? { rounds: { bytes: 16_000 } } : {}) },
+      }));
+    }
+    return memo.get(key)!;
+  };
+  const defaults = { aggregates: [71, 72, 73, 74], rounds: [81, 82, 83, 84] };
+  for (const seed of seedsOr(defaults.aggregates)) {
+    it(`1. answers whole-table aggregates at the transaction's snapshot, or refuses (seed ${seed})`, async () => {
+      const r = await once(false, seed);
+      expect(r.violations.slice(0, 3)).toEqual([]);
+    }, 120_000);
+  }
+  for (const seed of seedsOr(defaults.rounds)) {
+    it(`2. answers statements that send their requests in two rounds, or refuses (seed ${seed})`, async () => {
+      const r = await once(true, seed);
+      expect(r.violations.slice(0, 3)).toEqual([]);
+    }, 120_000);
+  }
+  // 検査が何も確かめていない実行にならないこと。既定の seed で数える。
+  it("reaches the shapes: a statement across a move, to one shard and to several, and a second round across a move", async () => {
+    const agg = await Promise.all(defaults.aggregates.map((s) => once(false, s)));
+    const rounds = await Promise.all(defaults.rounds.map((s) => once(true, s)));
+    const sum = (rs: Awaited<ReturnType<typeof runHistory>>[], f: (w: Awaited<ReturnType<typeof runHistory>>["wide"]) => number) => rs.reduce((a, r) => a + f(r.wide), 0);
+    const outcomes = (rs: Awaited<ReturnType<typeof runHistory>>[]) => {
+      const out: Record<string, number> = {};
+      for (const r of rs) for (const [k, n] of Object.entries(r.wide.outcomes)) out[k] = (out[k] ?? 0) + n;
+      return out;
+    };
+    console.info(
+      `generator 1: ${sum(agg, (w) => w.statements)} whole-table reads (${sum(agg, (w) => w.oneShard)} to one shard, ${sum(agg, (w) => w.manyShards)} to several), ` +
+        `${sum(agg, (w) => w.acrossMove)} across a move: ${JSON.stringify(outcomes(agg))}\n` +
+        `generator 2: ${sum(rounds, (w) => w.rounds)} statements in two or more rounds, ${sum(rounds, (w) => w.roundsAcrossMove)} with a move between rounds; ` +
+        `${sum(rounds, (w) => w.acrossMove)} across a move: ${JSON.stringify(outcomes(rounds))}`,
+    );
+    expect({
+      across: sum(agg, (w) => w.acrossMove) > 0,
+      oneShard: sum(agg, (w) => w.oneShard) > 0,
+      manyShards: sum(agg, (w) => w.manyShards) > 0,
+      rounds: sum(rounds, (w) => w.rounds) > 0,
+      roundsAcrossMove: sum(rounds, (w) => w.roundsAcrossMove) > 0,
+    }).toEqual({ across: true, oneShard: true, manyShards: true, rounds: true, roundsAcrossMove: true });
+  }, 240_000);
+});
+
 // 範囲の移動で時計を渡さない欠陥 (finishWithoutClock) は、この作業負荷では見つからない (2026-11-12 に seed 1 から 1000 で 0 件。
 // その前は 1000 のうち 1 つだった)。決定的な再現は test/move-timestamp.test.ts にある。見つける作業負荷は、計画書の
 // 「Early 版の線」の順番の 4 で作る。
