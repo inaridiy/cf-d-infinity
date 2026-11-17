@@ -402,7 +402,8 @@ export interface SettleAllFrame {
 /** ensureArrived の frame。 */
 export interface ArriveFrame {
   groups: string[];
-  asked?: true;
+  /** グループごとの、最後に引き取りを頼んだときの受け取り中の移動の epoch と、その移動で頼んだ回数。 */
+  asked?: Map<string, { epoch: number; times: number }>;
 }
 
 /** toEpoch (少なくともこの epoch まで列を適用する) の frame。 */
@@ -3095,15 +3096,32 @@ export class ShardKernel {
 
   // ---- 手続き: ライブ移動 ----
 
-  /** 未着のグループを引き取る。 */
+  /**
+   * 未着のグループを引き取る。引き取りの答えが返った後も、受け取り中の範囲にあって、まだ届いていないグループがあれば、いまの受け取り中の
+   * 移動で、もう一度頼む (docs/design-move-messages.md の規則 5。モデル M5d の ASK_AGAIN)。答えは、捨てられていることがある。前の移動の
+   * 間に頼んだ引き取りの答えは、その移動を受け取り終えた後に届くと捨てられ、そのとき範囲が戻って、また出ていれば、グループは、いまの
+   * 移動ではまだ届いていない。1 回だけ頼んで進むと、文は group not arrived で断られる。断られる理由は移動だけである (計画書の規則 4)。
+   *
+   * 頼み直す回数は、移動の数で抑えられる。受け取り中の移動の答えは、いつも、グループを届かせるか、受け取り終えさせるからである。
+   * 同じ移動で 2 回頼んでも届かないグループは、もう頼まない。殻は、引き取りをグループの名前でまとめるので、1 回目は、前の移動の間に
+   * 始まった引き取りに合流していることがある (その答えは捨てられる)。2 回目の引き取りは、その引き取りが終わった後に始まるので、いまの
+   * 移動のものである。その答えでも届かなければ、3 回目も同じ答えになる。
+   * 欠陥のスイッチ askOnce は、1 回だけ頼んで、届いたかを見ずに進む。
+   */
   private arriveStep(f: ArriveFrame): Step<void, ArriveFrame> {
-    if (f.asked) return done(undefined);
-    const wanted = f.groups.filter((g) => {
+    if (this.faults.askOnce && f.asked) return done(undefined);
+    const asked = (f.asked ??= new Map());
+    const wanted: string[] = [];
+    for (const g of f.groups) {
       const range = this.incomingIn(this.areaOf(g));
-      return range !== undefined && !this.arrivedIn(g, range);
-    });
+      if (range === undefined || this.arrivedIn(g, range)) continue;
+      const last = asked.get(g);
+      const times = last?.epoch === range.epoch ? last.times : 0;
+      if (times >= 2) continue;
+      asked.set(g, { epoch: range.epoch, times: times + 1 });
+      wanted.push(g);
+    }
     if (!wanted.length) return done(undefined);
-    f.asked = true;
     return wait({ kind: "pull", groups: wanted });
   }
 

@@ -582,6 +582,12 @@ export interface Faults {
    * の m5c_red_clear_at_start、未解決の問題 54)。グループが届く前に来た phase 2 を、適用も転送もせずに受け取ったと答える。
    */
   unmarkOnReturn?: boolean;
+  // ---- 移動の要求と応答が、その移動より後に届くときの規則 (計画書の不変条件 15。docs/design-move-messages.md、モデル M5d) ----
+  /**
+   * 引き取りの答えを待っていた文が、答えが返った後で、グループが届いたかを見ずに進む (5808b08 のコード。M5d の m5d_red_ask_once)。
+   * 前の移動の間に頼んだ引き取りの答えが、同じ範囲の後の移動の受け取り中に捨てられると、文は group not arrived で断られる。
+   */
+  askOnce?: boolean;
   /** autocommit の書き込みが、他の取引の intent との UNIQUE を照合しない (2026-11 のレビューで見つかった欠陥)。 */
   autoIgnoresUniqueIntents?: boolean;
   /**
