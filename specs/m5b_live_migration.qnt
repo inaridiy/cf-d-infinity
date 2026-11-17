@@ -90,6 +90,7 @@ module m5b_core {
   var finished: bool                      // C: 範囲の移動を終えた (finishRange)
   var pfloor: int -> int                  // P: group -> これより小さい T の読みを断る時刻。P が前の移動の子だったときの、到着の m と床
   var hops: int                           // 範囲を移し直した回数
+  var lateFinish: bool                    // 幽霊の変数 (2026-11-17、M5d に合わせた finishRange の witness 用): 渡したが届いていない空のグループがある間に、範囲の移動を終えた
 
   pure val noPull: Pull = { g: 0, m: 0, data: Set(), withIntent: false }
   pure val noBad: Bad = { g: 0, t: 0, dom: 0, got: 0, want: 0 }
@@ -113,10 +114,10 @@ module m5b_core {
     intent' = { where: 0, pts: 0, c: 0, pushed: 0, preparedAt: 0 },
     badRead' = false, lastBad' = noBad,
     open' = Set(), served' = GROUPS.mapBy(_ => 0), lateWrite' = false,
-    pendingDel' = DELETES, floor' = 0, finished' = false, pfloor' = GROUPS.mapBy(_ => 0), hops' = 0
+    pendingDel' = DELETES, floor' = 0, finished' = false, pfloor' = GROUPS.mapBy(_ => 0), hops' = 0, lateFinish' = false
   }
 
-  action keepFloor = all { floor' = floor, finished' = finished, pfloor' = pfloor, hops' = hops }
+  action keepFloor = all { floor' = floor, finished' = finished, pfloor' = pfloor, hops' = hops, lateFinish' = lateFinish }
   action keepMove = all { moved' = moved, arrived' = arrived, fenced' = fenced, route' = route, pullMsg' = pullMsg, open' = open, keepFloor }
   action keepWrites = all { pending' = pending, truth' = truth, cAccepted' = cAccepted, dual' = dual, hist' = hist, lateWrite' = lateWrite,
                             pendingDel' = pendingDel }
@@ -315,6 +316,7 @@ module m5b_core {
       open' = open.union(rest),
       hist' = hist.set(C, GROUPS.mapBy(g => if (rest.contains(g)) initVers else hist.get(C).get(g))),
       floor' = if (RANGE_FLOOR) m else floor, finished' = true, pfloor' = pfloor, hops' = hops,
+      lateFinish' = (lateFinish or handedEmpty != Set()),
       arrived' = arrived, fenced' = fenced, route' = route, pullMsg' = noPull,
       pending' = pending, truth' = truth, cAccepted' = cAccepted, dual' = dual, lateWrite' = lateWrite, pendingDel' = pendingDel,
       cache' = cache, intent' = intent, keepRead
@@ -324,7 +326,7 @@ module m5b_core {
   // 子の再起動。床が永続していなければ、床を忘れる。ほかの状態は永続している (pull の応答の喪失は losePull)。
   action restartC = all {
     RANGE_FLOOR, not(FLOOR_DURABLE), floor > 0,
-    floor' = 0, finished' = finished, pfloor' = pfloor, hops' = hops,
+    floor' = 0, finished' = finished, pfloor' = pfloor, hops' = hops, lateFinish' = lateFinish,
     moved' = moved, arrived' = arrived, fenced' = fenced, route' = route, pullMsg' = pullMsg, open' = open,
     hlc' = hlc, cache' = cache, intent' = intent, keepWrites, keepRead
   }
@@ -345,7 +347,7 @@ module m5b_core {
     hist' = Map(P -> hist.get(C), C -> GROUPS.mapBy(_ => Set())),
     pfloor' = GROUPS.mapBy(g => max(arrived.get(g), floor)),
     moved' = GROUPS.mapBy(_ => 0), arrived' = GROUPS.mapBy(_ => 0), open' = Set(),
-    fenced' = false, finished' = false, floor' = 0,
+    fenced' = false, finished' = false, floor' = 0, lateFinish' = lateFinish,
     route' = P, cache' = WORKERS.mapBy(_ => P), pullMsg' = noPull,
     intent' = if (intent.where == C) intent.with("where", P).with("preparedAt", P) else intent,
     cAccepted' = Set(),
@@ -473,9 +475,9 @@ module m5b_core {
   val witnessIntentMovedThenApplied = not(intent.where == 3 and intent.preparedAt == P and arrived.get(groupOf(X)) > 0
                                           and latest(hist.get(C).get(groupOf(X))).writer == X)
   val witnessOpenWritten = not(open != Set() and cAccepted.intersect(open) != Set())
-  // (2026-11-17、M5d に合わせて緩めた) 親が空のまま渡した (親の履歴に delete@m がある) グループを、子が到着なしで受け持ち、そこへ書き込みを受理した
-  val witnessHandedEmptyOpen = not(GROUPS.exists(g => open.contains(g) and arrived.get(g) == 0
-    and hist.get(P).get(g).exists(v => v.writer == TOMB) and cAccepted.contains(g)))
+  // (2026-11-17、M5d に合わせて緩めた finishRange) 渡したが届いていない空のグループがある間に、親が範囲の移動を終え、子が到着なしで
+  // 受け持った範囲に書き込みを受理した
+  val witnessLateFinish = not(lateFinish and cAccepted.intersect(open) != Set())
   // 親が移動の前に空にしたグループ (削除の版が、範囲の移動を終えた時刻より前にある) を、子が到着なしで受け持っている
   def emptiedThenOpen(g: int): bool =
     open.contains(g) and truth.get(g).exists(v => v.writer == 0 and v.ver > 0 and v.ver < moved.get(g))

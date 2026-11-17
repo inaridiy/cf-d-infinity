@@ -150,7 +150,7 @@ witness $f m5b_green_floor witnessEmptiedWritten
 witness $f m5b_green_floor_clock witnessEmptiedRead
 witness $f m5b_green_floor_resplit witnessSecondHopWritten
 witness $f m5b_green_floor_resplit witnessSecondHopEmptied
-witness $f m5b_green_floor_clock witnessHandedEmptyOpen   # 親が空のまま渡したグループを、子が到着なしで受け持ち、書き込みを受けた (M5d に合わせて緩めた finishRange)
+witness $f m5b_green_floor_clock witnessLateFinish        # 渡した空のグループの応答が飛んでいる間に親が終え、子が受け持った範囲に書き込みを受けた (M5d に合わせて緩めた finishRange)
 for m in m5b_green m5b_green_range m5b_red_range m5b_red_s3 m5b_red_s3_parent m5b_red_p2 m5b_red_p2_window m5b_red_intents \
          m5b_red_emptied m5b_green_floor m5b_green_floor_clock m5b_green_floor_clock_x m5b_red_floor_volatile m5b_red_floor_no_clock \
          m5b_green_floor_resplit m5b_green_floor_resplit_x; do tests $f $m; done
