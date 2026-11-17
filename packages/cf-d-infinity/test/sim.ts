@@ -384,6 +384,12 @@ export class SimNet {
    * 既定では何もしない。
    */
   reply: (m: Rpc) => Promise<void> | void = () => {};
+  /**
+   * 要求が宛先に届く瞬間に呼ぶ (gate と網の遅延の後、宛先の処理の直前)。投げると、その要求は届かずに失敗する (drop と同じ)。
+   * gate は遅延の前に呼ぶので、届くときの宛先の状態は、ここでしか見られない。乱択の検査が、届いた要求を宛先の記録で分類し、
+   * 見つけて直していない欠陥の要求を落とすのに使う (test/history.ts の MoveChaos.late)。既定では何もしない (RPC の列を変えない)。
+   */
+  arrive: (m: Rpc) => void = () => {};
 }
 
 /** Worker の側の欠陥のスイッチの名前 (src/client/db.ts の ClientFaults)。 */
@@ -914,6 +920,7 @@ export class SimCluster implements Cluster {
           const delay = this.net.jitter?.() ?? 0;
           if (this.virtual) await this.sleep(delay);
           else await new Promise((r) => (delay > 0 ? setTimeout(r, delay) : setImmediate(r)));
+          this.net.arrive(m);
           // JSON を通して、DO の RPC と同じく参照を共有しないようにする。
           const core = this.core(to);
           // シャードが再起動すると、その instance に届いていた要求は、答えを待たずに失敗する (DO の再起動と同じ。test/workerd-restart.test.ts)。

@@ -96,3 +96,61 @@ describe("transactions across ranges that return to a former owner, with the ask
     expect({ readOnly: sum((r) => r.across.readOnly) > 0, writing: sum((r) => r.across.writing) > 0 }).toEqual({ readOnly: true, writing: true });
   }, 240_000);
 });
+
+// ---- 生成器 5 (遅れた移動のメッセージ。test/history.ts の LateMoves) ----
+//
+// シャードの間のメッセージに期限はなく、移動のメッセージとその応答は、その移動より長く生き得る (consult-58。問題 54、55、58 は、どれもこの類
+// だった)。ここでは、上の 1 つ目と同じ作業負荷と移動に、移動のメッセージ (pull、listGroups、ack、finishMove、転送する phase 2 と、Meta への
+// endMove) の要求か応答を 1 つずつ止めて、その移動と、後に始まった移動が閉じてから届ける手を足す。範囲が前の持ち主へ戻るので、遅れた pull が、
+// 範囲を受け取り直した前の親に届く (表の 1 から 3)。
+// 足した検査は、内部の表の誤りで失敗した文と要求、「group not arrived」の断り、静止した後のメモリの印と記録から作り直す印の比べ、
+// 遅れた配送が受け手の渡しと到着の記録を変えたこと (計画書の不変条件 15) である (history.ts の runHistory)。
+// 2026-11-17 の木 (5808b08) は、この類を直していない (test/open/late-pull-*.test.ts)。既定では、受け手がもう生きた記録を持たない移動の pull と、
+// その応答 (history.ts の LateRow の 1 から 7、returning、other) の配送を落とし (網がメッセージを失うのと同じ)、落とした数を数える。OPEN=1 では
+// 落とさずに届け、検査が見つける。returning は、遅れた pull が、範囲が戻る途中の前の親に届く形 (問題 55 の形) で、このファイルの見出しは
+// 「起きない」としているが、グループが前の親へもう届いた後なら、内部の誤り (UNIQUE constraint failed: __moved...) になる
+// (test/open/late-pull-while-range-returns.test.ts。生成器 5 が OPEN=1 で見つけた)。
+const MASK_LATE = !process.env.OPEN;
+describe("late move messages on ranges that return to a former owner (generator 5)", () => {
+  const memo5 = new Map<number, Promise<RunResult>>();
+  const run5 = (seed: number) => {
+    if (!memo5.has(seed)) {
+      memo5.set(seed, runHistory({
+        seed, shards: 3, tenants: 40, skewMs: 20, ops: 40, thinkMs: 400, slowPhase2Ms: 2_000,
+        // 再起動は seed ごとに入れたり外したりする。再起動した子には、遅れた応答の結果が起きない (受け取る instance がない)。seed 1 から 60 で、
+        // 答えが送った instance へ戻った遅れた pull (LateCounts.lateToLive) と、印の比べが見つけた実行は、再起動ありとなしで、ここでは 45 と 45、
+        // 9 と 10 だったが、前へ進む鎖 (test/move-chains.test.ts) では 29 と 51、1 と 5 だった。
+        moves: { kind: "returns", restarts: seed % 2 === 1, stops: true, slowMoveRpcMs: 60, paceMs: 200, late: { share: 0.4, max: 3, mask: MASK_LATE } },
+      }));
+    }
+    return memo5.get(seed)!;
+  };
+  const defaults5 = [1, 2, 3, 4, 5, 6, 7, 8];
+  for (const seed of seedsOr(defaults5)) {
+    it(`stays serializable, loses no write, and keeps its move records while move messages outlive their moves (seed ${seed})`, async () => {
+      const r = await run5(seed);
+      expect(r.counts.moves).toBeGreaterThan(0);
+      expect(r.violations.slice(0, 3)).toEqual([]);
+      expect(r.problems.slice(0, 5)).toEqual([]);
+    }, 120_000);
+  }
+  // 生成器が何もしない実行にならないこと。止めたメッセージが、移動が閉じた後に届き、遅れた pull とその応答が、範囲が戻った前の親と、受け取り
+  // 終えた子に届く。既定では、mask がその配送を落としたこと (隠したものがあること) も確かめる。数えた形は 1 行で出す。
+  it("delivers move messages after their moves closed, and the mask hides the known defects", async () => {
+    const all = await Promise.all(defaults5.map(run5));
+    const add = (pick: (r: RunResult) => Record<string, number>) => {
+      const out: Record<string, number> = {};
+      for (const r of all) for (const [k, n] of Object.entries(pick(r))) out[k] = (out[k] ?? 0) + n;
+      return out;
+    };
+    const total = (x: Record<string, number>) => Object.values(x).reduce((a, n) => a + n, 0);
+    const situations = add((r) => r.late.situations);
+    const masked = add((r) => r.late.masked);
+    console.info(`generator 5 (returns): held ${JSON.stringify(add((r) => r.late.held))}; outlived ${JSON.stringify(add((r) => r.late.outlived))}; situations ${JSON.stringify(situations)}; masked ${JSON.stringify(masked)}`);
+    expect({
+      outlived: total(add((r) => r.late.outlived)) > 0,
+      late: total(situations) - (situations["request window"] ?? 0) > 0,
+      masked: MASK_LATE ? total(masked) > 0 : true,
+    }).toEqual({ outlived: true, late: true, masked: true });
+  }, 240_000);
+});

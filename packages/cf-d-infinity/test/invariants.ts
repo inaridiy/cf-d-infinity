@@ -29,7 +29,17 @@ export async function drain(c: SimCluster, rounds = 6): Promise<void> {
   for (let i = 0; i < rounds; i++) {
     await c.settle();
     let more = false;
-    for (const core of c.cores.values()) more = (await core.redrive()) || more;
+    for (const [id, core] of c.cores) {
+      // redrive の途中の移動の要求で、ほかのシャードが再起動することがある (test/history.ts の MoveChaos.restarts)。ここで手にした、その
+      // シャードの古い instance の redrive は「fenced instance」で失敗する。再起動で入れ替わった instance の失敗だけを読み飛ばし、次の回で
+      // 新しい instance を回す (検査の誤り。2026-11-17)。
+      try {
+        more = (await core.redrive()) || more;
+      } catch (e) {
+        if (c.cores.get(id) === core) throw e;
+        more = true;
+      }
+    }
     await c.settle();
     if (!more) return;
   }
