@@ -113,7 +113,7 @@ describe("history checker while the shards of a move restart and its driver stop
 // どの組 (sim、reference-scans、reference-full) でも、全表の読みは全表の経路を通る。
 // foundation-4 (517b674) のコードは、移動をまたいだ全表の読みを、範囲の床 (read too old) か、移動の途中の拒否 (migrating) か、範囲表を
 // 取り替えた後の競合で断る。断るのは許す (worker が数えて飛ばす)。答えたなら、正しくなければならない。数えた形は、最後の試験が確かめ、
-// 1 行で出す。2 回目の実装の枝 (eba3354) では、生成器 1 と 2 の 80 の実行のうち 77 で、区間の検査が、1 つの文の答えの claim が 2 つの
+// 1 行で出す。2 回目の実装の枝 (eba3354) では、生成器 1 と 2 の seed 1 から 40 (80 の実行) のうち 74 で、区間の検査が、1 つの文の答えの claim が 2 つの
 // 範囲表から来たことを報告した (未解決の問題 56。送り直す要求の claim を、取り替えた後の範囲表で作る)。
 describe("history checker with whole-table reads across live splits (generators 1 and 2)", () => {
   const memo = new Map<string, ReturnType<typeof runHistory>>();
