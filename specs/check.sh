@@ -794,6 +794,48 @@ fi
 for m in m23c_green_ro_w m23c_green_ro_y m23c_green_w m23c_green_retain m23c_green_empty m23c_base_ro m23c_red_child_below \
          m23c_red_no_merge m23c_red_prev_above m23c_red_no_retain m23c_red_no_epoch m23c_red_worker_routes m23c_red_empty_no_floor; do tests $f $m; done
 
+echo "== M23f statement snapshot (Worker の 1 つの文の要求は、どれも、その試みを計画した範囲表で区間を切る。実装より先に書いたモデル)"
+f=m23f_statement_snapshot.qnt
+green   $f m23f_green stmtSafe                          # 送る前に確かめ、取引の範囲表が試みのスナップショットでなければ計画し直す。移動 1 回
+green   $f m23f_green_plan stmtSafe                     # claim を試みのスナップショットで切り、計画し直すのは NotOwner のときだけ、という形も安全
+red     $f m23f_red_claim_at_send noRegionDropped       # 2 回目の実装: claim を、送るときの範囲表で切る。宛先にないシャードへ動いた区間を、誰も読まない
+red     $f m23f_red_claim_at_send noRegionTwice         # 同上: 答えを残した宛先から、送り直す宛先へ動いた区間を、2 度数える
+green   $f m23f_red_claim_at_send readAtT               # 同上でも、シャードの答えは T の値である (誤るのは、Worker の答えの合わせ方)
+red     $f m23f_red_resend_only noRegionTwice           # 送り直しの前だけ確かめる: 範囲表が替わった後の最初の送信が、新しい範囲表で切る
+red     $f m23f_red_keep_answers noRegionTwice          # 計画し直すとき、答えた宛先の答えを残す (2 つのスナップショットの答えが混ざる)
+live    $f m23f_live stmtEnds                           # 活性: 文はいつか揃う (移動では失敗しない)
+witness $f m23f_green witnessRestartThenDone            # 計画し直した文が、2 つのシャードの答えで揃う
+witness $f m23f_green witnessAdvancedAcrossSwap         # 範囲表を取り直した確かめが通って T が進み、文が揃う
+witness $f m23f_green witnessDoneOnOldSnapshot          # 範囲表が替わった後、送る要求が残っていなければ、前のスナップショットの答えだけで揃う
+witness $f m23f_green witnessFirstSendRestart           # 最初の送信の前の確かめで計画し直す (送り直しのない道)
+witness $f m23f_green witnessNotAdvanced                # T を進められなかった文が、古い T のまま、計画し直して揃う
+if [ "${HEAVY:-0}" = "1" ]; then                        # 移動 2 回 (2,896 万状態と 1,562 万状態。5 分と 3 分)
+  green $f m23f_green2 stmtSafe
+  green $f m23f_green_plan2 stmtSafe
+fi
+for m in m23f_green m23f_green_plan m23f_red_claim_at_send m23f_red_resend_only m23f_red_keep_answers; do tests $f $m; done
+
+echo "== M23g ask then enter (前の持ち主に尋ねてから同期区間に入る間に、範囲が戻ってくる。受け持った期間ごとに答える。実装より先に書いたモデル)"
+f=m23g_ask_then_enter.qnt
+green   $f m23g_green_read m23gSafe                     # 読むだけの取引 (古い読み)。範囲が P → C → P → C と動く。書き手 W 2 つと Y
+green   $f m23g_green_validate m23gSafe                 # 読んで書く取引 (確定の検証)
+green   $f m23g_green_read_d m23gSafe                   # 範囲が別のシャードを回って戻る形 (P → C → D → C)
+green   $f m23g_green_validate_d m23gSafe
+green   $f m23g_forward_no_recheck m23gSafe             # 範囲が前の持ち主へ戻らなければ (P → C → D)、入口の確かめがなくても破れない
+green   $f m23g_forward_no_recheck_validate m23gSafe
+red     $f m23g_red_no_recheck readConsistent           # 入口で受け取りの記録を確かめない (2 回目の実装): 古い読みが、ほかの期間に適用された T 以下の版を落とす
+red     $f m23g_red_no_recheck_validate serializable    # 同上、確定の検証: ほかの期間の確定を見落として確定する
+red     $f m23g_red_no_recheck_d serializable           # 同上、P → C → D → C の形
+red     $f m23g_red_no_window readConsistent            # 前の持ち主が、受け持った期間で区切らない: 後の期間の確定の before-image で、前の期間の行を戻す
+red     $f m23g_red_no_window answerStable              # 同上: 同じ問いの答えが、尋ねる時点で変わる
+red     $f m23g_red_held_overlaid readConsistent        # 前の持ち主が、T に持っていた部分にも残した版を重ねる: 古い版が、土台の新しい確定を隠す
+live    $f m23g_live xEnds                              # 活性: 尋ね直しは終わり、取引はいつか終わる
+witness $f m23g_green_read witnessReasked               # 尋ねてから入るまでに範囲が戻り、尋ね直して読みに答える
+witness $f m23g_green_read witnessOverlaidAfterReask    # 尋ね直した答えが、ほかのシャードの期間に、受け持ち始める前の c で適用された版である
+witness $f m23g_green_read witnessThreeHops             # 3 つの期間をさかのぼる読み
+witness $f m23g_green_validate witnessConflictAfterReask   # 尋ね直した確かめが、ほかの期間の確定を見つけて、取引が競合になる
+for m in m23g_green_read m23g_green_validate m23g_red_no_recheck m23g_red_no_recheck_validate m23g_red_no_window m23g_red_held_overlaid; do tests $f $m; done
+
 echo "== M25 txn lock lease (行ロックの寿命を取引のものにする。どの文も、取引の全部のロックを延ばす。実装より先に書いたモデル)"
 f=m25_txn_lock_lease.qnt
 green   $f m25_green leaseSafe                          # 決めた設計 (R = 1)。4 つの置き場所を、同じ利用者の手で並べて動かす
