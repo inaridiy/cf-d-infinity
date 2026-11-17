@@ -33,7 +33,8 @@ const run = (seed: number) => {
 };
 
 describe("ranges that move away and come back to a former owner, in random orders", () => {
-  const defaults = [1, 2, 3, 4, 5, 6, 7, 8];
+  // 1 から 8 と、問題 55 を見つけた 119 (伏せる条件 hideStalePull が、既定の seed で何かを後回しにすることを確かめるため)。
+  const defaults = [1, 2, 3, 4, 5, 6, 7, 8, 119];
   for (const seed of seedsOr(defaults)) {
     it(`stays serializable, loses no write, and leaves no delivered intent behind (seed ${seed})`, async () => {
       const r = await run(seed);
