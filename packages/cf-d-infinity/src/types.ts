@@ -361,15 +361,17 @@ export interface ShardApi {
   // 移動は Meta の列の move-start で始まる (docs/design-catalog-epoch.md の段 4)。親は move-start を適用すると、その区間の書き込みを
   // 断り (fence)、子は適用すると受け取り始め、自分で移動を進める。子から親への要求 (listGroups、pull、finishMove) は move-start の
   // epoch を運び、親は、その epoch まで列を適用してから答える (M21 の PULL_AT_EPOCH)。
+  // 移動の要求は、どれも、移動を epoch で名指しする (計画書の不変条件 15、docs/design-move-messages.md)。epoch は省けない。要求は、その移動が
+  // 閉じた後に届くことがあり、区間だけでは、同じ区間の後の移動と見分けられない。ack は、piece ごとに epoch を運ぶ。
   /** 終わっていない範囲の移動。 */
   moves(req: Record<string, never>): Promise<{ outgoing: (Interval & { to: string })[]; incoming: (Interval & { from: string })[] }>;
   /** 範囲にあるグループを列挙する。列挙するのはグループで、piece ではない。 */
-  listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch?: number }): Promise<{ groups: string[]; cursor: GroupCursor | null }>;
+  listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch: number }): Promise<{ groups: string[]; cursor: GroupCursor | null }>;
   /**
    * 区間 [start, end) の fence から、piece を子へ渡す。want は、グループごとに、子が欲しい piece を位置で指す。
    * いまは、どの piece もグループの全体なので、子は `{ g, from: null }` だけを送る。
    */
-  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch?: number }): Promise<PiecePayload[]>;
+  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch: number }): Promise<PiecePayload[]>;
   ack(req: { pieces: Piece[] }): Promise<void>;
   /**
    * 子が移動を終えるまで進める (docs/design-catalog-epoch.md の決めたこと 4)。epoch は移動の move-start の epoch で、子はそこまで列を
@@ -381,7 +383,7 @@ export interface ShardApi {
    * 範囲を渡し終えた印を付ける。返す m は、このシャードがその範囲について発行した、どの時刻よりも大きい。
    * 受け取る側の finishIncoming に渡す。
    */
-  finishMove(req: Interval & { epoch?: number }): Promise<{ m: Ts }>;
+  finishMove(req: Interval & { epoch: number }): Promise<{ m: Ts }>;
   /** 範囲を受け取り終えた印を付ける。時計を m まで進めてから、届かなかったグループ (渡す側に行がなかった) を受け持ち始める。 */
   finishIncoming(req: Interval & { m: Ts }): Promise<void>;
   metrics(req: Record<string, never>): Promise<ShardMetrics>;

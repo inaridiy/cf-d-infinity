@@ -384,7 +384,7 @@ export interface EpochFrame {
 
 /** pull の frame。 */
 export interface PullFrame {
-  req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch?: number };
+  req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch: number };
   /** 移動の epoch まで列を適用した (fence が付いた)。 */
   reached?: true;
   out?: PiecePayload[];
@@ -392,13 +392,13 @@ export interface PullFrame {
 
 /** listGroups の frame。 */
 export interface GroupsFrame {
-  req: Interval & { limit: number; cursor?: GroupCursor | null; epoch?: number };
+  req: Interval & { limit: number; cursor?: GroupCursor | null; epoch: number };
   reached?: true;
 }
 
 /** finishMove の frame。 */
 export interface FinishMoveFrame {
-  req: Interval & { epoch?: number };
+  req: Interval & { epoch: number };
   reached?: true;
 }
 
@@ -1263,12 +1263,11 @@ export class ShardKernel {
 
   /**
    * 子からの移動の要求 (listGroups、pull、finishMove) が名指しする fence。epoch は移動の move-start の epoch で、親はその epoch まで
-   * 列を適用してから引く (M21 の PULL_AT_EPOCH)。区間も、その fence の区間でなければならない。epoch を運ばない要求 (試験が直に
-   * 送る) は、区間の終わっていない fence を引く。
+   * 列を適用してから引く (M21 の PULL_AT_EPOCH)。区間も、その fence の区間でなければならない。fence は epoch だけで名指しする。区間で
+   * 引くと、終わった移動の遅れた要求が、同じ区間の後の移動の fence に当たる (docs/design-move-messages.md の「実装がすること」の 2)。
    */
-  private fenceOf(req: Interval & { epoch?: number }): FencedRange | undefined {
-    if (req.epoch !== undefined) return this.fenced.find((x) => x.epoch === req.epoch && sameInterval(x, req));
-    return this.fenced.find((x) => sameInterval(x, req) && !x.done);
+  private fenceOf(req: Interval & { epoch: number }): FencedRange | undefined {
+    return this.fenced.find((x) => x.epoch === req.epoch && sameInterval(x, req));
   }
 
   /**
@@ -1276,10 +1275,10 @@ export class ShardKernel {
    * ack されていないグループは移動済みでも返す。子が受け取る前に落ちると応答が失われるからである。
    * 渡して ack を受けたと数えるのは、この移動 (fence の epoch) で渡したグループだけである。前の移動で渡して、受け取り直したグループは数えない。
    */
-  private listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch?: number }): { groups: string[]; cursor: GroupCursor | null } {
+  private listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch: number }): { groups: string[]; cursor: GroupCursor | null } {
     // ブロックを途中で切る範囲では、範囲の中に行か intent を持つグループだけを挙げることになる。いまは、切らない範囲だけを受ける。
     this.wholeSlotsOnly(req);
-    const epoch = this.fenceOf(req)?.epoch ?? req.epoch;
+    const epoch = req.epoch;
     const handed = (g: string) => {
       const k = this.moved.get(g);
       return k !== undefined && k.epoch === epoch && k.acked;
@@ -1357,7 +1356,7 @@ export class ShardKernel {
   }
 
   /** 範囲を渡し終えた印を付けて、子に渡す時刻を返す。呼ぶのは、移動の epoch まで列を適用した後である (finishMoveStep)。 */
-  private finishHanding(req: Interval & { epoch?: number }): { m: Ts } {
+  private finishHanding(req: Interval & { epoch: number }): { m: Ts } {
     const f = this.fenceOf(req);
     if (f && !f.done) {
       this.b.exec(`UPDATE __fenced SET done = 1 WHERE epoch = ?`, f.epoch);
@@ -2937,15 +2936,15 @@ export class ShardKernel {
    * 子から親への移動の要求 (listGroups、pull、finishMove) を受けた親が、答える前に、要求が運ぶ move-start の epoch まで列を適用するか
    * (M21 の PULL_AT_EPOCH)。適用すると fence が付く。欠陥のスイッチ pullWithoutEpoch は、適用せずに (fence の前に) 答える。
    */
-  private reachMove(req: { epoch?: number }): boolean {
-    return !this.faults.pullWithoutEpoch && req.epoch !== undefined && req.epoch > this.applied;
+  private reachMove(req: { epoch: number }): boolean {
+    return !this.faults.pullWithoutEpoch && req.epoch > this.applied;
   }
 
   /** 範囲のグループを列挙する (ShardApi.listGroups)。親は、移動の epoch まで列を適用してから (fence が付いてから) 答える。 */
   private groupsStep(f: GroupsFrame): Step<{ groups: string[]; cursor: GroupCursor | null }, GroupsFrame> {
     if (!f.reached) {
       f.reached = true;
-      if (this.reachMove(f.req)) return wait(this.call("toEpoch", { epoch: f.req.epoch! }));
+      if (this.reachMove(f.req)) return wait(this.call("toEpoch", { epoch: f.req.epoch }));
     }
     return done(this.listGroups(f.req));
   }
@@ -2954,7 +2953,7 @@ export class ShardKernel {
   private finishMoveStep(f: FinishMoveFrame): Step<{ m: Ts }, FinishMoveFrame> {
     if (!f.reached) {
       f.reached = true;
-      if (this.reachMove(f.req)) return wait(this.call("toEpoch", { epoch: f.req.epoch! }));
+      if (this.reachMove(f.req)) return wait(this.call("toEpoch", { epoch: f.req.epoch }));
     }
     return done(this.finishHanding(f.req));
   }
@@ -2974,15 +2973,15 @@ export class ShardKernel {
       // 移動の epoch まで列を適用してから渡す。適用で fence が付き、以後、この区間の書き込みを断る。適用する前に渡すと、渡した後も古い
       // 範囲表の書き込みを受け、子へ渡した行に届かない (M21 の m21_red_pull_unfenced)。
       f.reached = true;
-      if (this.reachMove(f.req)) return wait(this.call("toEpoch", { epoch: f.req.epoch! }));
+      if (this.reachMove(f.req)) return wait(this.call("toEpoch", { epoch: f.req.epoch }));
     }
     f.out = this.pullPieces(f.req);
     return wait({ kind: "sync" });
   }
 
-  private pullPieces(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch?: number }): PiecePayload[] {
+  private pullPieces(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch: number }): PiecePayload[] {
     // 欠陥のスイッチ pullWithoutEpoch: move-start を適用していない (fence していない) 親が、頼まれた区間を、頼んだシャードへ渡す。
-    const fence = this.fenceOf(req) ?? (this.faults.pullWithoutEpoch ? { ...intervalOf(req), to: req.to, done: 0, epoch: req.epoch ?? 0 } : undefined);
+    const fence = this.fenceOf(req) ?? (this.faults.pullWithoutEpoch ? { ...intervalOf(req), to: req.to, done: 0, epoch: req.epoch } : undefined);
     const out: PiecePayload[] = [];
     let bytes = 0;
     for (const w of req.want) {

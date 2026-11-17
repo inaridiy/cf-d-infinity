@@ -282,13 +282,13 @@ export class ShardCore implements ShardApi {
   status(req: { txn: string }): Promise<TxnStatus> {
     return this.start("status", { req });
   }
-  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch?: number }): Promise<PiecePayload[]> {
+  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch: number }): Promise<PiecePayload[]> {
     return this.start("pull", { req });
   }
-  listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch?: number }): Promise<{ groups: string[]; cursor: GroupCursor | null }> {
+  listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch: number }): Promise<{ groups: string[]; cursor: GroupCursor | null }> {
     return this.start("groups", { req });
   }
-  finishMove(req: Interval & { epoch?: number }): Promise<{ m: Ts }> {
+  finishMove(req: Interval & { epoch: number }): Promise<{ m: Ts }> {
     return this.start("finishMove", { req });
   }
   /** 子として、移動を終えるまで進める (ShardApi.drain)。移動を進めている最中なら、それに合流する。 */
