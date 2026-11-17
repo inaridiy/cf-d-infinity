@@ -836,6 +836,24 @@ witness $f m23g_green_read witnessThreeHops             # 3 つの期間をさ�
 witness $f m23g_green_validate witnessConflictAfterReask   # 尋ね直した確かめが、ほかの期間の確定を見つけて、取引が競合になる
 for m in m23g_green_read m23g_green_validate m23g_red_no_recheck m23g_red_no_recheck_validate m23g_red_no_window m23g_red_held_overlaid; do tests $f $m; done
 
+echo "== M23h wide read (シャードの全表の読み。要求の claim の行だけを、時刻 T の値で答える。実装より先に書いたモデル)"
+f=m23h_wide_read.qnt
+green   $f m23h_green m23hSafe                          # 1 回の移動で 2 つの区間が動く。親は送り出しの途中も答え、子は受け取り終えるのを待って答える
+green   $f m23h_green2 m23hSafe                         # 2 回の移動 (受け取りの記録が 2 つ)。子は claim を記録ごとに分ける
+live    $f m23h_live readEnds                           # 活性: 読みは、いつか答えられるか NotOwner で断られる (子の待ちは終わる)
+red     $f m23h_red_ignore_claim answersClaim           # 答える行を claim で絞らない: move-start を適用していない親が、動く区間の行も答える
+red     $f m23h_red_partial answersClaim                # claim の一部しか持たなくても、持つ部分だけを答える
+red     $f m23h_red_newest_floor answersAtT             # claim の全部を、いちばん新しい記録の床で決める: 子の書き込みを落とす
+red     $f m23h_red_oldest_floor answersAtT             # いちばん古い記録の床で決める: 床より前の T の区間を、受け取った行で答える
+red     $f m23h_red_no_wait answersAtT                  # 受け取り中の子が、待たずに答える: 届いていない区間の行が落ちる
+red     $f m23h_red_child_migrating neverMigrating      # 前のコード: 受け取り中の子が migrating で断る (移動だけで文が失敗する)
+red     $f m23h_red_parent_migrating neverMigrating     # 前のコード: 送り出している親が migrating で断る
+witness $f m23h_green2 witnessSplitAnswer               # 1 つの claim の中で、ある区間は親に尋ね、別の区間は自分の行で答える
+witness $f m23h_green witnessWaitedThenAnswered         # 子が、受け取り終えるのを待ってから答える
+witness $f m23h_green witnessParentDuringMove           # 親が、送り出している途中に、残る区間の claim に答える
+witness $f m23h_green witnessNarrowClaim                # 親が、まだ適用していない move-start を知っている Worker の、狭い claim に答える
+for m in m23h_green m23h_green2 m23h_red_ignore_claim m23h_red_partial m23h_red_newest_floor m23h_red_oldest_floor m23h_red_no_wait; do tests $f $m; done
+
 echo "== M23i guard across move (取引が読んだ表を DROP する前の確かめを、範囲の移動をまたいで通す。実装より先に書いたモデル)"
 f=m23i_guard_across_move.qnt
 green   $f m23i_green m23iSafe                          # 確かめをいまの持ち主へ送り、持ち主が前の持ち主に尋ね、自分の記録を読んだ時刻から確かめる
