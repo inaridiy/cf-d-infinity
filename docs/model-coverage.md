@@ -78,6 +78,24 @@ Categories:
   `m23j_red_no_floor` (M24's `m24_floor_red_no_floor` again); `m23j_addcol_no_reshape` breaks only the image-shape invariant,
   so only the row-image check can replay it, and `m23j_always_rename` and the `floorNeeded` check of `m23j_green_rename`
   compare where the DDL floor is put (decided 2026-11-17: at the table's largest logged commit time, as above).
+  M5d (`m5d_move_messages.qnt`, 2026-11-17) models move requests and responses that outlive their move: a pull, a pull
+  response or an ack that arrives after the move finished, after the range moved on, or after it came back (problems 54,
+  55 and 58, and the seven orderings a review listed; [design-move-messages.md](./design-move-messages.md)). The rule it
+  checks is not in the code: a shard changes its handing and receiving records only for a request or response that names
+  a move epoch it holds a live record for, the parent answers "finished handing" otherwise and the child finishes
+  receiving on that answer, and the in-memory marks are derived from the records by one function. Its 16 modules with a
+  `red` line get rows, switches and replays with the implementation. `m5d_code_return`, `m5d_code_chain` and
+  `m5d_code_return3` are today's code (`5808b08`); their runs `member1Test` to `member7Test` are the seven orderings, and
+  `test/open/late-pull-after-range-returned.test.ts` replays the first. `m5d_code_parent_rule*`, `m5d_code_child_rule*`
+  and `m5d_code_derived_*` put one condition into today's code and show which orderings remain. The reds that remove one
+  condition, with the switch that should put it back: `m5d_red_rehand` (`rehandFinished`), `m5d_red_child_stale`
+  (`childAcceptsStale`), `m5d_red_finished_refusal` (`finishedAsRefusal`, the withdrawn attempt `89d99c8`),
+  `m5d_red_mark_before_write` (`markBeforeWrite`) and `m5d_red_boot_differs` (`bootMarksDiffer`); `m5d_red_late_ack` and
+  `m5d_red_ask_once` have no switch name yet. `markBeforeWrite` and `bootMarksDiffer` break nothing while the parent and
+  child rules hold (`m5d_marks_*` are green), so those two reds also remove the parent rule, and their replays have to
+  switch `rehandFinished` on as well. `m5d_red_rehand` and `m5d_red_late_ack` break only the rule itself
+  (`handsUnderFence`) and, for the former, a failed record write; a replay has to assert on the records, not on rows.
+  M5d replaces M5c's "refuse the late pull" (`m5c_red_rehand`) by "answer finished handing".
 
 | module | flaw modelled | fault switch | deterministic replay | cat |
 |---|---|---|---|---|
