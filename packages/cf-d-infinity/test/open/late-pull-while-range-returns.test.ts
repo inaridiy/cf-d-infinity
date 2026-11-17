@@ -1,4 +1,4 @@
-// 未解決 (2026-11-17、生成器 5 が見つけた。遅れた移動のメッセージの類で、consult-58 の表 (test/history.ts の LateRow) にない形。LateRow の returning): 終わった移動の遅れた pull が、範囲が前の
+// 未解決 (2026-11-17、生成器 10 が見つけた。遅れた移動のメッセージの類で、遅れた移動のメッセージの類の表 (test/history.ts の LateRow) にない形。LateRow の returning): 終わった移動の遅れた pull が、範囲が前の
 // 持ち主へ戻る途中 (前の持ち主が受け取り中) で、そのグループが前の持ち主へもう届いた後に届くと、前の持ち主は、そのグループを渡し直そうと
 // して、内部の誤り (UNIQUE constraint failed: __moved.g, __moved.epoch, __moved.after) で答える。その pull を待っていた利用者の文も、この誤りで
 // 失敗する。問題 55 の誤りと同じである。
@@ -7,7 +7,7 @@
 // 54 の直し (渡した印を、グループが戻るまで外さない) で通るようになった。印は、グループが届いたときに外れる (src/shard/kernel.ts の
 // receiveStep)。その後で届いた pull は、印がないので、新しい渡しとして __moved に (g, 移動 1) を足そうとし、移動 1 の drain が足した行と
 // ぶつかる。表の 3 (test/open/late-pull-of-carried-group.test.ts) は、同じことを、前の持ち主が受け取り終えた後に届けて起こす。
-// 乱択の検査では、生成器 5 (test/move-returns.test.ts の「generator 5」を OPEN=1 で流す) が「situation returning」として数え、内部の誤りの
+// 乱択の検査では、生成器 10 (test/move-returns.test.ts の「generator 10」を OPEN=1 で流す) が「situation returning」として数え、内部の誤りの
 // 検査が見つける。
 //
 // 台本: 1 シャードの全部の範囲を s0 から s1 へ動かし (移動 1)、s1 で id 7 を読む文が送る on-demand の pull を止める。移動 1 は drain で

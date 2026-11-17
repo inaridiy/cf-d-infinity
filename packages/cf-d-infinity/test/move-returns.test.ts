@@ -97,9 +97,9 @@ describe("transactions across ranges that return to a former owner, with the ask
   }, 240_000);
 });
 
-// ---- 生成器 5 (遅れた移動のメッセージ。test/history.ts の LateMoves) ----
+// ---- 生成器 10 (遅れた移動のメッセージ。test/history.ts の LateMoves) ----
 //
-// シャードの間のメッセージに期限はなく、移動のメッセージとその応答は、その移動より長く生き得る (consult-58。問題 54、55、58 は、どれもこの類
+// シャードの間のメッセージに期限はなく、移動のメッセージとその応答は、その移動より長く生き得る (問題 54、55、58 は、どれもこの類
 // だった)。ここでは、上の 1 つ目と同じ作業負荷と移動に、移動のメッセージ (pull、listGroups、ack、finishMove、転送する phase 2 と、Meta への
 // endMove) の要求か応答を 1 つずつ止めて、その移動と、後に始まった移動が閉じてから届ける手を足す。範囲が前の持ち主へ戻るので、遅れた pull が、
 // 範囲を受け取り直した前の親に届く (表の 1 から 3)。
@@ -109,9 +109,9 @@ describe("transactions across ranges that return to a former owner, with the ask
 // その応答 (history.ts の LateRow の 1 から 7、returning、other) の配送を落とし (網がメッセージを失うのと同じ)、落とした数を数える。OPEN=1 では
 // 落とさずに届け、検査が見つける。returning は、遅れた pull が、範囲が戻る途中の前の親に届く形 (問題 55 の形) で、このファイルの見出しは
 // 「起きない」としているが、グループが前の親へもう届いた後なら、内部の誤り (UNIQUE constraint failed: __moved...) になる
-// (test/open/late-pull-while-range-returns.test.ts。生成器 5 が OPEN=1 で見つけた)。
+// (test/open/late-pull-while-range-returns.test.ts。生成器 10 が OPEN=1 で見つけた)。
 const MASK_LATE = !process.env.OPEN;
-describe("late move messages on ranges that return to a former owner (generator 5)", () => {
+describe("late move messages on ranges that return to a former owner (generator 10)", () => {
   const memo5 = new Map<number, Promise<RunResult>>();
   const run5 = (seed: number) => {
     if (!memo5.has(seed)) {
@@ -146,7 +146,7 @@ describe("late move messages on ranges that return to a former owner (generator 
     const total = (x: Record<string, number>) => Object.values(x).reduce((a, n) => a + n, 0);
     const situations = add((r) => r.late.situations);
     const masked = add((r) => r.late.masked);
-    console.info(`generator 5 (returns): held ${JSON.stringify(add((r) => r.late.held))}; outlived ${JSON.stringify(add((r) => r.late.outlived))}; situations ${JSON.stringify(situations)}; masked ${JSON.stringify(masked)}`);
+    console.info(`generator 10 (returns): held ${JSON.stringify(add((r) => r.late.held))}; outlived ${JSON.stringify(add((r) => r.late.outlived))}; situations ${JSON.stringify(situations)}; masked ${JSON.stringify(masked)}`);
     expect({
       outlived: total(add((r) => r.late.outlived)) > 0,
       late: total(situations) - (situations["request window"] ?? 0) > 0,

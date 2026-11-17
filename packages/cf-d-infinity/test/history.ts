@@ -91,11 +91,11 @@ export interface MoveChaos {
    * chain は split と同じ半分の分割で、親を、いちばん新しい移動の子にしやすくする (s0 から s3、s3 から s4 と前へ進む鎖。範囲は戻らない)。
    */
   kind: "split" | "returns" | "chain";
-  /** 生成器 5。移動のメッセージを 1 つ選び、後の移動が閉じるまで止めてから届ける (LateMoves)。 */
+  /** 生成器 10。移動のメッセージを 1 つ選び、後の移動が閉じるまで止めてから届ける (LateMoves)。 */
   late?: LateMoves;
   /**
    * 「group not arrived」で断られた要求の数の上限。この断りは、移動だけが起こす (受け取り中の範囲の、まだ届いていないグループ)。
-   * 超えたら problems に書く。既定は 0 (consult-58 の数えで、split の seed 61 から 64 は 0 だった)。
+   * 超えたら problems に書く。既定は 0 (類の見直しの数えで、split の seed 61 から 64 は 0 だった)。
    */
   notArrivedMax?: number;
   /** 移動の手順の要求 (MOVE_RPCS) の配送の前に、ときどき子か親を再起動する。 */
@@ -132,7 +132,7 @@ export interface MoveChaos {
 }
 
 /**
- * 生成器 5 (consult-58 の「遅れた移動のメッセージ」の類)。シャードの間のメッセージに期限はなく、移動のメッセージとその応答は、
+ * 生成器 10 (「遅れた移動のメッセージ」の類。計画書の不変条件 15)。シャードの間のメッセージに期限はなく、移動のメッセージとその応答は、
  * その移動より長く生き得る。ここでは、移動のメッセージ (LATE_RPCS と、Meta への endMove) の要求か応答を 1 つ選んで止め、その移動が閉じ、
  * 後に始まった移動が 1 つか 2 つ閉じてから届ける。止めるのは SimNet の gate (要求) と reply (応答) で、endMove は Meta の endMove を包んで
  * 止める。乱数は、作業負荷とも移動とも別の流れ (r4) から引く。この選択肢のない実行の乱数の列と RPC の列は、足す前と同じである。
@@ -159,14 +159,14 @@ export interface LateMoves {
 }
 
 /**
- * 生成器 5 が止めるメッセージ (網を通るもの)。drain は止めない。進める側 (split) が待つので、止めると後の移動が始まらない。
+ * 生成器 10 が止めるメッセージ (網を通るもの)。drain は止めない。進める側 (split) が待つので、止めると後の移動が始まらない。
  * finishIncoming は子の中の呼び出し (moveStep) で、網を通らない。endMove は Meta への呼び出しで、Meta の endMove を包んで止める。
  * finalize と abort は、移動の後に前の持ち主が新しい持ち主へ転送する phase 2 (pieces を運ぶもの) だけを止める。
  */
 const LATE_RPCS = new Set(["pull", "listGroups", "ack", "finishMove", "finalize", "abort"]);
 
 /**
- * 遅れた pull とその応答が届いた場面 (consult-58 の見直しが挙げた表の行。この型が、その表の写しである。決まった台本は test/open/late-pull-*.test.ts)。届いた瞬間の、受け手の記録で決める。
+ * 遅れた pull とその応答が届いた場面 (類の見直し (2026-11-17)が挙げた表の行。この型が、その表の写しである。決まった台本は test/open/late-pull-*.test.ts)。届いた瞬間の、受け手の記録で決める。
  * 要求 (親 P への、移動 E の pull。子 C は E の宛先): P の E の fence が終わり、C が E を受け取り終えている (移動より長く生きた)。
  *   1  範囲が P へ戻り、P は受け取り終えた。グループは E で運ばれていない (行も intent もなかった)。
  *   2  1 と同じで、P はそのグループの行を、いま持っている (戻った後に確定した行)。
@@ -183,7 +183,7 @@ const LATE_RPCS = new Set(["pull", "listGroups", "ack", "finishMove", "finalize"
  */
 export type LateRow = "1" | "2" | "3" | "4" | "5" | "6" | "7" | "returning" | "other" | "window";
 
-/** 生成器 5 の数え (RunResult.late)。 */
+/** 生成器 10 の数え (RunResult.late)。 */
 export interface LateCounts {
   /** 止めた要求と応答 (`method request` か `method reply` ごと)。 */
   held: Record<string, number>;
@@ -331,7 +331,7 @@ export interface RunResult {
   wide: WideCounts;
   /** innerThinkMs の実行の、範囲が戻る移動をまたいだ取引の数え。 */
   across: AcrossCounts;
-  /** MoveChaos.late の実行の数え (生成器 5)。 */
+  /** MoveChaos.late の実行の数え (生成器 10)。 */
   late: LateCounts;
 }
 
@@ -365,7 +365,7 @@ export async function runHistory(o: RunOpts): Promise<RunResult> {
   c.net.jitter = () => (rnd() < 0.5 ? 0 : rnd() * 3);
   const run = Promise.race([body(o, c, rnd), c.stalled(STALL_MS, STALL_STEPS)]);
   if (!process.env.LATE_REPORT || !o.moves?.late) return run;
-  // 生成器 5 の seed を流して数えるとき、終わらなかった実行も 1 行に書く (終わらないこと自体が、移動の閉じない欠陥の現れである)。
+  // 生成器 10 の seed を流して数えるとき、終わらなかった実行も 1 行に書く (終わらないこと自体が、移動の閉じない欠陥の現れである)。
   return run.catch((e: unknown) => {
     const { deliveries, ...rest } = lateOf.get(c) ?? emptyLate();
     appendFileSync(process.env.LATE_REPORT!, `${JSON.stringify({
@@ -376,7 +376,7 @@ export async function runHistory(o: RunOpts): Promise<RunResult> {
   });
 }
 
-/** 実行ごとの、生成器 5 の数え。終わらなかった実行の書き出し (LATE_REPORT) が読む。 */
+/** 実行ごとの、生成器 10 の数え。終わらなかった実行の書き出し (LATE_REPORT) が読む。 */
 const lateOf = new WeakMap<SimCluster, LateCounts>();
 
 async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunResult> {
@@ -620,7 +620,7 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
   /**
    * moves の実行で、文が失敗した理由のうち、断りでも再起動でもないもの。投げずに集めて problems に書く (1 つ見つけた後も実行を続け、
    * ほかの検査の結果と数えを残す)。内部の表の誤り (internalError) は、利用者の UNIQUE の誤りより先に見る。見ないと、
-   * 「UNIQUE constraint failed: __moved...」を利用者の UNIQUE の誤りとして読み飛ばす (consult-58 の C)。
+   * 「UNIQUE constraint failed: __moved...」を利用者の UNIQUE の誤りとして読み飛ばす (類の見直しの C)。
    */
   const failures: string[] = [];
   const worker = async () => {
@@ -744,7 +744,7 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
   const counts = moves?.counts ?? { moves: 0, returns: 0, byChild: 0, restarts: 0, deferred: 0, notArrived: 0 };
   const late = moves?.late ?? emptyLate();
   const violations = checkHistory(history);
-  // 生成器 5 の seed を流して数えるための書き出し。LATE_REPORT=<ファイル> で、実行ごとに 1 行の JSON を足す。
+  // 生成器 10 の seed を流して数えるための書き出し。LATE_REPORT=<ファイル> で、実行ごとに 1 行の JSON を足す。
   if (process.env.LATE_REPORT && o.moves?.late) {
     const { deliveries, ...rest } = late;
     appendFileSync(process.env.LATE_REPORT, `${JSON.stringify({
@@ -791,7 +791,7 @@ function marksOf(c: SimCluster, id: string): Record<string, string[]> {
 /**
  * 静止した後で、どのシャードも、メモリの印 (渡した印 moved、到着 arrived、受け取り中と送り出しの範囲、範囲の床) が、表の記録から作り直す
  * 印と同じであること (計画書の不変条件 15 の後半: メモリの印は記録から導かれる)。シャードを再起動して起動の手順 (kernel.ts の boot) に
- * 作り直させ、再起動の前に読んだメモリと比べる。違えば、記録を変えずにメモリだけを変えたか (consult-58 の C の、書き込みが失敗した後に
+ * 作り直させ、再起動の前に読んだメモリと比べる。違えば、記録を変えずにメモリだけを変えたか (類の見直しの C の、書き込みが失敗した後に
  * 残った印)、記録とメモリを別の規則で変えた (A1 の、遅れた到着が先へ渡した印を外した) ことになる。
  * 再起動は RPC を送らず、静止した状態では何も失わない。実行の最後に呼ぶ。
  */
@@ -888,7 +888,7 @@ function startMoves(o: RunOpts, m: MoveChaos, c: SimCluster, r2: () => number, r
   const formerly: { shard: string; range: Interval }[] = [];
   const late = startLate(m.late ?? null, o.seed, c, problems);
   // 子が移動を閉じさせる手 (Meta の endMove) を見張る。子は、受け取り終えた後でだけ呼ぶ (M21 の END_AFTER_DRAIN)。受け取り終えた印
-  // (__incoming の done) は、その前に finishIncoming が付ける。生成器 5 は、この呼び出しと、その答えも止める。
+  // (__incoming の done) は、その前に finishIncoming が付ける。生成器 10 は、この呼び出しと、その答えも止める。
   const realEnd = c.meta.endMove.bind(c.meta);
   c.meta.endMove = async (epoch: number) => {
     const rec = readEpochs(c.metaBackend).find((x) => x.epoch === epoch)?.rec;
@@ -897,7 +897,7 @@ function startMoves(o: RunOpts, m: MoveChaos, c: SimCluster, r2: () => number, r
       const row = c.backends.get(rec.to)?.exec(`SELECT done FROM __incoming WHERE epoch = ?`, epoch)[0];
       if (row?.done !== 1) problems.push(`${rec.to} asked to close the move of epoch ${epoch} before it finished receiving it`);
     }
-    // 生成器 5 のない実行は、包む前と同じ形で返す (await を足すと Promise の段が変わり、同じ seed の RPC の列が変わり得る)。
+    // 生成器 10 のない実行は、包む前と同じ形で返す (await を足すと Promise の段が変わり、同じ seed の RPC の列が変わり得る)。
     if (!late || rec?.kind !== "move-start") return realEnd(epoch);
     const out = await realEnd(epoch);
     await late.endMove(epoch, rec, "reply");
@@ -948,7 +948,7 @@ function startMoves(o: RunOpts, m: MoveChaos, c: SimCluster, r2: () => number, r
     }
     for (let attempt = 0; attempt < 20; attempt++) {
       try {
-        // 生成器 5 は、進める側が split を待っている時間を見る (LateMoves)。生成器 5 のない実行は、包まずに待つ (Promise の段を変えない)。
+        // 生成器 10 は、進める側が split を待っている時間を見る (LateMoves)。生成器 10 のない実行は、包まずに待つ (Promise の段を変えない)。
         late?.driving(true);
         const r = late ? await split(c, from, to, { range }).finally(() => late.driving(false)) : await split(c, from, to, { range });
         const open = readEpochs(c.metaBackend).findLast((x) => x.rec.kind === "move-start" && x.rec.from === from && x.rec.to === to);
@@ -1080,13 +1080,13 @@ function startMoves(o: RunOpts, m: MoveChaos, c: SimCluster, r2: () => number, r
     for (const f of internal) problems.push(`${f.m.from}->${f.m.to} ${String(f.m.method)} failed: ${f.message.slice(0, 160)}`);
     return [...new Set(problems)];
   };
-  /** 静止した後の、生成器 5 の検査 (遅れて届いた応答が、受け取り終えた移動の到着の記録を足したか)。 */
+  /** 静止した後の、生成器 10 の検査 (遅れて届いた応答が、受け取り終えた移動の到着の記録を足したか)。 */
   const afterQuiet = (): string[] => late?.afterQuiet() ?? [];
   return { counts, finish, afterQuiet, late: late?.counts ?? null };
 }
 
 /**
- * 生成器 5 (LateMoves) の仕掛け。gate、reply、arrive と Meta の endMove の包みから呼ぶ。opt が null なら null を返し、何もしない。
+ * 生成器 10 (LateMoves) の仕掛け。gate、reply、arrive と Meta の endMove の包みから呼ぶ。opt が null なら null を返し、何もしない。
  * problems には、不変条件 15 を破った配送を書く (mask で落とした配送は、届いていないので書かない)。
  */
 function startLate(opt: LateMoves | null, seed: number, c: SimCluster, problems: string[]) {

@@ -1,9 +1,9 @@
-// 前へ進む移動の鎖に、遅れた移動のメッセージを混ぜる (生成器 5。test/history.ts の LateMoves と MoveChaos の chain)。
+// 前へ進む移動の鎖に、遅れた移動のメッセージを混ぜる (生成器 10。test/history.ts の LateMoves と MoveChaos の chain)。
 //
 // 本番の分割 (Autoscaler と /admin/split) は、親の最も広い区間の半分を、範囲を持たない新しいシャードへ渡す。範囲は前の持ち主へ戻らない。
 // ここでは、その半分の分割の親を、いちばん新しい子にしやすくして (s0 から s3 へ、s3 から s4 へ、と 2 度の分割が 1 つの範囲を運ぶ)、移動の
 // メッセージの要求か応答を 1 つずつ止め、その移動と後の移動が閉じてから届ける。前の移動の遅れた pull が、範囲を先へ渡した後の親に届き
-// (consult-58 の表の 4 と 5)、遅れた応答が、受け取り終えた子に届く (7)。作業負荷と移動の乱択は、test/history.test.ts の「移動の途中の再起動」と
+// (類の表の 4 と 5)、遅れた応答が、受け取り終えた子に届く (7)。作業負荷と移動の乱択は、test/history.test.ts の「移動の途中の再起動」と
 // 同じ値で、移動を作業負荷の全体に散らす (paceMs と maxMoves)。
 //
 // 確かめるのは、履歴の直列化可能性、最後の読み、行の置き場所、移動がどれも閉じること、取り残された intent、内部の表の誤り、「group not
@@ -23,14 +23,14 @@ const run = (seed: number) => {
   if (!memo.has(seed)) {
     memo.set(seed, runHistory({
       seed, shards: 3, tenants: 40, skewMs: 20, ops: 40, thinkMs: 400, slowPhase2Ms: 2_000,
-      // 再起動は seed ごとに入れたり外したりする (test/move-returns.test.ts の生成器 5 と同じ。再起動した子には、遅れた応答の結果が起きない)。
+      // 再起動は seed ごとに入れたり外したりする (test/move-returns.test.ts の生成器 10 と同じ。再起動した子には、遅れた応答の結果が起きない)。
       moves: { kind: "chain", restarts: seed % 2 === 1, stops: true, slowMoveRpcMs: 60, paceMs: 500, maxMoves: 16, late: { share: 0.4, max: 3, mask: MASK_LATE } },
     }));
   }
   return memo.get(seed)!;
 };
 
-describe("a forward chain of half splits, with move messages that outlive their moves (generator 5)", () => {
+describe("a forward chain of half splits, with move messages that outlive their moves (generator 10)", () => {
   const defaults = [1, 2, 3, 4, 5, 6, 7, 8];
   for (const seed of seedsOr(defaults)) {
     it(`stays serializable, loses no write, and keeps its move records (seed ${seed})`, async () => {
@@ -58,7 +58,7 @@ describe("a forward chain of half splits, with move messages that outlive their 
       const starts = readEpochs(r.c.metaBackend).flatMap((x) => (x.rec.kind === "move-start" ? [x.rec] : []));
       return starts.some((a, i) => starts.slice(i + 1).some((b) => b.from === a.to));
     }).length;
-    console.info(`generator 5 (chain): chained runs ${chained}; held ${JSON.stringify(add((r) => r.late.held))}; outlived ${JSON.stringify(add((r) => r.late.outlived))}; situations ${JSON.stringify(situations)}; masked ${JSON.stringify(masked)}`);
+    console.info(`generator 10 (chain): chained runs ${chained}; held ${JSON.stringify(add((r) => r.late.held))}; outlived ${JSON.stringify(add((r) => r.late.outlived))}; situations ${JSON.stringify(situations)}; masked ${JSON.stringify(masked)}`);
     expect({
       chained: chained > 0,
       outlived: total(add((r) => r.late.outlived)) > 0,

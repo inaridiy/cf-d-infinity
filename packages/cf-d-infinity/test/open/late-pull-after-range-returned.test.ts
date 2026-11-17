@@ -23,10 +23,10 @@
 // docs/design-refresh-across-move.md の「3 回目の実装の規則」の不変条件 D の最後の行、スイッチ rehandFinished)。参加者は、intent を適用
 // したか、いまの持ち主へ転送した後でだけ、phase 2 を受け取ったと答える (問題 54 の不変条件)。持ち主は、送り出した側の記録
 // (src/shard/kernel.ts の pullPieces、fenceOf)。問題 54、55 と同じ持ち主である。
-// consult-58 (2026-11-17) が、これを遅れた移動のメッセージの類の表の 1 とした (2 から 7 は test/open/late-pull-*.test.ts)。類の不変条件は、
+// 類の見直し (2026-11-17) が、これを遅れた移動のメッセージの類の表の 1 とした (2 から 7 は test/open/late-pull-*.test.ts)。類の不変条件は、
 // 計画書の不変条件 15 である: シャードは、生きた記録 (親なら終わっていない fence、子なら受け取り中の __incoming) を持つ移動の epoch を名指しする
 // 要求と応答でだけ、渡しと受け取りの記録を変え、メモリの印は、その記録から導く。持ち主は、シャードの移動の手順である。乱択の検査では、
-// 生成器 5 (test/move-returns.test.ts の「generator 5」を OPEN=1 で流す) が「situation 1」として数える。
+// 生成器 10 (test/move-returns.test.ts の「generator 10」を OPEN=1 で流す) が「situation 1」として数える。
 import { describe, expect, it } from "vitest";
 import { Db } from "../../src/client/db";
 import { keyString } from "../../src/keys";
