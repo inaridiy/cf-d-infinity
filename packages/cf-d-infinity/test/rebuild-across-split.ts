@@ -72,21 +72,25 @@ export async function rebuildAcrossSplit(seed: number, o: { faults?: Faults; str
   let other = new Db(c);
   const expected = new Map(copied);
   const writes = { before: 0, after: 0 };
+  // 書き込みは、行の更新、新しい行、行の削除である。消した行は、移動で子へ運ばれないので、子の記録に跡を残さない。
   const write = async (when: "before" | "after") => {
     const pool = rnd() < 0.6 && moving.length > 0 ? moving : staying.length > 0 ? staying : moving;
     const id = pool[Math.floor(rnd() * pool.length)]!;
-    const insert = rnd() < 0.3;
-    const sql = insert ? "INSERT INTO t VALUES (?, ?)" : "UPDATE t SET v = v + 1000 WHERE id = ?";
+    const k = rnd();
+    const kind = k < 0.25 ? "insert" : k < 0.45 && expected.has(id) ? "delete" : "update";
+    const sql = kind === "insert" ? "INSERT INTO t VALUES (?, ?)" : kind === "delete" ? "DELETE FROM t WHERE id = ?" : "UPDATE t SET v = v + 1000 WHERE id = ?";
     const fresh = 1000 + Math.floor(rnd() * 1000) * 7 + (when === "before" ? 1 : 2);
-    const r = await outcome(other.query(sql, insert ? [BigInt(fresh), BigInt(fresh)] : [BigInt(id)]));
-    if (r !== "ok") {
-      shape.push(`write ${when} failed: ${r.slice(0, 60)}`);
+    let changes = 0;
+    const r = await outcome(other.query(sql, kind === "insert" ? [BigInt(fresh), BigInt(fresh)] : [BigInt(id)]).then((q) => void (changes = q.changes)));
+    if (r !== "ok" || changes === 0) {
+      shape.push(`write ${when} ${r === "ok" ? "changed nothing" : `failed: ${r.slice(0, 60)}`}`);
       return;
     }
-    if (insert) expected.set(fresh, fresh);
+    if (kind === "insert") expected.set(fresh, fresh);
+    else if (kind === "delete") expected.delete(id);
     else expected.set(id, expected.get(id)! + 1000);
     writes[when]++;
-    shape.push(`write ${when} ${insert ? `insert ${fresh}` : `update ${id}`} (${insert ? "" : moving.includes(id) ? "moving" : "staying"})`);
+    shape.push(`write ${when} ${kind === "insert" ? `insert ${fresh}` : `${kind} ${id} (${moving.includes(id) ? "moving" : "staying"})`}`);
   };
   if (rnd() < 0.35) await write("before");
   await split(c, parent, `s${shards}`, { range });
