@@ -34,28 +34,17 @@
 //   表       確定した取引の書き込みだけが残る。DDL が確定したなら、その変更がある。行イメージの形は test/setup.ts の検査が確かめる。
 //   誤り     どの取引の文も、断られるなら busy の類の誤りだけである。
 // 4 つの実行の間では、DDL の結果 (ok、busy、ほかの誤り) と、holder と BEGIN IMMEDIATE の late の確定の成否が同じでなければならない。
-// 素の BEGIN の取引 (late と reader) は、SQLite でも成否が間合いで決まるので比べない。行が prepare を待っているシャードにあれば、
-// 書き込みが禁止の前に通って確定し、もう禁止したシャードにあれば待って SQLITE_BUSY になる (どちらも SQLite の答えのどれかである)。
+// 素の BEGIN の取引 (late と reader) は、SQLite でも成否が間合いで決まるので比べない (DDL の前に読んだ取引は、DDL が確定すれば断られ、
+// 失敗すれば通る。DDL の確定のすぐ前後に始めた late は、どちらの表定義で計画したかで決まる)。
 //
-// 既知の欠陥 (5808b08。直していない。test/open/ に再現がある)。既定の実行では、下の印のある実行の違反のうち、その欠陥が説明する種類
-// (explains) だけを伏せ、数える。表と表定義の違反、busy でない文の誤り、5 秒でない busy は伏せない。OPEN=1 では何も伏せない。
-//   D1  ロックを取る読みが、書き込み禁止の表で通る (test/open/locking-read-on-fenced-table.test.ts)。シャードの lockRows の確かめは、
-//       書き込みとして頼る表にしか、禁止を当てない (src/shard/kernel.ts の lockedStep)。全シャードが prepare を適用した後に、
-//       BEGIN IMMEDIATE の主キーの読みがロックを取り、続く書き込みが DDL を取り消させる (M24 の WOUND)。DDL は、やり直して、その取引を
-//       待つか、期限を過ぎて失敗する (busy でない誤りのこともある)。印: シャードが、lockRows のある exec に、x が禁止の間に答えた。
-//       基準経路では、主キーの読みも行を集めるのでロックを取らず (Txn.shardRead が通常の経路だけで lockRows を付ける)、BEGIN IMMEDIATE の
-//       取引の書き込みが、DDL の確定の後に SQLITE_BUSY になる。DDL の結果は通常の経路と違う。印: 基準経路で、ロックを読みで取る
-//       BEGIN IMMEDIATE の取引 (late と、DDL の前には読むだけの holder)。その取引と、それが holder なら DDL の違反を伏せる。
-//   D2  一意でない CREATE INDEX と DROP INDEX は、行ロックを持つ取引を待たない (test/open/index-ddl-ignores-row-locks.test.ts)。
-//       fence が空なので (src/sql/ddl.ts の createIndex と dropIndex)、prepare はロックを待たず (src/shard/kernel.ts の applyStep は、
-//       fence の表の行ロックだけを待つ)、DDL はすぐに確定し、表の書き込みの
-//       epoch を進める。ロックを持つ取引の次の書き込みと COMMIT が stale schema で断られる。印: その DDL の commit のとき、どこかの
-//       シャードに x の生きた行ロックがあった。
-//   D3  シャードが、prepare の適用を待っている間に、x のロックを持たない取引に、新しいロックを与える
-//       (test/open/ddl-busy-by-writer-during-its-wait.test.ts)。その取引がロックを持ち続けると、DDL は、DDL より前の取引が期限のうちに
-//       終わっても、5 秒で SQLITE_BUSY になる。行が、もう prepare を適用したシャードにあれば、取引は禁止で待ち、DDL は通る。
-//       印: DDL を始めて 100 ms より後、DDL が終わる前に、x のロックを持たない取引 (要求の lock.holds に x がない) の、ロックを取る
-//       要求に、シャードが答えた (不変条件 16。specs/m24c_lock_holders.qnt の CLOSE_WINDOW と ONE_RESTART)。この答えそのものも違反として数える。
+// 不変条件 16 (計画書。モデル specs/m24c_lock_holders.qnt) を、答えのほかに、シャードの状態でも直に確かめる。2026-11-17 までは、3 つとも
+// 既知の欠陥の印で、その実行の違反を伏せていた (D1、D2、D3。再現は test/locking-read-on-fenced-table.test.ts、
+// test/index-ddl-ignores-row-locks.test.ts、test/ddl-busy-by-writer-during-its-wait.test.ts)。直ったので、どれも違反として数える。
+//   lock granted on a fenced table   シャードが、ロックを取る読みに、x が書き込み禁止の間に答えた (D1。ANY_DEP)。
+//   ddl committed under a row lock   DDL の commit を Meta が記録したとき、どこかのシャードに x の生きた行ロックがあった (D2。FENCE_COVERS)。
+//                                    生成器の DDL は、どれも x の書き込みの epoch を進めるので、x の行ロックを待つ。
+//   lock granted during the wait     DDL を始めて 100 ms より後、DDL が終わる前に、x のロックを持たない取引 (要求の lock.holds に x が
+//                                    ない) の、ロックを取る要求に、シャードが答えた (D3。CLOSE_WINDOW と ONE_RESTART)。
 import { Db } from "../src/client/db";
 import { DDL_WAIT_MS } from "../src/meta";
 import { fencedBy } from "../src/catalog";
@@ -65,15 +54,15 @@ import { prng, rawRows } from "./ddl-harness";
 import { SimCluster } from "./sim";
 
 export type DdlKind = "create index" | "drop index" | "drop unique index" | "create unique index" | "create local unique index" | "add column";
-interface DdlSpec { sql: string; setup: string[]; fenced: boolean; build: boolean; check: (cat: CatalogLike) => boolean }
+interface DdlSpec { sql: string; setup: string[]; build: boolean; check: (cat: CatalogLike) => boolean }
 interface CatalogLike { indexes: Record<string, unknown>; tables: Record<string, { columns: string[] }> }
 export const DDL_KINDS: Record<DdlKind, DdlSpec> = {
-  "create index": { sql: "CREATE INDEX xi ON x(w)", setup: [], fenced: false, build: false, check: (c) => "xi" in c.indexes },
-  "drop index": { sql: "DROP INDEX xi0", setup: ["CREATE INDEX xi0 ON x(w)"], fenced: false, build: false, check: (c) => !("xi0" in c.indexes) },
-  "drop unique index": { sql: "DROP INDEX xu0", setup: ["CREATE UNIQUE INDEX xu0 ON x(v)"], fenced: false, build: false, check: (c) => !("xu0" in c.indexes) },
-  "create unique index": { sql: "CREATE UNIQUE INDEX xu ON x(v)", setup: [], fenced: true, build: true, check: (c) => "xu" in c.indexes },
-  "create local unique index": { sql: "CREATE UNIQUE INDEX xl ON x(id, w)", setup: [], fenced: true, build: false, check: (c) => "xl" in c.indexes },
-  "add column": { sql: "ALTER TABLE x ADD COLUMN y INTEGER NOT NULL DEFAULT 0", setup: [], fenced: true, build: false, check: (c) => c.tables.x!.columns.includes("y") },
+  "create index": { sql: "CREATE INDEX xi ON x(w)", setup: [], build: false, check: (c) => "xi" in c.indexes },
+  "drop index": { sql: "DROP INDEX xi0", setup: ["CREATE INDEX xi0 ON x(w)"], build: false, check: (c) => !("xi0" in c.indexes) },
+  "drop unique index": { sql: "DROP INDEX xu0", setup: ["CREATE UNIQUE INDEX xu0 ON x(v)"], build: false, check: (c) => !("xu0" in c.indexes) },
+  "create unique index": { sql: "CREATE UNIQUE INDEX xu ON x(v)", setup: [], build: true, check: (c) => "xu" in c.indexes },
+  "create local unique index": { sql: "CREATE UNIQUE INDEX xl ON x(id, w)", setup: [], build: false, check: (c) => "xl" in c.indexes },
+  "add column": { sql: "ALTER TABLE x ADD COLUMN y INTEGER NOT NULL DEFAULT 0", setup: [], build: false, check: (c) => c.tables.x!.columns.includes("y") },
 };
 
 export interface TxnPlan {
@@ -155,7 +144,8 @@ export function lockScript(seed: number): LockScript {
 }
 
 export type Path = "sim" | Reference;
-export interface StmtOutcome { sql: string; outcome: string; at: number }
+/** sentAt は文を送った時刻、at は答えを受けた時刻 (どちらも DDL を始めた時刻からの ms)。 */
+export interface StmtOutcome { sql: string; outcome: string; sentAt: number; at: number }
 export interface TxnOutcome { name: string; stmts: StmtOutcome[]; committed: boolean; endSentAt: number | null; endDoneAt: number | null; startedAt: number }
 export interface LockRun {
   script: LockScript;
@@ -172,9 +162,9 @@ export interface LockRun {
   /** 行ごとの w (最後の表)。 */
   w: Record<number, number>;
   schemaApplied: boolean;
-  /** 既知の欠陥の印 (上の D1、D2、D3)。 */
-  marks: { lockOnFence: boolean; d2LockAtCommit: boolean; grantInWait: boolean };
-  /** DDL が進んでいる間に、x のロックを持たない取引のロックを取る要求に、シャードが答えた (不変条件 16 の違反そのもの)。 */
+  /** 不変条件 16 を、シャードの状態で直に確かめた結果 (ファイルの初め)。 */
+  marks: { lockOnFence: boolean; lockAtCommit: boolean };
+  /** DDL が進んでいる間に、x のロックを持たない取引のロックを取る要求に、シャードが答えた。 */
   grantsInWait: { shard: string; at: number }[];
   /** 行ロックを持つ取引が DDL を取り消させた回数 (M24 の WOUND)。 */
   wounds: number;
@@ -206,7 +196,7 @@ export async function runLockScript(s: LockScript, o: { shards: number; path: Pa
   await c.settle();
 
   // ---- 見張り ----
-  const marks = { lockOnFence: false, d2LockAtCommit: false, grantInWait: false };
+  const marks = { lockOnFence: false, lockAtCommit: false };
   const grantsInWait: { shard: string; at: number }[] = [];
   // DDL が進んでいるか。最初の prepare の記録から、commit か、取り消させる手でない abort の記録まで (取り消させる手の abort の後は、
   // やり直しが続く)。DDL の文が終われば、進んでいない。
@@ -221,15 +211,12 @@ export async function runLockScript(s: LockScript, o: { shards: number; path: Pa
   c.net.reply = (m) => {
     if (m.from !== "client") return undefined;
     if (m.method === "exec") {
-      // D1 の印: ロックを取る読みに、x が書き込み禁止の間に答えた。
+      // ロックを取る読みに、x が書き込み禁止の間に答えた。
       const req = m.req as { lockRows?: { table: string }[]; write?: unknown; lock?: { holds?: string[] } };
       if (req.lockRows?.some((l) => l.table.toLowerCase() === "x") && fencedBy(kernelOf(c, m.to).snap as Parameters<typeof fencedBy>[0], "x")) marks.lockOnFence = true;
-      // D3 の印: DDL が進んでいる間に、x のロックを持たない取引の、ロックを取る要求に答えた。DDL を始めてすぐ (100 ms) は、prepared が
+      // DDL が進んでいる間に、x のロックを持たない取引の、ロックを取る要求に答えた。DDL を始めてすぐ (100 ms) は、prepared が
       // シャードへ届く前のことがあるので、数えない (同じ時刻の競り。SQLite でも、どちらが先にロックを取るかは決まっていない)。
-      if (req.lock && (req.write || req.lockRows) && !req.lock.holds?.includes("x") && ddlOpen && now() >= 100) {
-        marks.grantInWait = true;
-        grantsInWait.push({ shard: m.to, at: now() });
-      }
+      if (req.lock && (req.write || req.lockRows) && !req.lock.holds?.includes("x") && ddlOpen && now() >= 100) grantsInWait.push({ shard: m.to, at: now() });
       return undefined;
     }
     if (m.method !== "prepared" || signalAt !== null) return undefined;
@@ -250,11 +237,11 @@ export async function runLockScript(s: LockScript, o: { shards: number; path: Pa
   let committedAt: number | null = null;
   const commit = c.commit.bind(c);
   c.commit = async (...a: Parameters<typeof commit>) => {
-    // D2 の印: 書き込みを止めない DDL の commit のとき、x の生きた行ロックがある。
-    if (!spec.fenced && routingShards.some((id) => {
+    // DDL の commit のとき、x の生きた行ロックがある。
+    if (routingShards.some((id) => {
       const k = kernelOf(c, id);
       return [...k.locks].some(([key, l]) => key.startsWith("x\0") && (k.leases.get(l.txn)?.until ?? 0) > k.deps.clock.now());
-    })) marks.d2LockAtCommit = true;
+    })) marks.lockAtCommit = true;
     const out = await commit(...a);
     committedAt = now();
     ddlOpen = false;
@@ -289,8 +276,9 @@ export async function runLockScript(s: LockScript, o: { shards: number; path: Pa
     let failed = false;
     const stmt = async (sql: string, params: number[] = []) => {
       if (failed) return;
+      const sentAt = now();
       const r = await db.query(sql, params).then(() => "ok", (e: Error) => e.message);
-      out.stmts.push({ sql, outcome: r, at: now() });
+      out.stmts.push({ sql, outcome: r, sentAt, at: now() });
       if (r !== "ok") failed = true;
     };
     const read = (id: number) => stmt("SELECT v, w FROM x WHERE id = ?", [id]);
@@ -317,7 +305,7 @@ export async function runLockScript(s: LockScript, o: { shards: number; path: Pa
     } else {
       const end = p.rollback ? "ROLLBACK" : "COMMIT";
       const r = await db.query(end).then(() => "ok", (e: Error) => e.message);
-      out.stmts.push({ sql: end, outcome: r, at: now() });
+      out.stmts.push({ sql: end, outcome: r, sentAt: out.endSentAt ?? now(), at: now() });
       out.committed = end === "COMMIT" && r === "ok";
       if (r !== "ok") await db.query("ROLLBACK").catch(() => undefined);
     }
@@ -360,50 +348,7 @@ export async function runLockScript(s: LockScript, o: { shards: number; path: Pa
 
 // ---- 検査 ----
 
-/**
- * 既知の欠陥の印 (ファイルの初めの D1、D2)。違反に付け、既定の実行では伏せる。
- *   D1 lock on fence     通常の経路: シャードが、ロックを取る読みに、x が書き込み禁止の間に答えた。
- *   D1 reference read    基準経路: 読みでロックを取るはずの BEGIN IMMEDIATE の取引 (late と、DDL の前には読むだけの holder)。
- *   D2 commit under lock 書き込みを止めない index の DDL の commit のとき、x の生きた行ロックがあった。
- *   D3 lock during the wait  DDL が進んでいる間に、x のロックを持たない取引のロックを取る要求に、シャードが答えた。
- */
-export type Mask = "D1 lock on fence" | "D1 reference read" | "D2 commit under lock" | "D3 lock during the wait";
-export interface Finding { kind: string; detail: string; mask: Mask | null }
-export const defectOf = (m: Mask): "D1" | "D2" | "D3" => m.slice(0, 2) as "D1" | "D2" | "D3";
-const runMask = (r: LockRun): Mask | null => (r.marks.lockOnFence ? "D1 lock on fence" : r.marks.d2LockAtCommit ? "D2 commit under lock" : null);
-/** D3 の印は、D1 と D2 の印がない実行にだけ付ける (D1 の基準経路の印も先に見る。ロックを読みで取らなかった取引の書き込みも、ここに当たる)。 */
-const waitMask = (r: LockRun): Mask | null => (r.marks.grantInWait ? "D3 lock during the wait" : null);
-
-/** 古い計画として断られた誤り (DDL の確定の後の書き込みと COMMIT)。 */
-const STALE = /stale schema/;
-/** 行ロックを持つ取引が DDL を取り消させたときの理由 (src/client/db.ts の attemptStatement)。D1 の DDL が、やり直せずにこの文で失敗する。 */
-const WOUND_REASON = /reached the table's write lock on another shard, so the schema change was withdrawn to be run again/;
-
-/**
- * 印が説明する違反の種類。印のある実行でも、ほかの種類の違反 (表、表定義、busy でない文の誤り、5 秒でない busy など) は伏せない。
- * text は、違反のもとになった誤りの文 (DDL か取引の文の答え) である。
- */
-function explains(mask: Mask, kind: string, text: string): boolean {
-  switch (kind) {
-    case "ddl withdrawn by a later lock": return mask === "D1 lock on fence";
-    // どの欠陥でも起きる (D1: 読みで得たロック。D2: fence のない DDL は、ロックの要求を止めない。D3: 待っている間のロック)。
-    case "lock granted during the wait": return true;
-    case "ddl failed":
-      if (mask === "D3 lock during the wait") return classOf(text) === "busy";
-      return mask === "D1 lock on fence" && (classOf(text) === "busy" || WOUND_REASON.test(text));
-    case "ddl error": return mask === "D1 lock on fence" && WOUND_REASON.test(text);
-    case "ddl did not wait":
-    case "ddl not busy": return mask !== "D1 lock on fence" && mask !== "D3 lock during the wait";
-    case "holder refused":
-    case "late immediate refused": return STALE.test(text);
-    case "differs: ddl": return mask !== "D2 commit under lock";
-    case "differs: transaction": return mask !== "D2 commit under lock" && mask !== "D3 lock during the wait";
-    default: return false;
-  }
-}
-
-/** 基準経路で、読みでロックを取るはずの BEGIN IMMEDIATE の取引 (上の D1 の基準経路の印)。 */
-const lockByRead = (t: TxnPlan) => t.immediate && (t.role === "late" || t.readOnlyBefore);
+export interface Finding { kind: string; detail: string }
 
 /**
  * 基準経路の full は、条件を押し下げずに表の全行を読む (src/sql/plan.ts の Reference)。取引の読みの範囲は表の全体になり、ほかの取引が
@@ -412,16 +357,10 @@ const lockByRead = (t: TxnPlan) => t.immediate && (t.role === "late" || t.readOn
  */
 const fullSpan = (r: LockRun, x: StmtOutcome) => r.path === "full" && x.sql === "COMMIT" && /^conflict: span changed after T/.test(x.outcome);
 
-/** 1 つの実行を SQLite の答えと比べる。印のある違反には、既知の欠陥の名前を付ける。 */
+/** 1 つの実行を SQLite の答えと比べ、不変条件 16 をシャードの状態で確かめる。 */
 export function checkRun(r: LockRun): Finding[] {
   const out: Finding[] = [];
-  const refPath = r.path !== "sim";
-  const holderByRead = refPath && r.script.txns.some((t) => t.role === "holder" && lockByRead(t));
-  // 取引の違反は、その取引が基準経路で読みのロックを取らないなら D1 の基準経路の印、DDL と表の違反は、そういう holder がいれば同じ印。
-  const add = (kind: string, detail: string, txn?: TxnPlan, text = "") => {
-    const mask = runMask(r) ?? (refPath && (txn ? lockByRead(txn) : holderByRead) ? "D1 reference read" : null) ?? waitMask(r);
-    out.push({ kind, detail, mask: mask && explains(mask, kind, text) ? mask : null });
-  };
+  const add = (kind: string, detail: string) => out.push({ kind, detail });
   const plans = r.script.txns;
   const byName = new Map(r.txns.map((t) => [t.name, t]));
   // DDL
@@ -429,19 +368,22 @@ export function checkRun(r: LockRun): Finding[] {
   const ends = holders.map((p) => byName.get(p.name)!.endSentAt ?? Infinity);
   const busyExpected = ends.some((e) => e > DDL_WAIT_MS);
   const cls = classOf(r.ddl);
-  if (cls === "error") add("ddl error", `the DDL failed with an error that is not busy: ${r.ddl}`, undefined, r.ddl);
+  if (cls === "error") add("ddl error", `the DDL failed with an error that is not busy: ${r.ddl}`);
   if (busyExpected) {
-    if (cls !== "busy") add("ddl not busy", `a holder kept its locks past 5 s, but the DDL ${r.ddl} after ${r.ddlMs} ms`, undefined, r.ddl);
+    if (cls !== "busy") add("ddl not busy", `a holder kept its locks past 5 s, but the DDL ${r.ddl} after ${r.ddlMs} ms`);
     else if (r.ddlMs < DDL_WAIT_MS - 100 || r.ddlMs > DDL_WAIT_MS + 700) add("ddl busy at the wrong time", `the DDL was busy after ${r.ddlMs} ms, not at 5 s`);
   } else {
-    if (cls !== "ok") add("ddl failed", `no holder kept its locks past 5 s, but the DDL failed after ${r.ddlMs} ms: ${r.ddl}`, undefined, r.ddl);
+    if (cls !== "ok") add("ddl failed", `no holder kept its locks past 5 s, but the DDL failed after ${r.ddlMs} ms: ${r.ddl}`);
     const lastEnd = Math.max(0, ...ends.filter(Number.isFinite));
     if (cls === "ok" && r.ddlMs < lastEnd) add("ddl did not wait", `the DDL committed after ${r.ddlMs} ms, before a holder ended at ${lastEnd} ms`);
   }
   // 全シャードが prepare を適用したとき、x の行ロックはどこにもなかった。その後にロックを取った取引が、DDL を取り消させてはならない
   // (asSqlite: その後の取引は、SQLite では DDL の書き込みのロックを待つ)。
   if (r.woundsAfterSignal > 0) add("ddl withdrawn by a later lock", `a lock taken after every shard had applied the prepare withdrew the DDL ${r.woundsAfterSignal} time(s); the DDL ${r.ddl} after ${r.ddlMs} ms`);
-  // DDL が進んでいる間、x のロックを持たない取引は、ロックを得ない (不変条件 16。SQLite では、その取引は DDL の後ろで待つ)。
+  // 不変条件 16 を、シャードの状態で直に確かめる。
+  if (r.marks.lockOnFence) add("lock granted on a fenced table", `a shard answered a lock-taking read of x while x was fenced; the DDL ${r.ddl} after ${r.ddlMs} ms`);
+  if (r.marks.lockAtCommit) add("ddl committed under a row lock", `the DDL's commit was recorded while a transaction held a row lock on x; the DDL ${r.ddl} after ${r.ddlMs} ms`);
+  // DDL が進んでいる間、x のロックを持たない取引は、ロックを得ない (SQLite では、その取引は DDL の後ろで待つ)。
   if (r.grantsInWait.length > 0) {
     const g = r.grantsInWait[0]!;
     add("lock granted during the wait", `${r.grantsInWait.length} lock request(s) of transactions that held no lock on x were granted while the DDL was running (first on ${g.shard} at ${g.at} ms); the DDL ${r.ddl} after ${r.ddlMs} ms`);
@@ -451,10 +393,10 @@ export function checkRun(r: LockRun): Finding[] {
   for (const p of plans) {
     const t = byName.get(p.name)!;
     const refused = t.stmts.filter((x) => x.outcome !== "ok" && !fullSpan(r, x));
-    for (const x of refused) if (classOf(x.outcome) === "error") add("statement error", `${p.name}: ${x.sql} failed with an error that is not busy: ${x.outcome}`, p);
+    for (const x of refused) if (classOf(x.outcome) === "error") add("statement error", `${p.name}: ${x.sql} failed with an error that is not busy: ${x.outcome}`);
     const mustPass = p.role === "holder" || (p.role === "late" && p.immediate);
     if (mustPass && refused.length > 0) {
-      add(p.role === "holder" ? "holder refused" : "late immediate refused", `${p.name} (${p.immediate ? "BEGIN IMMEDIATE" : "BEGIN"}, ${p.role}): ${refused[0]!.sql} at ${refused[0]!.at} ms: ${refused[0]!.outcome}`, p, refused[0]!.outcome);
+      add(p.role === "holder" ? "holder refused" : "late immediate refused", `${p.name} (${p.immediate ? "BEGIN IMMEDIATE" : "BEGIN"}, ${p.role}): ${refused[0]!.sql} at ${refused[0]!.at} ms: ${refused[0]!.outcome}`);
     }
   }
   // 表
@@ -476,24 +418,18 @@ const summary = (r: LockRun) => ({
   txns: Object.fromEntries(r.script.txns.filter((p) => p.role === "holder" || (p.role === "late" && p.immediate)).map((p) => [p.name, r.txns.find((t) => t.name === p.name)!.committed])),
 });
 
-/** 2 つの実行を比べる。どちらかの実行に印があれば、その印を付ける。 */
+/** 2 つの実行を比べる。 */
 export function compareRuns(a: LockRun, b: LockRun): Finding[] {
   const sa = summary(a);
   const sb = summary(b);
-  const mask: Mask | null = runMask(a) ?? runMask(b);
   const out: Finding[] = [];
   const label = (r: LockRun) => `${r.shards} shard${r.shards > 1 ? "s" : ""} ${r.path}`;
-  const ref = [a, b].some((r) => r.path !== "sim");
-  if (sa.ddl !== sb.ddl) {
-    const m = mask ?? (ref && a.script.txns.some((t) => t.role === "holder" && lockByRead(t)) ? "D1 reference read" : null) ?? waitMask(a) ?? waitMask(b);
-    out.push({ kind: "differs: ddl", detail: `${label(a)}: ${a.ddl}; ${label(b)}: ${b.ddl}`, mask: m && explains(m, "differs: ddl", "") ? m : null });
-  }
+  if (sa.ddl !== sb.ddl) out.push({ kind: "differs: ddl", detail: `${label(a)}: ${a.ddl}; ${label(b)}: ${b.ddl}` });
   const spanRefused = (r: LockRun, name: string) => r.txns.find((t) => t.name === name)!.stmts.some((x) => fullSpan(r, x));
   for (const p of a.script.txns) {
     if (!(p.name in sa.txns) || sa.txns[p.name] === sb.txns[p.name]) continue;
     if (spanRefused(a, p.name) || spanRefused(b, p.name)) continue;
-    const m = mask ?? (ref && lockByRead(p) ? "D1 reference read" : null) ?? waitMask(a) ?? waitMask(b);
-    out.push({ kind: "differs: transaction", detail: `${p.name}: ${label(a)} ${sa.txns[p.name] ? "committed" : "did not commit"}; ${label(b)} ${sb.txns[p.name] ? "committed" : "did not commit"}`, mask: m && explains(m, "differs: transaction", "") ? m : null });
+    out.push({ kind: "differs: transaction", detail: `${p.name}: ${label(a)} ${sa.txns[p.name] ? "committed" : "did not commit"}; ${label(b)} ${sb.txns[p.name] ? "committed" : "did not commit"}` });
   }
   return out;
 }

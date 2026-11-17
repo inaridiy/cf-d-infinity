@@ -3,7 +3,7 @@ import { parseDdl, type DdlMode, type IndexInfo, type ParsedDdl } from "./sql/dd
 import { systemRuntime, type Runtime } from "./runtime";
 import { CAPTURE_TABLES } from "./shard/rows";
 import { checkInterval, initialRouting, rangeText, sameInterval, slotAligned, type Interval, type Routing } from "./routing";
-import { describeOpen, fold, refusal, type EpochRecord, type Logged, type Move, type ObjectEpochs, type OpenDdl, type OpenMove, type Snapshot } from "./catalog";
+import { describeOpen, fenceOf, fold, objectKey, refusal, type EpochRecord, type Logged, type Move, type ObjectEpochs, type OpenDdl, type OpenMove, type Snapshot } from "./catalog";
 
 /**
  * 表定義の遷移の期限 (docs/design-catalog-epoch.md の「期限」)。prepare から commit か abort までの間、fence の表への書き込みが止まる。
@@ -39,6 +39,8 @@ export interface OpenTransition {
   fence: string[];
   /** mode build のとき、作っている index の名前。 */
   index?: string;
+  /** やり直しの試みなら、その DDL の最初の試みの prepare の epoch。DDL を進める側が、自分の DDL のやり直しを見分ける。 */
+  retryOf?: number;
 }
 
 export interface Catalog {
@@ -82,6 +84,7 @@ function catalogOf(s: Snapshot): Catalog {
   if (s.open) {
     const o: OpenTransition = { epoch: s.open.epoch, mode: s.open.mode, fence: s.open.fence };
     if (s.open.mode === "build") o.index = Object.keys(s.open.ddl.indexes ?? {})[0]!;
+    if (s.open.retryOf !== undefined) o.retryOf = s.open.retryOf;
     cat.open = o;
   }
   if (s.aborted) cat.aborted = s.aborted;
@@ -434,15 +437,23 @@ export class MetaCore {
     const parsed = parseDdl(sql, s);
     if (parsed.noop) return { epoch: null, mode: "plain", catalog: catalogOf(s) };
     let mode: DdlMode = parsed.mode ?? "plain";
-    let fence = parsed.fence ?? [];
+    // 待つ表の集合 (fence) は、DDL が書き込みの epoch を進める表から導く (src/catalog.ts の fenceOf。計画書の不変条件 16)。
+    let fence = fenceOf(parsed, s.tables);
+    // 欠陥のスイッチ indexDdlUnfenced (2026-11-17 までの形): 行で失敗しない index の DDL (一意でない CREATE INDEX、DROP INDEX) は、
+    // 書き込みの epoch だけを進める表を、fence に入れない。
+    if (this.faults.indexDdlUnfenced && mode === "plain") {
+      const writeOnly = new Set((parsed.changes?.write ?? []).map(objectKey));
+      fence = fence.filter((t) => !writeOnly.has(objectKey(t)));
+    }
     const guard = opts.guard ?? [];
     if (guard.length > 0) {
+      // 取引が読んだ表の DROP。消す表は、もう fence にある。
       if (!guard.every((t) => parsed.drops.includes(t))) throw new SqlError(`DROP TABLE: the statement does not drop ${guard.join(", ")}`);
       mode = "guard";
       fence = [...new Set([...fence, ...guard])];
     }
     this.tryShadow(parsed);
-    const { mode: _m, fence: _f, staging, ...ddl } = parsed;
+    const { mode: _m, staging, ...ddl } = parsed;
     const rec: EpochRecord = {
       kind: "prepare", mode, ddl, fence, ...(staging ? { staging } : {}), ...(opts.waitUntil === undefined ? {} : { waitUntil: opts.waitUntil }),
     };
@@ -514,21 +525,44 @@ export class MetaCore {
    * そちらを利用者へ返す。もう commit された遷移は取り消せない (M21 の ONE_EXIT)。
    * wound は、fence の表の行ロックを持つ取引が、書き込み禁止に当たって取り消させる手である (M24 の WOUND)。記録に印を付ける。答えの
    * wound は、記録された (か、もう記録されていた) abort がその手のものか、である。DDL を進める側は、それを見て、やり直すかを決める。
+   *
+   * 取り消させる手では、abort と同じ 1 手で、やり直しの prepare を記録する (モデル M24c の ONE_RESTART)。同じ文、同じ fence、同じ待ちの
+   * 期限 (KEEP_BUDGET) で、epoch だけが新しい (FRESH_EPOCH。シャードは ok を答え直す)。DDL が始まってから終わるまで、列に、開いている
+   * 試みのない時がない。abort を適用したシャードは、同じ続きで、やり直しの prepare を見る。間があると、DDL の後ろで待っていた取引が、
+   * その間にロックを得て、DDL を待たせる (行が 2 つのシャードにあるときだけ起きるので、成否が置き場所で決まる)。
+   * 答えの next は、その DDL のやり直しのうち、いま開いている prepare の epoch である (なければ、ない)。やり直しの prepare は、DDL の
+   * 最初の試みの epoch を運ぶ (retryOf) ので、何度取り消させられても、同じ DDL のやり直しだと分かる。進める側は、待ちの期限のうちなら、
+   * それを引き継いで進め、過ぎていれば取り消す。進める側が止まっていれば、やり直しも、期限 (lease) で abort される。
+   * 欠陥のスイッチ woundWithoutRestart は、やり直しの prepare を記録しない (2026-11-17 までの形。進める側が、後から記録する)。
    */
-  async abort(epoch: number, reason: string, wound = false): Promise<{ reason: string; wound: boolean }> {
+  async abort(epoch: number, reason: string, wound = false): Promise<{ reason: string; wound: boolean; next?: number }> {
     this.expire();
     const s = this.snapshot();
     if (refusal(s, { kind: "abort", of: epoch, reason }) === null) {
-      this.b.tx(() => {
+      const prepared = readEpochs(this.b).find((x) => x.epoch === epoch)!.rec as Extract<EpochRecord, { kind: "prepare" }>;
+      const lease = this.lease(epoch);
+      const now = this.rt.now();
+      const next = this.b.tx(() => {
         this.record({ kind: "abort", of: epoch, reason, ...(wound ? { wound: true as const } : {}) });
         this.setLease(epoch, null);
+        // 待ちの期限を運ばない prepare (試験が直に開いた遷移) は、やり直さない。待つ者がいない。
+        if (!wound || this.faults.woundWithoutRestart || prepared.waitUntil === undefined) return undefined;
+        const e = this.record({ ...prepared, retryOf: prepared.retryOf ?? epoch });
+        // 書き込みが止まる時間の上限 (TRANSITION_MAX_MS) は、最初の試みから数える。
+        this.setLease(e, { epoch: e, started: lease?.started ?? now, until: now + this.leaseMs });
+        return e;
       });
-      return { reason, wound };
+      return { reason, wound, ...(next === undefined ? {} : { next }) };
     }
     const why = this.closedReason(epoch);
     if (/was already committed|is not open/.test(why)) throw new SqlError(`cannot withdraw: ${why}`);
-    const recorded = readEpochs(this.b).find((x) => x.rec.kind === "abort" && x.rec.of === epoch)?.rec as Extract<EpochRecord, { kind: "abort" }> | undefined;
-    return { reason: why, wound: recorded?.wound === true };
+    const log = readEpochs(this.b);
+    const recorded = log.find((x) => x.rec.kind === "abort" && x.rec.of === epoch)?.rec as Extract<EpochRecord, { kind: "abort" }> | undefined;
+    // その DDL のやり直しが、まだ開いていれば、それを答える。
+    const first = log.find((x) => x.epoch === epoch)?.rec as Extract<EpochRecord, { kind: "prepare" }> | undefined;
+    const origin = first?.retryOf ?? epoch;
+    const next = s.opens.find((o) => o.retryOf === origin)?.epoch;
+    return { reason: why, wound: recorded?.wound === true, ...(next === undefined ? {} : { next }) };
   }
 
   /** rowid を n 個採番する。min は利用者が明示した値で、これより大きい値から続ける。 */

@@ -88,7 +88,15 @@ export type Plan =
       indexed?: string[];
     }
   /** 読みの基準経路。走査で行を集め、元の文を Worker の SQLite で実行する。 */
-  | { kind: "gather"; scans: Scan[]; sql: string; params: Value[] }
+  | {
+      kind: "gather"; scans: Scan[]; sql: string; params: Value[];
+      /**
+       * 文が、主キーで決まる 1 行だけを読むなら、その行 (基準経路だけの計画に付く)。BEGIN IMMEDIATE の取引は、行を集める前に、この行の
+       * ロックを取る (Txn.read)。最適化の経路の、ロックを取る主キーの読み (kind shard の pk) と同じ行である。行は、走査ではなく、文から
+       * 決める (Reference の full は、条件を押し下げない)。
+       */
+      lockRow?: { table: string; sk: string; pk: string };
+    }
   | { kind: "partial"; scan: Scan; columns: string[]; mergeSql: string; mergeParams: Value[] }
   /** pragma は、PRAGMA と EXPLAIN の文である。型つきの読みに包めないので、素の列で読む (ScratchDb.pragma)。 */
   | { kind: "meta"; sql: string; params: Value[]; pragma?: true }
@@ -785,13 +793,19 @@ function planRead(stmt: Node, values: Value[], cat: Catalog, reference?: Referen
   const defs = [...new Set(scopes.flatMap((s) => s.refs.flatMap((r) => (r.def ? [r.def] : []))))];
   if (n.views.size === 0 && defs.length === 0) return { kind: "meta", sql, params };
   if (n.meta.used) return { kind: "meta", sql, params };
-  if (reference) return { kind: "gather", scans: referenceScans(scopes, n, values, reference), sql, params };
+  // 文が、1 つの shard key の行だけを読むなら、その shard key。さらに、主キーで決まる 1 行だけを読むなら、その主キー。
+  const key = n.views.size === 0 ? statementPin(scopes, values) : null;
+  const top = key !== null ? scopes.find((s) => s.node === stmt) : undefined;
+  const only = scopes.length === 1 && top?.refs.length === 1 ? top : null;
+  const pk = only ? pkOf(conjuncts(only.where), only.refs[0]!, only, values) : null;
+  if (reference) {
+    // 基準経路でも、BEGIN IMMEDIATE の主キーの読みは、行のロックを取る。取らないと、ロックを持つかどうかが、文の経路で変わる
+    // (表定義の変更は、ロックを持つ取引を待つ。持たない取引は、変更の後で断られる)。
+    const lockRow = key !== null && pk !== null && defs.length === 1 ? { table: defs[0]!.name, sk: key, pk } : null;
+    return { kind: "gather", scans: referenceScans(scopes, n, values, reference), sql, params, ...(lockRow ? { lockRow } : {}) };
+  }
   if (n.views.size === 0) {
-    const key = statementPin(scopes, values);
     if (key !== null) {
-      const top = scopes.find((s) => s.node === stmt);
-      const only = scopes.length === 1 && top?.refs.length === 1 ? top : null;
-      const pk = only ? pkOf(conjuncts(only.where), only.refs[0]!, only, values) : null;
       return { kind: "shard", route: { by: "sk", sks: [key] }, sql, params, tables: defs, pk, ...(n.indexed ? { indexed: [...n.indexed] } : {}) };
     }
     // グローバル index は、読み書きの経路には使わない (一意性の保証にだけ使う)。index が挙げた shard key でシャードを選び、

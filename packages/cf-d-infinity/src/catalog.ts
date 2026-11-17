@@ -15,7 +15,7 @@
 // 進むのは、その DDL が変えたもの (ParsedDdl.changes) の epoch だけである。prepare と abort は、どの epoch も進めない (決めたこと 6 を
 // 2026-11-17 に改めた)。失敗した DDL は、触った表の取引も古くしない。prepare が作る内部の表 (staging) だけは、prepare の epoch で生まれる。
 import { applyMove, overlaps, shardsOf, type Interval, type Routing } from "./routing";
-import type { DdlMode, IndexInfo, ParsedDdl } from "./sql/ddl";
+import { isInternalName, type DdlChanges, type DdlMode, type IndexInfo, type ParsedDdl } from "./sql/ddl";
 import type { TableDef, Ts } from "./types";
 
 export type { DdlMode } from "./sql/ddl";
@@ -41,6 +41,12 @@ export type EpochRecord =
        * やり直しの prepare も、最初の試みの期限を運ぶ (KEEP_BUDGET)。ない記録は、待たない。
        */
       waitUntil?: number;
+      /**
+       * やり直しの prepare である。値は、その DDL の最初の試みの prepare の epoch (何度やり直しても同じ)。Meta が、取り消させる手 (wound) の
+       * abort と同じ 1 手で記録する (M24c の ONE_RESTART)。DDL が始まってから終わるまで、開いている試みのない時がない。進める側は、
+       * 自分の DDL のやり直しを、これで見分けて、引き継ぐ (MetaCore.abort の答えの next、Catalog.open.retryOf)。
+       */
+      retryOf?: number;
     }
   /**
    * 遷移を確定する。of は終える prepare の epoch で、その prepare の ddl を確定する。at は index を公開する commit が運ぶ時刻で、
@@ -50,7 +56,8 @@ export type EpochRecord =
   | { kind: "commit"; of: number; at?: Ts }
   /**
    * 遷移を取り消す。禁止を解くだけで、利用者の表に触る文を持たない。wound は、fence の表の行ロックを持つ取引が、書き込み禁止に当たって
-   * 取り消させた印である (M24 の WOUND)。DDL を進める側は、この印のある取り消しだけを、待ちの期限のうちにやり直す (RETRY)。
+   * 取り消させた印である (M24 の WOUND)。Meta は、この印のある取り消しのすぐ後ろに、同じ 1 手で、やり直しの prepare (retryOf) を記録する
+   * (M24c の ONE_RESTART)。DDL を進める側は、待ちの期限のうちなら、それを引き継ぐ。
    */
   | { kind: "abort"; of: number; reason: string; wound?: true }
   | ({ kind: "move-start" } & Move)
@@ -70,6 +77,8 @@ export interface OpenDdl {
   /** prepare の ddl。commit が表定義に入れる。 */
   ddl: ParsedDdl;
   staging?: { sql: string[]; defs: TableDef[] };
+  /** やり直しの試みなら、その DDL の最初の試みの prepare の epoch (prepare の記録の retryOf)。 */
+  retryOf?: number;
 }
 
 /** 開いている移動。epoch は、その move-start の epoch。 */
@@ -142,15 +151,48 @@ export interface FoldFaults {
   indexAsObject?: boolean;
 }
 
+/**
+ * DDL が、確定で epoch を進めるもの。both は読みの epoch と書き込みの epoch の両方が進むもの、write は書き込みの epoch だけが進む表である。
+ * 畳み込み (advance) と、DDL が待つ表の集合 (fenceOf) は、どちらも、ここから作る。
+ */
+function advanced(c: DdlChanges, faults: FoldFaults = {}): { both: string[]; write: string[] } {
+  return { both: [...c.read, ...c.views], write: faults.indexAsObject ? [] : c.write };
+}
+
 /** DDL が変えるものの epoch を、epoch e に進める。 */
 function advance(s: Snapshot, d: Pick<ParsedDdl, "changes">, e: number, faults: FoldFaults): void {
-  const c = d.changes;
-  if (!c) return;
-  for (const n of [...c.read, ...c.views]) s.objects[objectKey(n)] = { read: e, write: e };
-  for (const n of faults.indexAsObject ? [] : c.write) {
+  if (!d.changes) return;
+  const a = advanced(d.changes, faults);
+  for (const n of a.both) s.objects[objectKey(n)] = { read: e, write: e };
+  for (const n of a.write) {
     const k = objectKey(n);
     s.objects[k] = { read: s.objects[k]?.read ?? 0, write: e };
   }
+}
+
+/**
+ * DDL が待つ表の集合 (fence。計画書の不変条件 16、モデル M24c の FENCE_COVERS)。その DDL が確定で書き込みの epoch を進める表のうち、
+ * prepare の直前の表定義にある、利用者の表である。prepare は、この表の行ロックが空くのを待ち、prepare から commit か abort まで、
+ * この表への書き込みを止める。DDL の種類ごとに並べず、畳み込みが epoch を進めるのと同じ一覧 (advanced) から作る。
+ *   書き込みの epoch が進むと、その表を書いた取引の、次の書き込みと COMMIT は、古い計画として断られる。行を書いた取引がロックを持つ間、
+ *   DDL のほうが待たなければ、取引が DDL のために失敗する (SQLite では、DDL のほうが、書いた取引を待つ)。
+ * 入れないもの。
+ *   まだない名前 (作る表、RENAME の新しい名前) と view。行がないので、行ロックもない。
+ *   内部の表 (__gidx_<index>)。その行は、元の表を書く取引が、同じ取引で書き、行ロックを取らない。止めると、行ロックを持つ取引の
+ *   COMMIT が、index の項目のシャード (元の表の行ロックがなく、prepare をもう適用している) で断られる。成否が、項目の置き場所で
+ *   決まる。元の表の fence が、項目を書く取引を待たせ、止める。
+ * tables は、prepare の直前のスナップショットの表定義である。返す名前は、表定義にある綴りである。
+ */
+export function fenceOf(d: Pick<ParsedDdl, "changes">, tables: Readonly<Record<string, unknown>>): string[] {
+  if (!d.changes) return [];
+  const a = advanced(d.changes);
+  const names = new Map(Object.keys(tables).map((n) => [objectKey(n), n]));
+  const out: string[] = [];
+  for (const n of [...a.both, ...a.write]) {
+    const name = names.get(objectKey(n));
+    if (name !== undefined && !isInternalName(name) && !out.includes(name)) out.push(name);
+  }
+  return out;
 }
 /** 表定義の全体の epoch を進める。 */
 function advanceAll(s: Snapshot, e: number): void {
@@ -204,6 +246,7 @@ export function fold(log: readonly Logged[], upTo = Number.POSITIVE_INFINITY, fa
       case "prepare": {
         const o: OpenDdl = { epoch, mode: rec.mode, fence: rec.fence, ddl: rec.ddl };
         if (rec.staging) o.staging = rec.staging;
+        if (rec.retryOf !== undefined) o.retryOf = rec.retryOf;
         s.opens = [...s.opens, o];
         s.open = o;
         // 内部の表 (index の表) は、prepare から表定義に載る。進める側が、commit の前に、ここへ項目を書くからである。
@@ -252,7 +295,8 @@ export function fold(log: readonly Logged[], upTo = Number.POSITIVE_INFINITY, fa
 
 /** 書き込みを止めている遷移のうち、表 table を fence に持つもの。なければ null。 */
 export function fencedBy(s: Pick<Snapshot, "opens">, table: string): OpenDdl | null {
-  return s.opens.find((o) => o.fence.includes(table)) ?? null;
+  const key = objectKey(table);
+  return s.opens.find((o) => o.fence.some((t) => objectKey(t) === key)) ?? null;
 }
 
 /** 開いている遷移の名前。誤りの文 (TableLocked、SchemaBusy、期限切れの abort の理由) に使う。 */

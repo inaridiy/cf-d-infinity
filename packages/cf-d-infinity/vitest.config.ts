@@ -28,6 +28,7 @@ const oracles = [
   "contextual-words", "join-word-before-comment", "placement-differential", "unique-diff",
   "last-insert-rowid", "insert-select-returning", "ranged-write-in-begin-takes-no-lock", "snapshot-read-after-two-shards-changed", "shared-rowid-block-rollback",
   "txn-across-ddl", "ddl-waits-for-row-locks", "lock-lease-placement",
+  "locking-read-on-fenced-table", "index-ddl-ignores-row-locks", "ddl-busy-by-writer-during-its-wait",
 ].map((name) => `test/${name}.test.ts`);
 
 export default defineConfig({

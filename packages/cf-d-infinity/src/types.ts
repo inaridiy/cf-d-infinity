@@ -616,6 +616,12 @@ export interface Faults {
    */
   applyRefusesTouched?: boolean;
   /**
+   * Meta が、行で失敗しない index の DDL (一意でない CREATE INDEX、DROP INDEX) の prepare に、表を fence として入れない (2026-11-17 までの
+   * 形。M24c の m24c_red_fence)。その DDL は、表の書き込みの epoch を進めるのに、表の行ロックを待たずに確定し、行を書いた取引の次の
+   * 書き込みと COMMIT が、古い計画として断られる。
+   */
+  indexDdlUnfenced?: boolean;
+  /**
    * シャードが、fence の表に行ロックがあっても、待たずに prepare を適用する (段 3 の形。M24 の m24_lock_red_no_wait、
    * m24_retry_red_no_wait)。行を書いた取引の COMMIT が、DDL の後で、古い計画として断られる。
    */
@@ -625,6 +631,30 @@ export interface Faults {
    * やり直しの prepare が、取引の書き込みより先に適用され、取引は、また禁止に当たる。
    */
   noLockAtFence?: boolean;
+  /**
+   * シャードが、行ロックを与えるときに、書き込みとして頼る表の行にしか、書き込み禁止を確かめない (2026-11-17 までの形。M24c の
+   * m24c_red_reads)。ロックを取る読み (BEGIN IMMEDIATE の主キーの読み) は、禁止の表でロックを得る。全シャードが prepare を適用した後に
+   * 始めた取引が、続く書き込みで、DDL を取り消させる。
+   */
+  lockGateWritesOnly?: boolean;
+  /**
+   * シャードが、prepare の適用を待っている間も、その表の行ロックを持たない取引に、新しいロックを与える (2026-11-17 までの形。M24c の
+   * m24c_red_window)。待っている間に来た取引がロックを持ち続けると、DDL は、DDL より前の取引が期限のうちに終わっても失敗する。行が、
+   * もう prepare を適用したシャードにあれば、その取引は待ち、DDL は通る。
+   */
+  lockDuringDdlWait?: boolean;
+  /**
+   * prepare の適用を待っているシャードが、その表の行ロックを、このシャードに持つ取引にだけ、新しいロックを与える (要求の運ぶ
+   * LockOwner.holds を見ない。M24c の m24c_red_holder_here)。別のシャードにロックを持つ取引の書き込みが、ロックを持たない取引と同じに
+   * 断られる。行が 1 つのシャードにあれば起きない。
+   */
+  holdsOnlyHere?: boolean;
+  /**
+   * Meta が、取り消させる手 (wound) の abort と一緒に、やり直しの prepare を記録しない (2026-11-17 までの形。M24c の m24c_red_gap)。
+   * やり直しは、進める側が、取り消しを知ってから記録する。取り消しを適用したシャードは、やり直しの prepare を見るまで、禁止も待ちもなく、
+   * DDL の後ろで待っていた取引が、その間にロックを得る。
+   */
+  woundWithoutRestart?: boolean;
   /**
    * 表定義の変更の床を、シャードに 1 つだけ持つ (段 3 の形。M24 の m24_floor_red_global)。どの DDL の commit も、全部の表の、床より古い
    * 時刻の読み戻しと refresh と述語の検証を断る。

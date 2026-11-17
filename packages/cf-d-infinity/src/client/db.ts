@@ -39,9 +39,10 @@ export interface Cluster {
   commit(epoch: number, acks: string[], at?: Ts): Promise<Catalog>;
   /**
    * 遷移を取り消す。もう取り消されていれば (期限切れか、取り消させる手)、記録した理由を返す。wound は、fence の表の行ロックを持つ取引が
-   * 取り消させる手である。答えの wound は、記録された abort がその手のものか、である。
+   * 取り消させる手である。答えの wound は、記録された abort がその手のものか、である。next は、Meta が取り消させる手の abort と同じ手で
+   * 記録した、やり直しの prepare (をたどった先) の epoch で、まだ開いているときだけ付く (meta.ts の abort)。
    */
-  abort(epoch: number, reason: string, wound?: boolean): Promise<{ reason: string; wound: boolean }>;
+  abort(epoch: number, reason: string, wound?: boolean): Promise<{ reason: string; wound: boolean; next?: number }>;
   /** 開いている遷移の期限を延ばす。epoch は prepare の epoch。期限の長さを返す。 */
   renew(epoch: number): Promise<{ leaseMs: number }>;
   /**
@@ -579,6 +580,14 @@ class ReadScope {
     }
   }
 
+  /**
+   * 行を集める読みが、主キーで決まる 1 行だけを読む。BEGIN IMMEDIATE の取引は、集める前に、その行のロックを取る (Txn.lockRead)。
+   * ロックを取らないなら、null を返す (呼び出し側は待たない)。
+   */
+  protected lockRead(_row: { table: string; sk: string; pk: string }): Promise<void> | null {
+    return null;
+  }
+
   protected async shardRead(p: Extract<Plan, { kind: "shard" }>, t: Target, maxBytes?: number): Promise<ExecRes> {
     const { tables, columns } = await this.db.shapeOf(p.sql, this.cat, p.tables, false);
     return this.call(t.shard, {
@@ -727,6 +736,9 @@ class ReadScope {
         return new QueryResult(parts[0]!.columns, parts.flatMap((r) => r.values), 0, null, this.T);
       }
       case "gather": {
+        // ロックを取らない読みでは、待ちを 1 つも足さない (足すと、基準経路の実行で、同じ seed の RPC の順が変わる)。
+        const locking = p.lockRow ? this.lockRead(p.lockRow) : null;
+        if (locking) await locking;
         const w = await this.gather(p.scans, p.sql);
         try {
           const r = w.select(p.sql, p.params);
@@ -1066,6 +1078,23 @@ export class Txn extends ReadScope {
     return this.spans.size === 0 && this.writes.size === 0;
   }
 
+  /**
+   * 取引の最初の文が、答えを返す前に断られた (表の書き込み禁止か、古い表定義)。その文が記録した読みを捨てて、何もしていない取引に戻す。
+   * 戻せたら true を返す。呼び出し側は、新しい表定義で計画し直す (rebase)。
+   * 行を集める経路 (基準経路) の文は、ロックを求める前に、行を読む。最適化の経路の文は、読む前にロックを求めるので、断られたときに、
+   * 何も記録していない。捨てないと、同じ文が、経路によって、計画し直せたり (通る)、直せなかったり (SQLITE_BUSY) する。
+   * 文は答えを返していないので、取引は何も見ていない。読み取り時刻も捨てる (新しい表定義の計画は、DDL より後の時刻で読む)。
+   * 行ロックを取っていたら、戻さない (ロックを持つ取引は、DDL のほうが待つ。取引は、自分の表定義のまま続ける)。
+   */
+  unread(): boolean {
+    if (this.writes.size > 0 || this.lockShards.size > 0 || this.lockTables.size > 0) return false;
+    this.spans.clear();
+    this.views.clear();
+    this.T = undefined;
+    this.wantsFresh = true;
+    return true;
+  }
+
   /** 取引が、表 table の行ロックを持つ (と、Worker が信じる) か。 */
   holdsLocksOn(table: string): boolean {
     return this.lockTables.has(objectKey(table));
@@ -1187,6 +1216,25 @@ export class Txn extends ReadScope {
       lockRows: [{ table: p.tables[0]!.name, pk: p.pk }],
       ...(p.indexed ? { rely: { write: p.indexed } } : {}),
     });
+  }
+
+  /**
+   * BEGIN IMMEDIATE の主キーの読みが、行を集める経路 (基準経路) で実行される。行を集める前に、その行のロックを取る。最適化の経路
+   * (shardRead) は、ロックを取って読む。取らないと、取引が行ロックを持つかどうかが、文の経路で変わり、表定義の変更との結果も変わる
+   * (ロックを持つ取引は、DDL のほうが待つ。まだ何も読んでいない取引のロックの要求は、DDL の後ろで待ち、DDL の後の表定義で計画し直す。
+   * ロックを取らずに読んだ取引は、DDL の後で断られる)。ロックを取る要求は行を読まない (LOCK_SQL)。行は、その後で、取引の読み取り時刻で
+   * 集める。取引の最初の文なら、読み取り時刻は、ロックを取った時刻になる。後の文では、読み取り時刻とロックの間に別の接続がその行を
+   * 確定していれば、COMMIT が競合になる (範囲で書く文と同じ。最適化の経路は、最新を読むので、競合にならない)。
+   */
+  protected override lockRead(row: { table: string; sk: string; pk: string }): Promise<void> | null {
+    if (!this.lockReads) return null;
+    const [t] = groupByShard(this.cat.routing, [row.sk]);
+    if (!t) return null;
+    return this.dml(t.shard, {
+      sql: LOCK_SQL, params: [], columns: ["locked"],
+      spans: [rowSpan(row.table, row.pk, row.sk)],
+      lockRows: [{ table: row.table, pk: row.pk }],
+    }, { overlay: false }).then(() => undefined);
   }
 
   /**
@@ -2057,8 +2105,14 @@ export class Db {
     let waitUntil = this.rt.now() + DDL_WAIT_MS;
     // 取り消された試みで ok と答えたシャード。欠陥のスイッチ retrySameEpoch だけが、やり直しに使う。
     let stale: string[] = [];
+    // Meta が、取り消させる手の abort と同じ手で記録した、やり直しの prepare。次の周で、新しく開かずに、これを進める。
+    let adopted: (Prepared & { before: number }) | null = null;
+    // この DDL の最初の試みの prepare の epoch。Meta の記録したやり直しは、これを運ぶ (Catalog.open.retryOf)。
+    let origin: number | null = null;
     for (;;) {
-      const p = await this.prepareDdl(sql, guard, waitUntil);
+      const p: Prepared & { before: number } = adopted ?? (await this.prepareDdl(sql, guard, waitUntil));
+      if (!adopted) origin = p.epoch;
+      adopted = null;
       this.publish(p.catalog);
       this.ids.clear();
       if (p.epoch === null) return; // 何も記録されなかった
@@ -2076,24 +2130,41 @@ export class Db {
           ? `CREATE INDEX ${index} did not finish: the table has too many rows to index within one request. The index was not created and the table is unchanged. A UNIQUE constraint declared in CREATE TABLE needs no build.`
           : ((e as Error)?.message ?? String(e));
         const withdrawn = await this.cluster.abort(epoch, reason).catch(() => null);
-        const now = await this.cluster.catalog().catch(() => null);
-        if (now) {
-          this.publish(now);
-          await this.syncAll(now);
-        }
-        if (exhausted) throw new SqlError(reason);
         // 行ロックを持つ取引が、書き込み禁止に当たって、この遷移を取り消させた (M24 の WOUND)。待ちの期限のうちなら、同じ DDL を、
-        // 新しい遷移でやり直す (RETRY)。新しい遷移は、新しい epoch の prepare を記録し、全部のシャードの ok を集め直す (FRESH_EPOCH)。
+        // 新しい遷移でやり直す。新しい遷移は、新しい epoch の prepare で、全部のシャードの ok を集め直す (FRESH_EPOCH)。
         // やり直さないと、DDL の成否が、取引の行の置き場所で決まる。取引の行が 1 つのシャードにあれば、DDL は、取引の確定を待って通る。
         // 行の確かめ (CHECK の試し、UNIQUE の重複) や、期限切れで取り消された遷移は、やり直さない。
-        if (withdrawn?.wound && !this.faults.noRetryAfterWound && this.rt.now() < waitUntil) {
+        // やり直しの prepare は、Meta が、取り消しと同じ手で記録している (withdrawn.next。モデル M24c の ONE_RESTART)。それを引き継ぐ。
+        // 進める側が後から記録すると、その間、シャードに禁止も待ちもなく、DDL の後ろで待っていた取引がロックを得る。
+        const retry = withdrawn?.wound === true && !this.faults.noRetryAfterWound && this.rt.now() < waitUntil;
+        // 欠陥のスイッチ retryRestartsBudget は、期限を数え直す。Meta の記録したやり直しは、前の期限を運ぶので、取り消して、開き直す。
+        const adopt = retry && withdrawn?.next !== undefined && !this.faults.retryRestartsBudget;
+        // やり直さないなら、Meta の記録したやり直しの prepare も、取り消す (その間に、また取り消させられていれば、その先も)。
+        for (let next = adopt ? undefined : withdrawn?.next; next !== undefined; ) {
+          next = (await this.cluster.abort(next, withdrawn!.reason).catch(() => null))?.next;
+        }
+        const now = await this.cluster.catalog().catch(() => null);
+        // 引き継ぐのは、いま開いている、この DDL のやり直しである。abort の答えを受けた後で、それが、また取り消させられていることがある
+        // (その先のやり直しが開いている)。
+        const mine = adopt && now?.open?.retryOf === origin ? now.open : undefined;
+        if (now) {
+          this.publish(now);
+          // 引き継ぐときは、すぐに、やり直しの prepared を全シャードに尋ねる。ここでは知らせない。
+          if (!mine) await this.syncAll(now);
+        }
+        if (exhausted) throw new SqlError(reason);
+        if (retry) {
           // 欠陥のスイッチ: やり直すたびに期限を数え直す (retryRestartsBudget)。取り消された試みの ok を使い続ける (retrySameEpoch)。
           if (this.faults.retryRestartsBudget) waitUntil = this.rt.now() + DDL_WAIT_MS;
           if (this.faults.retrySameEpoch) stale = [...new Set([...stale, ...acked])];
+          if (mine && now) adopted = { ...p, epoch: mine.epoch, catalog: now };
           continue;
         }
+        // 取り消させる手で取り消され、やり直さなかった DDL は、競合 (SQLITE_BUSY) で失敗する。取り消しを知った所 (prepared の答え、
+        // index を作る途中の stillOpen) に依らない。
+        if (withdrawn?.wound) throw new ConflictError(withdrawn.reason);
         // 期限で先に abort されていれば、その理由を返す。
-        if (withdrawn && withdrawn.reason !== reason) throw withdrawn.wound ? new ConflictError(withdrawn.reason) : new SqlError(withdrawn.reason);
+        if (withdrawn && withdrawn.reason !== reason) throw new SqlError(withdrawn.reason);
         throw e;
       } finally {
         lease.stop();
@@ -2398,9 +2469,9 @@ export class Db {
         }
         if (!isRetryable(e) || attempt >= retries) fail();
         this.onRetry(e);
-        // 表定義の変更が、表への書き込みを止めている。その遷移が閉じるのを待つ。
+        // 表定義の変更が、表への書き込みを止めている。その DDL が終わるのを待つ。
         const lock = tableLockOf(e);
-        if (lock && !(await this.transitionClosed(lock.epoch))) fail();
+        if (lock && !(await this.tableUnfenced(lock.table, lock.epoch))) fail();
         await backoff(this.rt, attempt);
       }
     }
@@ -2454,17 +2525,23 @@ export class Db {
   }
 
   /**
-   * 表への書き込みを止めている遷移 (prepare の epoch) が閉じる (commit か abort が記録される) のを待つ。閉じた後のスナップショットを返す。
-   * 待ち切れなければ null を返す。
-   * 表定義の遷移の prepare から commit か abort まで、シャードは fence の表への書き込みを断る。遷移には期限があるので、待てば必ず閉じる。
+   * 表 table への書き込みとロックを止めている DDL が終わるのを待つ。終わった後のスナップショットを返す。待ち切れなければ null を返す。
+   * epoch は、断ったシャードが名指した prepare の epoch である。
+   * 表定義の遷移の prepare から commit か abort まで、シャードは fence の表への書き込みを断り、その表の行ロックを持たない取引に、新しい
+   * ロックを与えない (prepare の適用を待っている間も)。遷移には期限があるので、待てば必ず終わる。
+   * 終わったと見るのは、その表を fence に持つ遷移が、開いていないときである。名指された試みが取り消させる手で取り消されても、Meta は、
+   * 同じ手で、やり直しの prepare を記録するので、DDL が終わるまで、その表を fence に持つ遷移が開いている (モデル M24c の ONE_RESTART)。
+   * 試みの epoch だけを見ると、やり直しのたびに送り直すことになる。
    * 段 3 までは、表定義全体の epoch が進むのを待った。commit だけが epoch を進める形では、abort の後に epoch が進まないので、遷移を見る。
    */
-  private async transitionClosed(epoch: number): Promise<Catalog | null> {
+  private async tableUnfenced(table: string, epoch: number): Promise<Catalog | null> {
     const deadline = this.rt.now() + (this.opts.schemaWaitMs ?? SCHEMA_WAIT_MS);
+    const key = objectKey(table);
     for (let i = 0; ; i++) {
       this.cached = null;
       const cat = await this.catalog();
-      if (cat.open?.epoch !== epoch) return cat;
+      const open = cat.open;
+      if (!open || (open.epoch !== epoch && !open.fence.some((t) => objectKey(t) === key))) return cat;
       if (this.rt.now() >= deadline) return null;
       await sleep(this.rt, Math.min(1000, 10 * 2 ** i));
     }
@@ -2536,11 +2613,16 @@ export class Db {
     let refreshed = false;
     let rerouted = 0;
     let lockWaits = 0;
+    // この文の前に、取引が何も読み書きしていなかった。この文が、答えを返す前に断られたら、何もしていない取引に戻せる (Txn.unread)。
+    // 文の最初の試みの前に見る。断られた試みが読みを記録した後の、次の試み (範囲の移動で計画し直した試みなど) でも、同じである。
+    const first = this.current;
+    const untouchedBefore = first?.untouched === true;
     for (let attempt = 0; ; attempt++) {
       info.attempts = attempt + 1;
       // 取引の中の文は、取引の表定義で計画する (Txn.catalog)。
       const txn = this.current;
       const cat = txn?.catalog ?? (await this.catalog());
+      const pristine = untouchedBefore && txn === first;
       // この試みの採番。文が失敗したら戻す (Taken)。SQLite でも失敗した INSERT は rowid を消費しない。
       const taken = new Taken();
       try {
@@ -2581,10 +2663,11 @@ export class Db {
           this.current?.rebase(await this.catalog());
           continue;
         }
-        // 取引の最初の文なら何も読んでいないので、表定義を取り直してやり直せる。
-        if (this.current?.untouched && /stale schema/.test((e as Error)?.message ?? "") && attempt < retries) {
+        // 取引の最初の文なら何も読んでいないので、表定義を取り直してやり直せる。行を集める経路の文は、断られる前に、ほかのシャードの行を
+        // 読んでいることがある。その読みは捨てる (Txn.unread)。
+        if (txn && this.current === txn && /stale schema/.test((e as Error)?.message ?? "") && attempt < retries && (txn.untouched || (pristine && txn.unread()))) {
           this.cached = null;
-          this.current.rebase(await this.catalog());
+          txn.rebase(await this.catalog());
           continue;
         }
         // 表定義の変更が、表への書き込みを止めている (列を足している最中、index を作っている最中、DROP の前)。その遷移が閉じるのを待って、
@@ -2604,10 +2687,12 @@ export class Db {
             txn.follow(await this.freshCatalog());
             continue;
           }
-          const fresh = lock && stmt.type !== "commit_transaction_stmt" && lockWaits++ < LOCK_WAITS ? await this.transitionClosed(lock.epoch) : null;
+          const fresh = lock && stmt.type !== "commit_transaction_stmt" && lockWaits++ < LOCK_WAITS ? await this.tableUnfenced(lock.table, lock.epoch) : null;
           if (fresh && this.current === txn) {
-            // 遷移が閉じた後のスナップショットの epoch を運ばせる。シャードは、禁止を解く記録を、その要求で適用する。
-            if (txn) txn.untouched ? txn.rebase(fresh) : txn.follow(fresh);
+            // DDL が終わった後のスナップショットの epoch を運ばせる。シャードは、禁止を解く記録を、その要求で適用する。
+            // この文の前に何もしていなかった取引は、DDL の後の表定義で計画し直す。行を集める経路の文は、ロックを求める前に行を読んで
+            // いるので、その読みを捨てる (Txn.unread)。読むか書くかした取引は、自分の表定義のまま、同じ文を送り直す。
+            if (txn) txn.untouched || (pristine && txn.unread()) ? txn.rebase(fresh) : txn.follow(fresh);
             continue;
           }
           this.onRetry(e);

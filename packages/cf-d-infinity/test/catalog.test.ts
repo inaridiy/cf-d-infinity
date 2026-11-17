@@ -7,11 +7,12 @@
 // 表定義の epoch は、表と view ごとに持ち、commit の記録でだけ進む (設計書の「表ごとの epoch」、M24。2026-11-17)。
 import { describe, expect, it } from "vitest";
 import { movesToResume, split } from "../src/autoscaler";
-import { fold, refusal, type Logged, type ObjectEpochs } from "../src/catalog";
+import { fold, objectKey, refusal, type Logged, type ObjectEpochs } from "../src/catalog";
 import { Db } from "../src/client/db";
 import { MetaCore, readEpochs } from "../src/meta";
 import { planSplit, REGION_TOKENS } from "../src/routing";
-import { parseDdl, type SchemaView } from "../src/sql/ddl";
+import { isInternalName, parseDdl, type SchemaView } from "../src/sql/ddl";
+import type { Faults } from "../src/types";
 import { driver } from "./ddl-driver";
 import { SimCluster, SqliteBackend, VirtualRuntime } from "./sim";
 
@@ -178,6 +179,54 @@ describe("the epoch log", () => {
     expect(parseDdl("CREATE TABLE IF NOT EXISTS x(id INTEGER PRIMARY KEY)", { tables: { x: {} as never }, views: {}, indexes: {} }).changes).toBeUndefined();
   });
 
+  // 計画書の不変条件 16 (モデル M24c の FENCE_COVERS)。DDL が待つ表の集合 (prepare の記録の fence) は、その DDL が確定で書き込みの epoch を
+  // 進める表のうち、prepare の直前にある利用者の表である (src/catalog.ts の fenceOf)。DDL の種類ごとに並べた一覧ではないことを、
+  // 畳み込みが epoch を進めた表と突き合わせて確かめる。まだない名前、view、内部の表 (__gidx_<index>) は入らない。
+  const FENCES: [string, string[]][] = [
+    ["CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, a TEXT, e TEXT UNIQUE, PRIMARY KEY (tenant_id, id))", []],
+    ["CREATE TABLE o(id INTEGER PRIMARY KEY)", []],
+    ["ALTER TABLE t ADD COLUMN b INTEGER", ["t"]],
+    ["CREATE INDEX ta ON t(a)", ["t"]],
+    ["CREATE UNIQUE INDEX tu ON t(tenant_id, a)", ["t"]],
+    ["CREATE INDEX te ON t(lower(a))", ["t"]],
+    ["CREATE UNIQUE INDEX tg ON t(a)", ["t"]],
+    ["DROP INDEX ta", ["t"]],
+    ["DROP INDEX tg", ["t"]],
+    ["CREATE VIEW tv AS SELECT a FROM t", []],
+    ["DROP VIEW tv", []],
+    ["ALTER TABLE t RENAME TO u", ["t"]],
+    ["DROP TABLE u", ["u"]],
+    ["DROP TABLE o", ["o"]],
+  ];
+  async function fences(faults: Faults = {}) {
+    const b = new SqliteBackend();
+    const meta = new MetaCore(b, ["s0", "s1"], { runtime: new VirtualRuntime(1), faults });
+    const out: { sql: string; fence: string[]; advanced: string[] }[] = [];
+    for (const [sql] of FENCES) {
+      const before = fold(readEpochs(b));
+      const p = await meta.prepare(sql, {}, before.schema);
+      const fence = (readEpochs(b).at(-1)!.rec as { fence: string[] }).fence;
+      await meta.commit(p.epoch!, ["s0", "s1"], 1);
+      const after = fold(readEpochs(b));
+      // prepare の直前にあった利用者の表のうち、commit で書き込みの epoch が進んだもの。
+      const advanced = Object.keys(before.tables).filter((t) => !isInternalName(t) && after.objects[objectKey(t)]!.write > before.objects[objectKey(t)]!.write);
+      out.push({ sql, fence: [...fence].sort(), advanced: advanced.sort() });
+    }
+    return out;
+  }
+  it("fences exactly the existing user tables whose write epoch the DDL's commit advances", async () => {
+    const got = await fences();
+    expect(got.map((x) => [x.sql, x.fence])).toEqual(FENCES);
+    for (const x of got) expect(x.fence, x.sql).toEqual(x.advanced);
+  });
+  // m24c_red_fence。行で失敗しない index の DDL (一意でない CREATE INDEX、DROP INDEX) の fence が空になる (2026-11-17 までの形)。
+  it("put back (indexDdlUnfenced): plain index DDLs advance the table's write epoch without fencing it", async () => {
+    const unfenced = (await fences({ indexDdlUnfenced: true })).filter((x) => x.fence.join() !== x.advanced.join());
+    expect(unfenced.map((x) => [x.sql, x.fence, x.advanced])).toEqual([
+      ["CREATE INDEX ta ON t(a)", [], ["t"]], ["DROP INDEX ta", [], ["t"]], ["DROP INDEX tg", [], ["t"]],
+    ]);
+  });
+
   it("aborts a transition whose lease lapsed, and refuses a late renewal and a late commit", async () => {
     const rt = new VirtualRuntime(1);
     const b = new SqliteBackend();
@@ -200,6 +249,60 @@ describe("the epoch log", () => {
     const q = await meta.prepare("DROP TABLE t");
     rt.set(rt.now() + 1_500);
     expect((await meta.catalog()).aborted).toEqual({ of: q.epoch, reason: "DROP TABLE t stopped before it finished and was withdrawn; the table is unchanged" });
+  });
+
+  // モデル M24c の ONE_RESTART (specs/m24c_lock_holders.qnt)。取り消させる手 (wound) の abort は、同じ 1 手で、やり直しの prepare を記録する。
+  // DDL が始まってから終わるまで、列に、開いている試みのない時がない。やり直しは、同じ文、同じ fence、同じ待ちの期限で、DDL の最初の
+  // 試みの epoch を運ぶ (何度取り消させられても)。書き込みが止まる時間の上限は、最初の試みから数える。
+  it("records the retry's prepare together with a wound's abort, and every retry names the DDL's first attempt", async () => {
+    const rt = new VirtualRuntime(1);
+    const b = new SqliteBackend();
+    const meta = new MetaCore(b, ["s0", "s1"], { runtime: rt, leaseMs: 5_000, buildMaxMs: 10_000 });
+    await ddl(meta, "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT)"); // epoch 1, 2
+    const t0 = rt.now();
+    const waitUntil = t0 + 5_000;
+    const first = await meta.prepare("ALTER TABLE t ADD COLUMN b INTEGER", { waitUntil }); // epoch 3
+    rt.set(t0 + 4_000);
+    expect(await meta.abort(first.epoch!, "a holder reached the lock", true)).toEqual({ reason: "a holder reached the lock", wound: true, next: 5 });
+    const log = readEpochs(b);
+    expect(log.slice(-2).map((x) => [x.epoch, x.rec.kind])).toEqual([[4, "abort"], [5, "prepare"]]);
+    expect(log.at(-1)!.rec).toMatchObject({ kind: "prepare", mode: "trial", fence: ["t"], waitUntil, retryOf: 3 });
+    expect((await meta.catalog()).open).toEqual({ epoch: 5, mode: "trial", fence: ["t"], retryOf: 3 });
+    // やり直しが、また取り消させられる。次のやり直しも、最初の試み (epoch 3) を名指す。
+    expect(await meta.abort(5, "another holder", true)).toEqual({ reason: "another holder", wound: true, next: 7 });
+    expect(readEpochs(b).at(-1)!.rec).toMatchObject({ kind: "prepare", waitUntil, retryOf: 3 });
+    // もう取り消された試みの abort は、記録せずに、その DDL の、いま開いているやり直しを答える。
+    expect(await meta.abort(3, "late")).toEqual({ reason: "a holder reached the lock", wound: true, next: 7 });
+    expect(await meta.abort(5, "late")).toEqual({ reason: "another holder", wound: true, next: 7 });
+    expect((await meta.catalog()).open).toMatchObject({ epoch: 7, retryOf: 3 });
+    expect(readEpochs(b).length).toBe(8);
+    // 期限の上限 (10 秒) は、最初の試みの prepare から数える。延ばしても、t0 + 10 秒で abort する (やり直しから数えれば、t0 + 14 秒まで開く)。
+    rt.set(t0 + 8_000);
+    await meta.renew(7);
+    rt.set(t0 + 10_500);
+    expect((await meta.catalog()).aborted).toEqual({ of: 7, reason: "ALTER TABLE t ADD COLUMN b INTEGER did not finish within 10 seconds and was withdrawn; the table is unchanged" });
+    // 閉じた DDL に、開いているやり直しはない。
+    expect(await meta.abort(3, "late")).toEqual({ reason: "a holder reached the lock", wound: true });
+    // 取り消させる手でない abort は、やり直さない。待ちの期限を運ばない prepare (待つ者がいない) も、やり直さない。
+    const second = await meta.prepare("ALTER TABLE t ADD COLUMN b INTEGER", { waitUntil: rt.now() + 5_000 });
+    expect(await meta.abort(second.epoch!, "the rows refused it")).toEqual({ reason: "the rows refused it", wound: false });
+    const bare = await meta.prepare("ALTER TABLE t ADD COLUMN b INTEGER");
+    expect(await meta.abort(bare.epoch!, "a holder reached the lock", true)).toEqual({ reason: "a holder reached the lock", wound: true });
+    expect((await meta.catalog()).open).toBeUndefined();
+    // やり直しを引き継いで、確定できる。
+    const third = await meta.prepare("ALTER TABLE t ADD COLUMN b INTEGER", { waitUntil: rt.now() + 5_000 });
+    const { next } = await meta.abort(third.epoch!, "a holder reached the lock", true);
+    expect((await meta.commit(next!, ["s0", "s1"])).tables.t!.columns).toEqual(["id", "a", "b"]);
+  });
+
+  // m24c_red_gap。取り消しと一緒に、やり直しの prepare を記録しない (2026-11-17 までの形)。取り消しの後、列に、開いている試みがない。
+  it("put back (woundWithoutRestart): a wound's abort leaves no open attempt in the log", async () => {
+    const rt = new VirtualRuntime(1);
+    const meta = new MetaCore(new SqliteBackend(), ["s0", "s1"], { runtime: rt, faults: { woundWithoutRestart: true } });
+    await ddl(meta, "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT)");
+    const first = await meta.prepare("ALTER TABLE t ADD COLUMN b INTEGER", { waitUntil: rt.now() + 5_000 });
+    expect(await meta.abort(first.epoch!, "a holder reached the lock", true)).toEqual({ reason: "a holder reached the lock", wound: true });
+    expect((await meta.catalog()).open).toBeUndefined();
   });
 
   it("does not record a DDL that does nothing, and refuses a plan made on an older schema epoch", async () => {

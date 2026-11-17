@@ -52,6 +52,9 @@ const SHARD = [
   "globalDdlFloor", "restoreAllTables", "noFloorOnChange", "ddlFloorAtApply", "refreshIgnoresSchema", "prepareIgnoresLocks", "noLockAtFence",
   // 取引の lease のスイッチ (docs/design-lock-lease.md、M25)。
   "perShardLockTtl", "localLockLease", "leaseIgnoresEpoch",
+  // ロックを与える判断と fence のスイッチ (docs/design-catalog-epoch.md の「ロックを与える判断と fence」、M24c)。indexDdlUnfenced と
+  // woundWithoutRestart は、Meta が読む。
+  "lockGateWritesOnly", "indexDdlUnfenced", "lockDuringDdlWait", "woundWithoutRestart", "holdsOnlyHere",
 ];
 const OTHER = [
   "rowSpanDespiteUnique", "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
