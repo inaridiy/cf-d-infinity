@@ -17,8 +17,10 @@
 //                  読み) を見ない。false は D1 (書き込みだけが fence を見る)。
 //   FENCE_COVERS   DDL が書きの epoch を進める表 X は、その DDL の fence に入る (prepare は X の行ロックを待ち、X への書き込みを止める)。
 //                  false は D2 (fence が空。prepare は待たずに適用され、DDL はすぐに確定する)。
-//   CLOSE_WINDOW   シャードは、prepare の適用を待ち始めた時 (PENDING) から、X の新しいロックを、X のロックを持たない取引に与えない。
-//                  与えられなかった要求は、断られずに、DDL の後ろで待つ (適用した後の書き込み禁止と同じ)。false は D3。
+//   CLOSE_WINDOW   シャードは、prepare の適用を待ち始めた時 (PENDING) から、X の新しいロックを、X のロックを持たない取引に与えず、
+//                  その取引の書き込みも受けない (適用した後の書き込み禁止と、同じ 1 つの判断)。与えられなかったロックの要求は、
+//                  断られずに、DDL の後ろで待つ。ロックを取らない書き込み (楽観の取引の COMMIT) は、禁止に当たったときと同じく、
+//                  競合になる。false は D3。
 //   ONE_RESTART    ロックを持つ取引が書き込み禁止に当たって試みを取り消させるとき、Meta は、取り消しと、やり直しの prepare (新しい
 //                  epoch、同じ期限) を、1 手で記録する。DDL が始まってから終わるまで、開いている試みのない時がない。false は、
 //                  m24_retry の形 (進める側が、取り消しを知ってからやり直す)。取り消しを適用したシャードは、やり直しの prepare を
@@ -45,6 +47,8 @@
 //   IMMEDIATE  BEGIN IMMEDIATE。1 つ目の文は、主キーで読んでロックを取る読み、2 つ目は書き込み。
 //   READER     素の BEGIN で、DDL より前に X をロックなしで読んだ。文は 2 つとも書き込み。何も読んでいない取引と違って、DDL の確定の
 //              後に計画し直せない (SQLite の SQLITE_BUSY_SNAPSHOT)。
+//   OPTIMISTIC 楽観の取引 (Worker の中の Db.begin())。行ロックを取らない。文は COMMIT の 1 つで、溜めた 1 行の書き込みを、行のシャードへ
+//              送る。待たない。X が書き込み禁止か、表定義が古ければ、競合になる (docs/sql-language.md の、SQLite との違いの 3 つ目)。
 // シャードの、いまの試みについての位置は 4 つ: UNSEEN (prepare を見ていない)、PENDING (見たが、X の行ロックがあるので適用を待って
 // いる)、FENCED (適用した。書き込み禁止)、ENDED (終わりを適用した)。
 //
@@ -56,6 +60,8 @@
 //   writersSurvive    断られるのは READER だけである (BEGIN IMMEDIATE の取引と、書き込みから始める取引は、DDL の後で計画し直す)。
 //   readerOutcome     DDL より後の刻みに最初の書き込みを求めた READER は、DDL が確定したときにだけ、断られる (SQLite と同じ。
 //                     置き場所に依らない)。
+//   optimisticOutcome DDL より後の刻みに COMMIT を送った OPTIMISTIC は、DDL が、その前に失敗して終わっていたときにだけ、確定する
+//                     (DDL が進んでいる間と、確定した後は、競合になる。置き場所に依らない)。
 //   holderNotDelayed  ロックを持つ取引の文は、時刻をまたいで待たない。
 //   waitsOnlyForDdl   文が時刻をまたいで待つのは、DDL が進んでいる間だけである (待ちは DDL の期限までに終わる)。
 //   preparedStays     全シャードが prepare を適用して ok と答えた試みは、取引に取り消されない。
@@ -89,6 +95,7 @@ module m24c_core {
   pure val WRITER = 0
   pure val IMMEDIATE = 1
   pure val READER = 2
+  pure val OPTIMISTIC = 3
   // いまの試み
   pure val NONE = 0
   pure val OPEN = 1
@@ -182,6 +189,8 @@ module m24c_core {
   def stale(t: int, s: int): bool = cur.get(s) == ENDED and meta == COMMITTED and not(rebased.get(t))
   /** 取引 t の次の、ロックを取る文の行のシャード。 */
   def opShard(t: int): int = sh.get(2 * (t - 1) + (if (pc.get(t) == 0) 1 else 2))
+  /** 取引 t は、行ロックを取らない (楽観の取引)。 */
+  def lockless(t: int): bool = style.get(t) == OPTIMISTIC
   /** 取引 t の次の文は、ロックを取る読みである (書き込みとして頼らない)。 */
   def isRead(t: int): bool = pc.get(t) == 0 and style.get(t) == IMMEDIATE
   /** この要求は、fence を見る。欠陥 D1 では、ロックを取る読みは見ない。 */
@@ -205,11 +214,13 @@ module m24c_core {
 
   // ---- 内部の手ができるか。tick の条件と、手の条件の両方に、この定義だけを使う ----
   def canExec(t: int): bool = pend.get(t) and (
-    if (pc.get(t) <= 1) mayLock(t, opShard(t))
+    if (lockless(t)) pc.get(t) == 0
+    else if (pc.get(t) <= 1) mayLock(t, opShard(t))
     else pc.get(t) == 2 and not(locks.get(t).exists(s => fencedAt(s)))
   )
   def canHold(t: int): bool =
-    pend.get(t) and pc.get(t) == 1 and gated(t) and holder(t) and fencedAt(opShard(t)) and not(locks.get(t).contains(opShard(t)))
+    not(lockless(t)) and pend.get(t) and pc.get(t) == 1 and gated(t) and holder(t) and fencedAt(opShard(t))
+      and not(locks.get(t).contains(opShard(t)))
   def canWound(t: int): bool =
     meta == OPEN and pend.get(t) and pc.get(t) <= 2 and holder(t) and blockers(t) != Set()
       and blockers(t).forall(s => locks.get(t).contains(s))
@@ -232,7 +243,7 @@ module m24c_core {
   // ---- 利用者 ----
   // 取引の次の文を送る (ロックを取る文 2 つ、COMMIT)。送らずに待ってもよい。
   action issue(t: int): bool = all {
-    not(pend.get(t)), pc.get(t) <= 2,
+    not(pend.get(t)), pc.get(t) <= 2, not(lockless(t)) or pc.get(t) == 0,
     pend' = pend.set(t, true), pc' = pc, locks' = locks, rebased' = rebased,
     tW' = if (pc.get(t) == 0) tW.set(t, now) else tW, tC' = if (pc.get(t) == 2) tC.set(t, now) else tC, d0' = d0, dEnd' = dEnd,
     keepDdl, keepFlags, keepEnv,
@@ -264,8 +275,14 @@ module m24c_core {
     val p = pc.get(t)
     val s = opShard(t)
     val old = if (p <= 1) stale(t, s) else locks.get(t).exists(x => stale(t, x))
+    // 楽観の取引の COMMIT。X が書き込み禁止か、prepare の適用を待っている (ロックを持たない取引は、書けない) か、表定義が古ければ、競合。
+    val shut = fencedAt(s) or (pendingAt(s) and CLOSE_WINDOW)
     all {
-      if (old and p == 0 and style.get(t) != READER) all {
+      if (lockless(t)) all {
+        pc' = pc.set(t, if (shut or old) 4 else 3), pend' = pend.set(t, false), locks' = locks, rebased' = rebased,
+        refusedHolder' = refusedHolder,
+        late' = if (not(shut or old) and dres == RUNNING and acked.contains(s)) late.union(Set(s)) else late,
+      } else if (old and p == 0 and style.get(t) != READER) all {
         rebased' = rebased.set(t, true), pc' = pc, pend' = pend, locks' = locks, refusedHolder' = refusedHolder, late' = late,
       } else if (old) all {
         pc' = pc.set(t, 4), pend' = pend.set(t, false), locks' = locks.set(t, Set()), rebased' = rebased,
@@ -386,11 +403,11 @@ module m24c_core {
   // ---- 不変条件 -------------------------------------------------------------
   def D0: int = d0 + B
   /** 取引 t は、DDL を始める前の刻みに、最初のロックを求めた。 */
-  def strict(t: int): bool = tW.get(t) >= 0 and tW.get(t) < d0
+  def strict(t: int): bool = not(lockless(t)) and tW.get(t) >= 0 and tW.get(t) < d0
   /** 取引 t は、DDL の期限のあいだずっとロックを持っていた (DDL より前の刻みに求め、COMMIT を期限の刻みまでに送っていない)。 */
   def heldThrough(t: int): bool = strict(t) and not(tC.get(t) >= 0 and tC.get(t) <= D0)
   /** 取引 t は、DDL を待たせないか、期限のうちにロックを放した (DDL より後の刻みに求めたか求めていない、または COMMIT を期限より前の刻みに送った)。 */
-  def releasedInTime(t: int): bool = not(tW.get(t) >= 0 and tW.get(t) <= d0) or (tC.get(t) >= 0 and tC.get(t) < D0)
+  def releasedInTime(t: int): bool = lockless(t) or not(tW.get(t) >= 0 and tW.get(t) <= d0) or (tC.get(t) >= 0 and tC.get(t) < D0)
   val asSqlite = d0 < 0 or and {
     dres != BUSY or (dEnd >= D0 and TXNS.exists(t => not(releasedInTime(t)))),
     dres != OK or TXNS.forall(t => not(heldThrough(t))),
@@ -401,12 +418,20 @@ module m24c_core {
   // 競りのない予定では、終わった DDL の結果は、利用者の時刻だけの関数である。行の置き場所も、取引の形も、使わない。
   val placementFree = d0 < 0 or dres == RUNNING or not(noTies) or ((dres == BUSY) == TXNS.exists(t => heldThrough(t)))
   val holderSurvives = not(refusedHolder)
-  val writersSurvive = TXNS.forall(t => pc.get(t) != 4 or style.get(t) == READER)
+  val writersSurvive = TXNS.forall(t => pc.get(t) != 4 or style.get(t) == READER or lockless(t))
   // DDL より後の刻みに最初の書き込みを求めた READER は、DDL の後ろで待ち、DDL が確定していれば断られ、失敗していれば通る。
   // DDL より前の刻みに求めた READER は、ロックを持つ取引で、断られない (holderSurvives)。
   val readerOutcome = TXNS.forall(t => or {
     style.get(t) != READER, pc.get(t) == 0,
     if (d0 >= 0 and tW.get(t) > d0) (pc.get(t) == 4) == (dres == OK) else (tW.get(t) == d0 or pc.get(t) != 4),
+  })
+  // 楽観の取引の COMMIT は、待たない。DDL より後の刻みに送った COMMIT が確定するのは、DDL が、その刻みまでに失敗して終わっていたときだけ
+  // である。断られるのは、DDL が進んでいたか、確定していたときだけである (失敗して終わった後の刻みには、断られない)。DDL を始めた刻みと、
+  // DDL が終わった刻みの COMMIT は、競りなので、両方を許す。
+  val optimisticOutcome = TXNS.forall(t => or {
+    not(lockless(t)), pc.get(t) == 0,
+    if (pc.get(t) == 3) (d0 < 0 or tW.get(t) <= d0 or (dres == BUSY and dEnd <= tW.get(t)))
+    else (d0 >= 0 and tW.get(t) >= d0 and not(dres == BUSY and dEnd < tW.get(t))),
   })
   val holderNotDelayed = not(delayed)
   val waitsOnlyForDdl = not(stuck)
@@ -414,8 +439,8 @@ module m24c_core {
   val noReblock = not(reblocked)
   val checkSawRows = not(badCheck)
   val lockSafe = and {
-    asSqlite, placementFree, holderSurvives, writersSurvive, readerOutcome, holderNotDelayed, waitsOnlyForDdl, preparedStays,
-    noReblock, checkSawRows,
+    asSqlite, placementFree, holderSurvives, writersSurvive, readerOutcome, optimisticOutcome, holderNotDelayed, waitsOnlyForDdl,
+    preparedStays, noReblock, checkSawRows,
   }
 
   // ---- witness (時刻は競りのないものだけ) ----
@@ -452,6 +477,14 @@ module m24c_core {
   // 同じ取引 2 が、DDL が失敗した後で通って確定する
   val witnessReaderPasses = not(style.get(2) == READER and strict(1) and tC.get(1) > D0 and tW.get(2) > d0 and tW.get(2) < D0
                                 and dres == BUSY and pc.get(2) == 3)
+  // 楽観の取引 2 の COMMIT が、DDL が取引 1 を待っている間に、待っているシャード (行は全部 P) で、競合になる
+  val witnessOptimisticBusyPending = not(onOneShard and lockless(2) and strict(1) and holder(1) and pendingAt(P) and dres == RUNNING
+                                         and tW.get(2) > d0 and pc.get(2) == 4)
+  // 同じく、prepare を適用したシャード (取引 2 の行は Q) で
+  val witnessOptimisticBusyFenced = not(sh.get(3) == Q and lockless(2) and strict(1) and holder(1) and fencedAt(Q) and dres == RUNNING
+                                        and tW.get(2) > d0 and pc.get(2) == 4)
+  // 楽観の取引 2 の COMMIT が、DDL が失敗した後の刻みに、確定する
+  val witnessOptimisticAfterBusy = not(lockless(2) and dres == BUSY and tW.get(2) > dEnd and pc.get(2) == 3)
 
   // ---- 活性 -----------------------------------------------------------------
   // 内部の手と刻みに、弱い公平性を置く。利用者の手 (文を送る、DDL を始める) には置かない。
@@ -512,6 +545,21 @@ module m24c_green_reader {
   import m24c_core(ANY_DEP = true, FENCE_COVERS = true, CLOSE_WINDOW = true, ONE_RESTART = true, HOLDS_ANYWHERE = true,
     SCENE = 0, STYLE1 = Set(0), STYLE2 = Set(2)).*
 }
+// 決めた設計で、行を全部 1 つのシャードに置く (m24c_green の置き場所の 1 つ。witness を速く見つけるための場面)。
+module m24c_green_one {
+  import m24c_core(ANY_DEP = true, FENCE_COVERS = true, CLOSE_WINDOW = true, ONE_RESTART = true, HOLDS_ANYWHERE = true,
+    SCENE = 1, STYLE1 = Set(0, 1), STYLE2 = Set(0, 1)).*
+}
+// 決めた設計で、取引 1 の行を P に、取引 2 の行を Q に置く (同上)。
+module m24c_green_apart {
+  import m24c_core(ANY_DEP = true, FENCE_COVERS = true, CLOSE_WINDOW = true, ONE_RESTART = true, HOLDS_ANYWHERE = true,
+    SCENE = 2, STYLE1 = Set(0, 1), STYLE2 = Set(0, 1)).*
+}
+// 決めた設計で、取引 2 が楽観の取引 (行ロックを取らず、COMMIT で書く)。
+module m24c_green_optimistic {
+  import m24c_core(ANY_DEP = true, FENCE_COVERS = true, CLOSE_WINDOW = true, ONE_RESTART = true, HOLDS_ANYWHERE = true,
+    SCENE = 0, STYLE1 = Set(0), STYLE2 = Set(3)).*
+}
 // 決めた設計の活性を確かめる場面。取引 1 の 2 つ目の行と、取引 2 の行を Q に置く (取り消しとやり直しが起きる置き場所)。
 module m24c_green_cross {
   import m24c_core(ANY_DEP = true, FENCE_COVERS = true, CLOSE_WINDOW = true, ONE_RESTART = true, HOLDS_ANYWHERE = true,
@@ -558,7 +606,14 @@ module m24c_red_fence {
 // 取引がロックを持ち続けると、DDL は、DDL より前の取引が期限のうちに確定しても、失敗する。
 module m24c_red_window {
   import m24c_core(ANY_DEP = true, FENCE_COVERS = true, CLOSE_WINDOW = false, ONE_RESTART = true, HOLDS_ANYWHERE = true,
-    SCENE = 1, STYLE1 = Set(0), STYLE2 = Set(0, 2)).*
+    SCENE = 1, STYLE1 = Set(0), STYLE2 = Set(0, 2, 3)).*
+  // 行は全部 P。P が取引 1 を待っている間に、楽観の取引 2 の COMMIT が通る。取引 2 の行が、prepare を適用したシャードにあれば、同じ
+  // COMMIT は競合になる (m24c_window_apart の apartOptimisticTest)。
+  run windowOptimisticTest =
+    initWith(P, P, P, WRITER, OPTIMISTIC).then(issue(1)).then(exec(1)).then(tick)
+        .then(startDdl).then(see(P)).then(see(Q)).then(ack(Q))
+        .then(tick).then(issue(2)).then(exec(2))
+        .expect(pc.get(2) == 3 and dres == RUNNING and not(optimisticOutcome))
   // 行は全部 P。P が取引 1 を待っている間に、取引 2 が書いてロックを得る。取引 1 は期限のうちに確定するが、P は取引 2 を待ち続け、
   // DDL は期限に失敗する。
   run windowTest =
@@ -574,7 +629,13 @@ module m24c_red_window {
 // 禁止で待つ。SQLite と同じ結果になる。m24c_red_window と合わせて、待つ間も与える形の成否が、行の置き場所で決まることを示す。
 module m24c_window_apart {
   import m24c_core(ANY_DEP = true, FENCE_COVERS = true, CLOSE_WINDOW = false, ONE_RESTART = true, HOLDS_ANYWHERE = true,
-    SCENE = 2, STYLE1 = Set(0), STYLE2 = Set(0, 2)).*
+    SCENE = 2, STYLE1 = Set(0), STYLE2 = Set(0, 2, 3)).*
+  // m24c_red_window の windowOptimisticTest と同じ利用者の時刻で、楽観の取引 2 の行を Q に置く。Q は prepare を適用していて、COMMIT は競合になる。
+  run apartOptimisticTest =
+    initWith(P, Q, Q, WRITER, OPTIMISTIC).then(issue(1)).then(exec(1)).then(tick)
+        .then(startDdl).then(see(P)).then(see(Q)).then(ack(Q))
+        .then(tick).then(issue(2)).then(exec(2))
+        .expect(pc.get(2) == 4 and dres == RUNNING and lockSafe)
   // m24c_red_window と同じ利用者の時刻で、取引 2 の行を Q に置く。取引 2 は Q の禁止で待ち、DDL は取引 1 の確定の後で確定する。
   run apartTest =
     initWith(P, Q, Q, WRITER, WRITER).then(issue(1)).then(exec(1)).then(tick)
