@@ -33,7 +33,7 @@ import {
   ACCT, SIDE, SIDE_GEN, SIDE_REORDERED, checkIndexReads, duplicates, extraViolations, hold, holdFinalize, indexAgreement, misplacedRows, rawRows,
   runScenario, schemaVersions, sideImages, stuckWork, tenantOn, touchAll, type Env, type Rec, type Report, type Scenario,
 } from "./ddl-harness";
-import { oldReadAfterDdl } from "./ddl-old-reads";
+import { oldReadAfterDdl, type OldReadDdl, type OldReadRun } from "./ddl-old-reads";
 import { rebuildAcrossSplit, type RebuildRun } from "./rebuild-across-split";
 
 // ---- 違反の分類 ----
@@ -1037,53 +1037,60 @@ describe("the checks are not vacuous", () => {
   });
 });
 
-// ---- 7. 移動の前に T を決めた読みが、移動と ADD COLUMN の後に届く (test/ddl-old-reads.ts) ----
+// ---- 7 と 7b. 移動の前に T を決めた読みが、移動と表定義の変更の後に届く (生成器 7。test/ddl-old-reads.ts) ----
 //
-// 前の持ち主が、渡した行を古い読みのために持ち続けると、M21 の排他が終わった後 (move-end の後) の ADD COLUMN が、その行に当たる。
-// 古い読みの答えを、T の時点の表と比べる。いまのコードは、移動の後の古い読みを、範囲の床か表定義の変更の床で断る (答えたなら、正しくなければ
-// ならない)。答えた数と断った数は、最後に 1 行で出す。
-describe("7. A read whose T was picked before a move, answered after the move and an ADD COLUMN", () => {
-  const outcomes = new Map<string, number>();
-  let plannedAfterDdl = 0;
-  afterAll(() => {
-    if (outcomes.size > 0) console.info(`old reads after a move and ADD COLUMN: ${[...outcomes].map(([k, n]) => `${k} x${n}`).join(", ")}; planned after the DDL and sent at the old T: ${plannedAfterDdl}`);
-  });
-  for (const seed of seedsOr([1, 2, 3, 4, 5, 6, 7, 8])) {
-    it(`answers the snapshot at its T or refuses (seed ${seed})`, async () => {
-      const r = await oldReadAfterDdl(seed);
-      outcomes.set(r.outcome, (outcomes.get(r.outcome) ?? 0) + 1);
-      if (r.plannedAfterDdl) plannedAfterDdl++;
-      expect(r.wrong, r.shape).toEqual([]);
-    });
-  }
-});
-
-// ---- 7b. 移動の後の RENAME TO と作り直しと、古い読み (生成器 7。test/ddl-old-reads.ts の OldReadDdl) ----
+// 7: 前の持ち主が、渡した行を古い読みのために持ち続けると、M21 の排他が終わった後 (move-end の後) の ADD COLUMN が、その行に当たる。
+// 7b: docs/design-refresh-across-move.md の「乱択の検査に足す生成器」の 7。前の持ち主が残した行 (と残した版) は、表定義の変更の前の形の
+// ままかもしれない (M23j)。RENAME TO の後の名前の読みは、T の時点の行を全部返し、作り直した表の読みは、前の表の行を 1 つも返さない。
+// 行を 1 つのシャードの範囲にだけ入れる実行 (確定を持たないシャードは、表定義の変更の床を置かない) も混ぜる。
+// 古い読みの答えを、T の時点の表と比べる。読みは、答えたなら正しくなければならず、断るなら、範囲の床か表定義の変更の床の誤りである。
 //
-// docs/design-refresh-across-move.md の「乱択の検査に足す生成器」の 7。前の持ち主が残した行 (と残した版) は、表定義の変更の前の形のまま
-// かもしれない (M23j)。RENAME TO の後の名前の読みは、T の時点の行を全部返し、作り直した表の読みは、前の表の行を 1 つも返さない。
-// 行を 1 つのシャードの範囲にだけ入れる実行 (確定を持たないシャードは、表定義の変更の床を置かない) も混ぜる。foundation-4 (517b674) の
-// コードは、移動の後の古い読みを、範囲の床か表定義の変更の床で断る (答えたなら、正しくなければならない)。答えた数と断った数は、最後に 1 行で出す。
 // 表ごとの epoch (5808b08) からは、t の DDL は、o だけを読んだ取引を古くしない。読み手の最初の文が DDL の前のスナップショットで答えれば、
 // 取引はそのスナップショットのまま続き、RENAME TO の後の名前 u を知らない (`no such table: u`。docs/sql-language.md の「取引の中の DDL」)。
-// 取引のスナップショットに u がないときだけ、その誤りを受け入れる (kept its snapshot)。
-describe("7b. A read whose T was picked before a move, answered after the move and a RENAME TO or a table re-created (generator 7)", () => {
-  const outcomes = new Map<string, number>();
-  let plannedAfterDdl = 0;
-  afterAll(() => {
-    if (outcomes.size > 0) console.info(`generator 7, old reads after a move and RENAME TO or re-create: ${[...outcomes].map(([k, n]) => `${k} x${n}`).join(", ")}; planned after the DDL and sent at the old T: ${plannedAfterDdl}`);
-  });
-  for (const kind of ["rename", "recreate"] as const) {
-    for (const seed of seedsOr([1, 2, 3, 4, 5, 6, 7, 8])) {
-      it(`${kind}: answers the table at its T or refuses (seed ${seed})`, async () => {
-        const r = await oldReadAfterDdl(seed, { kind });
-        outcomes.set(`${kind} ${r.outcome}`, (outcomes.get(`${kind} ${r.outcome}`) ?? 0) + 1);
-        if (r.plannedAfterDdl) plannedAfterDdl++;
+// 取引のスナップショットに u がなく、o の DDL のない実行でだけ、その誤りを受け入れる (kept its snapshot)。
+// 5808b08 の生成器は、T を決めた後にいつも移動し、範囲の床が T を断ったので、seed 1 から 600 のどの実行も、決めた T のまま答えず、
+// DDL の後の計画の読みを DDL の前の T で決める表の床 (M23j の m23j_exact_*) に届かなかった。いまの生成器は、T の後に移動しない実行、
+// 読み手の最初の文を o の DDL で DDL の後の表定義へ移す実行、その後に o を書いて T を進めさせない実行 (pinned) を混ぜる
+// (test/ddl-old-reads.ts の「読み手の形」)。pinned の読みは、表の床だけで決まるので、答えか断りかを厳密に比べる。
+// 最後の試験が、既定の seed で、決めた T のまま答えた実行、表の床が断った実行、T の後に移動した実行が、どの種類にもあることを確かめる。
+const oldReadKinds = ["add column", "rename", "recreate"] as const;
+const oldReadSeeds = Array.from({ length: 32 }, (_v, i) => i + 1);
+const oldReadRuns = new Map<string, Promise<OldReadRun>>();
+const oldRead = (kind: OldReadDdl, seed: number) => {
+  const k = `${kind}/${seed}`;
+  if (!oldReadRuns.has(k)) oldReadRuns.set(k, oldReadAfterDdl(seed, { kind }));
+  return oldReadRuns.get(k)!;
+};
+for (const kind of oldReadKinds) {
+  const title = kind === "add column"
+    ? "7. A read whose T was picked before a move, answered after the move and an ADD COLUMN"
+    : `7b. A read whose T was picked before a move, answered after the move and ${kind === "rename" ? "a RENAME TO" : "a table re-created"} (generator 7)`;
+  describe(title, () => {
+    for (const seed of seedsOr(oldReadSeeds)) {
+      it(`answers the table at its T or refuses (seed ${seed})`, async () => {
+        const r = await oldRead(kind, seed);
         expect(r.wrong, r.shape).toEqual([]);
       });
     }
-  }
-});
+    it("answers at the T picked before the DDL, has the table's floor refuse it, and still moves ranges after T", async () => {
+      const all = await Promise.all(oldReadSeeds.map((seed) => oldRead(kind, seed)));
+      const count = (f: (r: OldReadRun) => boolean) => all.filter(f).length;
+      const outcomes: Record<string, number> = {};
+      for (const r of all) outcomes[r.outcome] = (outcomes[r.outcome] ?? 0) + 1;
+      console.info(
+        `generator 7, ${kind}: ${JSON.stringify(outcomes)}; planned after the DDL and sent at the old T ${count((r) => r.plannedAfterDdl)}, ` +
+          `moved after T ${count((r) => !r.counts.quiet)}, rebased at T ${count((r) => r.counts.rebased)}, pinned ${count((r) => r.counts.pinned)}, ` +
+          `refused by the table's floor ${count((r) => r.counts.floorRefused)}`,
+      );
+      expect({
+        ownT: count((r) => r.outcome === "answered at its T") > 0,
+        floorRefused: count((r) => r.counts.floorRefused) > 0,
+        movedAfterT: count((r) => !r.counts.quiet) > 0,
+        kept: kind !== "rename" || count((r) => r.outcome.startsWith("kept its snapshot")) > 0,
+      }).toEqual({ ownT: true, floorRefused: true, movedAfterT: true, kept: true });
+    });
+  });
+}
 
 // ---- 8. 表の作り直しと、範囲の分割 (生成器 6。test/rebuild-across-split.ts) ----
 //
