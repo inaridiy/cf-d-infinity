@@ -33,7 +33,7 @@ import {
   ACCT, SIDE, SIDE_GEN, SIDE_REORDERED, checkIndexReads, duplicates, extraViolations, hold, holdFinalize, indexAgreement, misplacedRows, rawRows,
   runScenario, schemaVersions, sideImages, stuckWork, tenantOn, touchAll, type Env, type Rec, type Report, type Scenario,
 } from "./ddl-harness";
-import { classOf, lockHoldersSeed, type LockRun, type SeedReport } from "./ddl-lock-holders";
+import { classOf, defectOf, lockHoldersSeed, type LockRun, type SeedReport } from "./ddl-lock-holders";
 import { oldReadAfterDdl, type OldReadDdl, type OldReadRun } from "./ddl-old-reads";
 import { rebuildAcrossSplit, type RebuildRun } from "./rebuild-across-split";
 
@@ -1135,9 +1135,10 @@ describe("8. A table rebuilt in a transaction while the range its copy read spli
 // 適用した後に始めた取引 (late)、DDL の前に読んで後で書く取引 (reader) を混ぜ、一意でない CREATE INDEX、DROP INDEX、CREATE UNIQUE INDEX
 // (build と trial)、ADD COLUMN を同じ表へ出す。同じ台本を、1 シャードと 2 シャード、通常の経路と基準経路で流し、SQLite の答え
 // (M24 の asSqlite と holderSurvives) と比べ、4 つの実行の間でも比べる。答えの決め方は test/ddl-lock-holders.ts の初めに書いた。
-// 既知の欠陥 2 つ (D1: ロックを取る読みが書き込み禁止の表で通る。D2: 一意でない CREATE INDEX と DROP INDEX が行ロックを待たない) の
-// 印のある違反は、既定の実行では伏せて数え、最後の試験が、伏せたものがまだあることを確かめる (なくなったら、直ったので、伏せるのを
-// やめる)。OPEN=1 では伏せない。どちらも test/open/ に再現がある (locking-read-on-fenced-table、index-ddl-ignores-row-locks)。
+// 既知の欠陥 3 つ (D1: ロックを取る読みが書き込み禁止の表で通る。D2: 一意でない CREATE INDEX と DROP INDEX が行ロックを待たない。
+// D3: prepare の適用を待っているシャードが、新しい取引にロックを与える) の印のある違反は、既定の実行では伏せて数え、最後の試験が、
+// 伏せたものがまだあることを確かめる (なくなったら、直ったので、伏せるのをやめる)。OPEN=1 では伏せない。どれも test/open/ に再現がある
+// (locking-read-on-fenced-table、index-ddl-ignores-row-locks、ddl-busy-by-writer-during-its-wait)。
 describe("9. Transactions that read by primary key and then write, against index DDLs and ADD COLUMN on their table (generator 9, M24 asSqlite and holderSurvives)", () => {
   const OPEN = Boolean(process.env.OPEN);
   const defaults = Array.from({ length: 96 }, (_v, i) => i + 1);
@@ -1154,14 +1155,19 @@ describe("9. Transactions that read by primary key and then write, against index
       expect(shown(r).map((f) => `${f.mask ? `[${f.mask}] ` : ""}${f.kind}: ${f.detail}`), `${r.script.ddl}: ${txns}`).toEqual([]);
     });
   }
-  it("mixes the roles and DDLs, waits for holders and is busy at 5 s, and still meets the two known defects", async () => {
+  it("mixes the roles and DDLs, waits for holders and is busy at 5 s, and still meets the three known defects", async () => {
     const all = await Promise.all(defaults.map(once));
     const flat = all.flatMap((r) => r.runs);
-    const clean = flat.filter((x) => !x.marks.lockOnFence && !x.marks.d2LockAtCommit);
+    const clean = flat.filter((x) => !x.marks.lockOnFence && !x.marks.d2LockAtCommit && !x.marks.grantInWait);
     const outcomeOf = (x: LockRun, name: string) => x.txns.find((o) => o.name === name)!;
     const holderEnds = (x: LockRun) => x.script.txns.filter((t) => t.role === "holder").map((t) => outcomeOf(x, t.name).endSentAt ?? 0);
     const masked: Record<string, number> = {};
-    for (const f of all.flatMap((r) => r.findings)) if (f.mask) masked[f.mask] = (masked[f.mask] ?? 0) + 1;
+    const maskedKinds: Record<string, number> = {};
+    for (const f of all.flatMap((r) => r.findings)) {
+      if (!f.mask) continue;
+      masked[f.mask] = (masked[f.mask] ?? 0) + 1;
+      maskedKinds[`${defectOf(f.mask)} ${f.kind}`] = (maskedKinds[`${defectOf(f.mask)} ${f.kind}`] ?? 0) + 1;
+    }
     const coverage = {
       busyAt5s: clean.filter((x) => classOf(x.ddl) === "busy" && holderEnds(x).some((e) => e > 5_000)).length,
       waitedForHolder: clean.filter((x) => classOf(x.ddl) === "ok" && holderEnds(x).some((e) => e > 0 && x.ddlMs >= e)).length,
@@ -1170,15 +1176,18 @@ describe("9. Transactions that read by primary key and then write, against index
       deferredBusyAfterTheChange: clean.filter((x) => x.script.txns.some((t) => !t.immediate && t.role !== "holder" && outcomeOf(x, t.name).stmts.some((s) => classOf(s.outcome) === "busy"))).length,
     };
     const kinds = new Set(all.map((r) => r.script.ddl));
-    console.info(`generator 9: ${flat.length} runs, ${clean.length} without a known defect's mark; ${JSON.stringify(coverage)}; masked findings ${JSON.stringify(masked)}`);
+    console.info(`generator 9: ${flat.length} runs, ${clean.length} without a known defect's mark; ${JSON.stringify(coverage)}; masked findings ${JSON.stringify(masked)}, by kind ${JSON.stringify(maskedKinds)}`);
     expect({ kinds: kinds.size, ...Object.fromEntries(Object.entries(coverage).map(([k, n]) => [k, n > 0])) }).toEqual({
       kinds: 6, busyAt5s: true, waitedForHolder: true, retriedAfterHolderWound: true, lateDuringTheChange: true, deferredBusyAfterTheChange: true,
     });
     if (!OPEN) {
       expect(
-        { D1: (masked["D1 lock on fence"] ?? 0) > 0, D1ref: (masked["D1 reference read"] ?? 0) > 0, D2: (masked["D2 commit under lock"] ?? 0) > 0 },
-        "a known defect (test/open/locking-read-on-fenced-table.test.ts, test/open/index-ddl-ignores-row-locks.test.ts) no longer happens; stop masking it",
-      ).toEqual({ D1: true, D1ref: true, D2: true });
+        {
+          D1: (masked["D1 lock on fence"] ?? 0) > 0, D1ref: (masked["D1 reference read"] ?? 0) > 0, D2: (masked["D2 commit under lock"] ?? 0) > 0,
+          D3: (masked["D3 lock during the wait"] ?? 0) > 0,
+        },
+        "a known defect (test/open/locking-read-on-fenced-table.test.ts, test/open/index-ddl-ignores-row-locks.test.ts, test/open/ddl-busy-by-writer-during-its-wait.test.ts) no longer happens; stop masking it",
+      ).toEqual({ D1: true, D1ref: true, D2: true, D3: true });
     }
   });
 });
