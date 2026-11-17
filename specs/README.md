@@ -56,6 +56,10 @@ red と green は同じ core モジュールを `const` フラグで切り替え
 | M5b `m5b_red_floor_volatile` / `m5b_red_floor_no_clock` | `readConsistent` | `m5b_green_floor` から条件を 1 つずつ外す (床を子の再起動で忘れる / 移動を終えるときに親の時計を渡さない) | 反例 | 最短の反例は 7 / 9 手 | 反例 (2 本とも) |
 | M5b `m5b_green_floor_resplit` | `floorSafe` | 範囲の床あり。子が受け取り終えた範囲を、新しい空のシャードへもう一度移す。削除は両方のグループ、tick 1、T 0..5、取引 X なし | 6,127,304 (生成 3,933 万) | 28 | No violation |
 | M5b `m5b_green_floor_resplit_x` | `floorSafe` | 同上、取引 X あり、削除は X が書くグループ 1 だけ、tick なし、T 0..4 (HEAVY) | 43,323,996 (生成 2.55 億) | 29 | No violation |
+| M5c `m5c_green` / `m5c_green3` | `m5cSafe` と `delivers` (時相) | S0、S2、グループ 1 つ、確定した取引 Y の intent が S0 にあり、S0 への phase 2 が遅れる。移動 2 回 / 3 回 | 130 / 305 | 17 / | No violation |
+| M5c `m5c_red_clear_at_start` | `deliveredApplied` / `noLostWrite` | 段 4 のコード: 戻る移動の start で「渡した」印を外す | 49 / 112 で反例 | | 反例 (2 本とも) |
+| M5c `m5c_red_follow_stale` | `boundedForwards` | 段 4 より前のコード: 転送の記録を全部たどる | 100 で反例 | | 反例 |
+| M5c `m5c_red_rehand` | `handsUnderFence` / `boundedForwards` | 問題 55: 終わった移動の遅れた pull に、範囲が戻った親がグループを渡し直す | 68 / 158 で反例 | | 反例 (2 本とも) |
 | M7 `m7_green` | `restoreCorrect` | shard 2、APPROX 1、MARGIN 1、now 0..4、write 2/shard | 46,114,036 (生成 1.5 億、123 s) | 26 | No violation |
 | M7 `m7_red` | `restoreCorrect` | 同上 | 反例 | | 反例 |
 
@@ -607,6 +611,49 @@ invariant は 4 つである。
   `CROSS = false` は、取引 X を外す (状態を減らすため)。
   床のあるインスタンスは `floorSafe` (= migrationSafe ∧ openReadConsistent ∧ clockAboveFloor) を確かめる。
   欠陥と修正は「M5b: 親が空にしたグループを、古い読みの時刻で子に読む」の節に書いた。
+
+### M5c `m5c_phase2_return.qnt` — 範囲が前の持ち主へ戻る間に届く phase 2 (未解決の問題 54 と 55)
+
+2026-11-16 に書いた。実装より先に書いたモデルである (計画書の規則 3)。
+
+範囲が前の持ち主へ戻る途中 (前の持ち主が move-start を適用して受け取り始め、まだグループを引き取っていない) に phase 2 が届くと、段 4 のコードの前の持ち主は、intent を適用も転送もせずに受け取ったと答えた (`test/phase2-during-return.test.ts`)。
+anchor は届け終えた印を付け、記録を消した後は、戻ってきた intent を presumed abort で捨てる。
+M5b の phase 2 (`phase2X`) は moved 表で 1 回だけ転送し、範囲をもう一度動かす `nextHop` は受け取り終えた子を親に読み替えて新しい空の子へ渡すので、範囲は前の持ち主へ戻らない。
+M23b の `yPhase2` は、いまの持ち主に 1 手で適用し、前の持ち主が受け取ったと答える状態がない。
+どちらも、この形を確かめていなかった。
+
+舞台は、シャード S0 と S2、グループ 1 つである。
+確定した取引 Y の intent が S0 にあり、S0 への phase 2 は遅れて届く。
+範囲は S0 から S2 へ、S2 から S0 へ (`m5c_green3` では、もう一度 S2 へ) 動く。
+移動の手は段 4 の形で、`start` (親と子が move-start を適用する)、`pull` (親が行と intent を載せ、「渡した」印と転送の記録を残す)、`recv` (子が受け取り、自分の印を外す)、`ack` (親が渡した行と intent を消す)、`finish` の 5 つである。
+phase 2 の要求は 1 手で処理する。piece を運ぶ転送は、受け取り中でグループがまだ届いていなければ届くのを待ち、印がなく intent があれば適用し、印があってその移動の転送の記録があれば渡した先へ転送して、転送の答えを待ってから答える。
+anchor は、S0 への要求が答えたら届け終えた印を付け、後で記録を消す (`gc`)。
+自分のものとして持っている intent は、読み手か再駆動が anchor に尋ねて決着させ、記録がなければ presumed abort で捨てる (`resolve`)。
+
+`m5cSafe` は、`deliveredApplied` (届け終えたなら Y は適用されている。問題 54 の不変条件: 参加者は、intent を適用したか、いまの持ち主へ転送した後でだけ、phase 2 を受け取ったと答える)、`noLostWrite` (確定した Y を presumed abort で捨てない)、`finalValue` (移動を終えて届け終えたら、いまの持ち主の行は Y の値である)、`boundedForwards` (転送の数は移動の数以下)、`handsUnderFence` (親がグループを渡すのは、その移動が終わる前だけ。問題 55) である。
+時相の性質 `delivers` は、phase 2 がいつか届け終わることである。公平性は、移動の手と要求の手に、弱い公平性を置いた。
+
+| 条件 (定数) | 外したインスタンス | 反例 |
+|---|---|---|
+| 「渡した」印は、グループが届いたときに外す。戻る移動の start では外さない (`CLEAR_AT_START` = false) | `m5c_red_clear_at_start` | 移動 1 の後、移動 2 が始まり、S0 が印を外す。phase 2 が S0 に届き、S0 は intent も印も持たないので、何もせずに答える。anchor が記録を消した後、戻ってきた intent を presumed abort で捨てる |
+| 転送は、いまの印の移動の記録だけをたどる (`FOLLOW_STALE` = false) | `m5c_red_follow_stale` | 範囲が戻った後に phase 2 が届く。S0 は適用し、移動 1 の記録で S2 へも転送する。S2 は移動 2 の記録で S0 へ、S0 はまた移動 1 の記録で S2 へ転送する |
+| 親は、終わっていない fence の下でだけ渡す。終わった移動の pull は断る (`REHAND_FINISHED` = false) | `m5c_red_rehand` | 範囲が S0 へ戻った後に、移動 1 の遅れた pull が S0 に届き、S0 が移動 1 の印を付け直す。S0 に届いた phase 2 は、自分の intent に適用されずに S2 へ転送され、S2 は移動 2 の記録で S0 へ転送し返す |
+
+問題 55 (`REHAND_FINISHED`) は、同じ日の 2 回目に足した。
+範囲が前の親へ戻った後に、前の移動の遅れた pull が届くと、段 4 のコードの親は、グループを終わった移動の fence でもう一度渡そうとし、「渡した」印を付け直した (印は `__moved` への書き込みより前にメモリへ付けていたので、書き込みの失敗の後も残った。`test/stale-pull-after-return.test.ts`)。
+緑では、親は終わっていない fence の下でだけ渡し、終わった移動の pull を断る (終わった移動の子は、行か intent のあるグループを受け取り終えている)。断ることは状態を変えないので、緑には手として書いていない。
+足した後も、緑の状態数と `delivers` は変わらない。
+
+状態数は小さい (緑は 130 と 305。TLC を 1 本ずつ、2 workers、heap 2.5 GB で流した)。赤の状態数は、2 workers では反例を見つけた時点の数なので、流すたびに少し変わる (2026-11-17 に流し直した数を上の表に書いた)。
+witness は 2 つで、どちらも到達した。`witnessForwardBack` は、戻る移動の途中で S0 に届いた phase 2 が、S2 へ転送され、S2 がもう渡していたので S0 へ転送し返され、S0 がグループの到着を待って適用する経路である。`witnessAppliedAtS2` は、転送された phase 2 を、まだ渡していない S2 がそこで適用する経路である。
+決定的な run は、緑に 1 本 (`test/phase2-during-return.test.ts` の順序)、赤に 1 本ずつある。
+
+モデルにないもの。
+
+- 運ばれなかったグループ。グループに intent があれば、いつも運ばれる (`listGroups` は intent のあるグループも挙げる)。行も intent もないグループの印は、受け取り終えたとき (`finishIncoming`) に外す。これは `test/range-returns.test.ts` の空のグループの場面が確かめる。
+- 再起動。印は、起動のときに表から同じ規則で作り直す (`__moved` と、それより後の `__arrived` と、終えた `__incoming`)。
+- 断られた pull を待っていた子の要求。子は断りを読み飛ばす。行か intent のあるグループは届いているので、そのまま進む。空のグループで、子がまだ受け取り終えていなければ、所有の確かめが「届いていない」の競合で断る (やり直してよい誤り)。
+- 取引が 2 つ以上あること、anchor の再駆動 (同じ phase 2 を何度も送る)。
 
 ### M7 `m7_restore.qnt` — W への同時点復元 (S6)
 

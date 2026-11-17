@@ -818,6 +818,21 @@ live_red $f m25_red_no_epoch locksReleased              # 版を見ないと、�
 for m in m25_green m25_green_exact m25_per_shard_same m25_red_per_shard m25_red_local_lease m25_red_no_epoch m25_red_regrant \
          m25_red_trust_lease; do tests $f $m; done
 
+echo "== M5c phase 2 while a range returns (範囲が前の持ち主へ戻る間に届く phase 2。未解決の問題 54 と 55。実装より先に書いたモデル)"
+f=m5c_phase2_return.qnt
+green   $f m5c_green m5cSafe                             # 「渡した」印はグループが届いたときに外し、転送はいまの印の移動の記録だけをたどる。移動 2 回
+green   $f m5c_green3 m5cSafe                            # 同上、移動 3 回 (S0 → S2 → S0 → S2)
+red     $f m5c_red_clear_at_start deliveredApplied       # 段 4 のコード: 戻る移動の start で印を外す。前の持ち主が適用も転送もせずに答える
+red     $f m5c_red_clear_at_start noLostWrite            # 同上: 届け終えた記録が消えた後、戻ってきた intent を presumed abort で捨てる
+red     $f m5c_red_follow_stale boundedForwards          # 段 4 より前: 転送の記録を全部たどり、S0 と S2 が互いに転送し合う
+red     $f m5c_red_rehand handsUnderFence                # 問題 55: 終わった移動の遅れた pull に、範囲が戻った親がグループを渡し直す
+red     $f m5c_red_rehand boundedForwards                # 同上: 付け直した印で、S0 の phase 2 が S2 との間を行き来する
+live    $f m5c_green delivers                            # 活性: phase 2 はいつか届け終わる
+live    $f m5c_green3 delivers
+witness $f m5c_green witnessForwardBack                  # 戻る移動の途中で届いた phase 2 が、S2 へ行って S0 へ戻り、S0 で適用される
+witness $f m5c_green witnessAppliedAtS2                  # 転送された phase 2 を、まだ渡していない S2 が適用する
+for m in m5c_green m5c_red_clear_at_start m5c_red_follow_stale m5c_red_rehand; do tests $f $m; done
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect
