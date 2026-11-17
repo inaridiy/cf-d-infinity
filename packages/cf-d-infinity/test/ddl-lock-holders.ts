@@ -37,7 +37,8 @@
 // 素の BEGIN の取引 (late と reader) は、SQLite でも成否が間合いで決まるので比べない。行が prepare を待っているシャードにあれば、
 // 書き込みが禁止の前に通って確定し、もう禁止したシャードにあれば待って SQLITE_BUSY になる (どちらも SQLite の答えのどれかである)。
 //
-// 既知の欠陥 (5808b08。直していない。test/open/ に再現がある)。既定の実行では、下の印のある実行の違反を伏せ、数える。OPEN=1 で伏せない。
+// 既知の欠陥 (5808b08。直していない。test/open/ に再現がある)。既定の実行では、下の印のある実行の違反のうち、その欠陥が説明する種類
+// (explains) だけを伏せ、数える。表と表定義の違反、busy でない文の誤り、5 秒でない busy は伏せない。OPEN=1 では何も伏せない。
 //   D1  ロックを取る読みが、書き込み禁止の表で通る (test/open/locking-read-on-fenced-table.test.ts)。シャードの lockRows の確かめは、
 //       書き込みとして頼る表にしか、禁止を当てない (src/shard/kernel.ts の lockedStep)。全シャードが prepare を適用した後に、
 //       BEGIN IMMEDIATE の主キーの読みがロックを取り、続く書き込みが DDL を取り消させる (M24 の WOUND)。DDL は、やり直して、その取引を
@@ -335,6 +336,30 @@ export interface Finding { kind: string; detail: string; mask: Mask | null }
 export const defectOf = (m: Mask): "D1" | "D2" => m.slice(0, 2) as "D1" | "D2";
 const runMask = (r: LockRun): Mask | null => (r.marks.lockOnFence ? "D1 lock on fence" : r.marks.d2LockAtCommit ? "D2 commit under lock" : null);
 
+/** 古い計画として断られた誤り (DDL の確定の後の書き込みと COMMIT)。 */
+const STALE = /stale schema/;
+/** 行ロックを持つ取引が DDL を取り消させたときの理由 (src/client/db.ts の attemptStatement)。D1 の DDL が、やり直せずにこの文で失敗する。 */
+const WOUND_REASON = /reached the table's write lock on another shard, so the schema change was withdrawn to be run again/;
+
+/**
+ * 印が説明する違反の種類。印のある実行でも、ほかの種類の違反 (表、表定義、busy でない文の誤り、5 秒でない busy など) は伏せない。
+ * text は、違反のもとになった誤りの文 (DDL か取引の文の答え) である。
+ */
+function explains(mask: Mask, kind: string, text: string): boolean {
+  switch (kind) {
+    case "ddl withdrawn by a later lock": return mask === "D1 lock on fence";
+    case "ddl failed": return mask === "D1 lock on fence" && (classOf(text) === "busy" || WOUND_REASON.test(text));
+    case "ddl error": return mask === "D1 lock on fence" && WOUND_REASON.test(text);
+    case "ddl did not wait":
+    case "ddl not busy": return mask !== "D1 lock on fence";
+    case "holder refused":
+    case "late immediate refused": return STALE.test(text);
+    case "differs: ddl":
+    case "differs: transaction": return mask !== "D2 commit under lock";
+    default: return false;
+  }
+}
+
 /** 基準経路で、読みでロックを取るはずの BEGIN IMMEDIATE の取引 (上の D1 の基準経路の印)。 */
 const lockByRead = (t: TxnPlan) => t.immediate && (t.role === "late" || t.readOnlyBefore);
 
@@ -351,9 +376,9 @@ export function checkRun(r: LockRun): Finding[] {
   const refPath = r.path !== "sim";
   const holderByRead = refPath && r.script.txns.some((t) => t.role === "holder" && lockByRead(t));
   // 取引の違反は、その取引が基準経路で読みのロックを取らないなら D1 の基準経路の印、DDL と表の違反は、そういう holder がいれば同じ印。
-  const add = (kind: string, detail: string, txn?: TxnPlan) => {
+  const add = (kind: string, detail: string, txn?: TxnPlan, text = "") => {
     const mask = runMask(r) ?? (refPath && (txn ? lockByRead(txn) : holderByRead) ? "D1 reference read" : null);
-    out.push({ kind, detail, mask });
+    out.push({ kind, detail, mask: mask && explains(mask, kind, text) ? mask : null });
   };
   const plans = r.script.txns;
   const byName = new Map(r.txns.map((t) => [t.name, t]));
@@ -362,12 +387,12 @@ export function checkRun(r: LockRun): Finding[] {
   const ends = holders.map((p) => byName.get(p.name)!.endSentAt ?? Infinity);
   const busyExpected = ends.some((e) => e > DDL_WAIT_MS);
   const cls = classOf(r.ddl);
-  if (cls === "error") add("ddl error", `the DDL failed with an error that is not busy: ${r.ddl}`);
+  if (cls === "error") add("ddl error", `the DDL failed with an error that is not busy: ${r.ddl}`, undefined, r.ddl);
   if (busyExpected) {
-    if (cls !== "busy") add("ddl not busy", `a holder kept its locks past 5 s, but the DDL ${r.ddl} after ${r.ddlMs} ms`);
+    if (cls !== "busy") add("ddl not busy", `a holder kept its locks past 5 s, but the DDL ${r.ddl} after ${r.ddlMs} ms`, undefined, r.ddl);
     else if (r.ddlMs < DDL_WAIT_MS - 100 || r.ddlMs > DDL_WAIT_MS + 700) add("ddl busy at the wrong time", `the DDL was busy after ${r.ddlMs} ms, not at 5 s`);
   } else {
-    if (cls !== "ok") add("ddl failed", `no holder kept its locks past 5 s, but the DDL failed after ${r.ddlMs} ms: ${r.ddl}`);
+    if (cls !== "ok") add("ddl failed", `no holder kept its locks past 5 s, but the DDL failed after ${r.ddlMs} ms: ${r.ddl}`, undefined, r.ddl);
     const lastEnd = Math.max(0, ...ends.filter(Number.isFinite));
     if (cls === "ok" && r.ddlMs < lastEnd) add("ddl did not wait", `the DDL committed after ${r.ddlMs} ms, before a holder ended at ${lastEnd} ms`);
   }
@@ -382,7 +407,7 @@ export function checkRun(r: LockRun): Finding[] {
     for (const x of refused) if (classOf(x.outcome) === "error") add("statement error", `${p.name}: ${x.sql} failed with an error that is not busy: ${x.outcome}`, p);
     const mustPass = p.role === "holder" || (p.role === "late" && p.immediate);
     if (mustPass && refused.length > 0) {
-      add(p.role === "holder" ? "holder refused" : "late immediate refused", `${p.name} (${p.immediate ? "BEGIN IMMEDIATE" : "BEGIN"}, ${p.role}): ${refused[0]!.sql} at ${refused[0]!.at} ms: ${refused[0]!.outcome}`, p);
+      add(p.role === "holder" ? "holder refused" : "late immediate refused", `${p.name} (${p.immediate ? "BEGIN IMMEDIATE" : "BEGIN"}, ${p.role}): ${refused[0]!.sql} at ${refused[0]!.at} ms: ${refused[0]!.outcome}`, p, refused[0]!.outcome);
     }
   }
   // 表
@@ -414,14 +439,14 @@ export function compareRuns(a: LockRun, b: LockRun): Finding[] {
   const ref = [a, b].some((r) => r.path !== "sim");
   if (sa.ddl !== sb.ddl) {
     const m = mask ?? (ref && a.script.txns.some((t) => t.role === "holder" && lockByRead(t)) ? "D1 reference read" : null);
-    out.push({ kind: "differs: ddl", detail: `${label(a)}: ${a.ddl}; ${label(b)}: ${b.ddl}`, mask: m });
+    out.push({ kind: "differs: ddl", detail: `${label(a)}: ${a.ddl}; ${label(b)}: ${b.ddl}`, mask: m && explains(m, "differs: ddl", "") ? m : null });
   }
   const spanRefused = (r: LockRun, name: string) => r.txns.find((t) => t.name === name)!.stmts.some((x) => fullSpan(r, x));
   for (const p of a.script.txns) {
     if (!(p.name in sa.txns) || sa.txns[p.name] === sb.txns[p.name]) continue;
     if (spanRefused(a, p.name) || spanRefused(b, p.name)) continue;
     const m = mask ?? (ref && lockByRead(p) ? "D1 reference read" : null);
-    out.push({ kind: "differs: transaction", detail: `${p.name}: ${label(a)} ${sa.txns[p.name] ? "committed" : "did not commit"}; ${label(b)} ${sb.txns[p.name] ? "committed" : "did not commit"}`, mask: m });
+    out.push({ kind: "differs: transaction", detail: `${p.name}: ${label(a)} ${sa.txns[p.name] ? "committed" : "did not commit"}; ${label(b)} ${sb.txns[p.name] ? "committed" : "did not commit"}`, mask: m && explains(m, "differs: transaction", "") ? m : null });
   }
   return out;
 }
