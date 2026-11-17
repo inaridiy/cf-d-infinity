@@ -9,7 +9,7 @@ import { Db, type ClientFaults, type Txn } from "../src/client/db";
 import { split } from "../src/autoscaler";
 import { ownerOf, planSplit, shardsOf } from "../src/routing";
 import { fold, type EpochRecord } from "../src/catalog";
-import type { Catalog } from "../src/meta";
+import { LEASE_MS, type Catalog } from "../src/meta";
 import { decode, encode } from "../src/shard/rows";
 import { isInternalName } from "../src/sql/ddl";
 import { decodeElem } from "../src/value";
@@ -871,6 +871,8 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   };
 
   let stop = false;
+  /** 作業負荷が止まった時刻 (仮想の時計の ms)。止まった後の分割が、表定義の遷移の枠を待つ上限を決める。 */
+  let stoppedAt = Infinity;
   let splits = 0;
   /** 分割を進めている最中か。checkpoint は、これが終わるのを待ってから表を調べる。 */
   let splitting = false;
@@ -924,6 +926,16 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
             await c.sleep(50);
             continue;
           }
+          // 作業負荷が止まった後の split busy は、上で待たずに回数に数える (5 ms ずつ 20 回)。進める側が止まった表定義の遷移は、期限
+          // (Scenario.leaseMs、既定は meta.ts の LEASE_MS) で Meta が abort するまで枠を持つので、20 回では足りないことがある
+          // (splitStops の seed 231。CREATE INDEX の進める側が commit の前で止まり、1 s の期限の前に 100 ms で諦めて、誤りにした。
+          // 待てば遷移は abort され、分割は通る)。最後の回でも枠が空いていなければ、期限の 3 倍まで待ってから誤りにする。
+          // それまでの回は前と同じに進めるので、前に通った実行の RPC の列は変わらない。
+          if (attempt === 19 && /^split busy:/.test(m) && c.time - stoppedAt < 3 * (s.leaseMs ?? LEASE_MS)) {
+            attempt--;
+            await c.sleep(50);
+            continue;
+          }
           // 子が古い表定義のまま親の行を受け取ると drain が失敗する。要求が届けば子は追い付くので、やり直す。
           if (attempt === 19) errors.push(`split: ${m}`);
           await c.sleep(5);
@@ -936,6 +948,7 @@ async function runSeeded(c: SimCluster, seed: number, s: Scenario, rnd: () => nu
   const ddl = s.ddl(env).catch((e) => void errors.push(`ddl actor: ${e instanceof Error ? e.message : String(e)}`));
   await Promise.all(Array.from({ length: clients }, worker));
   stop = true;
+  stoppedAt = c.time;
   await ddl;
   await grower;
 
