@@ -5,12 +5,12 @@ import { Db, type ClientFaults, type Cluster } from "../src/client/db";
 import { keyString } from "../src/keys";
 import { fold, type EpochRecord, type Move } from "../src/catalog";
 import { MetaCore, type Catalog } from "../src/meta";
-import { initialRouting, shardsOf, tokenOf, type Interval, type Routing } from "../src/routing";
+import { initialRouting, regionsOf, shardsOf, tokenOf, type Interval, type Routing } from "../src/routing";
 import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
 import { ShardCore, type SpanEscape, type WriteCheck } from "../src/shard/core";
 import { imageColumns } from "../src/shard/rows";
-import type { Backend, Change, Faults, Plain, PlainRow, ShardApi, Span, TableDef, Ts, Value } from "../src/types";
+import { isWideSpan, type Backend, type Change, type ExecReq, type Faults, type Plain, type PlainRow, type ShardApi, type Span, type TableDef, type Ts, type Value } from "../src/types";
 import { bindPlain, bindTyped, decodeElem, restoreColumns, type Tuple } from "../src/value";
 
 /**
@@ -494,6 +494,76 @@ const MOVE_ALARM_LIMIT = 60;
 export const allSpanEscapes: SpanEscape[] = [];
 /** このプロセスの全クラスタで見つかった、宣言の外か持ち主でないシャードへの書き込み。test/setup.ts が試験ごとに確かめて空にする。 */
 export const allWriteEscapes: WriteEscape[] = [];
+
+/**
+ * 全表の読みの区間の検査 (specs/m19_claim_resplit.qnt の SPLIT_EXACT、反例 m19_red_gap)。Worker が 1 つの全表の読みで使った答えの
+ * claim は、1 つの範囲表のスナップショットで、token の全体をちょうど覆わなければならない。抜けた区間の行は、どのシャードからも返らない。
+ * どのシャードも、自分の持たない claim には答えていないので、シャードの側の検査 (範囲の検査、書き込みの側の検査) では見えない
+ * (M19 の「どのシャードも、持っていない claim には答えていない」)。
+ *
+ * 確かめ方。シミュレータの stub が、Worker へ返す exec の答えごとに、その答えを返した要求 (宛先、span と claim、名乗った epoch) を覚える
+ * (answeredBy)。test/setup.ts が、Worker が複数のシャードの答えを 1 つの文の答えにまとめるところ (src/client/db.ts の ReadScope.budgeted)
+ * から、使った答えの組を受け取って、ここへ渡す。全表の span (isWideSpan で、claim のあるもの) について、要求の文面と表ごとに次を確かめる。
+ *   1. 使った答えの要求は、どれも同じ epoch を名乗る (1 つのスナップショット)。
+ *   2. その epoch まで Meta の列を畳んだ範囲表 R で、尋ねたシャードの集まりが R のシャードの全部で、同じシャードは 1 度だけである。
+ *   3. どの要求の claim も、R でそのシャードが持つ区間 (regionsOf) と同じである。
+ * 3 つが揃えば、claim は R の区間をちょうど 1 度ずつ覆う。答えを覚えていない組 (シミュレータの外の Cluster) は確かめない。
+ * 確かめるだけで、処理は変えない (RPC の列も変わらない)。見つけたものは test/setup.ts が試験ごとに確かめる。
+ */
+export const allTilingProblems: string[] = [];
+/** 確かめた組の数と、答えを覚えていないので確かめなかった組の数。検査が空回りしていないことを、試験が確かめるのに使う。 */
+export const tilingStats = { checked: 0, unknown: 0 };
+const answeredBy = new WeakMap<object, { c: SimCluster; shard: string; req: ExecReq }>();
+
+const intervalsText = (xs: readonly Interval[]) => xs.map((x) => `[${x.start}, ${x.end})`).join(" ") || "none";
+const sameIntervals = (a: readonly Interval[], b: readonly Interval[]) => {
+  const key = (xs: readonly Interval[]) => xs.map((x) => `${x.start}-${x.end}`).sort().join(",");
+  return key(a) === key(b);
+};
+
+/** Worker が 1 つの文の答えにまとめた、シャードの答えの組 parts を確かめる (上の allTilingProblems)。 */
+export function checkTiling(parts: readonly unknown[]): void {
+  const sent = parts.map((p) => (p !== null && typeof p === "object" ? answeredBy.get(p) : undefined));
+  if (sent.length === 0) return;
+  if (sent.some((s) => s === undefined)) {
+    tilingStats.unknown++;
+    return;
+  }
+  const asked = sent as { c: SimCluster; shard: string; req: ExecReq }[];
+  // 文面と表ごとに分ける。1 つの組の要求は、いまは同じ文面である (走査か押し下げた読み)。
+  const byTable = new Map<string, { sql: string; table: string; used: { shard: string; claim: Interval[]; epoch: number }[] }>();
+  for (const s of asked) {
+    for (const sp of s.req.spans) {
+      if (!isWideSpan(sp) || sp.claim === undefined) continue;
+      const k = `${sp.table}\0${s.req.sql}`;
+      const g = byTable.get(k) ?? { sql: s.req.sql.slice(0, 160), table: sp.table, used: [] };
+      g.used.push({ shard: s.shard, claim: sp.claim, epoch: s.req.epoch });
+      byTable.set(k, g);
+    }
+  }
+  if (byTable.size === 0) return;
+  tilingStats.checked++;
+  const c = asked[0]!.c;
+  for (const { sql, table, used } of byTable.values()) {
+    const epochs = [...new Set(used.map((u) => u.epoch))].sort((a, b) => a - b);
+    if (epochs.length > 1) {
+      allTilingProblems.push(`${sql} | table ${table}: the answers come from routing snapshots at epochs ${epochs.join(", ")}: ${used.map((u) => `${u.shard}@${u.epoch}`).join(" ")}`);
+      continue;
+    }
+    const R = c.routingAt(epochs[0]!);
+    const problems: string[] = [];
+    const shards = used.map((u) => u.shard);
+    const twice = shards.filter((s, i) => shards.indexOf(s) !== i);
+    if (twice.length > 0) problems.push(`asked ${[...new Set(twice)].join(", ")} more than once`);
+    const missing = shardsOf(R).filter((s) => !shards.includes(s));
+    if (missing.length > 0) problems.push(`did not ask ${missing.map((s) => `${s} (${intervalsText(regionsOf(R, s))})`).join(", ")}`);
+    for (const u of used) {
+      if (!sameIntervals(u.claim, regionsOf(R, u.shard))) problems.push(`asked ${u.shard} for ${intervalsText(u.claim)}, but it holds ${intervalsText(regionsOf(R, u.shard))}`);
+    }
+    if (problems.length > 0) allTilingProblems.push(`${sql} | table ${table}, routing at epoch ${epochs[0]}: ${problems.join("; ")}`);
+  }
+}
+
 /**
  * RPC_TRACE=<ディレクトリ> のとき、このプロセスで作ったクラスタの網。test/setup.ts が試験ごとに、RPC の送り元、宛先、種類の列を
  * 書き出して空にする。中身は書かない。変更の前後で、同じ seed の実行の RPC の列が同じかを比べるのに使う。
@@ -741,6 +811,23 @@ export class SimCluster implements Cluster {
   }
 
   /**
+   * Meta の epoch の列を epoch まで畳んだ範囲表 (全表の読みの区間の検査、checkTiling)。routingOwner と同じく、SQLite から直に読む。
+   * 記録した epoch の中身は後から変わらないので、epoch ごとに覚えて使い回す。
+   */
+  private routings = new Map<number, Routing>();
+  routingAt(epoch: number): Routing {
+    let r = this.routings.get(epoch);
+    if (r === undefined) {
+      const rows = this.metaBackend.db.prepare(`SELECT epoch, rec FROM __epoch WHERE epoch <= ? ORDER BY epoch`).all(epoch) as { epoch: number; rec: string }[];
+      r = rows.some((x) => x.epoch === 0)
+        ? fold(rows.map((x) => ({ epoch: x.epoch, rec: JSON.parse(x.rec) as EpochRecord })), epoch).routing
+        : initialRouting(this.shardIds);
+      this.routings.set(epoch, r);
+    }
+    return r;
+  }
+
+  /**
    * 子として移動を進めるシャードの alarm (docs/design-catalog-epoch.md の決めたこと 4)。DO の alarm と同じく、予約から MOVE_ALARM_MS の後に
    * redrive を走らせ、まだ進める移動が残っていれば、もう一度予約する。仮想の時計のクラスタでだけ、仮想の時計で発火させる (実時間の
    * タイマーは使わない)。移動のない alarm (取り残された intent と phase 2 の再駆動) は、今までどおり試験が fireAlarms で発火させる。
@@ -821,7 +908,11 @@ export class SimCluster implements Cluster {
           });
           const hold = this.net.reply(m);
           if (hold) await hold;
-          return out === undefined ? undefined : structuredClone(out);
+          if (out === undefined) return undefined;
+          const answer = structuredClone(out);
+          // Worker へ返す exec の答えに、それを返した要求を結び付ける (全表の読みの区間の検査、checkTiling)。
+          if (from === "client" && method === "exec" && answer !== null && typeof answer === "object") answeredBy.set(answer, { c: this, shard: to, req: req as ExecReq });
+          return answer;
         } finally {
           this.unanswered.delete(sent);
         }

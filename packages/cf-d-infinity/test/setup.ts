@@ -5,12 +5,13 @@ import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { afterEach, beforeAll, beforeEach, expect } from "vitest";
+import { Txn } from "../src/client/db";
 import { spanFaults } from "../src/client/spans";
 import { imageChecks, imageFaults } from "../src/shard/rows";
 import { parseObserver } from "../src/sql/cst";
 import { openScratch } from "../src/sql/scratch";
 import { systemRuntime } from "../src/runtime";
-import { allDriverIntegers, allSpanEscapes, allWriteEscapes, imageCheckOff, injectedFault, realTimeCluster, tracedNets } from "./sim";
+import { allDriverIntegers, allSpanEscapes, allTilingProblems, allWriteEscapes, checkTiling, imageCheckOff, injectedFault, realTimeCluster, tracedNets } from "./sim";
 
 // PARSER_CORPUS=<ディレクトリ> を付けて流すと、試験が解析に渡した文を、プロセスごとの 1 行 1 文の JSON のファイルに書き出す。
 // パーサの突き合わせ (test/parser-oracle.test.ts) が、これを文の集まりとして読む。同じ文は、プロセスの中で 1 度だけ書く。
@@ -86,6 +87,37 @@ afterEach(() => {
     .map((e) => `${e.shard}: ${e.sql === null ? "(a transaction's writes at commit)" : e.sql.slice(0, 160)} | ${e.row} | ${e.problem.slice(0, 240)}`)
     .filter((s) => !seen.has(s) && seen.add(s));
   expect(distinct.slice(0, 10), "writes outside their declared spans, or rows left on a shard that does not own them").toEqual([]);
+});
+
+// 全表の読みの区間の検査 (test/sim.ts の checkTiling、M19 の m19_red_gap)。Worker が 1 つの文の答えにまとめたシャードの答えの claim が、
+// 1 つの範囲表のスナップショットで token の全体をちょうど覆わなければ、その試験を失敗にする。
+// Worker が複数のシャードの答えをまとめるところは、ReadScope.budgeted の 1 か所である (走査、押し下げた読み、部分の集約、書き込みの
+// 基準経路の集める読み)。その返り値の parts が、使った答えの全部である (予算を超えて読み直したシャードは、読み直した答えだけが入る)。
+// 押し下げる書き込みの文 (Txn.write) は、いつも shard key で宛先を決め、全表の span を運ばない (src/sql/plan.ts の planUpdateDelete。
+// 主キーか shard key で絞れない UPDATE と DELETE は、基準経路で行を集める)。UNIQUE の index を作る走査 (Db.scanShard) は、ページごとに
+// 別の時点で読む作り方の読みで、文の読みではない。どちらも確かめない。
+// ReadScope は書き出されていないので、Txn の親の prototype から取る。名前が変わったら、ここで落とす (黙って確かめなくなるのを防ぐ)。
+// 包みは同じ Promise を返し、確かめは横に付けた then で走らせる。async の包みにすると、Promise の解決の段が増え、同じ seed の RPC の列が
+// 変わり得る。横の then は、呼び出し側の続きより先に、同じ段で走る (RPC_TRACE で、包む前と同じ RPC の列であることを確かめた)。
+{
+  const scope = Object.getPrototypeOf(Txn.prototype) as { budgeted?: (...a: unknown[]) => Promise<{ parts: unknown[] }> };
+  const budgeted = scope.budgeted;
+  if (typeof budgeted !== "function") throw new Error("test/setup.ts: ReadScope.budgeted is gone from src/client/db.ts; move the tiling check (test/sim.ts checkTiling) to where the Worker now merges the answers of one statement");
+  scope.budgeted = function (this: unknown, ...a: unknown[]) {
+    const out = budgeted.apply(this, a);
+    out.then(({ parts }) => {
+      try {
+        checkTiling(parts);
+      } catch (e) {
+        allTilingProblems.push(`the tiling check could not read the answers: ${(e as Error)?.message ?? String(e)}`);
+      }
+    }, () => undefined);
+    return out;
+  };
+}
+afterEach(() => {
+  const found = [...new Set(allTilingProblems.splice(0))];
+  expect(found.slice(0, 5), "whole-table reads whose answers do not cover the token space exactly once under one routing snapshot").toEqual([]);
 });
 
 // 型つきの読みの検査 (docs/design-values.md の「足す検査」の 5 の 1 つ目、test/sim.ts の allDriverIntegers)。利用者の表に触る文
