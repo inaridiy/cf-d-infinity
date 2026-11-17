@@ -972,7 +972,7 @@ green   $f m5d_green_return3 m5dSafe                     # 戻って、もう一
 green   $f m5d_green_groups m5dSafe                      # グループ 2 つ (行のあるものと、ないもの)。持ち主の書き込みと再起動なし
 live    $f m5d_green_return m5dLive                      # 活性: どの移動も閉じ、始めた取引の phase 2 は届け終わる
 live    $f m5d_green_chain m5dLive
-if [ "${HEAVY:-0}" = "1" ]; then                         # 大きい形と、既定から外した緑
+if [ "${HEAVY:-0}" = "1" ]; then                         # 大きい形と、既定から外した緑 (合わせて 8 分ほど)
   live  $f m5d_green_return3 m5dLive
   green $f m5d_green_return3_txn m5dSafe                 # 0 → 1 → 0 → 1 に、取引を足す (再起動なし)
   green $f m5d_green_chain_back m5dSafe                  # 0 → 1 → 2 → 0 (再起動なし)
@@ -982,6 +982,7 @@ if [ "${HEAVY:-0}" = "1" ]; then                         # 大きい形と、既
   green $f m5d_red_late_ack m5dOutcome                   # ack の規則を外しても、害はない
   green $f m5d_red_boot_differs markMatchesRecord        # 書き込みの後で付ける印は、記録と合う
   green $f m5d_prototype_return3 m5dData                 # 試作は、範囲が戻ってもう一度出る列でも、行と印は壊さない
+  green $f m5d_prototype_chain m5dOutcome                # 試作は、戻らない列でも、害がない
 fi
 # 5808b08 のコード: 類の 1 から 7
 red     $f m5d_code_return deliveredApplied              # 類の 1 と 3: 渡し直した印が、後の取引の phase 2 を適用させない
@@ -998,6 +999,8 @@ red     $f m5d_code_child_rule deliveredApplied          # 子の規則だけ: �
 red     $f m5d_code_child_rule ownerHasTruth             # 子の規則だけ: 類の 2 が残る (子は、捨てた応答にも ack を送る)
 green   $f m5d_code_child_rule_chain m5dData             # 子の規則だけ: 戻らない列では、行も印も壊れない (類の 4、5、7)
 red     $f m5d_code_derived_return rowsOnlyAtOwner       # 印の関数だけ: 類の 2 の行が、持ち主でない前の子に入る
+red     $f m5d_code_derived_return ackWillLand           # 印の関数だけ: 類にない順序。渡し直した行が、まだ閉じていない移動 2 の親に入り、移動が閉じない
+red     $f m5d_code_derived_return ownerHasTruth         # 印の関数だけ: 類にない順序。渡し直しが 2 回続き、持ち主が消した行が戻る
 red     $f m5d_code_derived_return3 ownerHasTruth        # 印の関数だけ: 類の 6 が残る
 green   $f m5d_code_derived_chain m5dData                # 印の関数だけ: 戻らない列では、行も印も壊れない (類の 4、5、7)
 # 緑から、条件を 1 つ外す

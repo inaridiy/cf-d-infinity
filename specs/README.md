@@ -62,7 +62,7 @@ red と green は同じ core モジュールを `const` フラグで切り替え
 | M5c `m5c_red_rehand` | `handsUnderFence` / `boundedForwards` | 問題 55: 終わった移動の遅れた pull に、範囲が戻った親がグループを渡し直す | 68 / 158 で反例 | | 反例 (2 本とも) |
 | M5d `m5d_green_return` / `_chain` / `_return3` / `_groups` | `m5dSafe` (`_return` と `_chain` は `m5dLive` (時相) も) | シャード 3、範囲 1 つ。移動の列は 0 → 1 → 0 / 0 → 1 → 2 / 0 → 1 → 0 → 1 (取引なし) / 0 → 1 → 0 でグループ 2 つ (持ち主の書き込みと再起動なし)。ほかは、グループ 1 つ、取引 1 つ、持ち主の書き込みと削除、再起動 1 回 | 137,091 / 141,993 / 101,154 / 319,104 | 32 / 32 / 36 / 40 | No violation |
 | M5d `m5d_code_return` / `_chain` / `_return3` | `deliveredApplied`、`ownerHasTruth`、`markMatchesRecord` / `deliveredApplied`、`ackWillLand`、`movesClose` (時相) / `ownerHasTruth` | `5808b08` のコード: 親の規則も子の規則もなく、印は手ごとに書き換える (類の 1 から 7) | 反例 | | 反例 (7 本すべて) |
-| M5d `m5d_code_parent_rule` / `_parent_rule3` / `m5d_code_child_rule` / `m5d_code_derived_return` / `_derived_return3` | `deliveredApplied` / `ownerHasTruth` / `deliveredApplied`、`ownerHasTruth` / `rowsOnlyAtOwner` / `ownerHasTruth` | `5808b08` のコードに、親の規則だけ / 子の規則だけ / 印の関数だけを入れる | 反例 | | 反例 (6 本すべて) |
+| M5d `m5d_code_parent_rule` / `_parent_rule3` / `m5d_code_child_rule` / `m5d_code_derived_return` / `_derived_return3` | `deliveredApplied` / `ownerHasTruth` / `deliveredApplied`、`ownerHasTruth` / `rowsOnlyAtOwner`、`ackWillLand`、`ownerHasTruth` / `ownerHasTruth` | `5808b08` のコードに、親の規則だけ / 子の規則だけ / 印の関数だけを入れる | 反例 | | 反例 (8 本すべて) |
 | M5d `m5d_code_child_rule_chain` / `m5d_code_derived_chain` | `m5dData` | 同上で、戻らない列 (0 → 1 → 2)。子の規則だけ / 印の関数だけ | 86,509 / 84,009 | | No violation |
 | M5d `m5d_red_rehand` / `m5d_red_late_ack` | `handsUnderFence`、`noFailedWrite` / `handsUnderFence` | 緑から、親の規則 (pull) / ack の規則だけを外す | 反例 | | 反例。`m5d_red_rehand` の `m5dData` (178,031) と `m5d_red_late_ack` の `m5dOutcome` (177,129。HEAVY) は No violation |
 | M5d `m5d_red_child_stale` / `m5d_red_finished_refusal` / `m5d_red_ask_once` | `ownerHasTruth`、`receivesUnderIncoming` / `noMoveRefusal` / `noMoveRefusal` | 緑から、子の規則 / 「渡し終えた」は答え / 尋ね直しを外す | 反例 | | 反例 (4 本すべて) |
@@ -752,6 +752,7 @@ M5b の `finishRange` と `nextHop` は、飛んでいる pull がないこと (
 子は、再起動の前の自分や、ほかの文が出した pull を知らないので、コードはこの条件を守れない。
 M5d の規則が、その代わりになる。終わった移動の pull は「渡し終えた」と答えられて何も変えず、その応答は捨てられるので、「飛んでいない」のと同じである。
 だから、M5b の `nextHop` (元の親はモデルから消える) と、開いたグループに `pull` が出ないことは、変えなくてよい。
+これは M5d の緑からの議論で、M5b に遅れた要求と応答を足して流したものではない。
 
 変える必要があるのは、`finishRange` の「渡したグループが全部届いている」である。
 親が渡し終える直前に、on-demand の pull が空のグループを渡すと、親は、その応答が子に届く前に渡し終える。
@@ -761,7 +762,8 @@ M5b は、この形を置いていない。
 `m5b_green_range` の `migrationSafe` は 8,488,781 状態 (元は 8,306,186)、`m5b_green_floor_clock` の `floorSafe` は 4,374,286 状態 (元は 4,150,998)、`m5b_green_floor_resplit` の `floorSafe` は 7,835,054 状態 (元は 6,127,304) で、どれも成り立った。
 緩めた道を通った後で、子がそのグループに書き込みを受理する状態にも届く (写しに足した、見るための印で確かめた)。
 `m5b_red_range` (`noWriteBelowRead`) と `m5b_red_floor_no_clock` (`readConsistent`) は、緩めた写しでも赤のままである。
-だから、M5b の時計と床の性質は、この形でも保たれる。M5b の本体に入れるなら、`finishRange` の条件と `rest` を、この形に直す。
+取引 X を入れた `HEAVY` の 2 つ (`m5b_green_floor_clock_x`、`m5b_green_floor_resplit_x`) は、流していない。
+流した範囲では、M5b の時計と床の性質は、この形でも保たれる。M5b の本体に入れるなら、`finishRange` の条件と `rest` を、この形に直す。
 
 #### 結果
 
@@ -769,6 +771,8 @@ TLC を 1 本ずつ、4 workers、heap 2.5 GB で流した。
 緑の状態数は、`m5d_green_return` が 137,091 (生成 129 万、深さ 32)、`m5d_green_chain` が 141,993 (生成 133 万、深さ 32)、`m5d_green_return3` が 101,154 (生成 96 万、深さ 36)、`m5d_green_groups` が 319,104 (生成 388 万、深さ 40) である。
 `m5dLive` は、`m5d_green_return` と `m5d_green_chain` で成り立つ。
 赤の状態数は、反例を見つけた時点の数なので、流すたびに少し変わる。
+既定の行 (62 行) を通して流したのは 1 回で、1,435 秒かかった。同じ計算機でほかの検査が流れていて、load average は 13 から 24 だった。
+行ごとの時間を、ほかの検査が少なかったときの値で足すと、9 分ほどになる (見積もりで、通して測ったものではない)。その後に赤を 2 行足した。
 
 `HEAVY=1` は、次を足す。どれも 2026-11-17 に流して、成り立った。
 
@@ -782,6 +786,9 @@ TLC を 1 本ずつ、4 workers、heap 2.5 GB で流した。
 | `m5d_red_late_ack` | `m5dOutcome` | ack の規則だけを外す | 177,129 |
 | `m5d_red_boot_differs` | `markMatchesRecord` | 印を手ごとに書き換え、親の規則も外す | 356,402 |
 | `m5d_prototype_return3` | `m5dData` | 読み直しの試作、0 → 1 → 0 → 1 | 318,128 |
+| `m5d_prototype_chain` | `m5dOutcome` | 読み直しの試作、0 → 1 → 2 | 188,305 |
+
+この 10 行を通して流すと、8 分ほどかかった (load average は 9 前後)。
 
 witness は 5 つ (`check.sh` の行は 6 本) で、どれも到達した。
 

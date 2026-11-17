@@ -96,7 +96,7 @@ TLC は、`m5d_code_return` の `deliveredApplied` の反例として、類の 1
 |---|---|---|---|
 | 1 と 2 の親の側。親は、生きた fence の下の pull でだけ渡す (`PARENT_RULE`) | `m5d_red_rehand` | `handsUnderFence` (規則だけ) と `noFailedWrite` (類の 3 の、UNIQUE の失敗)。行、intent、印は壊れない (`m5dData` は緑) | `rehandFinished` |
 | 同上。親は、生きた fence の下の ack でだけ消す (`ACK_RULE`) | `m5d_red_late_ack` | `handsUnderFence` (規則だけ)。害はない (`m5dOutcome` は緑) | なし (下の「ack」) |
-| 1 と 2 の子の側。子は、受け取り中の移動の応答でだけ受け取る (`CHILD_RULE`) | `m5d_red_child_stale` | `ownerHasTruth` (類の 6。消した行が戻る)、`receivesUnderIncoming` | `childAcceptsStale` |
+| 1 と 2 の子の側。子は、受け取り中の移動の応答でだけ受け取る (`CHILD_RULE`) | `m5d_red_child_stale` | `ownerHasTruth`、`receivesUnderIncoming`。`ownerHasTruth` を破る道は 2 つある。類の 6 (run の `member6Test`。消した行が戻る) と、移動 1 の遅れた「渡し終えた」が、同じ範囲の移動 3 の受け取りを終える道 (`closeEarlyTest`。TLC の反例はこちら) である | `childAcceptsStale` |
 | 3。「渡し終えた」は答えである (`FINISHED_ANSWERS`) | `m5d_red_finished_refusal` | `noMoveRefusal` (行のないグループの文が `group not arrived` で断られる)。行と印は壊れない | `finishedAsRefusal` |
 | 4。印は、記録の書き込みの後で付ける (`MARKS` = 2 が外した形) | `m5d_red_mark_before_write` (親の規則も外す) | `markMatchesRecord` (類の 3 の、メモリだけの印)、`deliveredApplied` | `markBeforeWrite` |
 | 4。動いている間も、起動のときと同じ関数で印を作る (`MARKS` = 1 が外した形) | `m5d_red_boot_differs` (親の規則も外す) | `marksDerived`、`deliveredApplied` (類の 1)。`markMatchesRecord` は緑 | `bootMarksDiffer` |
@@ -105,7 +105,7 @@ TLC は、`m5d_code_return` の `deliveredApplied` の反例として、類の 1
 ### 条件を 1 つだけ入れた形
 
 `5808b08` のコード (`m5d_code_return`、`m5d_code_chain`、`m5d_code_return3`) は、条件を 1 つも満たさず、類の 1 から 7 が全部起きる。
-破れる不変条件は、`deliveredApplied`、`noLostWrite`、`ownerHasTruth`、`rowsOnlyAtOwner`、`ackWillLand`、`markMatchesRecord`、`noFailedWrite` と、活性の `movesClose` である。
+破れる不変条件は、`deliveredApplied`、`noLostWrite`、`ownerHasTruth`、`rowsOnlyAtOwner`、`ackWillLand`、`markMatchesRecord`、`noFailedWrite` と、活性の `movesClose` である (`noLostWrite`、`rowsOnlyAtOwner`、`noFailedWrite` は run が、ほかは `check.sh` の TLC の行が確かめる)。
 
 このコードに、条件を 1 つだけ入れた形を 3 つ流した。
 欄は、類ごとの run の結果である。
@@ -209,6 +209,7 @@ TLC は、印の関数だけの形 (`m5d_code_derived_return`) で、表にな�
    - 案 A：入れる (`arriveStep` を、届くまで尋ね直す形にする)。
    - 案 B：入れない。文が、範囲の 2 回の移動をまたいで待った後に、3 回目の移動の受け取りの途中で `group not arrived` (やり直してよい競合) で断られる。対話的な取引では、ORM に `SQLITE_BUSY` が届く。
    - 推奨は案 A である。案 B は、置き場所だけが理由の失敗で、規則 4 に反する。変更は `arriveStep` の 1 か所で、尋ね直す回数は移動の数で抑えられる。
+   - piece を運ぶ phase 2 と abort の要求 (`finalizeStep`、`abortStep`) も、同じ `arriveStep` を通る。M5d は、この要求を、グループが届くまで待つものとして置いた (M5c と同じ)。案 A は、モデルが前提にしたこの形に、コードを合わせることにもなる。1 回だけ尋ねて進む形の phase 2 は、モデルでは確かめていない。
 2. **前の決まりの書き換え**。[design-refresh-across-move.md](./design-refresh-across-move.md) の不変条件 D の最後の行 (「終わった移動の遅れた pull を断り」) と、`specs/README.md` の M5c の節の「緑では、終わった移動の pull を断る」を、「答える」に直す。この作業は、その 2 か所を書き換えていない (書いてよいのは、この文書と、M5d の行だけだった)。
 3. **M5b の `finishRange` を緩めるか**。M5b は、渡したグループが全部届いてから範囲の移動を終える。コードの親は、行と intent が残っていなければ渡し終えるので、空のグループを渡した応答が飛んでいる間に終えることがある。
    - 案 A：M5b の本体を、緩めた形にする (子は、渡されたが届いていない空のグループも、到着の記録なしで受け持ち、飛んでいる応答を捨てる)。手元の写しでは、`m5b_green_range`、`m5b_green_floor_clock`、`m5b_green_floor_resplit` が成り立った。取引 X を入れた `HEAVY` の 2 つは流していない。
