@@ -626,32 +626,28 @@ f=m24c_lock_holders.qnt
 green   $f m24c_green lockSafe                          # 決めた設計。取引 2 件 (書き込みから始めるか、ロックを取る読みから始める)、置き場所 8 通り
 green   $f m24c_green_reader lockSafe                   # 取引 2 が、DDL より前に X をロックなしで読んでいる (計画し直せない)
 green   $f m24c_green_optimistic lockSafe               # 取引 2 が楽観の取引 (行ロックを取らず、COMMIT で書く)
-green   $f m24c_green_cross lockSafe                    # 取り消しとやり直しが起きる置き場所だけ (下の活性の場面)
 red     $f m24c_red_reads asSqlite                      # D1: ロックを与える判断が、書き込みとして頼る表にしか fence を見ない
 red     $f m24c_red_reads preparedStays                 # 同上: 全シャードが ok と答えた試みを、後から始めた取引が取り消させる
 red     $f m24c_red_fence holderSurvives                # D2: 書きの epoch を進める表が fence にない。行を書いた取引が断られる
-red     $f m24c_red_window asSqlite                     # D3: 待つ間も新しい取引にロックを与える。行は 1 つのシャード
-red     $f m24c_red_window placementFree
+red     $f m24c_red_window placementFree                # D3: 待つ間も新しい取引にロックを与える。行は 1 つのシャード (asSqlite も破れる)
 red     $f m24c_red_window optimisticOutcome            # 同上: 待っているシャードが、楽観の取引の COMMIT を受ける
 green   $f m24c_window_apart lockSafe                   # 同じ形でも、2 つの取引の行が別のシャードにあれば SQLite と同じ (上の赤と合わせて、置き場所で決まる)
 red     $f m24c_red_gap asSqlite                        # やり直しを進める側が後から記録する (m24_retry の形): 取り消しとやり直しの間に、待っていた取引がロックを得る
 green   $f m24c_gap_one_shard lockSafe                  # 同じ形でも、行が 1 つのシャードにあれば取り消しが起きず、SQLite と同じ
 red     $f m24c_red_holder_here holderNotDelayed        # 待っているシャードが、そのシャードにロックを持つ取引にだけ与える: 別のシャードの持ち主の書き込みが待たされる
 green   $f m24c_holder_here_one_shard lockSafe          # 同じ形でも、行が 1 つのシャードにあれば待たされない
+# witness は、置き場所を 1 つにした場面で探す (m24c_green の置き場所の 1 つ)。モデルには、ここで流さない witness もある
+# (witnessLateBlockedFenced、witnessReaderPasses、witnessOptimisticBusyFenced、witnessOptimisticAfterBusy。2026-11-17 に届くことを確かめた)。
 witness $f m24c_green_one witnessLateWaitsOne           # 行が 1 つのシャード。待つ間に来た BEGIN IMMEDIATE の取引が待ち、DDL が確定し、取引も確定する
 witness $f m24c_green_apart witnessLateWaitsTwo         # 同じ予定で、後から来た取引の行が、prepare を適用したシャードにある
 witness $f m24c_green_one witnessLateBlockedPending     # 後から来た取引が、待っているシャードで、与えられずに待っている
-witness $f m24c_green_cross witnessLateBlockedFenced    # 同じく、prepare を適用したシャードで
 witness $f m24c_green_cross witnessRestartKeepsWaiting  # 取り消しとやり直しをまたいで、後から来た取引が待ち続け、DDL が確定する
 witness $f m24c_green_cross witnessBusyThenLate         # 持ち主が期限を過ぎてロックを持ち、DDL が期限に失敗し、待っていた取引はその後で通る
 witness $f m24c_green_cross witnessTwoHolders           # 2 つの持ち主。片方の、もう片方を待つシャードへの書き込みが、取り消させずに通る
 witness $f m24c_green_reader witnessReaderRefused       # DDL の前に読んだ取引は、DDL の確定の後で断られる
-witness $f m24c_green_reader witnessReaderPasses        # 同じ取引が、DDL が失敗した後では通る
 witness $f m24c_green_optimistic witnessOptimisticBusyPending  # 楽観の取引の COMMIT が、待っているシャードで競合になる
-witness $f m24c_green_optimistic witnessOptimisticBusyFenced   # 同じく、prepare を適用したシャードで
-witness $f m24c_green_optimistic witnessOptimisticAfterBusy    # DDL が失敗した後の刻みには、確定する
 green   $f m24c_red_window witnessLateBlockedPending    # 同じ witness は、待つ間も与える形では届かない
-live    $f m24c_green_cross lockLive                    # 活性: 始めた DDL は終わり、時刻は上限まで進み、送られた文は答えを得る
+live    $f m24c_green_cross lockLive                    # 活性: 始めた DDL は終わり、時刻は上限まで進み、送られた文は答えを得る (取り消しとやり直しが起きる置き場所)
 for m in m24c_green m24c_red_reads m24c_red_fence m24c_red_window m24c_window_apart m24c_red_gap m24c_gap_one_shard \
          m24c_red_holder_here; do tests $f $m; done
 

@@ -2570,11 +2570,12 @@ M24 の `m24_retry` は、悲観の取引 1 件と、書き込みのロックだ
 | D3 | シャードが行ロックの持ち主を待っている間に、新しい取引がロックを得る。その取引がロックを持ち続けると、DDL は失敗する。行が、もう prepare を適用したシャードにあれば、取引は待ち、DDL は確定する (規則 4) | 取引が 1 件 |
 
 M24c は、`m24_retry` の時刻の数え方 (刻みは、内部の手がどれもできないときにだけ進む。期限は 2 刻み、時刻は 0〜4) をそのまま使い、取引を 2 件にしたモデルである。M24 のファイルは変えていない。
-取引は、ロックを取る文を 2 つ実行して `COMMIT` する。行の置き場所は init が選ぶ (取引 1 の 1 つ目の行は P。対称なので、置き場所は 8 通り)。取引の形は 3 つある。
+取引は、ロックを取る文を 2 つ実行して `COMMIT` する。行の置き場所は init が選ぶ (取引 1 の 1 つ目の行は P。対称なので、置き場所は 8 通り)。取引の形は 4 つある。
 
 - `WRITER`: SQL の `BEGIN`。文は 2 つとも書き込み。
 - `IMMEDIATE`: `BEGIN IMMEDIATE`。1 つ目の文は、主キーで読んでロックを取る読み、2 つ目は書き込み。
 - `READER`: 素の `BEGIN` で、DDL より前に X をロックなしで読んだ。文は 2 つとも書き込み。DDL の確定の後に、計画し直せない (SQLite の `SQLITE_BUSY_SNAPSHOT`)。
+- `OPTIMISTIC`: 楽観の取引 (Worker の中の `Db.begin()`)。行ロックを取らない。文は `COMMIT` の 1 つで、溜めた 1 行の書き込みを、行のシャードへ送る。待たない。X が書き込み禁止か、表定義が古ければ、競合になる。
 
 シャードの、いまの試みについての位置は 4 つである。`UNSEEN` (prepare を見ていない)、`PENDING` (見たが、X の行ロックがあるので適用を待っている)、`FENCED` (適用した。書き込み禁止)、`ENDED` (終わりを適用した)。
 `m24_retry` の条件のうち `WAIT_LOCKS`、`WOUND`、`HOLD`、`KEEP_BUDGET`、`FRESH_EPOCH` は、決めたとおりに固定した。`RETRY` は、下の `ONE_RESTART` に替えた。
@@ -2585,7 +2586,7 @@ M24c は、`m24_retry` の時刻の数え方 (刻みは、内部の手がどれ�
 |---|---|---|---|
 | `ANY_DEP` | シャードは、行ロックを与えるかを、1 つの判断で決める。要求が表に書き込みとして頼るか、読みとして頼るか (ロックを取る読み) を見ない | `m24c_red_reads` (D1) | `asSqlite`、`preparedStays` |
 | `FENCE_COVERS` | DDL が書きの epoch を進める表は、その DDL の fence に入る (prepare は、その表の行ロックを待ち、書き込みを止める) | `m24c_red_fence` (D2) | `holderSurvives` |
-| `CLOSE_WINDOW` | シャードは、prepare の適用を待ち始めた時 (`PENDING`) から、X の新しいロックを、X のロックを持たない取引に与えない | `m24c_red_window` (D3) | `asSqlite`、`placementFree` |
+| `CLOSE_WINDOW` | シャードは、prepare の適用を待ち始めた時 (`PENDING`) から、X の新しいロックを、X のロックを持たない取引に与えず、その取引の書き込みも受けない (適用した後の書き込み禁止と、同じ 1 つの判断) | `m24c_red_window` (D3) | `asSqlite`、`placementFree`、`optimisticOutcome` |
 | `ONE_RESTART` | ロックを持つ取引が書き込み禁止に当たって試みを取り消させるとき、Meta は、取り消しと、やり直しの prepare (新しい epoch、同じ期限) を、1 手で記録する。DDL が始まってから終わるまで、開いている試みのない時がない | `m24c_red_gap` | `asSqlite` |
 | `HOLDS_ANYWHERE` | 「X のロックを持つ取引」は、X のロックをどのシャードに持っていてもよい (要求が運ぶ。`m24_retry` の `HOLD` と同じ) | `m24c_red_holder_here` | `holderNotDelayed` |
 
@@ -2593,6 +2594,7 @@ M24c は、`m24_retry` の時刻の数え方 (刻みは、内部の手がどれ�
 `SQLITE_BUSY` で断る案は採らない。SQLite では、DDL が書き込みのロックを待つ間に来た書き手は、busy_timeout まで待ち、DDL が終われば通る。すぐに断ると、SQLite では通る文が失敗する。
 `BEGIN IMMEDIATE` の取引と、書き込みから始める取引は、何も読んでいないので、DDL が確定した後の表定義で計画し直して通る (`writersSurvive`)。
 DDL の前に読んだ取引 (`READER`) は、DDL が確定していれば断られ、失敗していれば通る (`readerOutcome`)。SQLite でも、読んだ後に別の接続が確定した取引の書き込みは `SQLITE_BUSY_SNAPSHOT` になる。
+ロックを取らない書き込み (`OPTIMISTIC` の `COMMIT`) は、待たない。DDL が進んでいる間は、適用を待っているシャードでも、prepare を適用したシャードでも、競合になる (`optimisticOutcome`。楽観の取引の `COMMIT` が DDL のために競合になるのは、前からある SQLite との違いである)。
 
 **許す結果**。SQLite の書き込みのロックに、公平な列はない。持ち主 H が確定した時、待っていた DDL と、待っていた新しい書き手 R の、どちらが先にロックを取るかは決まっていない。R が先に取って期限まで持てば、DDL は `SQLITE_BUSY` になる。
 D∞ は、そのうちの片方だけを起こす。DDL を始めた刻みより後の刻みに最初のロックを求めた取引は、いつも DDL の後ろになる。
@@ -2604,56 +2606,59 @@ D∞ は、そのうちの片方だけを起こす。DDL を始めた刻みよ�
 
 1. 禁止は、試みごとではなく、DDL が終わるまで続かなければならない。`m24_retry` の形 (進める側が、取り消しを知ってからやり直す) では、取り消しを適用したシャードは、やり直しの prepare を見るまで、禁止も待ちもない。DDL の後ろで待っていた取引が、その間にロックを得て、持ち続けると、DDL は失敗する (`m24c_red_gap`)。取り消させる手は、行が 2 つのシャードにあるときだけ起きるので、行が 1 つのシャードにあれば緑である (`m24c_gap_one_shard`)。`CLOSE_WINDOW` だけでは、規則 4 が残る。`ONE_RESTART` は、取り消しとやり直しの prepare を Meta の 1 手にして、間をなくす。
 2. 「ロックを持たない取引」は、そのシャードではなく、どのシャードにも X のロックを持たない取引でなければならない。そのシャードで見ると、P にロックを持つ取引の、Q (別の取引を待っている) への書き込みが、DDL の期限まで待たされる (`m24c_red_holder_here`。行が 1 つのシャードにあれば待たない、`m24c_holder_here_one_shard`)。
-3. fence に入れるのは、いまある利用者の表だけである (モデルの外。設計の文書に理由を書いた)。内部の表 (`__gidx_<index>`) を止めると、行ロックを持つ取引の `COMMIT` が、index の項目のシャードで断られ、成否が項目の置き場所で決まる。
+3. 止めるのは、ロックだけでなく、書き込みもである。適用を待っているシャードが、ロックを取らない書き込みを受けると、楽観の取引の `COMMIT` は、行が 1 つのシャードにあれば通り、prepare を適用したシャードにあれば競合になる (`m24c_red_window` の `optimisticOutcome`。`m24c_window_apart` は緑)。書き込みの禁止と、ロックを与える判断を、1 つにする。
+4. fence に入れるのは、いまある利用者の表だけである (モデルの外。設計の文書に理由を書いた)。内部の表 (`__gidx_<index>`) を止めると、行ロックを持つ取引の `COMMIT` が、index の項目のシャードで断られ、成否が項目の置き場所で決まる。
 
 不変条件は `lockSafe` にまとめた。
 
 - `asSqlite`、`placementFree`: 上のとおり。
 - `holderSurvives`: X の行ロックを持つ取引は、DDL のために断られない。
-- `writersSurvive`: 断られるのは `READER` だけである。
+- `writersSurvive`: 断られるのは `READER` と `OPTIMISTIC` だけである。
 - `readerOutcome`: DDL より後の刻みに最初の書き込みを求めた `READER` は、DDL が確定したときにだけ断られる。
+- `optimisticOutcome`: DDL より後の刻みに `COMMIT` を送った `OPTIMISTIC` が確定するのは、DDL が、その刻みまでに失敗して終わっていたときだけである。
 - `holderNotDelayed`: ロックを持つ取引の文は、時刻をまたいで待たない。
 - `waitsOnlyForDdl`: 文が時刻をまたいで待つのは、DDL が進んでいる間だけである。
 - `preparedStays`: 全シャードが prepare を適用して ok と答えた試みは、取引に取り消されない。
 - `noReblock`、`checkSawRows`: `m24_retry` と同じ。
 
-2026-11-17 に、TLC (heap 2.5 GB、3 workers) で流した。TLC の 24 個 (緑 7、赤 7、witness 9、活性 1) と `run` の試験 8 モジュール (10 本) で 275 秒。load average が 4 前後の計算機で測った。
+2026-11-17 に、TLC (heap 2.5 GB、3 workers) で流した。`check.sh` の節は、TLC の 23 個 (緑 7、赤 7、witness 8、活性 1) と `run` の試験 8 モジュール (12 本) で、327 秒だった。ほかの作業が並んで動いていて、load average が 9 から 11 の計算機で測った (TLC の 1 回の起動に、状態の数に依らず 10 秒ほどかかるので、行の数で決まる)。
 
 | 種類 | インスタンス | 性質 | 到達状態数 (distinct) | 確かめること |
 |---|---|---|---|---|
 | green | `m24c_green` | `lockSafe` | 1,479,176 | 決めた設計。取引 2 件 (`WRITER` か `IMMEDIATE`)、置き場所 8 通り |
 | green | `m24c_green_reader` | `lockSafe` | 324,939 | 取引 2 が `READER` |
-| green | `m24c_green_cross` | `lockSafe` | 86,724 | 取り消しとやり直しが起きる置き場所だけ (活性の場面) |
-| red | `m24c_red_reads` | `asSqlite` | 73,487 | D1。後から来た `BEGIN IMMEDIATE` の取引の読みが、禁止の表でロックを得る。続く書き込みが試みを取り消させ、やり直しはその取引を待って、期限に失敗する |
-| red | `m24c_red_reads` | `preparedStays` | 10,578 | 同上。全シャードが ok と答えた試みが、取り消される |
-| red | `m24c_red_fence` | `holderSurvives` | 23,650 | D2。prepare は行ロックを待たず、DDL はすぐに確定し、行を書いた取引の次の書き込みが断られる |
-| red | `m24c_red_window` | `asSqlite` | 14,961 | D3。行は全部 1 つのシャード。待つ間に来た取引がロックを持ち続け、DDL は、前からの取引が期限のうちに確定しても失敗する |
-| red | `m24c_red_window` | `placementFree` | 21,344 | 同上 |
-| green | `m24c_window_apart` | `lockSafe` | 52,957 | 同じ形 (待つ間も与える) でも、2 つの取引の行が別のシャードにあれば SQLite と同じ。上の赤と合わせて、成否が置き場所で決まる |
-| red | `m24c_red_gap` | `asSqlite` | 293,643 | やり直しを、進める側が後から記録する。取り消しとやり直しの間に、待っていた取引がロックを得る |
+| green | `m24c_green_optimistic` | `lockSafe` | 80,880 | 取引 2 が `OPTIMISTIC` |
+| red | `m24c_red_reads` | `asSqlite` | 76,499 | D1。後から来た `BEGIN IMMEDIATE` の取引の読みが、禁止の表でロックを得る。続く書き込みが試みを取り消させ、やり直しはその取引を待って、期限に失敗する |
+| red | `m24c_red_reads` | `preparedStays` | 10,843 | 同上。全シャードが ok と答えた試みが、取り消される |
+| red | `m24c_red_fence` | `holderSurvives` | 24,114 | D2。prepare は行ロックを待たず、DDL はすぐに確定し、行を書いた取引の次の書き込みが断られる |
+| red | `m24c_red_window` | `placementFree` | 25,164 | D3。行は全部 1 つのシャード。待つ間に来た取引がロックを持ち続け、DDL は、前からの取引が期限のうちに確定しても失敗する (`asSqlite` も破れる) |
+| red | `m24c_red_window` | `optimisticOutcome` | 3,406 | 同上。待っているシャードが、楽観の取引の `COMMIT` を受ける |
+| green | `m24c_window_apart` | `lockSafe` | 59,699 | 同じ形 (待つ間も与える) でも、2 つの取引の行が別のシャードにあれば SQLite と同じ。上の赤と合わせて、成否が置き場所で決まる |
+| red | `m24c_red_gap` | `asSqlite` | 291,454 | やり直しを、進める側が後から記録する。取り消しとやり直しの間に、待っていた取引がロックを得る |
 | green | `m24c_gap_one_shard` | `lockSafe` | 26,844 | 同じ形でも、行が 1 つのシャードにあれば、取り消しが起きず、SQLite と同じ |
-| red | `m24c_red_holder_here` | `holderNotDelayed` | 9,992 | 待っているシャードが、そのシャードにロックを持つ取引にだけ与える |
+| red | `m24c_red_holder_here` | `holderNotDelayed` | 9,957 | 待っているシャードが、そのシャードにロックを持つ取引にだけ与える |
 | green | `m24c_holder_here_one_shard` | `lockSafe` | 26,844 | 同じ形でも、行が 1 つのシャードにあれば待たされない |
-| witness | `m24c_green` | `witnessLateWaitsOne` | 1,088,172 | 行が 1 つのシャード。待つ間に来た `BEGIN IMMEDIATE` の取引が待ち、DDL が確定し、取引も確定する |
-| witness | `m24c_green` | `witnessLateWaitsTwo` | 1,119,482 | 同じ予定で、後から来た取引の行が、prepare を適用したシャードにある |
-| witness | `m24c_green` | `witnessLateBlockedPending` | 36,780 | 後から来た取引が、待っているシャードで、与えられずに待っている |
-| witness | `m24c_green_cross` | `witnessLateBlockedFenced` | 2,926 | 同じく、prepare を適用したシャードで |
-| witness | `m24c_green_cross` | `witnessRestartKeepsWaiting` | 84,734 | 取り消しとやり直しをまたいで、後から来た取引が待ち続け、DDL が確定する |
-| witness | `m24c_green_cross` | `witnessBusyThenLate` | 62,477 | 持ち主が期限を過ぎてロックを持ち、DDL が期限に失敗し、待っていた取引はその後で通る |
-| witness | `m24c_green_cross` | `witnessTwoHolders` | 42,392 | 2 つの持ち主。片方の、もう片方を待つシャードへの書き込みが、取り消させずに通る |
-| witness | `m24c_green_reader` | `witnessReaderRefused` | 131,909 | DDL の前に読んだ取引は、DDL の確定の後で断られる |
-| witness | `m24c_green_reader` | `witnessReaderPasses` | 215,001 | 同じ取引が、DDL が失敗した後では通る |
-| green | `m24c_red_window` | `witnessLateBlockedPending` | 51,748 | 同じ witness は、待つ間も与える形では届かない |
+| witness | `m24c_green_one` | `witnessLateWaitsOne` | 93,713 | 行が 1 つのシャード。待つ間に来た `BEGIN IMMEDIATE` の取引が待ち、DDL が確定し、取引も確定する |
+| witness | `m24c_green_apart` | `witnessLateWaitsTwo` | 101,277 | 同じ予定で、後から来た取引の行が、prepare を適用したシャードにある |
+| witness | `m24c_green_one` | `witnessLateBlockedPending` | 5,490 | 後から来た取引が、待っているシャードで、与えられずに待っている |
+| witness | `m24c_green_cross` | `witnessRestartKeepsWaiting` | 84,504 | 取り消しとやり直しをまたいで、後から来た取引が待ち続け、DDL が確定する |
+| witness | `m24c_green_cross` | `witnessBusyThenLate` | 61,850 | 持ち主が期限を過ぎてロックを持ち、DDL が期限に失敗し、待っていた取引はその後で通る |
+| witness | `m24c_green_cross` | `witnessTwoHolders` | 42,889 | 2 つの持ち主。片方の、もう片方を待つシャードへの書き込みが、取り消させずに通る |
+| witness | `m24c_green_reader` | `witnessReaderRefused` | 131,064 | DDL の前に読んだ取引は、DDL の確定の後で断られる |
+| witness | `m24c_green_optimistic` | `witnessOptimisticBusyPending` | 10,801 | 楽観の取引の `COMMIT` が、待っているシャードで競合になる |
+| green | `m24c_red_window` | `witnessLateBlockedPending` | 58,086 | 同じ witness は、待つ間も与える形では届かない |
 | live | `m24c_green_cross` | `lockLive` | 86,724 | 始めた DDL は終わり、時刻は上限まで進み、送られた文は答えを得る (内部の手と刻みに弱い公平性) |
 
+`m24c_green_one`、`m24c_green_apart`、`m24c_green_cross` は、`m24c_green` の置き場所の 1 つで、witness を速く見つけるための場面である (`m24c_green_cross` は、活性の場面でもある)。
+`check.sh` の行の数を抑えるために、次の 6 つは、`check.sh` に入れていない。2026-11-17 に 1 度流して、期待どおりだった: `m24c_green_cross` の `lockSafe` (緑、86,724。`m24c_green` に含まれる)、`m24c_red_window` の `asSqlite` (赤、18,376)、witness の `witnessLateBlockedFenced` (`m24c_green_cross`、3,255)、`witnessReaderPasses` (`m24c_green_reader`、208,597)、`witnessOptimisticBusyFenced` (`m24c_green_optimistic`、10,608)、`witnessOptimisticAfterBusy` (同、25,093)。
 赤と witness の状態数は、反例が見つかるまでに調べた数で、実行ごとに少し変わる。
-`run` の試験は、赤ごとの反例の手順と、同じ利用者の時刻で置き場所だけを変えた緑の手順である (`m24c_red_window` の `windowTest` と `m24c_window_apart` の `apartTest`、`m24c_red_gap` の `gapTest` と `m24c_gap_one_shard` の `oneShardTest`)。
+`run` の試験は、赤ごとの反例の手順と、同じ利用者の時刻で置き場所だけを変えた緑の手順である (`m24c_red_window` の `windowTest` と `windowOptimisticTest`、`m24c_window_apart` の `apartTest` と `apartOptimisticTest`、`m24c_red_gap` の `gapTest` と `m24c_gap_one_shard` の `oneShardTest`)。
 
 M24c にないもの。
 
 - ロックの寿命 (M25 の取引の lease)。`asSqlite` は、ロックが切れない取引についての性質である。
 - 行ロックの取り合い。2 つの取引の行は別である。行を待っていた要求が、DDL が始まった後に起こされる形は、モデルにない。実装は、ロックを与える判断を、起こされた後の、与える直前に置く。
-- 楽観の取引と autocommit の書き込み。ロックを持たないので、待っているシャードでは通り、prepare を適用したシャードでは待つ。成否は変わらない (どちらも通る)。
+- autocommit の書き込み。ロックを取らず、止められれば、待って、新しい表定義で通る (`OPTIMISTIC` と違って、送り直せる)。成否は変わらない。
 - 全シャードが prepare を適用した後の仕事 (index の行の走査など) の長さ。モデルの DDL は、全シャードが ok と答えれば、同じ刻みで確定する。実装では、その間の書き込みとロックの要求は、今の書き込み禁止の待ちの上限 (30 秒) まで待つ。
 - 取引 3 件以上、シャード 3 つ以上。
 - `COMMIT` が書き込み禁止に当たる形 (未解決の問題 59)、進める側が止まる形、行で失敗する DDL。`m24_retry` と同じ。

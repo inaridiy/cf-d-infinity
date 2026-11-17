@@ -179,8 +179,14 @@ only the range table moved is not stale.
 
 `DinfMeta` runs the shard statements of a change in its own SQLite, on empty copies of the tables, and records the
 prepare only if they succeed. A statement that parses but that SQLite rejects is therefore refused up front. The
-prepare stops writes to the tables the change must keep still (a table it drops, renames or adds a column to, or
-indexes from its rows); a shard that applies it refuses those writes until it applies the commit or the abort. A
+prepare stops writes to every existing table whose write plans the change makes stale (a table it drops, renames,
+adds a column to, or creates or drops an index on); a shard that applies it refuses those writes, and gives out no
+new row lock on those tables, until it applies the commit or the abort. A shard does not apply the prepare while a
+transaction holds a row lock on such a table: the change waits for that transaction, for at most 5 seconds from its
+start, as a schema change in SQLite waits for the writer. From the moment a shard starts waiting it stops the table
+for every transaction that holds no row lock on it, so a transaction that arrives later waits behind the change
+wherever its rows are, and the change's outcome depends only on the transactions that held locks before it began
+(models M24 and M24c). A
 statement that can fail only where rows exist (a `UNIQUE` index over duplicates, `ADD COLUMN` with a `CHECK`) is tried
 by every shard on its fenced table and rolled back; if a shard's rows break it, the change is aborted and the caller
 gets SQLite's message. Nothing is undone: a change enters the schema only at its commit, so no statement ever planned
