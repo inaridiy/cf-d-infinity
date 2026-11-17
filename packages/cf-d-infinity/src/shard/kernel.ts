@@ -719,7 +719,7 @@ export class ShardKernel {
    * 適用が、行ロックを待って止めている prepare (計画書の不変条件 16。モデル M24c の PENDING)。待っていなければ null。
    * 表の prepare は、その表 (fence) に行ロックがある間は適用しない (M24 の WAIT_LOCKS)。適用は、その prepare の手前で終わり、ここに
    * 覚える。待つのは、prepare を適用させたい者 (preparedStep。DDL を進める側の要求) で、ロックが空いたら、適用をやり直す。
-   * 待っている間、シャードは、tables の表の新しい行ロックを、その表の行ロックを持たない取引に与えない (lockGate)。与えると、後から来た
+   * 待っている間、シャードは、tables の表の新しい行ロックを、その表の行ロックを持たない取引に与えず、その取引の書き込みも受けない (tableGate)。与えると、後から来た
    * 取引が DDL を待たせ、成否が、行の置き場所で決まる (もう prepare を適用したシャードでは、その取引は禁止で待つ)。
    * その prepare を適用したとき (ロックが空いたか、取ってきた続きで、もう閉じていた) に消す。メモリだけに持つ。再起動すれば行ロックも
    * 消えるので、prepare は待たずに適用される。
@@ -2616,7 +2616,7 @@ export class ShardKernel {
       // 表の prepare は、その表 (fence) に行ロックがある間は適用しない (M24 の WAIT_LOCKS)。行を書いた取引がロックを持つ間、その表の DDL の
       // ほうが待つ。SQLite で、書いた取引が書き込みのロックを持つ間、ほかの接続の DDL が busy_timeout まで待つのと同じである。
       // 適用は、ここで終わる (その手前までは適用した)。待ち始めたことを覚え (pending)、その表の新しい行ロックを、ロックを持たない取引に
-      // 与えなくなる (lockGate)。待つのは、prepare を適用させたい者 (preparedStep) である。ほかの要求は通す (ロックを持つ取引の、その後の
+      // 与えず、その取引の書き込みも受けなくなる (tableGate)。待つのは、prepare を適用させたい者 (preparedStep) である。ほかの要求は通す (ロックを持つ取引の、その後の
       // 文と COMMIT を待たせない)。取ってきた続きで、もう閉じている prepare は、待たない (遅れたシャードが prepare と abort を続けて
       // 適用するときに、ロックの持ち主が追いつきを止めないように)。
       if (rec.kind === "prepare" && !this.faults.prepareIgnoresLocks && !f.got.some((y) => (y.rec.kind === "abort" || y.rec.kind === "commit") && y.rec.of === x.epoch)) {

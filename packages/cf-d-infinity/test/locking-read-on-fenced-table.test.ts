@@ -5,7 +5,7 @@
 // 取引の時刻だけで決まり、SQLite (busy_timeout 5 秒) と同じである。全シャードが prepare を適用したとき、表の行ロックはどこにもなかった。
 // その後に始めた取引は、SQLite では DDL の書き込みのロックを待つので、DDL を失敗させない (BEGIN IMMEDIATE は、DDL が終わるのを待ってから
 // 始まる)。
-// 持ち主: シャードの、ロックを与える 1 つの判断 (src/shard/kernel.ts の lockGate。書いた行も、ロックを取る読みの行も、表への頼り方に
+// 持ち主: シャードの、ロックを与える 1 つの判断 (src/shard/kernel.ts の tableGate。書いた行も、ロックを取る読みの行も、表への頼り方に
 // 依らずに通る) と、Worker の取引の層 (src/client/db.ts の Txn.shardRead と Txn.lockRead。主キーの読みは、どちらの経路でも、行を読む前に
 // ロックを求める)。
 //
