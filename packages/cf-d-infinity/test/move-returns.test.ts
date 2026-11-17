@@ -10,31 +10,28 @@
 // 未解決の問題 54 (範囲が前の持ち主へ戻る途中に届いた phase 2) は、2026-11-17 に直した (test/phase2-during-return.test.ts、M5c)。
 // それまで伏せていた MoveChaos.hide54 は外した。
 //
-// 伏せているもの (MoveChaos.hideStalePull)。終わった移動の遅れた pull が、範囲が戻ってきた前の親に届くと、親は、終わった移動の fence で
-// グループを渡し直そうとし、内部の誤り (UNIQUE constraint failed: __moved...) で答え、その pull を待っていた利用者の文も失敗する
-// (test/open/stale-pull-after-return.test.ts。この生成器の seed 119 が見つけた)。宛先へ向かう pull がまだ届いていない間は、その宛先への
-// 移動を後回しにする。OPEN=1 で外す。
+// 問題 55 (終わった移動の遅れた pull) は、54 の直しで渡した印がグループの戻るまで残るので起きない (test/stale-pull-after-return.test.ts)。
+// それまで伏せていた MoveChaos.hideStalePull も外した (2026-11-17。シミュレータの再起動が飛んでいる要求を失敗させる形で、OPEN=1 の
+// seed 1 から 300 が通った)。
 import { describe, expect, it } from "vitest";
 import { runHistory, type RunResult } from "./history";
 import { seedsOr } from "./sim";
 
 /** 見つけて直していない欠陥の時刻を伏せる (上の 2 つ)。OPEN=1 で外す。 */
-const HIDE_OPEN = !process.env.OPEN;
 
 const memo = new Map<number, Promise<RunResult>>();
 const run = (seed: number) => {
   if (!memo.has(seed)) {
     memo.set(seed, runHistory({
       seed, shards: 3, tenants: 40, skewMs: 20, ops: 40, thinkMs: 400, slowPhase2Ms: 2_000,
-      moves: { kind: "returns", restarts: true, stops: true, hide54: false, hideStalePull: HIDE_OPEN, slowMoveRpcMs: 60, paceMs: 200 },
+      moves: { kind: "returns", restarts: true, stops: true, hide54: false, hideStalePull: false, slowMoveRpcMs: 60, paceMs: 200 },
     }));
   }
   return memo.get(seed)!;
 };
 
 describe("ranges that move away and come back to a former owner, in random orders", () => {
-  // 1 から 8 と、問題 55 を見つけた 119 (伏せる条件 hideStalePull が、既定の seed で何かを後回しにすることを確かめるため)。
-  const defaults = [1, 2, 3, 4, 5, 6, 7, 8, 119];
+  const defaults = [1, 2, 3, 4, 5, 6, 7, 8];
   for (const seed of seedsOr(defaults)) {
     it(`stays serializable, loses no write, and leaves no delivered intent behind (seed ${seed})`, async () => {
       const r = await run(seed);
@@ -45,7 +42,7 @@ describe("ranges that move away and come back to a former owner, in random order
     }, 120_000);
   }
   // 検査が何も確かめていない実行にならないこと。範囲は前の持ち主へ戻り、子と親は移動の途中で再起動し、進める側なしで閉じる移動がある。
-  // 伏せる実行では、伏せるために後回しにした移動がある (伏せる条件が、何かを外している)。既定の seed で数える。
+  // 既定の seed で数える。
   it("moves ranges back to former owners, restarts the shards of a move, and finishes moves without their driver", async () => {
     const all = await Promise.all(defaults.map(run));
     const sum = (f: (r: RunResult) => number) => all.reduce((a, r) => a + f(r), 0);
@@ -53,7 +50,6 @@ describe("ranges that move away and come back to a former owner, in random order
       returns: sum((r) => r.counts.returns) > 0,
       restarts: sum((r) => r.counts.restarts) > 0,
       byChild: sum((r) => r.counts.byChild) > 0,
-      deferred: !HIDE_OPEN || sum((r) => r.counts.deferred) > 0,
-    }).toEqual({ returns: true, restarts: true, byChild: true, deferred: true });
+    }).toEqual({ returns: true, restarts: true, byChild: true });
   }, 240_000);
 });

@@ -1,4 +1,4 @@
-// 未解決: 終わった移動の遅れた pull が、範囲が戻ってきた前の親に届くと、親はそのグループを、終わった移動の fence でもう一度渡そうとし、
+// 直った (2026-11-17、問題 55。問題 54 の直しで、渡した印を、グループが戻ってくるまで外さないので、遅れた pull を渡し直そうとしない): 終わった移動の遅れた pull が、範囲が戻ってきた前の親に届くと、親はそのグループを、終わった移動の fence でもう一度渡そうとし、
 // 内部の誤り (UNIQUE constraint failed: __moved.g, __moved.epoch, __moved.after) で答える。その pull を待っていた利用者の文も、この誤りで
 // 失敗する。
 //
@@ -15,10 +15,10 @@
 // 受け取ったか、持ち主でない)。渡した印 (メモリ) と記録 (__moved) は、同じ書き込みの後で一緒に変わる。持ち主は、送り出した側の記録
 // (src/shard/kernel.ts の pullPieces、fenceOf、moveStarted)。問題 54 と同じ持ち主である。
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { keyString } from "../../src/keys";
-import { REGION_TOKENS } from "../../src/routing";
-import { SimCluster } from "../sim";
+import { Db } from "../src/client/db";
+import { keyString } from "../src/keys";
+import { REGION_TOKENS } from "../src/routing";
+import { SimCluster } from "./sim";
 
 const whole = { start: 0, end: REGION_TOKENS };
 const ids = Array.from({ length: 40 }, (_, i) => i + 1);

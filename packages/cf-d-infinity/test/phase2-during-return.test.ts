@@ -71,7 +71,7 @@ async function scenario(faults?: Faults, restart = false) {
   await c.sleep(50);
   // s0 が z を引き取り、移動 2 が終わる。再起動した s0 では、進める側の drain は古い instance と一緒に失敗し、子の alarm が続きを進める。
   releaseList();
-  expect(await back).toBe(restart ? "fenced instance" : "ok");
+  expect(await back).toMatch(restart ? /^fenced instance/ : /^ok$/);
   for (let i = 0; i < 400 && (await c.moves()).length > 0; i++) await c.sleep(50);
   expect(await c.moves()).toEqual([]);
   await c.settle();
