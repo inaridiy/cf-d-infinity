@@ -119,6 +119,8 @@ export interface MoveChaos {
    * 応答を、ときどき最大この ms だけ遅らせる。その間に、範囲が前の持ち主へ戻る。乱数は、作業負荷とも移動とも別の流れ (r3) から引く。
    */
   slowAsksMs?: number;
+  /** 始める移動の数の上限。既定は MAX_MOVES。 */
+  maxMoves?: number;
 }
 
 /**
@@ -174,6 +176,8 @@ export interface AcrossCounts {
   writing: number;
   /** その結末。committed か、断った誤りの文の頭。 */
   outcomes: Record<string, number>;
+  /** 取引の間に、同じ区間が 2 度動いた取引 (前の持ち主が、さらに前の持ち主へ尋ねる形。M23b、M23g)。 */
+  twoMoves: number;
   /** 遅らせた、前の持ち主への尋ねの要求と応答 (ASK_RPCS)。 */
   delayedAsks: number;
 }
@@ -290,7 +294,7 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
     await admin.ddl("CREATE TABLE tags(tenant_id INTEGER PRIMARY KEY)");
     await admin.query(`INSERT INTO tags VALUES ${Array.from({ length: TENANTS }, (_v, i) => `(${i + 1})`).join(", ")}`);
   }
-  const across: AcrossCounts = { readOnly: 0, writing: 0, outcomes: {}, delayedAsks: 0 };
+  const across: AcrossCounts = { readOnly: 0, writing: 0, outcomes: {}, twoMoves: 0, delayedAsks: 0 };
   const moves = o.moves ? startMoves(o, o.moves, c, r2, r3, across) : null;
   const wide: WideCounts = { statements: 0, oneShard: 0, manyShards: 0, acrossMove: 0, rounds: 0, roundsAcrossMove: 0, outcomes: {} };
   if (o.wide?.holdMs) {
@@ -310,6 +314,11 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
   const returnsAfter = (from: number) => {
     const log = readEpochs(c.metaBackend).flatMap((x) => (x.rec.kind === "move-start" ? [{ epoch: x.epoch, rec: x.rec }] : []));
     return log.filter((x) => x.epoch > from && log.some((y) => y.epoch < x.epoch && y.rec.from === x.rec.to && overlaps(y.rec, x.rec))).length;
+  };
+  /** epoch from より後に、重なる区間の移動が 2 つ始まったか。 */
+  const twiceAfter = (from: number) => {
+    const log = readEpochs(c.metaBackend).flatMap((x) => (x.rec.kind === "move-start" && x.epoch > from ? [x.rec] : []));
+    return log.some((x, i) => log.slice(i + 1).some((y) => overlaps(x, y)));
   };
   const lastEpoch = () => readEpochs(c.metaBackend).at(-1)?.epoch ?? -1;
   const head = (e: unknown) => {
@@ -409,6 +418,7 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
     const epoch0 = innerThink ? lastEpoch() : 0;
     const settle = (outcome: string) => {
       if (!innerThink || returnsAfter(epoch0) === 0) return;
+      if (twiceAfter(epoch0)) across.twoMoves++;
       if (writes.length === 0) across.readOnly++;
       else across.writing++;
       tally(across.outcomes, outcome);
@@ -745,7 +755,7 @@ function startMoves(o: RunOpts, m: MoveChaos, c: SimCluster, r2: () => number, r
     readEpochs(c.metaBackend).some((x) => x.rec.kind === "move-start" && x.rec.from === p.from && x.rec.to === p.to && x.rec.start === p.range.start && x.rec.end === p.range.end);
   let stop = false;
   const mover = (async () => {
-    while (!stop && counts.moves < MAX_MOVES) {
+    while (!stop && counts.moves < (m.maxMoves ?? MAX_MOVES)) {
       // 取引の間に待ちを置く実行では、移動も同じ速さに散らす。散らさないと、移動は作業負荷の最初の 1 秒ほどで上限に届く。
       await c.sleep(20 + r2() * (m.paceMs ?? (o.thinkMs ? 2 * o.thinkMs : 60)));
       // Autoscaler の次の判断は、開いたままの移動を再開する (movesToResume)。子が移動を知っていれば、子が自分で進めているので、

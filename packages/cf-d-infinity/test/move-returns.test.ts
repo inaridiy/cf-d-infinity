@@ -53,3 +53,46 @@ describe("ranges that move away and come back to a former owner, in random order
     }).toEqual({ returns: true, restarts: true, byChild: true });
   }, 240_000);
 });
+
+// ---- 生成器 4 (docs/design-refresh-across-move.md の「乱択の検査に足す生成器」) ----
+//
+// 範囲が前の持ち主へ戻る間に、持ち主が前の持ち主へ尋ねる要求 (history.ts の ASK_RPCS) と、その応答を遅らせる (MoveChaos.slowAsksMs)。
+// 尋ねてから同期区間に入るまでの間に、範囲が戻ってくる形 (C → D → C、P → C → P。M23g) を作る。取引の文と文の間に待ちを置き
+// (RunOpts.innerThinkMs)、読むだけの取引 (移動の前の T のまま読み続ける) と、書く取引 (確定の検証の窓が移動をまたぐ) を、戻る移動に
+// またがらせる。tenant を少なくして、読むだけの取引の読んだ行がほかの接続に書かれ、T を進められずに古い T で読む実行を増やす。
+// foundation-4 (517b674) のコードは、前の持ち主に尋ねないので、遅らせる手は効かない (数えた delayedAsks は 0)。移動をまたいだ読みと
+// 確かめを、範囲の床 (read too old) か競合で断る。断るのは許す。答えたなら、正しくなければならない。数えた形は、最後の試験が確かめる。
+describe("transactions across ranges that return to a former owner, with the asks to former owners delayed (generator 4)", () => {
+  const memo4 = new Map<number, Promise<RunResult>>();
+  const run4 = (seed: number) => {
+    if (!memo4.has(seed)) {
+      memo4.set(seed, runHistory({
+        seed, shards: 3, tenants: 12, skewMs: 20, ops: 20, thinkMs: 300, innerThinkMs: 600, slowPhase2Ms: 2_000,
+        moves: { kind: "returns", restarts: true, stops: true, slowMoveRpcMs: 60, paceMs: 400, maxMoves: 40, slowAsksMs: 300 },
+      }));
+    }
+    return memo4.get(seed)!;
+  };
+  const defaults4 = [101, 102, 103, 104, 105, 106];
+  for (const seed of seedsOr(defaults4)) {
+    it(`stays serializable while transactions span returns and the asks are slow (seed ${seed})`, async () => {
+      const r = await run4(seed);
+      expect(r.counts.moves).toBeGreaterThan(0);
+      expect(r.violations.slice(0, 3)).toEqual([]);
+      expect(r.problems.slice(0, 5)).toEqual([]);
+    }, 120_000);
+  }
+  // 検査が何も確かめていない実行にならないこと。範囲は前の持ち主へ戻り、読むだけの取引と書く取引が、その移動をまたぐ。既定の seed で数える。
+  it("makes read-only and writing transactions span moves that return a range", async () => {
+    const all = await Promise.all(defaults4.map(run4));
+    const sum = (f: (r: RunResult) => number) => all.reduce((a, r) => a + f(r), 0);
+    const outcomes: Record<string, number> = {};
+    for (const r of all) for (const [k, n] of Object.entries(r.across.outcomes)) outcomes[k] = (outcomes[k] ?? 0) + n;
+    console.info(
+      `generator 4: ${sum((r) => r.counts.returns)} returns; transactions across a return: ${sum((r) => r.across.readOnly)} read-only, ` +
+        `${sum((r) => r.across.writing)} writing, ${sum((r) => r.across.twoMoves)} of them across two moves of one range: ${JSON.stringify(outcomes)}; ` +
+        `asks delayed: ${sum((r) => r.across.delayedAsks)}`,
+    );
+    expect({ readOnly: sum((r) => r.across.readOnly) > 0, writing: sum((r) => r.across.writing) > 0 }).toEqual({ readOnly: true, writing: true });
+  }, 240_000);
+});
