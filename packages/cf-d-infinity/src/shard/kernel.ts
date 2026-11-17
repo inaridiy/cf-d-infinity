@@ -720,9 +720,13 @@ export class ShardKernel {
   private logLowWater: Ts = 0;
   /**
    * 表ごとの、表定義の変更の床 (docs/design-catalog-epoch.md の「表ごとの epoch」の「シャード」の床)。鍵は小文字の表の名前で、値は、その表の
-   * 読みの epoch を進める commit を適用したときに、このシャードが発行した時刻である。変更ログの行イメージは、その commit より前の表の形
-   * なので、床より古い時刻には、その表の行を読み戻せない。床より古い時刻の、その表の読み戻し、refresh、述語の検証を断る。ほかの表の
-   * 読みは断らない (M24 の m24_floor_red_global)。欠陥のスイッチ globalDdlFloor は、どの commit でも、全部の表 (ALL_OBJECTS) の床を置く。
+   * 読みの epoch を進める commit を適用したときに、このシャードの変更ログにあった、その表の確定の時刻の最大である (lastLogged。モデル
+   * M23j の m23j_exact_*)。それらの確定の行イメージは、commit より前の表の形なので、床より古い時刻には、その表の行を読み戻せない。床より
+   * 古い時刻の、その表の読み戻し、refresh、述語の検証を断る。床以上の時刻の読みが戻す行イメージは、commit の後の形のものだけである。
+   * その表の確定が変更ログにないシャードは、床を置かない。ほかの表の読みは断らない (M24 の m24_floor_red_global)。
+   * 床を見るのは、行を T まで戻すシャードである (自分の変更ログで戻すので、自分の床を見る)。
+   * 欠陥のスイッチ globalDdlFloor は、どの commit でも、全部の表 (ALL_OBJECTS) の床を、適用した時刻に置く (段 3 の形)。ddlFloorAtApply は、
+   * 表ごとの床を、適用した時刻に置く (M23j の m23j_always_*。前の形の最後の確定から適用までの間の時刻の読みを、要らないのに断る)。
    */
   private tableFloors = new Map<string, Ts>();
   private flushedTs: Ts = 0;
@@ -1739,6 +1743,26 @@ export class ShardKernel {
   }
 
   /**
+   * 変更ログにある、表 keys (小文字の名前) の行の確定の時刻の最大。なければ 0。表定義の変更の床に使う (tableFloors)。
+   * 表ごとの最新の確定の時刻は、直近 write の索引が持つ (touch の `t\0表`。起動のときに変更ログから作り直す)。索引は、膨らむと捨てる
+   * (pruneRecent)。捨てた時刻以下の確定は索引にないので、変更ログから探す。変更ログの切り詰めで消えた確定は、数えない (それより古い
+   * 時刻の読みは、logLowWater が断る)。
+   * RENAME TO は、前の名前と後の名前の両方が keys に入る。後の名前の床は、前の名前で記録された確定の時刻になる。
+   */
+  private lastLogged(keys: ReadonlySet<string>): Ts {
+    let last = 0;
+    for (const [k, ts] of this.recent) {
+      if (ts > last && k.startsWith("t\0") && keys.has(objectKey(k.slice(2)))) last = ts;
+    }
+    if (last < this.recentLowWater && this.recentLowWater > this.logLowWater) {
+      this.logEach(`WHERE commit_ts > ? AND commit_ts <= ?`, [last, this.recentLowWater], (ts, _txn, blob) => {
+        if (decode<Change[]>(blob).some((c) => keys.has(objectKey(c.table)))) last = Math.max(last, ts);
+      });
+    }
+    return last;
+  }
+
+  /**
    * 表 tables (範囲の表の名前。"*" は全部の表) の、表定義の変更の床のうち、いちばん大きいもの。床がなければ 0。
    */
   private floorOf(tables: Iterable<string>): Ts {
@@ -2305,15 +2329,19 @@ export class ShardKernel {
     return { ok: true, prepareTs };
   }
 
-  refresh(req: { txn: string; spans: Span[]; from: Ts; to: Ts }): { ok: boolean; reason?: string } {
+  refresh(req: { txn: string; spans: Span[]; from: Ts; to: Ts; deps: Dep[] }): { ok: boolean; reason?: string } {
     // 先に HLC を to まで進める。これ以後に置かれる intent は prepare_ts > to になる。
     if (!this.faults.refreshNoBump) this.observe(req.to);
-    // 範囲の表の DDL や、変更ログの切り詰めより古い窓は、変更の有無を確かめられない。ほかの表の DDL は、窓を古くしない。
+    // 前の形の確定が窓に入る表や、変更ログの切り詰めより古い窓は、変更の有無を確かめられない。ほかの表の DDL は、窓を古くしない。
     if (req.from < this.floorOf(req.spans.map((s) => s.table)) || req.from < this.logLowWater) return { ok: false, reason: "refresh: window too old" };
     let sec: Section<"owned">;
     try {
+      // 取引が読んだ表の DDL が、読んだ後に確定していれば、断る (deps が、このシャードの epoch と違う)。表の床は、適用した時刻より前に
+      // あるので、床だけでは、行の変更のない DDL をまたぐ前進を止められない。取引は、DDL の前の表と、DDL の後のほかの表を見ることになる。
+      // 範囲は、このシャードが、同じ deps の読みに答えたものなので、このシャードが要求より古いことはない。違えば、どちら向きでも断る。
+      // 欠陥のスイッチ refreshIgnoresSchema は、比べない。
       // from より後に移動してきたグループは、親での変更を確かめられないので abort する。
-      sec = this.enter({ spans: req.spans, writes: [], at: req.from });
+      sec = this.enter({ deps: this.faults.refreshIgnoresSchema ? [] : req.deps, spans: req.spans, writes: [], at: req.from });
     } catch (e) {
       return { ok: false, reason: e instanceof Error ? e.message : String(e) };
     }
@@ -2574,14 +2602,19 @@ export class ShardKernel {
       // ここから先、このシャードで読む文は index を使う。その文が、時刻の順で、それらの書き込みの後ろに来るようにする。
       if (rec.at !== undefined && !this.faults.publishWithoutClock) this.observe(rec.at);
       // 変更ログの行イメージは DDL より前の形なので、それより古い T には、形の変わった表の行を読み戻せない。読みの epoch が進む表に床を置く。
+      // 床は、変更ログにある、その表の確定の時刻の最大である (lastLogged)。それ以上の T の読みが戻す行イメージは、この commit の後の
+      // 形のものだけなので、断らなくてよい (M23j の m23j_exact_*)。その表の確定が変更ログになければ、床を置かない。
       // index を作るか消すだけの DDL (書き込みの epoch だけが進む) は、行の形を変えないので、床を置かない。
-      // 欠陥のスイッチ globalDdlFloor は、どの commit でも全部の表の床を置き (段 3 の形)、noFloorOnChange は、床を置かない。
+      // 欠陥のスイッチ globalDdlFloor は、どの commit でも全部の表の床を、ddlFloorAtApply は、形の変わった表の床を、適用した時刻に置く。
+      // noFloorOnChange は、床を置かない。
       const changed = this.faults.globalDdlFloor ? [ALL_OBJECTS] : this.faults.noFloorOnChange ? []
         : Object.entries(this.snap.objects).filter(([k, o]) => k !== ALL_OBJECTS && o.read === x.epoch).map(([k]) => k);
       if (changed.length > 0) {
-        const floor = this.issue();
-        for (const k of changed) this.tableFloors.set(k, floor);
-        this.metaSet("ddl_floors", JSON.stringify([...this.tableFloors]));
+        const floor = this.faults.globalDdlFloor || this.faults.ddlFloorAtApply ? this.issue() : this.lastLogged(new Set(changed));
+        if (floor > 0) {
+          for (const k of changed) this.tableFloors.set(k, Math.max(this.tableFloors.get(k) ?? 0, floor));
+          this.metaSet("ddl_floors", JSON.stringify([...this.tableFloors]));
+        }
       }
     }
     if (stale) this.resnap();
@@ -3673,7 +3706,8 @@ export class ShardKernel {
           : unprotectedSpans(p.spans, p.writes);
         return spans.length > 0 && stamps[i]! < c ? [{ p, spans, from: stamps[i]! }] : [];
       });
-      const calls = stale.map((s) => this.peer(s.p.shard, "refresh", { txn: req.txn, spans: s.spans, from: s.from, to: c }));
+      // 確かめは、参加者の prepare と同じ deps を運ぶ。prepare の後に、読んだだけの表の DDL が確定していれば、参加者は断る。
+      const calls = stale.map((s) => this.peer(s.p.shard, "refresh", { txn: req.txn, spans: s.spans, from: s.from, to: c, deps: s.p.deps }));
       return wait({ kind: "peers", calls }, "refreshed");
     }
     const c = f.c;

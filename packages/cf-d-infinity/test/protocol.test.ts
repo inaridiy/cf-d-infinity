@@ -27,6 +27,8 @@ function wireSample(): string {
     lease: { txn: "t-1", epoch: 2, ms: 6500 }, lock: { txn: "t-1", start: 1000, lease: { epoch: 2, ms: 6500 }, holds: ["u"] },
   } satisfies Partial<ExecReq>;
   const renew: Parameters<ShardApi["renew"]>[0] = { txn: "t-1", lease: { epoch: 3, ms: 7500 } };
+  // 読みの時刻を進める確かめも、読んだ表の epoch を運ぶ (版 10 から)。
+  const refresh: Parameters<ShardApi["refresh"]>[0] = { txn: "t-1", spans: [{ kind: "table", table: "t" }], from: 5, to: 9, deps: [{ name: "t", epoch: 4 }] };
   // 書き込みの応答は、文が入れた行を、入れた順に運ぶ (版 7 から。lastInsertRowid はこれだけから決める)。
   const written = { changes: [change], inserted: [{ table: "t", pk: keyString([1n]) }], count: 1 } satisfies Partial<ExecRes>;
   // 表定義の遷移の prepare を適用したかを尋ねる要求と、その答え (版 8 から。docs/design-catalog-epoch.md の段 3)。
@@ -40,6 +42,7 @@ function wireSample(): string {
     encode(written),
     encode(prepared),
     encode(renew),
+    encode(refresh),
   ].join("\n");
 }
 
@@ -75,7 +78,7 @@ const WIRE: Record<number, string> = {
   7: "ada064f16f3fde8e",
   8: "edeccd61efb19a77",
   9: "4e20b5834a72831a",
-  10: "2de4394854904371",
+  10: "fb3d9f42b31bd937",
 };
 
 describe("protocol version", () => {

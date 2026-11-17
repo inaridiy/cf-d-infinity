@@ -335,7 +335,7 @@ export interface ShardApi {
   commitLocal(req: Omit<PrepareReq, "anchor">): Promise<CommitRes>;
   commit(req: CommitReq): Promise<CommitRes>;
   prepare(req: PrepareReq): Promise<PrepareRes>;
-  refresh(req: { txn: string; spans: Span[]; from: Ts; to: Ts }): Promise<{ ok: boolean; reason?: string }>;
+  refresh(req: { txn: string; spans: Span[]; from: Ts; to: Ts; deps: Dep[] }): Promise<{ ok: boolean; reason?: string }>;
   /**
    * 表を消す前の確認 (mode guard の遷移)。atLeast の epoch (その遷移の prepare。表の書き込み禁止) まで列を適用した後で、spans に
    * from より後の変更も intent もないかを答える。from は、取引がその範囲を読んだ時刻である。読みの要求が時刻を運ぶので、
@@ -640,6 +640,16 @@ export interface Faults {
    * 読み戻す。
    */
   noFloorOnChange?: boolean;
+  /**
+   * 形を変えた表の床を、変更ログにあるその表の確定の時刻の最大ではなく、commit を適用した時刻に置く (2026-11-17 までの形。M23j の
+   * m23j_always_*)。答えは誤らないが、前の形の最後の確定から適用までの間の時刻の読みを、戻す行イメージが後の形のものだけでも、断る。
+   */
+  ddlFloorAtApply?: boolean;
+  /**
+   * 読みの時刻を進める確かめ (refresh) が、取引の読んだ表の epoch を比べない。読んだ表の DDL が確定した後でも、行の変更がなければ、
+   * 取引は読みの時刻を進め、DDL の前の表と、DDL の後のほかの表を見る。
+   */
+  refreshIgnoresSchema?: boolean;
   /** 取引の変更の大きさを確定の前に検査しない。変更ログの 1 行が DO の行の上限を超え、確定後の適用が失敗する。 */
   noWriteSetLimit?: boolean;
   /** 複数シャードの autocommit の読みが、決着させた取引の c > T でも T を取り直さない (同上)。 */
@@ -781,8 +791,8 @@ export class ReadTooOld extends Error {
 // listGroups、pull、finishMove は move-start の epoch を運ぶ。Piece は移動の epoch を運ぶ。版 8 のシャードは move-start から
 // 受け取りを始めず、版 8 の Autoscaler は分割の枠を取るので、版 8 の要求は受け付けない。
 // 版 10 (2026-11-17): 要求が、表定義全体の epoch (schema) の代わりに、頼るものごとの epoch (deps) を運ぶ (docs/design-catalog-epoch.md の
-// 「表ごとの epoch」)。ExecReq、PrepareReq と、CommitReq の参加者が deps を運び、遷移の仕事の要求 (index の作成の行の走査、unchanged) は
-// atLeast を運ぶ。syncSchema は { atLeast } を受ける。表定義の epoch は commit の記録でだけ進む。版 9 の要求の schema は、新しいシャードが
+// 「表ごとの epoch」)。ExecReq、PrepareReq、CommitReq の参加者と、refresh が deps を運び、遷移の仕事の要求 (index の作成の行の走査、
+// unchanged) は atLeast を運ぶ。syncSchema は { atLeast } を受ける。表定義の epoch は commit の記録でだけ進む。版 9 の要求の schema は、新しいシャードが
 // 比べるものを運ばないので、受け付けない。
 // 同じ版で、行ロックの寿命を取引のものにした (docs/design-lock-lease.md)。悲観の取引の要求が lease (版と残り) を運び、新しい入口 renew が
 // 取引の lease を延ばす。ロックを取る要求は、取引が行ロックを持つ表 (holds) も運ぶ。

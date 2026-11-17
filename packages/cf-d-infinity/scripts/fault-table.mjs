@@ -49,7 +49,7 @@ const SHARD = [
   "endBeforeDrained", "pullWithoutEpoch",
   // 表ごとの epoch のスイッチ (docs/design-catalog-epoch.md の「表ごとの epoch」、M24)。epochOnPrepare と indexAsObject は、畳み込みが読む。
   "epochOnPrepare", "indexAsObject", "writeComparesRead", "applyRefusesAll", "applyRefusesTouched",
-  "globalDdlFloor", "restoreAllTables", "noFloorOnChange", "prepareIgnoresLocks", "noLockAtFence",
+  "globalDdlFloor", "restoreAllTables", "noFloorOnChange", "ddlFloorAtApply", "refreshIgnoresSchema", "prepareIgnoresLocks", "noLockAtFence",
   // 取引の lease のスイッチ (docs/design-lock-lease.md、M25)。
   "perShardLockTtl", "localLockLease", "leaseIgnoresEpoch",
 ];

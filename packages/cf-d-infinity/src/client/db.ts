@@ -955,7 +955,8 @@ export class Txn extends ReadScope {
   private async refreshTo(to: Ts): Promise<boolean> {
     const from = this.T!;
     const res = await Promise.all([...this.spans].map(([shard, spans]) =>
-      this.db.shardOf(shard).refresh({ txn: this.id, spans, from, to }),
+      // 確かめも、読んだ表と view の epoch を運ぶ。読んだ後に、その表の DDL が確定していれば、シャードは断り、取引は T を進めない。
+      this.db.shardOf(shard).refresh({ txn: this.id, spans, from, to, deps: depsOf(this.cat, this.db.faults, spans, { views: [...(this.views.get(shard) ?? [])] }) }),
     ));
     if (res.some((r) => !r.ok)) return false;
     this.T = Math.max(from, to);
