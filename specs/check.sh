@@ -1039,10 +1039,10 @@ red     $f m5d_red_rehand handsUnderFence                # 親の規則を外す
 red     $f m5d_red_rehand noFailedWrite                  # 同上: 類の 3 の、UNIQUE の失敗
 green   $f m5d_red_rehand m5dData                        # 同上: 子の規則と印の関数があるので、行も印も壊れない
 red     $f m5d_red_late_ack handsUnderFence              # ack の規則を外す (試作の形)。害がないことは HEAVY で確かめる
-red     $f m5d_red_child_stale ownerHasTruth            # 子の規則を外す (スイッチ childAcceptsStale): 類の 6 と、遅れた「渡し終えた」が、いまの受け取りを終える場面
+red     $f m5d_red_child_stale ownerHasTruth            # 子の規則を外す (スイッチ childAcceptsStale と finishIncomingByInterval): 類の 6 と、遅れた「渡し終えた」が、いまの受け取りを終える場面
 red     $f m5d_red_child_stale receivesUnderIncoming
 red     $f m5d_red_finished_refusal noMoveRefusal        # 「渡し終えた」を断りとして読む (スイッチ finishedAsRefusal。取り下げた 89d99c8)
-red     $f m5d_red_ask_once noMoveRefusal                # 捨てた答えの後で、尋ね直さない (規則にない条件)
+red     $f m5d_red_ask_once noMoveRefusal                # 捨てた答えの後で、尋ね直さない (規則にない条件。スイッチ askOnce)
 red     $f m5d_red_boot_differs marksDerived             # 印を手ごとに書き換える (スイッチ bootMarksDiffer)。親の規則も外す
 red     $f m5d_red_boot_differs deliveredApplied         # 同上: 類の 1
 red     $f m5d_red_mark_before_write markMatchesRecord   # 印を書き込みより前に付ける (スイッチ markBeforeWrite)。親の規則も外す: 類の 3

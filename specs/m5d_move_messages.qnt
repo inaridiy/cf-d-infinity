@@ -710,7 +710,7 @@ module m5d_code_return {
   import m5d_core(PARENT_RULE = false, ACK_RULE = false, CHILD_RULE = false, FINISHED_ANSWERS = true, MARKS = 2, ASK_AGAIN = false,
     ROUTE = [0, 1, 0], GROUPS_N = 1, FULL = Set(), TXN = true, OWNER_OPS = true, RESTARTS = 1).*
 
-  // 類の 1 (test/open/late-pull-after-range-returned.test.ts)
+  // 類の 1 (test/late-pull-after-range-returned.test.ts)
   run member1Test =
     init.then(emptyMoveLatePull(1)).then(emptyMove(2))
         .expect(owner == 0 and mark.get((0, 1)).e == 0)
