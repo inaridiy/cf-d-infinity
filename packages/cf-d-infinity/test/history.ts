@@ -166,7 +166,7 @@ export interface LateMoves {
 const LATE_RPCS = new Set(["pull", "listGroups", "ack", "finishMove", "finalize", "abort"]);
 
 /**
- * 遅れた pull とその応答が届いた場面 (類の見直し (2026-11-17)が挙げた表の行。この型が、その表の写しである。決まった台本は test/open/late-pull-*.test.ts)。届いた瞬間の、受け手の記録で決める。
+ * 遅れた pull とその応答が届いた場面 (類の見直し (2026-11-17)が挙げた表の行。この型が、その表の写しである。決まった台本は test/late-pull-*.test.ts)。届いた瞬間の、受け手の記録で決める。
  * 要求 (親 P への、移動 E の pull。子 C は E の宛先): P の E の fence が終わり、C が E を受け取り終えている (移動より長く生きた)。
  *   1  範囲が P へ戻り、P は受け取り終えた。グループは E で運ばれていない (行も intent もなかった)。
  *   2  1 と同じで、P はそのグループの行を、いま持っている (戻った後に確定した行)。
@@ -174,7 +174,7 @@ const LATE_RPCS = new Set(["pull", "listGroups", "ack", "finishMove", "finalize"
  *   4  範囲は C からさらに先へ渡った (C に E より後の fence がある。前へ進む鎖)。グループは E で運ばれていない。
  *   5  4 と同じで、C はそのグループを先へ渡し、ack をまだ受けていない。
  *   returning  範囲が P へ戻る途中 (P は受け取り中。問題 55 の形。グループが P へもう届いていれば、内部の誤りになる。
- *              test/open/late-pull-while-range-returns.test.ts)。
+ *              test/late-pull-while-range-returns.test.ts)。
  *   other  範囲は C に留まっているか、運ばれたグループが前へ進んだ。
  *   window  P の fence は終わったが、C はまだ受け取り中 (空のグループの窓。test/empty-group-after-parent-finished.test.ts)。遅れではない。
  * 応答 (子 C への、移動 E の pull の応答): C が E を受け取り終えている。

@@ -583,6 +583,40 @@ export interface Faults {
    */
   unmarkOnReturn?: boolean;
   // ---- 移動の要求と応答が、その移動より後に届くときの規則 (計画書の不変条件 15。docs/design-move-messages.md、モデル M5d) ----
+  // どれも、規則の条件を 1 つ外す。5808b08 のコードか、取り下げた直しの形である。
+  /**
+   * 親が、渡し終えた fence の下でも、pull にグループを渡し直し、ack で行と intent を消す (M5d の m5d_red_rehand)。渡した記録が、終わった
+   * 移動に付く。そのグループがその移動でもう運ばれていれば、記録の書き込みは内部の UNIQUE の誤りで失敗する。印は記録から作るので、
+   * これだけでは、行も intent も印も壊れない。markBeforeWrite か bootMarksDiffer と一緒に入れると、渡し直しの印が残る。
+   */
+  rehandFinished?: boolean;
+  /**
+   * 子が、受け取り終えた移動の piece も受け取る (M5d の m5d_red_child_stale の member6Test)。受け取り直した後に消した行が戻り、受け取り
+   * 終えた移動に、後から到着の記録が付く。
+   */
+  childAcceptsStale?: boolean;
+  /**
+   * 子が、受け取り終える答えを、移動の epoch ではなく区間で引く (M5d の m5d_red_child_stale の closeEarlyTest)。移動 1 の遅れた
+   * 「渡し終えた」が、同じ区間の移動 3 の受け取りを終える。行は親に残ったままで、子は、届いていないグループを空として答える。
+   */
+  finishIncomingByInterval?: boolean;
+  /**
+   * 子が、親の「渡し終えた」の答えを、断りとして読み飛ばす (取り下げた直し 89d99c8。M5d の m5d_red_finished_refusal)。親が渡し終えた後、
+   * 子が受け取り終える前に、行のないグループを待っていた文が、group not arrived で断られる。
+   */
+  finishedAsRefusal?: boolean;
+  /**
+   * 「渡した」印を、渡した記録の書き込みより前に付ける。書き込みが失敗しても、印はメモリにだけ残る。印は、記録から作らずに、手ごとに
+   * 書き換える (M5d の m5d_red_mark_before_write。MARKS = 2)。これだけでは何も破らない。書き込みが失敗するのは、親の規則がないとき
+   * だけなので、rehandFinished と一緒に入れる。メモリだけの印が、後の取引の phase 2 を、適用も転送もさせない。
+   */
+  markBeforeWrite?: boolean;
+  /**
+   * 印を、動いている間は、記録を書いた手ごとに書き換え、記録から作るのは起動のときだけにする (M5d の m5d_red_boot_differs。MARKS = 1)。
+   * これだけでは何も破らない (生きた記録の下の書き換えは、記録から作る印と同じである)。rehandFinished と一緒に入れると、範囲が戻った後の
+   * 渡し直しの印が、再起動まで残り、後の取引の phase 2 を、適用も転送もさせない。
+   */
+  bootMarksDiffer?: boolean;
   /**
    * 引き取りの答えを待っていた文が、答えが返った後で、グループが届いたかを見ずに進む (5808b08 のコード。M5d の m5d_red_ask_once)。
    * 前の移動の間に頼んだ引き取りの答えが、同じ範囲の後の移動の受け取り中に捨てられると、文は group not arrived で断られる。

@@ -1,4 +1,7 @@
-// 未解決 (2026-11-17、生成器 10 が見つけた。遅れた移動のメッセージの類で、test/history.ts の LateRow の other): 終わった移動の遅れた pull が、
+// 直した (2026-11-17。計画書の不変条件 15、docs/design-move-messages.md、モデル M5d): 親は、渡し終えた移動の pull に、記録も印も変えずに
+// 「渡し終えた」と答え、子は、受け取り中でない移動の応答を捨てる。下は、直す前 (5808b08) の欠陥の説明で、この試験は、その再現である。
+//
+// 直す前の欠陥 (2026-11-17、生成器 10 が見つけた。遅れた移動のメッセージの類で、test/history.ts の LateRow の other): 終わった移動の遅れた pull が、
 // 範囲が子に留まったまま (前の親へ戻らず、先へも渡らずに) 親に届くと、親は、その移動で運ばなかった (行も intent もなかった) グループを、
 // 終わった fence で渡し直し、渡しの記録 (__moved) を足す。子は、受け取り終えた移動の応答を到着として受け取り、到着の記録 (__arrived) を足す。
 // 表の 4 (親が渡し直す側) と 7 (子が受け取り終えた後に到着を足す側) を、後の移動なしで合わせた形である。生成器 10 が、不変条件 15 を破る
@@ -12,10 +15,10 @@
 // 名指しする要求と応答でだけ、渡しと受け取りの記録 (__moved、__moved_txn、__arrived) を変える。メモリの印 (moved、arrived) は、その記録から
 // 導く。持ち主は、シャードの移動の手順 (src/shard/kernel.ts の pullPieces、fetchStep、receiveStep)。
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { keyString } from "../../src/keys";
-import { ownerOf, regionsOf } from "../../src/routing";
-import { SimCluster, type Rpc } from "../sim";
+import { Db } from "../src/client/db";
+import { keyString } from "../src/keys";
+import { ownerOf, regionsOf } from "../src/routing";
+import { SimCluster, type Rpc } from "./sim";
 
 const latch = () => {
   let resolve!: () => void;

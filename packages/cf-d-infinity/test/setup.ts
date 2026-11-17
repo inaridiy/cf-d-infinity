@@ -11,7 +11,7 @@ import { imageChecks, imageFaults } from "../src/shard/rows";
 import { parseObserver } from "../src/sql/cst";
 import { openScratch } from "../src/sql/scratch";
 import { systemRuntime } from "../src/runtime";
-import { allDriverIntegers, allSpanEscapes, allTilingProblems, allWriteEscapes, checkTiling, imageCheckOff, injectedFault, realTimeCluster, tracedNets } from "./sim";
+import { allDriverIntegers, allSpanEscapes, allTilingProblems, allWriteEscapes, checkTiling, imageCheckOff, injectedFaults, realTimeCluster, tracedNets } from "./sim";
 
 // PARSER_CORPUS=<ディレクトリ> を付けて流すと、試験が解析に渡した文を、プロセスごとの 1 行 1 文の JSON のファイルに書き出す。
 // パーサの突き合わせ (test/parser-oracle.test.ts) が、これを文の集まりとして読む。同じ文は、プロセスの中で 1 度だけ書く。
@@ -32,11 +32,12 @@ beforeAll(async () => {
   (await openScratch({ ddl: [] })).close();
 });
 
-// 欠陥のスイッチを、環境変数 FAULT で入れる (sim.ts の injectedFault)。範囲の作り方のスイッチは、プロセス全体で 1 つである。
+// 欠陥のスイッチを、環境変数 FAULT で入れる (sim.ts の injectedFaults)。範囲の作り方のスイッチは、プロセス全体で 1 つである。
 beforeEach(() => {
-  const f = injectedFault();
-  if (f?.side === "span") (spanFaults as Record<string, boolean>)[f.name] = true;
-  if (f?.side === "image") (imageFaults as Record<string, boolean>)[f.name] = true;
+  for (const f of injectedFaults()) {
+    if (f.side === "span") (spanFaults as Record<string, boolean>)[f.name] = true;
+    if (f.side === "image") (imageFaults as Record<string, boolean>)[f.name] = true;
+  }
 });
 
 // RPC_TRACE=<ディレクトリ> を付けて流すと、試験ごとに、その試験が作ったクラスタの RPC の送り元、宛先、種類の列を 1 つのファイルに

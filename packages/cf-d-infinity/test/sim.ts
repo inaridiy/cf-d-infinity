@@ -402,7 +402,7 @@ const CLIENT_FAULTS = new Set([
 ]);
 /**
  * Worker と Meta の両方が読むスイッチの名前。1 つの欠陥を、2 つの守りを外して戻す (commitWithoutAcks は、Worker が 1 つのシャードの
- * prepared を待たず、Meta が ok の集合を確かめない)。injectedFault は、両方に入れる。
+ * prepared を待たず、Meta が ok の集合を確かめない)。injectedFaults は、両方に入れる。
  */
 const BOTH_FAULTS = new Set(["commitWithoutAcks"]);
 /** 範囲の作り方の欠陥のスイッチの名前 (src/client/spans.ts の spanFaults)。test/setup.ts が入れる。 */
@@ -411,16 +411,16 @@ export const SPAN_FAULTS = new Set(["rowSpanDespiteUnique"]);
 export const IMAGE_FAULTS = new Set(["roundedImages"]);
 
 /**
- * 環境変数 FAULT で、欠陥のスイッチを 1 つ、全部のシミュレータに入れる。乱択の検査が、その欠陥を見つけるかを測るためにある
+ * 環境変数 FAULT で、欠陥のスイッチを、全部のシミュレータに入れる。乱択の検査が、その欠陥を見つけるかを測るためにある
  * (scripts/fault-table.mjs)。試験が自分で入れるスイッチには、上書きせずに足す。
+ * ふつうは 1 つである。`FAULT=rehandFinished+markBeforeWrite` のように + でつなぐと、いくつかを一緒に入れる。1 つの守りを外しただけでは
+ * 何も破らず、もう 1 つと組でだけ欠陥になるスイッチがある (docs/design-move-messages.md の「条件 4 は、規則が 2 つともあれば破れない」)。
  */
-export function injectedFault(): { name: string; side: "shard" | "client" | "both" | "span" | "image" } | null {
-  const name = process.env.FAULT;
-  if (!name) return null;
-  return {
+export function injectedFaults(): { name: string; side: "shard" | "client" | "both" | "span" | "image" }[] {
+  return (process.env.FAULT ?? "").split("+").filter((name) => name !== "").map((name) => ({
     name,
     side: BOTH_FAULTS.has(name) ? "both" : CLIENT_FAULTS.has(name) ? "client" : SPAN_FAULTS.has(name) ? "span" : IMAGE_FAULTS.has(name) ? "image" : "shard",
-  };
+  }));
 }
 
 export interface SimOptions {
@@ -607,7 +607,7 @@ export class SimCluster implements Cluster {
   net = new SimNet();
   /** 時刻、待ち、乱数、識別子の出どころ。Db もシャードも、ここから取る。 */
   readonly runtime: Runtime;
-  /** FAULT で入れた Worker の側の欠陥 (下の injectedFault)。 */
+  /** FAULT で入れた Worker の側の欠陥 (下の injectedFaults)。 */
   readonly clientFaults: ClientFaults | undefined;
   /** 行ロックの TTL (SimOptions.lockTtlMs)。このクラスタへつなぐ Db は、取引の lease の長さを、これから決める。 */
   get lockTtlMs(): number | undefined {
@@ -638,9 +638,11 @@ export class SimCluster implements Cluster {
   alarms = new Set<string>();
 
   constructor(private o: SimOptions = {}) {
-    const injected = injectedFault();
-    if (injected?.side === "shard" || injected?.side === "both") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
-    this.clientFaults = injected?.side === "client" || injected?.side === "both" ? { ...o.clientFaults, [injected.name]: true } : o.clientFaults;
+    this.clientFaults = o.clientFaults;
+    for (const injected of injectedFaults()) {
+      if (injected.side === "shard" || injected.side === "both") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
+      if (injected.side === "client" || injected.side === "both") this.clientFaults = { ...this.clientFaults, [injected.name]: true };
+    }
     if (process.env.RPC_TRACE) tracedNets.push(this.net);
     if (o.noImageCheck) imageCheckOff.now = true;
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);

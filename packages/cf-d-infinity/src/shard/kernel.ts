@@ -298,6 +298,17 @@ class Receiving {
 }
 
 /**
+ * 移動の記録を書いたこと。記録を書く関数 (handGroup、dropHanded、storePieces、markReceived) が、書いた後で、印を作り直すのに渡す
+ * (ShardKernel.marked)。handed はグループを渡した、acked は ack で行と intent を消した、arrived は piece を入れた、received は範囲を
+ * 受け取り終えた、である。
+ */
+type MoveWrite =
+  | { kind: "handed"; g: string; m: Ts; to: string; epoch: number }
+  | { kind: "acked"; groups: Iterable<string> }
+  | { kind: "arrived"; pieces: PiecePayload[]; epoch: number }
+  | { kind: "received"; range: IncomingRange };
+
+/**
  * 2PC の ID (`<取引の ID>#<続きの中身の指紋>`、Txn.commit) から、行ロックの持ち主の ID を取り出す。ロックは、COMMIT の前の
  * 文が取引の ID で取るので、prepare と確定と中止は、この ID で自分のロックを見分けて手放す。
  */
@@ -1124,6 +1135,52 @@ export class ShardKernel {
       } else this.moved.delete(g);
     }
   }
+
+  /**
+   * 移動の記録を書いた後で、その記録のグループの印を、記録から作り直す (remark)。受け取り終えた記録が変えるのは、その範囲のグループの
+   * 「渡した」印だけである。
+   *
+   * 欠陥のスイッチ bootMarksDiffer と markBeforeWrite は、記録から作らずに、書いた手ごとに印を書き換える (5808b08 のコード。記録から
+   * 作るのは起動のときだけ。M5d の MARKS = 1 と 2)。markBeforeWrite は、それに加えて、渡した印を記録の書き込みより前に付ける (handGroup)。
+   * 生きた記録の下の書き換えは、remark と同じ印を作るので、どちらも、それだけでは何も破らない (M5d の m5d_marks_*)。親の規則を外す
+   * スイッチ rehandFinished と一緒に入れると、渡し直しの印が残り、確定した書き込みを失う (m5d_red_boot_differs、m5d_red_mark_before_write)。
+   */
+  private marked(wrote: MoveWrite): void {
+    if (!this.faults.bootMarksDiffer && !this.faults.markBeforeWrite) {
+      this.remark(
+        wrote.kind === "handed" ? [wrote.g]
+          : wrote.kind === "acked" ? wrote.groups
+            : wrote.kind === "arrived" ? wrote.pieces.map((p) => p.g)
+              : [...this.moved.keys()].filter((g) => overlaps(blockOf(g), wrote.range)),
+      );
+      return;
+    }
+    switch (wrote.kind) {
+      case "handed":
+        this.moved.set(wrote.g, { m: wrote.m, to: wrote.to, acked: false, epoch: wrote.epoch });
+        return;
+      case "acked":
+        for (const g of wrote.groups) {
+          const k = this.moved.get(g);
+          if (k) k.acked = true;
+        }
+        return;
+      case "arrived":
+        // 届いたグループの「渡した」印を、移動を比べずに外す。
+        for (const p of wrote.pieces) {
+          this.arrived.set(p.g, { m: p.m, epoch: wrote.epoch });
+          this.moved.delete(p.g);
+          this.maxArrived = Math.max(this.maxArrived, p.m);
+        }
+        return;
+      case "received":
+        for (const [g, k] of [...this.moved]) {
+          const back = (this.arrived.get(g)?.epoch ?? -1) > k.epoch;
+          if (back || (wrote.range.epoch > k.epoch && overlaps(blockOf(g), wrote.range))) this.moved.delete(g);
+        }
+        return;
+    }
+  }
   /** 子として進める移動の epoch。受け取り中の移動と、受け取り終えたが、自分の写しでまだ閉じていない (move-end を記録させていない) 移動である。 */
   private childMoves(): number[] {
     const out = new Set(this.incoming.map((x) => x.epoch));
@@ -1335,22 +1392,34 @@ export class ShardKernel {
    *   fence が終わっている (done = 1) "finished" を返す。呼び出し側は、状態を変えずに答える。
    *   その fence がない               null を返す。
    * 欠陥のスイッチ pullWithoutEpoch は、move-start を適用していない (fence していない) 親が、頼まれた区間を、頼んだシャードへ渡す。
+   * 欠陥のスイッチ rehandFinished は、終わった fence にも印を返す (5808b08 のコード。M5d の m5d_red_rehand)。
    */
   private handing(req: Interval & { epoch: number; to?: string }): Handing | "finished" | null {
     const fence = this.fenced.find((x) => x.epoch === req.epoch && sameInterval(x, req));
     if (!fence) {
       return this.faults.pullWithoutEpoch ? Handing[HAND]({ ...intervalOf(req), to: req.to ?? "", done: 0, epoch: req.epoch }) : null;
     }
-    return fence.done ? "finished" : Handing[HAND](fence);
+    return fence.done && !this.faults.rehandFinished ? "finished" : Handing[HAND](fence);
   }
 
   /**
    * 受け取る側の入口。渡す側の応答が名指しする移動 epoch を、受け取り中 (__incoming の done = 0) なら、印を返す。受け取った記録を書ける
    * のは、この印を持つ関数だけである。受け取り中でなければ null を返し、呼び出し側は応答を捨てる。受け取りも epoch で名指しする。
+   * pieces は、応答が piece を運ぶか (運ばなければ、受け取り終える答えである)。欠陥のスイッチが、応答の種類ごとにある。どちらも 5808b08 の
+   * コードで、M5d の m5d_red_child_stale の 2 つの run である。
+   *   childAcceptsStale         受け取り終えた移動の piece も受け取る (member6Test。受け取り直した後に消した行が戻る)。
+   *   finishIncomingByInterval  受け取り終える答えを、epoch ではなく区間で引く。名指しされた移動と同じ区間の、いまの受け取りを終える
+   *                             (closeEarlyTest。移動 1 の遅れた答えが、移動 3 の受け取りを終える)。
    */
-  private receiving(epoch: number): Receiving | null {
+  private receiving(epoch: number, pieces = false): Receiving | null {
     const range = this.incoming.find((x) => x.epoch === epoch);
-    return range ? Receiving[RECEIVE](range) : null;
+    if (range) return Receiving[RECEIVE](range);
+    if (!(pieces ? this.faults.childAcceptsStale : this.faults.finishIncomingByInterval)) return null;
+    const past = this.b.exec(`SELECT lo AS start, hi AS "end", from_id, epoch FROM __incoming WHERE epoch = ?`, epoch)[0] as unknown as IncomingRange | undefined;
+    if (!past) return null;
+    if (pieces) return Receiving[RECEIVE](past);
+    const same = this.incoming.find((x) => sameInterval(x, past));
+    return same ? Receiving[RECEIVE](same) : null;
   }
 
   /**
@@ -1431,6 +1500,9 @@ export class ShardKernel {
   private handGroup(h: Handing, g: string, intents: Row[]): Ts {
     const f = h.fence;
     const m = this.issue();
+    const wrote: MoveWrite = { kind: "handed", g, m, to: f.to, epoch: f.epoch };
+    // 欠陥のスイッチ markBeforeWrite: 印を、記録の書き込みより前に付ける。書き込みが失敗しても、印はメモリにだけ残る (5808b08 のコード)。
+    if (this.faults.markBeforeWrite) this.marked(wrote);
     this.b.tx(() => {
       this.b.exec(
         `INSERT INTO __moved(g, lo, hi, "after", up_to, m, dest, epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, g, f.start, f.end, END, END, m, f.to, f.epoch,
@@ -1441,7 +1513,7 @@ export class ShardKernel {
         );
       }
     });
-    this.remark([g]);
+    if (!this.faults.markBeforeWrite) this.marked(wrote);
     return m;
   }
 
@@ -1464,7 +1536,7 @@ export class ShardKernel {
       }
     });
     // 印は、記録を書いた取引の後で作り直す。取引が失敗して巻き戻れば、印も変えない。
-    this.remark(acked);
+    this.marked({ kind: "acked", groups: acked });
   }
 
   /** 生きた fence に、渡し終えた印を付ける。以後、この移動の要求には、状態を変えずに答える。 */
@@ -1529,7 +1601,7 @@ export class ShardKernel {
         );
       }
     });
-    this.remark(fresh.map((p) => p.g));
+    this.marked({ kind: "arrived", pieces: fresh, epoch: r.range.epoch });
     for (const p of fresh) this.observe(p.m);
   }
 
@@ -1551,8 +1623,8 @@ export class ShardKernel {
     this.incoming = this.incoming.filter((x) => x !== cur);
     this.raiseFloor(intervalOf(cur), m);
     // 範囲が前の持ち主へ戻ったとき、運ばれなかった (行も intent もない) グループの「渡した」印は、受け取り終えたここで外れる。終えた
-    // 記録が変えるのは、その範囲のグループの「渡した」印だけなので、その印を作り直す (remark)。
-    this.remark([...this.moved.keys()].filter((g) => overlaps(blockOf(g), cur)));
+    // 記録が変えるのは、その範囲のグループの「渡した」印だけなので、その印を作り直す (marked)。
+    this.marked({ kind: "received", range: cur });
   }
 
   /**
@@ -3264,7 +3336,9 @@ export class ShardKernel {
     if ("finished" in f.res) {
       // 渡す側は、この移動を渡し終えている。行か intent のあるグループは、もう届いている。受け取り中なら、渡す側の時計を受け取って、
       // ここで受け取り終える。答えを待っていた文は、行のないグループを、到着の記録なしで、範囲の床から受け持つ。
-      const r = this.receiving(f.res.finished.epoch);
+      // 欠陥のスイッチ finishedAsRefusal は、この答えを断りとして読み飛ばす (取り下げた直し 89d99c8。M5d の m5d_red_finished_refusal)。
+      // 子は受け取り中のままで、行のないグループを待っていた文は group not arrived で断られる。
+      const r = this.faults.finishedAsRefusal ? null : this.receiving(f.res.finished.epoch);
       if (r) this.markReceived(r, f.res.finished.m);
       f.taken = [];
       return done(f.taken);
@@ -3286,7 +3360,7 @@ export class ShardKernel {
     for (const p of payload) byMove.set(p.epoch, [...(byMove.get(p.epoch) ?? []), p]);
     const taken: Piece[] = [];
     for (const [epoch, pieces] of byMove) {
-      const r = this.receiving(epoch);
+      const r = this.receiving(epoch, true);
       // 受け取り中でない移動の応答は、捨てる。受け取ると、受け取り直した後に消した行が戻り、受け取り終えた移動に到着の記録が付く。
       if (!r) continue;
       this.storePieces(r, pieces);

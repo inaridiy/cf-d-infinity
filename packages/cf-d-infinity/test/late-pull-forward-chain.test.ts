@@ -1,4 +1,7 @@
-// 未解決 (2026-11-17、遅れた移動のメッセージの類の表 (test/history.ts の LateRow) の 4 と 5。遅れた移動のメッセージの類): 範囲が前へ進む鎖 (s0 から s2、s2 から s3。どちらも、親の範囲の
+// 直した (2026-11-17。計画書の不変条件 15、docs/design-move-messages.md、モデル M5d): 親は、渡し終えた移動の pull に、記録も印も変えずに
+// 「渡し終えた」と答え、子は、受け取り中でない移動の応答を捨てる。下は、直す前 (5808b08) の欠陥の説明で、この試験は、その再現である。
+//
+// 直す前の欠陥 (2026-11-17、遅れた移動のメッセージの類の表 (test/history.ts の LateRow) の 4 と 5。遅れた移動のメッセージの類): 範囲が前へ進む鎖 (s0 から s2、s2 から s3。どちらも、親の範囲の
 // 上半分を空のシャードへ渡す、本番の分割の形) で、移動 1 の遅れた pull が s0 に届くと、s0 は、移動 1 で運ばなかった (行も intent もなかった)
 // グループを、終わった移動 1 の fence で s2 へ渡し直す。s2 は、移動 1 を受け取り終えているのに、その応答を到着として受け取り、そのグループの
 // 「渡した」印 (移動 2 で s3 へ渡したもの) を外す。
@@ -17,11 +20,11 @@
 // 導く。ここでは、親 s0 が終わった fence の pull で渡しの記録を足し、子 s2 が受け取り終えた移動の応答で到着の記録を足し、別の移動の印を外した。
 // 持ち主は、シャードの移動の手順 (src/shard/kernel.ts の pullPieces、fetchStep、receiveStep、ack)。
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { keyString } from "../../src/keys";
-import { applyMove, ownerOf, planSplit, slotOf, type Interval } from "../../src/routing";
-import { strandedIntents } from "../history";
-import { SimCluster, type Rpc } from "../sim";
+import { Db } from "../src/client/db";
+import { keyString } from "../src/keys";
+import { applyMove, ownerOf, planSplit, slotOf, type Interval } from "../src/routing";
+import { strandedIntents } from "./history";
+import { SimCluster, type Rpc } from "./sim";
 
 const latch = () => {
   let resolve!: () => void;

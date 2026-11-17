@@ -1,8 +1,11 @@
-// 未解決 (2026-11-17、遅れた移動のメッセージの類の表 (test/history.ts の LateRow) の 7。遅れた移動のメッセージの類): 親が、終わっていない fence の下で答えた pull の応答が、子が移動を
+// 直した (2026-11-17。計画書の不変条件 15、docs/design-move-messages.md、モデル M5d): 親は、渡し終えた移動の pull に、記録も印も変えずに
+// 「渡し終えた」と答え、子は、受け取り中でない移動の応答を捨てる。下は、直す前 (5808b08) の欠陥の説明で、この試験は、その再現である。
+//
+// 直す前の欠陥 (2026-11-17、遅れた移動のメッセージの類の表 (test/history.ts の LateRow) の 7。遅れた移動のメッセージの類): 親が、終わっていない fence の下で答えた pull の応答が、子が移動を
 // 受け取り終えた後に届く。子は、受け取り終えた移動の応答を到着として受け取り、そのグループの到着の記録 (__arrived) を、受け取り終えた後で
 // 足す。グループは運ばれていなかった (行も intent もなかった) ので、子は、受け取り終えたときに、親の時計の後で空のグループとして受け持って
 // いた。後から足した到着の記録とメモリの印は、受け取り終えた後の記録とメモリを変える。グループをさらに先へ渡した後なら、到着の受け取りが、
-// 先へ渡した印も外す (表の 4 の子の側。test/open/late-pull-forward-chain.test.ts)。
+// 先へ渡した印も外す (表の 4 の子の側。test/late-pull-forward-chain.test.ts)。
 //
 // 台本: s0 の範囲を s2 へ動かし (移動 1)、s2 で z (行のないグループ) を読む文が送る on-demand の pull を、s2 の drain が終わり、s2 が
 // finishMove を送るまで止める。そこで pull を放し、finishMove を、s0 が pull に答えるまで止める (s0 は、終わっていない fence の下で z を渡す)。
@@ -15,10 +18,10 @@
 // 導く。ここでは、子 s2 が、受け取り終えた移動 1 の応答で、到着の記録を足した。持ち主は、シャードの移動の手順 (src/shard/kernel.ts の
 // fetchStep と receiveStep)。
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { keyString } from "../../src/keys";
-import { ownerOf, regionsOf } from "../../src/routing";
-import { SimCluster, type Rpc } from "../sim";
+import { Db } from "../src/client/db";
+import { keyString } from "../src/keys";
+import { ownerOf, regionsOf } from "../src/routing";
+import { SimCluster, type Rpc } from "./sim";
 
 const latch = () => {
   let resolve!: () => void;

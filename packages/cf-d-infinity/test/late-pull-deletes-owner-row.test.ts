@@ -1,9 +1,12 @@
-// 未解決 (2026-11-17、遅れた移動のメッセージの類の表 (test/history.ts の LateRow) の 2。遅れた移動のメッセージの類): 終わった移動の遅れた pull が、範囲が前の持ち主へ戻って受け取り終え、
+// 直した (2026-11-17。計画書の不変条件 15、docs/design-move-messages.md、モデル M5d): 親は、渡し終えた移動の pull に、記録も印も変えずに
+// 「渡し終えた」と答え、子は、受け取り中でない移動の応答を捨てる。下は、直す前 (5808b08) の欠陥の説明で、この試験は、その再現である。
+//
+// 直す前の欠陥 (2026-11-17、遅れた移動のメッセージの類の表 (test/history.ts の LateRow) の 2。遅れた移動のメッセージの類): 終わった移動の遅れた pull が、範囲が前の持ち主へ戻って受け取り終え、
 // 前の持ち主 (いまの持ち主) がそのグループに行を確定した後で届くと、前の持ち主は、その行を、終わった移動の宛先へ渡し直す。宛先は受け取って
 // ack を返し、前の持ち主は ack で自分の行を消す。確定した行が、持ち主から消える (宛先には残るが、宛先は持ち主でない)。
 //
 // 台本: s0 の範囲を s2 へ動かし (移動 1)、s2 の on-demand の pull (行のないグループ z) を止める。移動 1 が閉じ、範囲を s0 へ戻し (移動 2)、
-// s0 が受け取り終えてから、z に行を確定し (1 シャードの取引)、止めた pull を届ける。表の 1 (test/open/late-pull-after-range-returned.test.ts) と
+// s0 が受け取り終えてから、z に行を確定し (1 シャードの取引)、止めた pull を届ける。表の 1 (test/late-pull-after-range-returned.test.ts) と
 // 同じ場面で、届ける前に行を確定する。見つけたのは 類の見直し (2026-11-17)の B である。乱択の検査では、生成器 10 (test/move-returns.test.ts の
 // 「generator 10」を OPEN=1 で流す) が、この場面を「situation 2」として数える。
 //
@@ -12,10 +15,10 @@
 // 導く。ここでは、親 s0 が、終わった fence (移動 1) の pull で、渡しの記録を足した。持ち主は、シャードの移動の手順 (src/shard/kernel.ts の
 // pullPieces と fenceOf。渡し直しの ack を受ける ack)。
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { keyString } from "../../src/keys";
-import { ownerOf, regionsOf } from "../../src/routing";
-import { SimCluster, type Rpc } from "../sim";
+import { Db } from "../src/client/db";
+import { keyString } from "../src/keys";
+import { ownerOf, regionsOf } from "../src/routing";
+import { SimCluster, type Rpc } from "./sim";
 
 const latch = () => {
   let resolve!: () => void;

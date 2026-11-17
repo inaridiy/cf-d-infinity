@@ -9,8 +9,12 @@
 // (試験の制限時間は、イベントループが回らないと効かない)。上限を超えた実行は、プロセスのグループごと止め、表に「止まった」と書く。
 // 表は、欠陥 1 つごとに書き足す。途中で止めても、そこまでの行は残る。
 //
+//   node scripts/fault-table.mjs --to 100 --procs 2 --harness move-returns,move-chains --name "generator 10" --only rehandFinished,childAcceptsStale
+//       (生成器 10 の試験だけを数える。move-returns には、seed ごとの試験の組が 3 つある)
+//
 // 欠陥のスイッチ (src/types.ts の Faults、src/client/spans.ts の spanFaults、src/client/db.ts の ClientFaults) を、環境変数
-// FAULT で 1 つずつ入れ (test/sim.ts の injectedFault)、乱択の検査の seed ごとの試験を、同じ seed の範囲で流す。
+// FAULT で 1 つずつ入れ (test/sim.ts の injectedFaults)、乱択の検査の seed ごとの試験を、同じ seed の範囲で流す。
+// `a+b` と書いた欠陥は、2 つのスイッチを一緒に入れる (1 つでは何も破らず、組でだけ欠陥になるもの)。
 // 「見つけた」は、その欠陥を入れたときに落ちた試験の数である。欠陥を入れない行 (none) で落ちる数が、検査そのものの誤りの数になる。
 // 作業ツリーで流すと、途中の編集が混ざる。コミットした版の worktree で流す。
 import { spawn } from "node:child_process";
@@ -30,6 +34,8 @@ const outFile = flag("--out", null);
 const only = flag("--only", null)?.split(",");
 const limitMs = Number(flag("--limit", "900")) * 1000;
 const resume = args.includes("--resume");
+// --name <正規表現> で、名前がそれに当たる seed ごとの試験だけを数える。
+const nameFilter = flag("--name", null);
 
 /**
  * 欠陥のスイッチ。triggerCapture は欠陥ではなく、遅い経路を使わせるだけである (見つからないのが正しい)。
@@ -43,7 +49,7 @@ const SHARD = [
   "ignoreFence", "staleWideRead", "finishWithoutClock", "noRangeFloor", "ignoreTableLock", "publishWithoutClock", "validateFromT", "trustLocks",
   "phase2BeforeSync", "dropNoLowWater", "gcUndone", "flushPastIntents", "unchangedIgnoresIntents", "commitIgnoresDigest", "prepareKeepsFirst",
   "lockedReadAtT", "dmlAtT", "dmlSkipsClock", "woundPrepared", "prepareWaits",
-  // Meta が読むスイッチ (同じ Faults にある)。commitWithoutAcks は Worker の側にもあり、test/sim.ts の injectedFault が両方に入れる。
+  // Meta が読むスイッチ (同じ Faults にある)。commitWithoutAcks は Worker の側にもあり、test/sim.ts の injectedFaults が両方に入れる。
   "commitAfterAbort", "commitWithoutAcks", "overlappingTransitions", "ddlDuringMove", "moveDuringDdl",
   // 子が移動を進める手順のスイッチ (段 4)。
   "endBeforeDrained", "pullWithoutEpoch",
@@ -55,6 +61,11 @@ const SHARD = [
   // ロックを与える判断と fence のスイッチ (docs/design-catalog-epoch.md の「ロックを与える判断と fence」、M24c)。indexDdlUnfenced と
   // woundWithoutRestart は、Meta が読む。
   "lockGateWritesOnly", "indexDdlUnfenced", "lockDuringDdlWait", "woundWithoutRestart", "holdsOnlyHere",
+  // 移動の要求と応答が、その移動より後に届くときの規則のスイッチ (docs/design-move-messages.md、M5d、計画書の不変条件 15)。見つけるのは
+  // 生成器 10 (test/move-returns.test.ts と test/move-chains.test.ts の「generator 10」。--harness と --name で選ぶ)。
+  // markBeforeWrite と bootMarksDiffer は、それだけでは何も破らない (見つからないのが正しい)。親の規則を外す rehandFinished との組で欠陥になる。
+  "rehandFinished", "childAcceptsStale", "finishIncomingByInterval", "finishedAsRefusal", "askOnce", "markBeforeWrite", "bootMarksDiffer",
+  "rehandFinished+markBeforeWrite", "rehandFinished+bootMarksDiffer",
 ];
 const OTHER = [
   "rowSpanDespiteUnique", "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
@@ -99,7 +110,8 @@ async function run(fault, file) {
     const b = Math.min(to, a + size - 1);
     if (a > b) continue;
     const json = join(out, `${i}.json`);
-    const argv = ["node_modules/vitest/vitest.mjs", "run", file, "--project", "sim", "--reporter=json", `--outputFile=${json}`, "-t", "seed \\d+"];
+    const names = nameFilter ? `^(?=.*seed \\d+)(?=.*${nameFilter})` : "seed \\d+";
+    const argv = ["node_modules/vitest/vitest.mjs", "run", file, "--project", "sim", "--reporter=json", `--outputFile=${json}`, "-t", names];
     const env = { ...process.env, SEEDS: `${a}..${b}` };
     if (fault === "none") delete env.FAULT;
     else env.FAULT = fault;
@@ -163,7 +175,8 @@ const kept = [];
 if (resume && outFile) {
   try {
     for (const line of readFileSync(outFile, "utf8").split("\n")) {
-      const m = /^\| (\w+) \| /.exec(line);
+      // 組で入れる欠陥の名前は `a+b` である。
+      const m = /^\| ([\w+]+) \| /.exec(line);
       if (m && m[1] !== "fault") kept.push({ fault: m[1], line });
     }
   } catch {

@@ -105,11 +105,11 @@ describe("transactions across ranges that return to a former owner, with the ask
 // 範囲を受け取り直した前の親に届く (表の 1 から 3)。
 // 足した検査は、内部の表の誤りで失敗した文と要求、「group not arrived」の断り、静止した後のメモリの印と記録から作り直す印の比べ、
 // 遅れた配送が受け手の渡しと到着の記録を変えたこと (計画書の不変条件 15) である (history.ts の runHistory)。
-// 2026-11-17 の木 (5808b08) は、この類を直していない (test/open/late-pull-*.test.ts)。既定では、受け手がもう生きた記録を持たない移動の pull と、
+// 2026-11-17 の木 (5808b08) は、この類を直していない (test/late-pull-*.test.ts)。既定では、受け手がもう生きた記録を持たない移動の pull と、
 // その応答 (history.ts の LateRow の 1 から 7、returning、other) の配送を落とし (網がメッセージを失うのと同じ)、落とした数を数える。OPEN=1 では
 // 落とさずに届け、検査が見つける。returning は、遅れた pull が、範囲が戻る途中の前の親に届く形 (問題 55 の形) で、このファイルの見出しは
 // 「起きない」としているが、グループが前の親へもう届いた後なら、内部の誤り (UNIQUE constraint failed: __moved...) になる
-// (test/open/late-pull-while-range-returns.test.ts。生成器 10 が OPEN=1 で見つけた)。
+// (test/late-pull-while-range-returns.test.ts。生成器 10 が OPEN=1 で見つけた)。
 const MASK_LATE = !process.env.OPEN;
 describe("late move messages on ranges that return to a former owner (generator 10)", () => {
   const memo5 = new Map<number, Promise<RunResult>>();

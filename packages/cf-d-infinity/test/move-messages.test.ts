@@ -52,7 +52,7 @@ async function stage(faults: Faults = {}) {
 // s0 に届く。s0 は「渡し終えた」と答え、s2 は、移動 1 を受け取り中ではないので、答えを捨てる。待っていた文は、移動 3 で尋ね直す。
 // 1 回だけ尋ねて進むと (5808b08 の arriveStep)、z は移動 3 ではまだ届いていないので、文は group not arrived で断られる。断られる理由は
 // 移動だけである (計画書の規則 4)。
-async function askAgain(faults: Faults, joined = false) {
+async function askAgain(faults: Faults, joined = false, stopAtAnswer = false) {
   const { c, range, z, g } = await stage(faults);
   const gates = { list: latch(), pull: latch(), drain3: latch() };
   let [listed, pulled, third] = [false, false, false];
@@ -99,12 +99,20 @@ async function askAgain(faults: Faults, joined = false) {
   const atAnswer = {
     handed: c.backends.get("s0")!.exec(`SELECT epoch FROM __moved WHERE g = ? ORDER BY epoch`, g).map((r) => r.epoch),
     refused: notArrived(c), asked: pullsOfMove3(),
+    // 移動 3 を、s2 が受け取り終えたか、s0 が渡し終えたか (記録の done)。
+    move3: {
+      received: c.backends.get("s2")!.exec(`SELECT done FROM __incoming WHERE epoch = ?`, move3)[0]?.done,
+      handed: c.backends.get("s0")!.exec(`SELECT done FROM __fenced WHERE epoch = ?`, move3)[0]?.done,
+    },
   };
-  gates.drain3.resolve();
-  expect(await closed(c)).toBe(true);
-  await c.settle();
+  // stopAtAnswer: 移動 3 の drain を止めたまま、ここで終える (スイッチを入れた場面では、移動 3 は閉じない)。
+  if (!stopAtAnswer) {
+    gates.drain3.resolve();
+    expect(await closed(c)).toBe(true);
+    await c.settle();
+  }
   return {
-    before, first, joinedAnswer, refused: atAnswer.refused, askedAgain: atAnswer.asked,
+    before, first, joinedAnswer, refused: atAnswer.refused, askedAgain: atAnswer.asked, move3AtAnswer: atAnswer.move3,
     // s0 は、移動 1 では z を渡していない (行がなかった)。渡した記録は、あっても移動 3 のものだけである。
     handedInMove1: atAnswer.handed.some((e) => e !== move3),
     owner: c.backends.get("s2")!.exec("SELECT n FROM items WHERE id = ?", z),
@@ -140,5 +148,24 @@ describe("a statement that waited for a pull since an earlier move, answered whi
     });
     // 行と印は壊れない (m5d_red_ask_once の m5dData は緑)。断られた文は、行を書いていない。
     expect({ owner: r.owner, former: r.former, handedInMove1: r.handedInMove1 }).toEqual({ owner: [{ n: 7 }], former: [], handedInMove1: false });
+  });
+});
+
+// ---- 受け取り終える答えは、移動の epoch で引く (M5d の m5d_red_child_stale の closeEarlyTest) ----
+//
+// 上と同じ場面である。移動 1 の遅れた pull への「渡し終えた」の答えが、s2 が移動 3 を受け取っている間に届く。移動 1 と移動 3 は、同じ
+// 区間を動かす。受け取りを区間で引くと (5808b08 の finishIncoming)、移動 1 の答えが、移動 3 の受け取りを終えてしまう。s0 は移動 3 を
+// まだ渡し終えておらず、z の行は s0 に残ったままである。s2 は、届いていない z を、行のないグループとして答える。
+describe("a late \"finished handing\" of an earlier move, reaching the child while it receives a later move of the same range", () => {
+  it("does not finish the later receive: the child still receives move 3, and answers with the row the owner committed", async () => {
+    const r = await askAgain({});
+    expect({ first: r.first, move3AtAnswer: r.move3AtAnswer }).toEqual({ first: [{ n: 9 }], move3AtAnswer: { received: 0, handed: 0 } });
+  });
+  it("put back (finishIncomingByInterval): the answer of move 1 finishes the receive of move 3, and the child answers without the row", async () => {
+    // 文は、z の行 (n = 7。s0 が確定した) を書き換えるはずだった。s2 は、行はないと答える (ownerHasTruth)。
+    const r = await askAgain({ finishIncomingByInterval: true }, false, true);
+    expect({ first: r.first, move3AtAnswer: r.move3AtAnswer, owner: r.owner, former: r.former }).toEqual({
+      first: [], move3AtAnswer: { received: 1, handed: 0 }, owner: [], former: [{ n: 7 }],
+    });
   });
 });

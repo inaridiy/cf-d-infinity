@@ -1,4 +1,7 @@
-// 未解決 (2026-11-17、生成器 10 が見つけた。遅れた移動のメッセージの類で、遅れた移動のメッセージの類の表 (test/history.ts の LateRow) にない形。LateRow の returning): 終わった移動の遅れた pull が、範囲が前の
+// 直した (2026-11-17。計画書の不変条件 15、docs/design-move-messages.md、モデル M5d): 親は、渡し終えた移動の pull に、記録も印も変えずに
+// 「渡し終えた」と答え、子は、受け取り中でない移動の応答を捨てる。下は、直す前 (5808b08) の欠陥の説明で、この試験は、その再現である。
+//
+// 直す前の欠陥 (2026-11-17、生成器 10 が見つけた。遅れた移動のメッセージの類で、遅れた移動のメッセージの類の表 (test/history.ts の LateRow) にない形。LateRow の returning): 終わった移動の遅れた pull が、範囲が前の
 // 持ち主へ戻る途中 (前の持ち主が受け取り中) で、そのグループが前の持ち主へもう届いた後に届くと、前の持ち主は、そのグループを渡し直そうと
 // して、内部の誤り (UNIQUE constraint failed: __moved.g, __moved.epoch, __moved.after) で答える。その pull を待っていた利用者の文も、この誤りで
 // 失敗する。問題 55 の誤りと同じである。
@@ -6,7 +9,7 @@
 // 問題 55 (test/stale-pull-after-return.test.ts) は、遅れた pull を、範囲が戻る移動を前の持ち主が適用した直後 (グループがまだ届く前) に届け、
 // 54 の直し (渡した印を、グループが戻るまで外さない) で通るようになった。印は、グループが届いたときに外れる (src/shard/kernel.ts の
 // receiveStep)。その後で届いた pull は、印がないので、新しい渡しとして __moved に (g, 移動 1) を足そうとし、移動 1 の drain が足した行と
-// ぶつかる。表の 3 (test/open/late-pull-of-carried-group.test.ts) は、同じことを、前の持ち主が受け取り終えた後に届けて起こす。
+// ぶつかる。表の 3 (test/late-pull-of-carried-group.test.ts) は、同じことを、前の持ち主が受け取り終えた後に届けて起こす。
 // 乱択の検査では、生成器 10 (test/move-returns.test.ts の「generator 10」を OPEN=1 で流す) が「situation returning」として数え、内部の誤りの
 // 検査が見つける。
 //
@@ -19,10 +22,10 @@
 // 導く。ここでは、親 s0 が、終わった fence (移動 1) の pull で渡しを始めた。s0 は、移動 2 を受け取り中だが、移動 1 の生きた記録はない。
 // 持ち主は、シャードの移動の手順 (src/shard/kernel.ts の pullPieces と fenceOf)。
 import { describe, expect, it } from "vitest";
-import { Db } from "../../src/client/db";
-import { keyString } from "../../src/keys";
-import { REGION_TOKENS } from "../../src/routing";
-import { SimCluster, type Rpc } from "../sim";
+import { Db } from "../src/client/db";
+import { keyString } from "../src/keys";
+import { REGION_TOKENS } from "../src/routing";
+import { SimCluster, type Rpc } from "./sim";
 
 const whole = { start: 0, end: REGION_TOKENS };
 const ids = Array.from({ length: 40 }, (_, i) => i + 1);
