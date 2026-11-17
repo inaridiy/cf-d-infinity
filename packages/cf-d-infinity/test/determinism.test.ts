@@ -61,12 +61,16 @@ describe("the shard kernel is synchronous", () => {
     expect(found).toEqual([]);
   });
 
-  it("no frame of a kernel program can hold a Section: a check made before a wait cannot be carried past it", () => {
-    // frame は、待ちをまたいで残る、ただ 1 つのものである。その宣言に、同期区間の印の型が現れない。
+  it("no frame of a kernel program can hold a Section, a Handing or a Receiving: a check made before a wait cannot be carried past it", () => {
+    // frame は、待ちをまたいで残る、ただ 1 つのものである。その宣言に、同期区間の印の型も、移動の記録の入口の印の型 (Handing と
+    // Receiving。待ちの間に、移動は終わり得る) も現れない。
     const src = readFileSync(join(SRC, "shard", "kernel.ts"), "utf8");
     const frames = src.slice(src.indexOf("// ---- 手続きの frame ----"), src.indexOf("export class ShardKernel"));
     expect(frames.length).toBeGreaterThan(1000);
-    expect(frames.split("\n").filter((line) => /\bSection\b/.test(code(line)))).toEqual([]);
+    expect(frames.split("\n").filter((line) => /\b(Section|Handing|Receiving)\b/.test(code(line)))).toEqual([]);
+    // 印の型は、frame の宣言より前にある。検査が、見るべき宣言を見ていることを確かめる。
+    for (const mark of ["class Section", "class Handing", "class Receiving"]) expect(src.indexOf(mark)).toBeGreaterThan(0);
+    for (const mark of ["class Section", "class Handing", "class Receiving"]) expect(src.indexOf(mark)).toBeLessThan(src.indexOf("// ---- 手続きの frame ----"));
   });
 
   it("the check itself finds a wait, and the shell is where the waits are", () => {

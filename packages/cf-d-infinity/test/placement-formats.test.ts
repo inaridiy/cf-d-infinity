@@ -11,7 +11,7 @@ import { fold } from "../src/catalog";
 import { Db } from "../src/client/db";
 import { readEpochs } from "../src/meta";
 import { REGION_TOKENS, SUBSLOTS, TOKENS, blockOf, ownerOf, planSplit, slotAligned, slotOf } from "../src/routing";
-import type { PiecePayload } from "../src/types";
+import type { PiecePayload, PullRes } from "../src/types";
 import { quiescentProblems } from "./invariants";
 import { SimCluster, USERS } from "./sim";
 
@@ -196,13 +196,15 @@ describe("a shard", () => {
     for (const named of wrong) {
       expect(await outcome(c.shard("s0").pull({ ...named, want: [{ g, from: null }], to: "s2", maxBytes: 1_000_000 }))).toMatch(/unfenced/);
     }
-    const [piece] = await c.shard("s0").pull({ ...range, want: [{ g, from: null }], to: "s2", maxBytes: 1_000_000, epoch });
+    // 親は、終わっていない fence の下で渡す。応答は piece の組である (渡し終えた移動には「渡し終えた」と答える。src/types.ts の PullRes)。
+    const answer = await c.shard("s0").pull({ ...range, want: [{ g, from: null }], to: "s2", maxBytes: 1_000_000, epoch });
+    const [piece] = "pieces" in answer ? answer.pieces : [];
     expect({ ...piece, m: 0, rows: piece!.rows.length, intents: piece!.intents.length }).toEqual({
       g, range, after: null, epoch, upTo: null, m: 0, rows: 1, intents: 0, schema: (await c.catalog()).schema,
     });
     // グループの一部だけの piece を受け取ると、届いていない行のあるグループを「到着した」と記録してしまう。子の SQLite は、ここで作る。
     await c.shard("s2").moves({});
-    const receive = (p: PiecePayload) => (c.cores.get("s2") as unknown as { receive(p: PiecePayload[]): Promise<void> }).receive([p]);
+    const receive = (p: PiecePayload) => (c.cores.get("s2") as unknown as { receive(res: PullRes): Promise<unknown> }).receive({ pieces: [p] });
     expect(await outcome(receive({ ...piece!, upTo: from }))).toMatch(/received a part of group/);
     expect(c.backends.get("s2")!.exec("SELECT count(*) AS n FROM __arrived")[0]!.n).toBe(0);
     // グループの一部を指す ack は、渡した piece のものではないので、何も消さない。

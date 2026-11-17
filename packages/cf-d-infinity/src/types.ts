@@ -371,7 +371,7 @@ export interface ShardApi {
    * 区間 [start, end) の fence から、piece を子へ渡す。want は、グループごとに、子が欲しい piece を位置で指す。
    * いまは、どの piece もグループの全体なので、子は `{ g, from: null }` だけを送る。
    */
-  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch: number }): Promise<PiecePayload[]>;
+  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch: number }): Promise<PullRes>;
   ack(req: { pieces: Piece[] }): Promise<void>;
   /**
    * 子が移動を終えるまで進める (docs/design-catalog-epoch.md の決めたこと 4)。epoch は移動の move-start の epoch で、子はそこまで列を
@@ -384,8 +384,12 @@ export interface ShardApi {
    * 受け取る側の finishIncoming に渡す。
    */
   finishMove(req: Interval & { epoch: number }): Promise<{ m: Ts }>;
-  /** 範囲を受け取り終えた印を付ける。時計を m まで進めてから、届かなかったグループ (渡す側に行がなかった) を受け持ち始める。 */
-  finishIncoming(req: Interval & { m: Ts }): Promise<void>;
+  /**
+   * 移動 epoch を受け取り終えた印を付ける。時計を m まで進めてから、届かなかったグループ (渡す側に行がなかった) を受け持ち始める。
+   * 受け取りは epoch で名指しする。区間で引くと、終わった移動の遅れた答えが、同じ区間の後の移動の受け取りを終えてしまう
+   * (specs/m5d_move_messages.qnt の m5d_red_child_stale の closeEarlyTest)。その移動を受け取り中でなければ、何もしない。
+   */
+  finishIncoming(req: { epoch: number; m: Ts }): Promise<void>;
   metrics(req: Record<string, never>): Promise<ShardMetrics>;
   /** このシャードが健全かを運用者に見せるための状態。 */
   health(req: Record<string, never>): Promise<ShardHealth>;
@@ -450,6 +454,16 @@ export interface PiecePayload extends Piece {
   /** 送り出した親の表定義の epoch。行はこの表定義の形をしている。 */
   schema: number;
 }
+
+/**
+ * pull の応答 (計画書の不変条件 15、docs/design-move-messages.md の規則 2 と 3)。
+ *   pieces    親が、要求の名指しする移動の fence の下で渡した piece。親は、その移動を渡し終えていない。
+ *   finished  親は、その移動 (epoch) を渡し終えている。記録も印も変えずに、そのことと、いま発行した時刻 m を答える。断りではなく答えで
+ *             ある。行か intent のあるグループは、渡し終える前に全部届いているので、子は、その移動を受け取り中なら、m で受け取り終える
+ *             (finishMove の応答の m と同じ性質の時刻である)。受け取り中でなければ、捨てる。断りにすると、行のないグループを待っていた
+ *             文が group not arrived で失敗する (m5d_red_finished_refusal)。
+ */
+export type PullRes = { pieces: PiecePayload[] } | { finished: { epoch: number; m: Ts } };
 
 /**
  * グループの列挙の続きの位置。表の名前の順に、表の中は shard key の順に進む。
@@ -828,8 +842,12 @@ export class ReadTooOld extends Error {
 // 比べるものを運ばないので、受け付けない。
 // 同じ版で、行ロックの寿命を取引のものにした (docs/design-lock-lease.md)。悲観の取引の要求が lease (版と残り) を運び、新しい入口 renew が
 // 取引の lease を延ばす。ロックを取る要求は、取引が行ロックを持つ表 (holds) も運ぶ。
-export const PROTOCOL_VERSION = 10;
-export const MIN_PROTOCOL_VERSION = 10;
+// 版 11 (2026-11-17): 移動の要求と応答が、その移動より後に届くときの規則を入れた (docs/design-move-messages.md、計画書の不変条件 15)。
+// listGroups、pull、finishMove の epoch は省けない。pull の応答は、piece の配列から PullRes になり、親が渡し終えた移動には「渡し終えた」と
+// 時刻を答える。finishIncoming は、区間ではなく epoch で受け取りを名指しする。版 10 の子は「渡し終えた」の答えを読めず、版 10 の親は
+// 終わった移動の pull に渡し直すので、版 10 の要求は受け付けない。
+export const PROTOCOL_VERSION = 11;
+export const MIN_PROTOCOL_VERSION = 11;
 
 export class VersionSkew extends Error {
   readonly retryable = true;

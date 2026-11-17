@@ -5,7 +5,7 @@
 //   - 複数の要求が同じ仕事を待つための合流 (表定義の適用、グループの引き取り)。
 //   - 行を待つタイマー (waitForRow)。
 // 待ちの数と順序は、核の 1 歩が返す Effect で決まる。殻は、待ちを足しも省きもしない。型は step.ts にある。
-import type { Backend, ExecReq, ExecRes, CommitReq, CommitRes, GroupCursor, LockOwner, Piece, PiecePayload, PieceWant, PrepareReq, PrepareRes, ShardApi, Span, Ts, TxnLease, TxnStatus } from "../types";
+import type { Backend, ExecReq, ExecRes, CommitReq, CommitRes, GroupCursor, LockOwner, Piece, PieceWant, PrepareReq, PrepareRes, PullRes, ShardApi, Span, Ts, TxnLease, TxnStatus } from "../types";
 import { ConflictError } from "../types";
 import type { Interval } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
@@ -282,7 +282,7 @@ export class ShardCore implements ShardApi {
   status(req: { txn: string }): Promise<TxnStatus> {
     return this.start("status", { req });
   }
-  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch: number }): Promise<PiecePayload[]> {
+  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch: number }): Promise<PullRes> {
     return this.start("pull", { req });
   }
   listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch: number }): Promise<{ groups: string[]; cursor: GroupCursor | null }> {
@@ -302,9 +302,9 @@ export class ShardCore implements ShardApi {
   redrive(): Promise<boolean> {
     return this.start("redrive", {});
   }
-  /** 届いた piece を受け取る。試験が、届く順序を作るのに直に呼ぶ。 */
-  private receive(payload: PiecePayload[]): Promise<void> {
-    return this.start("receive", { payload });
+  /** 届いた pull の応答を受け取る。受け取った piece を返す。試験が、届く順序を作るのに直に呼ぶ。 */
+  private receive(res: PullRes): Promise<Piece[]> {
+    return this.start("receive", { res });
   }
 
   // 待ちのない要求。核の同期の関数が、そのまま答える。

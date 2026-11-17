@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { keyString } from "../src/keys";
 import { SUBSLOTS, type Interval } from "../src/routing";
 import { encode } from "../src/shard/rows";
-import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type ExecReq, type ExecRes, type Piece, type PiecePayload, type PieceWant, type ShardApi, type Span } from "../src/types";
+import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type ExecReq, type ExecRes, type Piece, type PiecePayload, type PieceWant, type PullRes, type ShardApi, type Span } from "../src/types";
 import { encodeTuple } from "../src/value";
 
 /**
@@ -65,7 +65,11 @@ function moveSample(): string {
   // 子から親への移動の要求は move-start の epoch を運び、進める側の drain も、その epoch を名指しする (版 9 から)。
   const pull = { ...range, want, to: "s1", maxBytes: 1_000_000, epoch: 11 } satisfies Parameters<ShardApi["pull"]>[0];
   const drain = { ...range, epoch: 11 } satisfies Parameters<ShardApi["drain"]>[0];
-  return JSON.stringify([span, range, part, piece, want, payload, pull, drain]);
+  // pull の応答は、piece の組か、親がその移動を渡し終えたこと (渡し終えた後に発行した時刻を運ぶ) である (版 11 から。
+  // docs/design-move-messages.md)。finishIncoming は、受け取りを、区間ではなく移動の epoch で名指しする。
+  const answers = [{ pieces: [payload] }, { finished: { epoch: 11, m: 2048 } }] satisfies PullRes[];
+  const finish = { epoch: 11, m: 2048 } satisfies Parameters<ShardApi["finishIncoming"]>[0];
+  return JSON.stringify([span, range, part, piece, want, payload, pull, drain, answers, finish]);
 }
 
 /** 版ごとの、見本の指紋。古い版の値は、その版のときの見本のもので、いまの見本からは作れない。 */
@@ -79,6 +83,7 @@ const WIRE: Record<number, string> = {
   8: "edeccd61efb19a77",
   9: "4e20b5834a72831a",
   10: "fb3d9f42b31bd937",
+  11: "96ef29c9127e33f0",
 };
 
 describe("protocol version", () => {
