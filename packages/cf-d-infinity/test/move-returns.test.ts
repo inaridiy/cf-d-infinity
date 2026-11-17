@@ -105,12 +105,11 @@ describe("transactions across ranges that return to a former owner, with the ask
 // 範囲を受け取り直した前の親に届く (表の 1 から 3)。
 // 足した検査は、内部の表の誤りで失敗した文と要求、「group not arrived」の断り、静止した後のメモリの印と記録から作り直す印の比べ、
 // 遅れた配送が受け手の渡しと到着の記録を変えたこと (計画書の不変条件 15) である (history.ts の runHistory)。
-// 2026-11-17 の木 (5808b08) は、この類を直していない (test/late-pull-*.test.ts)。既定では、受け手がもう生きた記録を持たない移動の pull と、
-// その応答 (history.ts の LateRow の 1 から 7、returning、other) の配送を落とし (網がメッセージを失うのと同じ)、落とした数を数える。OPEN=1 では
-// 落とさずに届け、検査が見つける。returning は、遅れた pull が、範囲が戻る途中の前の親に届く形 (問題 55 の形) で、このファイルの見出しは
-// 「起きない」としているが、グループが前の親へもう届いた後なら、内部の誤り (UNIQUE constraint failed: __moved...) になる
-// (test/late-pull-while-range-returns.test.ts。生成器 10 が OPEN=1 で見つけた)。
-const MASK_LATE = !process.env.OPEN;
+// 遅れたメッセージは、どれも届ける。計画書の不変条件 15 (docs/design-move-messages.md、モデル M5d) を入れる前の木 (5808b08) は、この類を
+// 直しておらず (決まった順の再現は test/late-pull-*.test.ts)、受け手がもう生きた記録を持たない移動の pull と、その応答 (history.ts の LateRow の
+// 1 から 7、returning、other) の配送を落として数えていた。落とさずに届けると、seed 1 から 200 の 138 が落ちた。returning は、遅れた pull が、
+// 範囲が戻る途中の前の親に届く形 (問題 55 の形) で、このファイルの見出しは「起きない」としているが、グループが前の親へもう届いた後なら、
+// 直す前は、内部の誤り (UNIQUE constraint failed: __moved...) になった (test/late-pull-while-range-returns.test.ts。生成器 10 が見つけた)。
 describe("late move messages on ranges that return to a former owner (generator 10)", () => {
   const memo5 = new Map<number, Promise<RunResult>>();
   const run5 = (seed: number) => {
@@ -120,7 +119,7 @@ describe("late move messages on ranges that return to a former owner (generator 
         // 再起動は seed ごとに入れたり外したりする。再起動した子には、遅れた応答の結果が起きない (受け取る instance がない)。seed 1 から 60 で、
         // 答えが送った instance へ戻った遅れた pull (LateCounts.lateToLive) と、印の比べが見つけた実行は、再起動ありとなしで、ここでは 45 と 45、
         // 9 と 10 だったが、前へ進む鎖 (test/move-chains.test.ts) では 29 と 51、1 と 5 だった。
-        moves: { kind: "returns", restarts: seed % 2 === 1, stops: true, slowMoveRpcMs: 60, paceMs: 200, late: { share: 0.4, max: 3, mask: MASK_LATE } },
+        moves: { kind: "returns", restarts: seed % 2 === 1, stops: true, slowMoveRpcMs: 60, paceMs: 200, late: { share: 0.4, max: 3 } },
       }));
     }
     return memo5.get(seed)!;
@@ -135,8 +134,8 @@ describe("late move messages on ranges that return to a former owner (generator 
     }, 120_000);
   }
   // 生成器が何もしない実行にならないこと。止めたメッセージが、移動が閉じた後に届き、遅れた pull とその応答が、範囲が戻った前の親と、受け取り
-  // 終えた子に届く。既定では、mask がその配送を落としたこと (隠したものがあること) も確かめる。数えた形は 1 行で出す。
-  it("delivers move messages after their moves closed, and the mask hides the known defects", async () => {
+  // 終えた子に届く。届いた配送は、受け手の渡しと到着の記録を変えていない (broken は空)。数えた形は 1 行で出す。
+  it("delivers move messages after their moves closed, and none of them changes the records of a finished move", async () => {
     const all = await Promise.all(defaults5.map(run5));
     const add = (pick: (r: RunResult) => Record<string, number>) => {
       const out: Record<string, number> = {};
@@ -145,12 +144,13 @@ describe("late move messages on ranges that return to a former owner (generator 
     };
     const total = (x: Record<string, number>) => Object.values(x).reduce((a, n) => a + n, 0);
     const situations = add((r) => r.late.situations);
-    const masked = add((r) => r.late.masked);
-    console.info(`generator 10 (returns): held ${JSON.stringify(add((r) => r.late.held))}; outlived ${JSON.stringify(add((r) => r.late.outlived))}; situations ${JSON.stringify(situations)}; masked ${JSON.stringify(masked)}`);
+    const broken = add((r) => r.late.broken);
+    const toLive = all.reduce((a, r) => a + r.late.lateToLive, 0);
+    console.info(`generator 10 (returns): held ${JSON.stringify(add((r) => r.late.held))}; outlived ${JSON.stringify(add((r) => r.late.outlived))}; situations ${JSON.stringify(situations)}; answered to the live sender ${toLive}; broken ${JSON.stringify(broken)}`);
     expect({
       outlived: total(add((r) => r.late.outlived)) > 0,
       late: total(situations) - (situations["request window"] ?? 0) > 0,
-      masked: MASK_LATE ? total(masked) > 0 : true,
-    }).toEqual({ outlived: true, late: true, masked: true });
+      broken,
+    }).toEqual({ outlived: true, late: true, broken: {} });
   }, 240_000);
 });

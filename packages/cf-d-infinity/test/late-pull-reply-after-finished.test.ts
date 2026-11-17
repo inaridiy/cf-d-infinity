@@ -10,7 +10,7 @@
 // 台本: s0 の範囲を s2 へ動かし (移動 1)、s2 で z (行のないグループ) を読む文が送る on-demand の pull を、s2 の drain が終わり、s2 が
 // finishMove を送るまで止める。そこで pull を放し、finishMove を、s0 が pull に答えるまで止める (s0 は、終わっていない fence の下で z を渡す)。
 // pull の応答を止め、finishMove を放す。移動 1 が閉じてから、止めた応答を届ける。類の表の 7 の台本で、見直しの試験にはなかったので
-// 足した。乱択の検査では、生成器 10 (test/move-returns.test.ts と test/move-chains.test.ts の「generator 10」を OPEN=1 で流す) が「situation 7」
+// 足した。乱択の検査では、生成器 10 (test/move-returns.test.ts と test/move-chains.test.ts の「generator 10」) が「situation 7」
 // として数え、遅れた応答が受け手の到着の記録を変えたことを報告する。
 //
 // 不変条件 (計画書の不変条件 15): シャードは、生きた記録 (親なら終わっていない fence、子なら受け取り中の __incoming) を持つ移動の epoch を

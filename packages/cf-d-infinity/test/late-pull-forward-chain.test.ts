@@ -12,7 +12,7 @@
 // 台本: z は移動 2 の区間のグループで、移動 1 のときに行がない。s2 で z を読む文が送る on-demand の pull を止め、移動 1 を閉じる。s2 で z に
 // 行を入れ、z (s2) と y (s1) を書く取引 Y を確定する (s2 への phase 2 は止める)。移動 2 を進め、止めた pull を届ける (4 は移動 2 が閉じた後、
 // 5 は s3 の ack を止めている間)。その後で、Y の phase 2 を s2 へ届ける。見つけたのは 類の見直し (2026-11-17)の A1 と A2 で、遅れた pull を届けない
-// 同じ台本 (A0) は通る。乱択の検査では、生成器 10 (test/move-chains.test.ts と test/move-returns.test.ts の「generator 10」を OPEN=1 で流す) が
+// 同じ台本 (A0) は通る。乱択の検査では、生成器 10 (test/move-chains.test.ts と test/move-returns.test.ts の「generator 10」) が
 // 「situation 4」と「situation 5」として数え、メモリの印と記録から作り直す印の比べ (test/history.ts の marksProblems) が、4 の外れた印を見つける。
 //
 // 不変条件 (計画書の不変条件 15): シャードは、生きた記録 (親なら終わっていない fence、子なら受け取り中の __incoming) を持つ移動の epoch を

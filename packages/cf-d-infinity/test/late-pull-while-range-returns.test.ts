@@ -10,7 +10,7 @@
 // 54 の直し (渡した印を、グループが戻るまで外さない) で通るようになった。印は、グループが届いたときに外れる (src/shard/kernel.ts の
 // receiveStep)。その後で届いた pull は、印がないので、新しい渡しとして __moved に (g, 移動 1) を足そうとし、移動 1 の drain が足した行と
 // ぶつかる。表の 3 (test/late-pull-of-carried-group.test.ts) は、同じことを、前の持ち主が受け取り終えた後に届けて起こす。
-// 乱択の検査では、生成器 10 (test/move-returns.test.ts の「generator 10」を OPEN=1 で流す) が「situation returning」として数え、内部の誤りの
+// 乱択の検査では、生成器 10 (test/move-returns.test.ts の「generator 10」) が「situation returning」として数え、内部の誤りの
 // 検査が見つける。
 //
 // 台本: 1 シャードの全部の範囲を s0 から s1 へ動かし (移動 1)、s1 で id 7 を読む文が送る on-demand の pull を止める。移動 1 は drain で

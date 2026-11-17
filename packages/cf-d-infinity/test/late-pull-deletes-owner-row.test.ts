@@ -8,7 +8,7 @@
 // 台本: s0 の範囲を s2 へ動かし (移動 1)、s2 の on-demand の pull (行のないグループ z) を止める。移動 1 が閉じ、範囲を s0 へ戻し (移動 2)、
 // s0 が受け取り終えてから、z に行を確定し (1 シャードの取引)、止めた pull を届ける。表の 1 (test/late-pull-after-range-returned.test.ts) と
 // 同じ場面で、届ける前に行を確定する。見つけたのは 類の見直し (2026-11-17)の B である。乱択の検査では、生成器 10 (test/move-returns.test.ts の
-// 「generator 10」を OPEN=1 で流す) が、この場面を「situation 2」として数える。
+// 「generator 10」) が、この場面を「situation 2」として数える。
 //
 // 不変条件 (計画書の不変条件 15): シャードは、生きた記録 (親なら終わっていない fence、子なら受け取り中の __incoming) を持つ移動の epoch を
 // 名指しする要求と応答でだけ、渡しと受け取りの記録 (__moved、__moved_txn、__arrived) を変える。メモリの印 (moved、arrived) は、その記録から

@@ -141,6 +141,9 @@ export interface MoveChaos {
  * 閉じず、後の移動も始まらない。止めてから stallMs の後も移動が開いていれば、要求の送り手を再起動する。移動は、新しい instance の alarm が
  * 進め直し、止めた要求は、古い instance が再起動の前に送ったものとして、後で届く。止めた応答は、そのとき届ける (遅れの効かない応答)。
  * どの条件も満たさないまま capMs が過ぎるか、移動を始める側が止まったら (後の移動はもう始まらない)、届ける。
+ *
+ * 遅れたメッセージは、どれも届ける。不変条件 15 を入れる前 (5808b08) は、受け手がもう生きた記録を持たない移動の pull とその応答の配送を
+ * 落として数える伏せ (mask) があった。規則を入れたので外した (docs/design-move-messages.md の「実装の結果」)。
  */
 export interface LateMoves {
   /** 止める候補のメッセージごとの、止める確率。 */
@@ -151,11 +154,6 @@ export interface LateMoves {
   capMs?: number;
   /** 止めたメッセージの移動が、止めてからこの ms の後も開いていれば、上のとおりにする。既定は 2_000。 */
   stallMs?: number;
-  /**
-   * 見つけて直していない欠陥 (下の LateRow の 1 から 7 と returning、other) の配送を落とす。落とした数を LateCounts.masked に数える。
-   * 落とすのは、網がメッセージを失うのと同じである。OPEN=1 では落とさずに届け、検査が見つける。
-   */
-  mask?: boolean;
 }
 
 /**
@@ -191,8 +189,6 @@ export interface LateCounts {
   outlived: Record<string, number>;
   /** 遅れた pull と応答の場面 (LateRow ごと。グループの数で数える)。 */
   situations: Record<string, number>;
-  /** mask が落とした配送 (LateRow ごと)。 */
-  masked: Record<string, number>;
   /** 不変条件 15 を破った配送 (LateRow ごと)。受け手が、生きた記録のない移動の渡しか到着の記録を変えた。 */
   broken: Record<string, number>;
   /** 止めた応答のうち、送り手の instance が再起動せずに受け取ったもの。 */
@@ -202,7 +198,7 @@ export interface LateCounts {
   /** 遅れて届いた pull (表の行のどれか) のうち、その答えが、送った instance (再起動していない) へ戻ったもの。子の側の結果は、これにだけ起きる。 */
   lateToLive: number;
   /** 遅れて届いた pull と応答の明細 (検査の報告と、seed を流して数えるため)。 */
-  deliveries: { side: "request" | "reply"; row: LateRow; g: string; epoch: number; from: string; to: string; at: number; masked: boolean }[];
+  deliveries: { side: "request" | "reply"; row: LateRow; g: string; epoch: number; from: string; to: string; at: number }[];
 }
 
 /**
@@ -369,7 +365,7 @@ export async function runHistory(o: RunOpts): Promise<RunResult> {
   return run.catch((e: unknown) => {
     const { deliveries, ...rest } = lateOf.get(c) ?? emptyLate();
     appendFileSync(process.env.LATE_REPORT!, `${JSON.stringify({
-      kind: o.moves!.kind, seed: o.seed, mask: Boolean(o.moves!.late!.mask), counts: {}, ...rest,
+      kind: o.moves!.kind, seed: o.seed, counts: {}, ...rest,
       deliveries: deliveries.filter((d) => d.row !== "window"), violations: [], problems: [`the run did not finish: ${(e as Error)?.message?.slice(0, 300)}`],
     })}\n`);
     throw e;
@@ -748,14 +744,14 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
   if (process.env.LATE_REPORT && o.moves?.late) {
     const { deliveries, ...rest } = late;
     appendFileSync(process.env.LATE_REPORT, `${JSON.stringify({
-      kind: o.moves.kind, seed: o.seed, mask: Boolean(o.moves.late.mask), counts, ...rest,
+      kind: o.moves.kind, seed: o.seed, counts, ...rest,
       deliveries: deliveries.filter((d) => d.row !== "window"), violations: violations.slice(0, 5), problems: problems.slice(0, 20),
     })}\n`);
   }
   return { history, violations, unknown, c, splits, problems, counts, wide, across, late };
 }
 
-const emptyLate = (): LateCounts => ({ held: {}, outlived: {}, situations: {}, masked: {}, broken: {}, liveReplies: 0, stallRestarts: 0, lateToLive: 0, deliveries: [] });
+const emptyLate = (): LateCounts => ({ held: {}, outlived: {}, situations: {}, broken: {}, liveReplies: 0, stallRestarts: 0, lateToLive: 0, deliveries: [] });
 
 /** 内部の表 (名前が __ で始まる) の誤り。利用者の文の誤りではなく、シャードの手順の誤りである。 */
 export const internalError = (m: string): boolean => /(constraint failed|no such table|no such column|already exists)[^\n]*\b__[a-z]/i.test(m);
@@ -1087,7 +1083,7 @@ function startMoves(o: RunOpts, m: MoveChaos, c: SimCluster, r2: () => number, r
 
 /**
  * 生成器 10 (LateMoves) の仕掛け。gate、reply、arrive と Meta の endMove の包みから呼ぶ。opt が null なら null を返し、何もしない。
- * problems には、不変条件 15 を破った配送を書く (mask で落とした配送は、届いていないので書かない)。
+ * problems には、不変条件 15 を破った配送を書く。
  */
 function startLate(opt: LateMoves | null, seed: number, c: SimCluster, problems: string[]) {
   if (!opt) return null;
@@ -1259,11 +1255,10 @@ function startLate(opt: LateMoves | null, seed: number, c: SimCluster, problems:
   const before = new WeakMap<Rpc, { row: LateRow; g: string; epoch: number; n: number }[]>();
   /** 届けた遅れた応答の、届いたときの受け手の到着の記録。静止した後で比べる (afterQuiet)。 */
   const replies: { x: Rpc; row: LateRow; g: string; epoch: number; n: number }[] = [];
-  const record = (side: "request" | "reply", x: Rpc, found: { row: LateRow; g: string; epoch: number }[], masked: boolean) => {
+  const record = (side: "request" | "reply", x: Rpc, found: { row: LateRow; g: string; epoch: number }[]) => {
     for (const f of found) {
       tally(counts.situations, `${side} ${f.row}`);
-      if (masked) tally(counts.masked, `${side} ${f.row}`);
-      counts.deliveries.push({ side, row: f.row, g: f.g, epoch: f.epoch, from: x.from, to: x.to, at: c.time, masked });
+      counts.deliveries.push({ side, row: f.row, g: f.g, epoch: f.epoch, from: x.from, to: x.to, at: c.time });
     }
   };
   const outlived = (x: Rpc, side: "request" | "reply") => {
@@ -1271,7 +1266,6 @@ function startLate(opt: LateMoves | null, seed: number, c: SimCluster, problems:
     const E = epochOf(x);
     if (E !== null && closed(E)) tally(counts.outlived, `${String(x.method)} ${side}`);
   };
-  const lost = (what: string) => new Error(`rpc dropped: ${what} (a known defect, masked by the late-move generator)`);
 
   return {
     counts,
@@ -1284,15 +1278,13 @@ function startLate(opt: LateMoves | null, seed: number, c: SimCluster, problems:
       if (!eligible(x) || holds.size >= max || r4() >= opt.share * weight(x.method)) return undefined;
       return hold(`${String(x.method)} request`, epochOf(x), rangeOf(x), x.from, groupOf(x));
     },
-    /** 要求が届く瞬間 (SimNet.arrive)。遅れた pull を分類し、mask なら落とす (投げる)。 */
+    /** 要求が届く瞬間 (SimNet.arrive)。遅れた pull を分類し、届く前の受け手の渡しの記録を覚える。 */
     arrive(x: Rpc): void {
       outlived(x, "request");
       if (x.method !== "pull") return;
       const found = requestRows(x);
       const lateOnes = found.filter((f) => f.row !== "window");
-      const mask = Boolean(opt.mask) && lateOnes.length > 0;
-      record("request", x, found, mask);
-      if (mask) throw lost(`a pull of the finished move of epoch ${lateOnes[0]!.epoch}`);
+      record("request", x, found);
       if (lateOnes.length > 0) before.set(x, lateOnes.map((f) => ({ ...f, n: handing(x.to, f.g, f.epoch) })));
     },
     /** 応答 (SimNet.reply)。遅れた pull の渡しの記録を比べ、応答を止めるか、応答が届く瞬間に分類する。 */
@@ -1318,21 +1310,15 @@ function startLate(opt: LateMoves | null, seed: number, c: SimCluster, problems:
         outlived(x, "reply");
         if (x.method !== "pull") return;
         const found = replyRows(x);
-        const mask = Boolean(opt.mask) && found.length > 0;
-        record("reply", x, found, mask);
-        if (mask) throw lost(`the answer to a pull of the finished move of epoch ${found[0]!.epoch}`);
+        record("reply", x, found);
         for (const f of found) replies.push({ x, ...f, n: arrivals(x.from, f.g, f.epoch) });
       };
       if (eligible(x) && holds.size < max && r4() < opt.share * weight(x.method)) {
         heldReply = true;
         return hold(`${String(x.method)} reply`, epochOf(x), rangeOf(x), null, groupOf(x)).then(deliver);
       }
-      // 止めない応答は、遅れた pull の応答のときだけ Promise を返す (ほかは、応答の Promise の段を変えない)。
-      try {
-        deliver();
-      } catch (e) {
-        return Promise.reject(e);
-      }
+      // 止めない応答は、Promise を返さない (応答の Promise の段を変えない)。
+      deliver();
       return undefined;
     },
     /** Meta の endMove の要求 (送り手は子 child) と応答。 */
