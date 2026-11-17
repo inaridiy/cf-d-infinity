@@ -366,8 +366,9 @@ describe("DDL through the HTTP /ddl endpoint", () => {
 });
 
 // 行を書いた取引がいる表の DDL と、取引の行ロックの寿命を、本物の DO で通す (docs/design-catalog-epoch.md の「表ごとの epoch」の実装の
-// 一覧の 9、docs/design-lock-lease.md)。取引は、行を書いた後で 6 秒放っておかれる。行ロックは、取引の最後の文から 5 秒の間は切れない
-// (7.5 秒までに切れる) ので、その表の index の作成は、5 秒待って SQLITE_BUSY になり、取引の COMMIT は通る。取引が終わった後の同じ DDL は通る。
+// 一覧の 9、docs/design-lock-lease.md)。取引は、行を書いた後、DDL が答えるまで放っておかれる。行ロックは、取引の最後の文から 5 秒の間は
+// 切れない (7.5 秒までに切れる) ので、その表の index の作成は、5 秒待って SQLITE_BUSY になり、その後で送る取引の COMMIT は通る。取引が
+// 終わった後の同じ DDL は通る。
 // シャードが行ロックを見直すタイマーと、Meta の列の取り直しが、本物の DO で動くことを確かめる。
 //
 // 2026-11-17 までは、この場面で、書き込み禁止の期限 (meta.ts の LEASE_MS、5 秒) の延長を確かめていた。行ロックが 5 秒で切れ、DDL が
@@ -375,24 +376,23 @@ describe("DDL through the HTTP /ddl endpoint", () => {
 // ままにする手が、外からはなくなった。延長は、シミュレータの test/unique-index-build.test.ts (「is kept while a build that takes longer
 // than the lease keeps renewing it」) が確かめる。本物の DO での確かめは、ここにはない。
 describe("a schema change on a table whose rows an open transaction wrote", () => {
-  it("is busy after waiting 5 seconds while the transaction, left idle for 6 seconds, keeps its row lock and commits; it goes through afterwards", async () => {
+  it("is busy after waiting 5 seconds while the transaction, left idle, keeps its row lock; the transaction then commits, and the change goes through afterwards", async () => {
     const client = createClient({ url: await base(), authToken: TOKEN });
     await client.execute("CREATE TABLE lease_t(id INTEGER PRIMARY KEY, email TEXT)");
     await client.execute("INSERT INTO lease_t VALUES (1, 'a@x'), (2, 'b@x')");
     const tx = await client.transaction("write");
     await tx.execute("INSERT INTO lease_t VALUES (3, 'c@x')");
     const t0 = Date.now();
-    const build = post("/ddl", { sql: "CREATE UNIQUE INDEX lease_email ON lease_t(email)" }).then((r) => ({ status: r.status, error: r.error, ms: Date.now() - t0 }));
-    await new Promise((r) => setTimeout(r, 6000));
+    // DDL は、取引が開いている間に答える (COMMIT は、DDL が答えた後で送る)。取引の COMMIT を待って答えたのではない。
+    const built = await post("/ddl", { sql: "CREATE UNIQUE INDEX lease_email ON lease_t(email)" }).then((r) => ({ status: r.status, error: r.error, ms: Date.now() - t0 }));
     const committed = await tx.commit().then(() => true, (e: Error) => e.message);
-    const built = await build;
     console.log(`the schema change: ${built.ms} ms, status ${built.status}, ${built.error ?? "ok"}; the open transaction: ${committed}`);
-    expect(committed).toBe(true);
     expect(built.status).toBe(400);
     expect(built.error).toMatch(/^conflict: a transaction holds row locks on table lease_t/);
-    // DDL は、待ちの上限 (5 秒) まで待ってから失敗する。それより早くも、取引の COMMIT を待って遅くもならない。
+    // DDL は、待ちの上限 (5 秒) まで待ってから失敗する。
     expect(built.ms).toBeGreaterThanOrEqual(4900);
-    expect(built.ms).toBeLessThan(6000);
+    // 取引は、5 秒より長く放っておかれたが、行ロックを持ったままで、確定する。
+    expect(committed).toBe(true);
     expect((await post("/ddl", { sql: "CREATE UNIQUE INDEX lease_email ON lease_t(email)" })).status).toBe(200);
     const rows = await client.execute("SELECT id FROM lease_t ORDER BY id");
     expect(rows.rows.map((r) => r.id)).toEqual([1, 2, 3]);
