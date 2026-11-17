@@ -114,11 +114,15 @@ describe("history checker while the shards of a move restart and its driver stop
 // 許す (worker が数えて飛ばす)。答えたなら、正しくなければならない。数えた形は、最後の試験が確かめ、1 行で出す。
 describe("history checker with whole-table reads across live splits (generators 1 and 2)", () => {
   const memo = new Map<string, ReturnType<typeof runHistory>>();
+  // 半分の seed は、Autoscaler の分割を最後まで進める (splits)。残りは、移動の手順の要求を遅らせ、進める側をときどき startMove の後で
+  // 止める (moves)。移動が開いている間 (親が行を渡したが、まだ ack を受けていない間) の全表の読みは、後者でしか起きない。
   const once = (rounds: boolean, seed: number) => {
     const key = `${rounds}/${seed}`;
     if (!memo.has(key)) {
+      const slow = Math.floor(seed / 2) % 2 === 1;
       memo.set(key, run({
-        seed, skewMs: 20, splits: true, splitPaceMs: 120, ops: 30, tenants: 20, shards: seed % 2 === 1 ? 1 : 3,
+        seed, skewMs: 20, ops: 30, tenants: 20, shards: seed % 2 === 1 ? 1 : 3,
+        ...(slow ? { moves: { kind: "returns" as const, stops: true, slowMoveRpcMs: 60, paceMs: 150 } } : { splits: true, splitPaceMs: 120 }),
         wide: { share: 0.5, thinkMs: 60, holdMs: 40, ...(rounds ? { rounds: { bytes: 16_000 } } : {}) },
       }));
     }
