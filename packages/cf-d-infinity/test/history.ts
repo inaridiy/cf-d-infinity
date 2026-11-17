@@ -166,7 +166,7 @@ export interface LateMoves {
 const LATE_RPCS = new Set(["pull", "listGroups", "ack", "finishMove", "finalize", "abort"]);
 
 /**
- * 遅れた pull とその応答が届いた場面 (consult-58 の表の行。決まった台本は test/open/late-pull-*.test.ts)。届いた瞬間の、受け手の記録で決める。
+ * 遅れた pull とその応答が届いた場面 (consult-58 の見直しが挙げた表の行。この型が、その表の写しである。決まった台本は test/open/late-pull-*.test.ts)。届いた瞬間の、受け手の記録で決める。
  * 要求 (親 P への、移動 E の pull。子 C は E の宛先): P の E の fence が終わり、C が E を受け取り終えている (移動より長く生きた)。
  *   1  範囲が P へ戻り、P は受け取り終えた。グループは E で運ばれていない (行も intent もなかった)。
  *   2  1 と同じで、P はそのグループの行を、いま持っている (戻った後に確定した行)。
