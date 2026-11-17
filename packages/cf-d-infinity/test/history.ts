@@ -161,10 +161,16 @@ export interface WideCounts {
   manyShards: number;
   /** 取引の最初の読みから、全表の読みの文が終わるまでに、範囲の移動が始まった文 (生成器 1 の危険な形)。 */
   acrossMove: number;
-  /** 要求を 2 回以上に分けて送った文 (予算の 2 回目、2 つ目の表)。 */
+  /** 最初の回の宛先より多く要求を送った文 (予算の 2 回目、2 つ目の表、範囲の移動で断られて計画し直した試み)。 */
   rounds: number;
   /** そのうち、送る回の間に範囲の移動が始まった文 (生成器 2 の危険な形)。 */
   roundsAcrossMove: number;
+  /** 計画の途中で別の読みをする文 (INSERT の値の副問い合わせを、先に取引の読みとして集める。生成器 2)。 */
+  planReads: number;
+  /** そのうち、計画の途中の読みを送った後、文が終わるまでに範囲の移動が始まった文。 */
+  planReadsAcrossMove: number;
+  /** 全表の読みの文の形ごとの、文の数と、2 回以上に分けて送った文の数。 */
+  byShape: Record<string, { statements: number; rounds: number }>;
   /** 移動をまたいだ文の結末。answered か、断った誤りの文の頭。 */
   outcomes: Record<string, number>;
 }
@@ -296,7 +302,9 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
   }
   const across: AcrossCounts = { readOnly: 0, writing: 0, outcomes: {}, twoMoves: 0, delayedAsks: 0 };
   const moves = o.moves ? startMoves(o, o.moves, c, r2, r3, across) : null;
-  const wide: WideCounts = { statements: 0, oneShard: 0, manyShards: 0, acrossMove: 0, rounds: 0, roundsAcrossMove: 0, outcomes: {} };
+  const wide: WideCounts = {
+    statements: 0, oneShard: 0, manyShards: 0, acrossMove: 0, rounds: 0, roundsAcrossMove: 0, planReads: 0, planReadsAcrossMove: 0, outcomes: {}, byShape: {},
+  };
   if (o.wide?.holdMs) {
     // Worker の refresh と exec の配送を遅らせる。分割が、文の送信と送信の間、確かめの最中に入る実行を増やす。
     const hold = o.wide.holdMs;
@@ -344,18 +352,57 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
   };
   const put = async (tx: Txn, x: { t: number; i: number }, v: number, writes: TxRecord["writes"]) => {
     await tx.query("DELETE FROM users WHERE tenant_id = ? AND id = ?", [BigInt(x.t), BigInt(x.i)]);
-    if (o.wide?.rounds) await tx.query("INSERT INTO users(tenant_id, id, n, name) VALUES (?, ?, ?, ?)", [BigInt(x.t), BigInt(x.i), BigInt(v), padOf(x.t)]);
+    if (o.wide?.rounds && r3() < 0.5) await planReadInsert(tx, x, v);
+    else if (o.wide?.rounds) await tx.query("INSERT INTO users(tenant_id, id, n, name) VALUES (?, ?, ?, ?)", [BigInt(x.t), BigInt(x.i), BigInt(v), padOf(x.t)]);
     else await tx.query("INSERT INTO users(tenant_id, id, n) VALUES (?, ?, ?)", [BigInt(x.t), BigInt(x.i), BigInt(v)]);
     writes.push({ key: k(x), value: v });
+  };
+
+  /**
+   * 取引の、複数のシャードの答えをまとめる口 (ReadScope.budgeted。test/setup.ts が区間の検査を掛けた prototype のもの) を、fn の間だけ
+   * 取引の上で包む。包みは同じ Promise を返し、送る要求ごとに、Meta が記録した移動の数を seen に覚えるだけである (RPC の列を変えない)。
+   */
+  type Sends = { sends: number[]; first: number };
+  const watchSends = async (tx: Txn, seen: Sends, fn: () => Promise<unknown>) => {
+    type Read1 = (t: unknown, maxBytes: number) => Promise<unknown>;
+    const scope = tx as unknown as { budgeted: (targets: unknown[], budget: number, read: Read1) => Promise<unknown> };
+    const real = scope.budgeted;
+    scope.budgeted = (targets, budget, read) => {
+      if (seen.first < 0) seen.first = targets.length;
+      return real.call(tx, targets, budget, (t, maxBytes) => {
+        seen.sends.push(moveStarts());
+        return read(t, maxBytes);
+      });
+    };
+    try {
+      await fn();
+    } finally {
+      delete (scope as Partial<typeof scope>).budgeted;
+    }
+  };
+
+  /**
+   * 計画の途中で別の読みをする文 (生成器 2)。INSERT の値の副問い合わせは、文を送る前に、取引の読みとして求める (src/sql/plan.ts の
+   * ctx.read)。副問い合わせは全表を読み、値は v のままである (0 * count(*))。読んだ範囲は、確定のときに検証される。
+   */
+  const planReadInsert = async (tx: Txn, x: { t: number; i: number }, v: number) => {
+    const seen: Sends = { sends: [], first: -1 };
+    try {
+      await watchSends(tx, seen, () => tx.query(
+        "INSERT INTO users(tenant_id, id, n, name) VALUES (?, ?, (SELECT ? + 0 * count(*) FROM users), ?)",
+        [BigInt(x.t), BigInt(x.i), BigInt(v), padOf(x.t)],
+      ));
+    } finally {
+      wide.planReads++;
+      if (seen.sends.length > 0 && moveStarts() > Math.max(...seen.sends)) wide.planReadsAcrossMove++;
+    }
   };
 
   /**
    * 全表の読み (生成器 1 と 2)。主キーでも shard key でも絞れない文にする (n はいつも 1 以上なので、n > 0 は全行である)。rounds の実行では、
    * 大きい行の列 (name) も集める文と、2 つの表を集める文を混ぜる。
    */
-  const readAll = async (tx: Txn, reads: Read[]) => {
-    const shapes = o.wide?.rounds ? ["padded", "joined", "count", "rows"] as const : ["count", "filtered", "rows"] as const;
-    const shape = shapes[Math.floor(r3() * shapes.length)]!;
+  const readAll = async (tx: Txn, reads: Read[], shape: string) => {
     const agg = (r: { rows: Record<string, unknown>[] }) => reads.push({ all: "agg", value: { count: r.rows[0]!.c, sum: r.rows[0]!.s } });
     const rows = (r: { rows: Record<string, unknown>[] }) =>
       reads.push({ all: "rows", value: r.rows.map((x) => [Number(x.tenant_id), Number(x.id), Number(x.n)]) });
@@ -372,26 +419,21 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
    * 移動の数を覚えるだけである (RPC の列を変えない)。
    */
   const countedReadAll = async (tx: Txn, reads: Read[], since: number) => {
-    type Read1 = (t: unknown, maxBytes: number) => Promise<unknown>;
-    const scope = tx as unknown as { budgeted: (targets: unknown[], budget: number, read: Read1) => Promise<unknown> };
-    const real = scope.budgeted;
-    const sends: number[] = [];
-    let first = -1;
-    scope.budgeted = (targets, budget, read) => {
-      if (first < 0) first = targets.length;
-      return real.call(tx, targets, budget, (t, maxBytes) => {
-        sends.push(moveStarts());
-        return read(t, maxBytes);
-      });
-    };
+    const shapes = o.wide?.rounds ? ["padded", "joined", "count", "rows"] as const : ["count", "filtered", "rows"] as const;
+    const shape = shapes[Math.floor(r3() * shapes.length)]!;
+    const seen: Sends = { sends: [], first: -1 };
+    const { sends } = seen;
     let outcome = "answered";
     try {
-      await readAll(tx, reads);
+      await watchSends(tx, seen, () => readAll(tx, reads, shape));
     } catch (e) {
       outcome = head(e);
       throw e;
     } finally {
-      delete (scope as Partial<typeof scope>).budgeted;
+      const first = seen.first;
+      const by = (wide.byShape[shape] ??= { statements: 0, rounds: 0 });
+      by.statements++;
+      if (sends.length > Math.max(first, 0)) by.rounds++;
       wide.statements++;
       if (first === 1) wide.oneShard++;
       else if (first > 1) wide.manyShards++;

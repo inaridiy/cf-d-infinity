@@ -107,7 +107,8 @@ describe("history checker while the shards of a move restart and its driver stop
 //    その間に、分割が読む範囲を動かし、ほかの接続が書く。Worker の refresh と exec の配送を遅らせ、分割が文の途中に入る実行を増やす。
 //    宛先が 1 つの形 (1 シャードから始める実行の、最初の分割の前) と、2 つ以上の形を混ぜる。
 // 2. 1 つの文が、要求を 2 回に分けて送る形。集める予算を小さくし、1 つの tenant の行を大きくして、行の多いシャードが取り分を超え、
-//    予算の残りで 2 回目を送る (ReadScope.budgeted)。2 つの表を集める文 (表ごとに送る。ReadScope.collect) も混ぜる。
+//    予算の残りで 2 回目を送る (ReadScope.budgeted)。2 つの表を集める文 (表ごとに送る。ReadScope.collect) と、計画の途中で別の読みを
+//    する文 (INSERT の値の副問い合わせを、先に取引の読みとして集めてから、INSERT を送る) も混ぜる。
 // 判定は、履歴の検査 (数と和、全行の値) と、どの試験にも掛かる全表の読みの区間の検査 (test/sim.ts の checkTiling) である。
 // どの組 (sim、reference-scans、reference-full) でも、全表の読みは全表の経路を通る。
 // foundation-4 (517b674) のコードは、移動をまたいだ全表の読みを、範囲の床 (read too old) か、移動の途中の拒否 (migrating) か、範囲表を
@@ -148,6 +149,13 @@ describe("history checker with whole-table reads across live splits (generators 
     const agg = await Promise.all(defaults.aggregates.map((s) => once(false, s)));
     const rounds = await Promise.all(defaults.rounds.map((s) => once(true, s)));
     const sum = (rs: Awaited<ReturnType<typeof runHistory>>[], f: (w: Awaited<ReturnType<typeof runHistory>>["wide"]) => number) => rs.reduce((a, r) => a + f(r.wide), 0);
+    const byShape = (rs: Awaited<ReturnType<typeof runHistory>>[]) => {
+      const out: Record<string, string> = {};
+      const all: Record<string, { statements: number; rounds: number }> = {};
+      for (const r of rs) for (const [k, v] of Object.entries(r.wide.byShape)) all[k] = { statements: (all[k]?.statements ?? 0) + v.statements, rounds: (all[k]?.rounds ?? 0) + v.rounds };
+      for (const [k, v] of Object.entries(all)) out[k] = `${v.rounds}/${v.statements}`;
+      return out;
+    };
     const outcomes = (rs: Awaited<ReturnType<typeof runHistory>>[]) => {
       const out: Record<string, number> = {};
       for (const r of rs) for (const [k, n] of Object.entries(r.wide.outcomes)) out[k] = (out[k] ?? 0) + n;
@@ -157,7 +165,8 @@ describe("history checker with whole-table reads across live splits (generators 
       `generator 1: ${sum(agg, (w) => w.statements)} whole-table reads (${sum(agg, (w) => w.oneShard)} to one shard, ${sum(agg, (w) => w.manyShards)} to several), ` +
         `${sum(agg, (w) => w.acrossMove)} across a move: ${JSON.stringify(outcomes(agg))}\n` +
         `generator 2: ${sum(rounds, (w) => w.rounds)} statements in two or more rounds, ${sum(rounds, (w) => w.roundsAcrossMove)} with a move between rounds; ` +
-        `${sum(rounds, (w) => w.acrossMove)} across a move: ${JSON.stringify(outcomes(rounds))}`,
+        `${sum(rounds, (w) => w.acrossMove)} across a move: ${JSON.stringify(outcomes(rounds))}; rounds by shape ${JSON.stringify(byShape(rounds))}; ` +
+        `${sum(rounds, (w) => w.planReads)} statements that read while planning, ${sum(rounds, (w) => w.planReadsAcrossMove)} with a move after the read`,
     );
     expect({
       across: sum(agg, (w) => w.acrossMove) > 0,
@@ -165,7 +174,8 @@ describe("history checker with whole-table reads across live splits (generators 
       manyShards: sum(agg, (w) => w.manyShards) > 0,
       rounds: sum(rounds, (w) => w.rounds) > 0,
       roundsAcrossMove: sum(rounds, (w) => w.roundsAcrossMove) > 0,
-    }).toEqual({ across: true, oneShard: true, manyShards: true, rounds: true, roundsAcrossMove: true });
+      planReadsAcrossMove: sum(rounds, (w) => w.planReadsAcrossMove) > 0,
+    }).toEqual({ across: true, oneShard: true, manyShards: true, rounds: true, roundsAcrossMove: true, planReadsAcrossMove: true });
   }, 240_000);
 });
 
