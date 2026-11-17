@@ -58,8 +58,8 @@ Categories:
   `m23d_old_read_retention.qnt` (versions an owner applied below its start survive log truncation; taken verbatim from the
   reference branch of the second round) has `m23d_red_log_only` and `m23d_red_keep_until_c`;
   `m23e_lock_carry.qnt` (row locks move with their range, on M25's lease) has `m23e_red_no_carry`, `m23e_red_regrant`,
-  `m23e_red_fresh_lease`, `m23e_red_no_forward_renew`, `m23e_red_no_forward_unlock` and `m23e_red_no_early`, and
-  `m23e_memory_record` is a design alternative that breaks only `endReleases` (a D row unless the owner chooses the durable record);
+  `m23e_red_fresh_lease`, `m23e_red_no_forward_renew`, `m23e_red_no_forward_unlock`, `m23e_red_no_early` and
+  `m23e_red_memory_record` (the record of where a lock went is kept in memory only; it becomes a D row if the owner decides against the durable record);
   `m23f_statement_snapshot.qnt` (one routing snapshot per attempt of a Worker statement) has `m23f_red_claim_at_send`,
   `m23f_red_resend_only` and `m23f_red_keep_answers`;
   `m23g_ask_then_enter.qnt` (an owner re-checks its receive record when it enters, and former owners answer per holding

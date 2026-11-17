@@ -22,7 +22,7 @@
 //   EARLY        受け取る側は、ロックより先に届いた転送 (延長か unlock) を覚え、届いたロックに当てる。pull の応答が飛んでいる間に、
 //                親が延長や unlock を受けて転送することがある。M25 の「延長はロックを作らない」は変えない。覚えた延長は、届いた
 //                ロックの期限を延ばすだけである
-//   DURABLE      親は、ロックを運んだ先を、保存した記録に持つ (false: メモリにだけ持つ)。親が再起動した後の転送にだけ効く
+//   DURABLE      親は、ロックを運んだ先を、保存した記録に持つ。親が再起動した後も、延長と unlock を転送するためである
 // M25 の規則は、設計どおりに固定した (Worker が lease の版と終わりを持つ、シャードは新しい版でだけ延ばす、延長は生きている
 // ロックだけを延ばす、COMMIT は lease を信じずに検証する)。外した形は M25 が確かめている。
 //
@@ -36,15 +36,18 @@
 //
 // invariant (置き場所ごと。M25 と同じ)
 //   serializable  x の値は、確定した書き込みの数と同じである
-//   stmtKeeps     持ち主のロックが期限で切れるのは、取引が終わったか、最後の文から TTL 以上経ったときだけである (故障のない走りで)
+//   stmtKeeps     持ち主のロックが期限で切れるのは、取引が終わったか、最後の文から TTL 以上経ったときだけである (M25 と同じく、
+//                 再起動のある走りでも。再起動は、そのシャードのロックを消すが、ほかのシャードのロックを期限で切らさない)
 //   idleLoses     ロックが生きているのは、取引の最後の文から L のうちだけである
 //   lockProtects  持ち主に取引のロックがある間は、x は、取引が読んだ後に、ほかの接続に書かれていない
 // invariant (置き場所をまたいで。故障のない走りで)
 //   locksSame     x の持ち主に取引のロックが生きているかは、動く置き場所でも動かない置き場所でも同じである
 //   outcomeSame   W の結果 (確定か SQLITE_BUSY、その時刻) と取引の結果は、どちらの置き場所でも同じである (規則 4。行が飛んでいる
 //                 間を除く)
-// DURABLE を比べるための性質 (m23eSafe には入れない)
-//   endReleases   取引が終わった後は、どのシャードにも、その取引の生きているロックはない (親が再起動した走りでも)
+//   movedNoWorse  動かない置き場所で持ち主のロックが生きている間は、動く置き場所でも生きている (再起動のある走りでも)
+//   endReleases   取引が終わった後は、どのシャードにも、その取引の生きているロックはない (再起動のある走りでも)
+// m23eSafe は、この 8 つである。m23eWeak は、stmtKeeps を故障のない走りに限り、endReleases を除いたもので、記録をメモリにだけ持つ形が
+// 守るものを示す。
 module m23e_core {
   const CARRY: int              // 1: 運ぶ。0 赤: 運ばない。2 赤: 運ばず、延長が届いたら、新しい持ち主がロックを与え直す
   const KEEP_LEASE: bool
@@ -271,15 +274,18 @@ module m23e_core {
   def faulted: bool = restarts > 0
   pure def wrote(c: Copy): int = (if (c.w == W_OK) 1 else 0) + (if (c.tRes == T_OK) 1 else 0)
   val serializable = COPIES.forall(k => cp.get(k).xv == wrote(cp.get(k)))
-  val stmtKeeps = faulted or COPIES.forall(k => not(cp.get(k).early))
+  val stmtKeeps = COPIES.forall(k => not(cp.get(k).early))
   val idleLoses = COPIES.forall(k => (live(cp.get(k).lockP, now) or live(cp.get(k).lockC, now)) implies now < lastAct + L)
   val lockProtects = COPIES.forall(k => live(ownerLock(cp.get(k)), now) implies cp.get(k).xv == cp.get(k).tv)
   val locksSame = faulted or live(ownerLock(cp.get(U)), now) == live(ownerLock(cp.get(M)), now)
   pure def outcome(c: Copy): (int, int, int) = (c.w, c.wAt, c.tRes)
   // 行が飛んでいる間は比べない。その間、動く置き場所の W は書けず、届いたときに、同じ時刻で追いつく (移動は 1 刻みの中で終わる)
   val outcomeSame = faulted or flying or outcome(cp.get(U)) == outcome(cp.get(M))
-  val m23eSafe = and { serializable, stmtKeeps, idleLoses, lockProtects, locksSame, outcomeSame }
+  // 行が飛んでいる間、動く置き場所の持ち主のロックは、親の写しである
+  val movedNoWorse = live(ownerLock(cp.get(U)), now) implies live(ownerLock(cp.get(M)), now)
   val endReleases = pc != 2 or COPIES.forall(k => not(live(cp.get(k).lockP, now)) and not(live(cp.get(k).lockC, now)))
+  val m23eSafe = and { serializable, stmtKeeps, idleLoses, lockProtects, locksSame, outcomeSame, movedNoWorse, endReleases }
+  val m23eWeak = and { serializable, faulted or stmtKeeps, idleLoses, lockProtects, locksSame, outcomeSame, movedNoWorse }
 
   // ---- witness ----
   // 移動の後も y で働き続ける取引の、運んだロックが、転送された延長で延び、W はどちらの置き場所でも SQLITE_BUSY になり、取引が確定する
@@ -319,24 +325,13 @@ module m23e_green {
         .then(issueW).then(tick).then(stmtY).then(tick)
         .expect(COPIES.forall(k => cp.get(k).w == W_BUSY and cp.get(k).wAt == 4))
         .then(commit)
-        .expect(m23eSafe and endReleases and not(witnessCarriedBusy))
+        .expect(m23eSafe and not(witnessCarriedBusy))
   // pull の応答が飛んでいる間の ROLLBACK。C は、先に届いた unlock を覚えて、届いたロックを入れない
   run earlyUnlockTest =
     init.then(stmtX).then(tick).then(fence).then(pull).then(rollback)
         .expect(cp.get(M).pend.kind == PD_RELEASED)
         .then(recv).then(ack).then(issueW)
-        .expect(m23eSafe and endReleases and not(witnessEarlyUnlock))
-}
-// 同上、記録をメモリにだけ持つ。P が再起動すると転送は止まるが、M25 の性質は破れない
-module m23e_memory_record {
-  import m23e_core(CARRY = 1, KEEP_LEASE = true, FWD_RENEW = true, FWD_UNLOCK = true, EARLY = true, DURABLE = false, RESTARTS = 1, R = 1).*
-  // P の再起動の後の ROLLBACK は、C のロックを外さない。残ったロックは、lease の期限 (時刻 3) で切れる
-  run leftoverTest =
-    init.then(stmtX).then(fence).then(pull).then(recv).then(ack)
-        .then(restartP).then(tick).then(rollback)
-        .expect(live(cp.get(M).lockC, now) and not(endReleases) and m23eSafe and not(witnessLeftover))
-        .then(tick).then(tick)
-        .expect(noLocks and m23eSafe)
+        .expect(m23eSafe and not(witnessEarlyUnlock))
 }
 // 活性 (故障なし)
 module m23e_live {
@@ -381,6 +376,23 @@ module m23e_red_no_forward_unlock {
   run leakTest =
     init.then(stmtX).then(fence).then(pull).then(recv).then(ack).then(issueW).then(tick).then(rollback)
         .expect(cp.get(U).w == W_OK and cp.get(M).w == W_WAIT and not(outcomeSame))
+}
+// 赤: 親が、運んだ先の記録をメモリにだけ持つ。親が再起動すると、転送が止まる。運んだロックは、取引が働いている間に切れ、
+// 終わった取引のロックは、lease の期限まで残る。動かない置き場所より早く失うことはなく (movedNoWorse)、直列化可能性も破れない
+module m23e_red_memory_record {
+  import m23e_core(CARRY = 1, KEEP_LEASE = true, FWD_RENEW = true, FWD_UNLOCK = true, EARLY = true, DURABLE = false, RESTARTS = 1, R = 1).*
+  // P の再起動の後の ROLLBACK は、C のロックを外さない。残ったロックは、lease の期限 (時刻 3) で切れる
+  run leftoverTest =
+    init.then(stmtX).then(fence).then(pull).then(recv).then(ack)
+        .then(restartP).then(tick).then(rollback)
+        .expect(live(cp.get(M).lockC, now) and not(endReleases) and m23eWeak and not(witnessLeftover))
+        .then(tick).then(tick)
+        .expect(noLocks and m23eWeak)
+  // P の再起動の後、時刻 2 の文の延長は C へ届かない。C のロックは、取引が働いている間に、時刻 3 に切れる
+  run expireTest =
+    init.then(stmtX).then(fence).then(pull).then(recv).then(ack)
+        .then(restartP).then(tick).then(tick).then(stmtY).then(tick)
+        .expect(not(live(cp.get(M).lockC, now)) and not(stmtKeeps) and m23eWeak)
 }
 // 赤: 受け取る側が、ロックより先に届いた転送を覚えない。飛んでいる間の ROLLBACK の後に、ロックが C に届く
 module m23e_red_no_early {

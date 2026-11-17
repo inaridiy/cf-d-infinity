@@ -805,10 +805,10 @@ for m in m23d_green m23d_red_log_only m23d_red_keep_until_c; do tests $f $m; don
 
 echo "== M23e lock carry (範囲の移動で、行ロックを新しい持ち主へ運ぶ。寿命は M25 の取引の lease。実装より先に書いたモデル)"
 f=m23e_lock_carry.qnt
-green   $f m23e_green m23eSafe                          # 運び、lease をそのまま持ち、延長と unlock を転送し、先に届いた転送を覚える。動く置き場所と動かない置き場所で結果が同じ
-green   $f m23e_green endReleases                       # 記録を保存していれば、親が再起動した後も、取引が終わればロックは残らない
-green   $f m23e_memory_record m23eSafe                  # 記録をメモリにだけ持つ形でも、M25 の性質は破れない
-red     $f m23e_memory_record endReleases               # 同上: 親が再起動した後に終わった取引の、運んだロックが残る (lease の期限で切れる)
+green   $f m23e_green m23eSafe                          # 運び、lease をそのまま持ち、延長と unlock を転送し、先に届いた転送を覚え、運んだ先を保存する。動く置き場所と動かない置き場所で結果が同じ
+red     $f m23e_red_memory_record stmtKeeps             # 運んだ先をメモリにだけ持つ: 親が再起動すると延長が届かず、運んだロックが、取引が働く間に切れる
+red     $f m23e_red_memory_record endReleases           # 同上: 親が再起動した後に終わった取引の、運んだロックが残る (lease の期限で切れる)
+green   $f m23e_red_memory_record m23eWeak              # 同上でも、直列化可能性は破れず、動かない置き場所より早くロックを失うことはない
 red     $f m23e_red_no_carry outcomeSame                # 運ばない: lease は取引のものでも、W は、動く置き場所でだけ、待たずに書く
 red     $f m23e_red_regrant lockProtects                # 運ばず、延長が届いたら与え直す: 取引は、読んだ後に書かれた行のロックを持つ (M25 の m25_red_regrant と同じ欠陥)
 red     $f m23e_red_regrant outcomeSame
@@ -821,8 +821,8 @@ live    $f m23e_live leaseLive                          # 活性: ロックは�
 witness $f m23e_green witnessCarriedBusy                # 運んだロックが転送された延長で延び、W はどちらの置き場所でも SQLITE_BUSY、取引が確定する
 witness $f m23e_green witnessEarlyRenew                 # pull の応答が飛んでいる間の延長を、届いたロックに当てる
 witness $f m23e_green witnessEarlyUnlock                # 飛んでいる間に ROLLBACK した取引のロックを入れず、W がどちらの置き場所でも書く
-witness $f m23e_memory_record witnessLeftover           # 親の再起動の後に取引が終わり、運んだロックが残る
-for m in m23e_green m23e_memory_record m23e_red_no_carry m23e_red_regrant m23e_red_fresh_lease m23e_red_no_forward_renew \
+witness $f m23e_red_memory_record witnessLeftover       # 親の再起動の後に取引が終わり、運んだロックが残る
+for m in m23e_green m23e_red_memory_record m23e_red_no_carry m23e_red_regrant m23e_red_fresh_lease m23e_red_no_forward_renew \
          m23e_red_no_forward_unlock m23e_red_no_early; do tests $f $m; done
 
 echo "== M23f statement snapshot (Worker の 1 つの文の要求は、どれも、その試みを計画した範囲表で区間を切る。実装より先に書いたモデル)"
