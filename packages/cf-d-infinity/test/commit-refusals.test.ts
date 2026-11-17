@@ -62,11 +62,11 @@ describe("a commit that the shard refuses by throwing (stale schema, not the own
   it("keeps the row lock until its expiry when the client's unlock never arrives, and the writer then goes on", async () => {
     const r = await refusedCommitWithWaiter(false);
     expect(r.commit).toMatch(/stale schema/);
-    // シャードは、例外で断った確定のロックを自分では手放さない。期限で消える。
+    // シャードは、例外で断った確定のロックを自分では手放さない。取引の lease の期限 (最後に延ばした文から 7.5 秒) で消える。
     expect(r.held).toBe(1);
     expect({ write: r.write, row: r.row }).toEqual({ write: "ok", row: { n: 2 } });
     expect(r.waited).toBeGreaterThan(1000);
-    expect(r.waited).toBeLessThan(6000);
+    expect(r.waited).toBeLessThan(8000);
   });
 });
 

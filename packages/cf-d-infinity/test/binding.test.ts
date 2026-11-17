@@ -78,12 +78,16 @@ describe("the Database binding inside the same Worker", () => {
     });
   });
 
-  it("discards a transaction the caller left open; its row locks expire with the TTL", async () => {
+  // 放っておかれた取引の行ロックは、取引の最後の文から 7.5 秒までに切れる。すぐ後に同じ行を書く取引は、5 秒待って SQLITE_BUSY に
+  // なり得るので (行ロックの待ちの上限)、やり直す。やり直しは、ロックが切れた後で通る。
+  it("discards a transaction the caller left open; its row locks expire with the transaction's lease", async () => {
     expect(await call("abandon")).toEqual({ left: "open" });
     const after = await call("afterAbandon");
     expect(after.balance).toBe(70);
-    expect(after.ms).toBeLessThan(8000);
-  }, 15000);
+    for (const m of after.failed as string[]) expect(m).toMatch(/^(SQLITE_BUSY|conflict)/);
+    expect((after.failed as string[]).length).toBeLessThanOrEqual(1);
+    expect(after.ms).toBeLessThan(10_000);
+  }, 20000);
 
   it("rolls back at once when the transaction is disposed, as `await using` does", async () => {
     const r = await call("scoped");

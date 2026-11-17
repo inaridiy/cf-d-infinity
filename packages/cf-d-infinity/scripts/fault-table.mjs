@@ -50,6 +50,8 @@ const SHARD = [
   // 表ごとの epoch のスイッチ (docs/design-catalog-epoch.md の「表ごとの epoch」、M24)。epochOnPrepare と indexAsObject は、畳み込みが読む。
   "epochOnPrepare", "indexAsObject", "writeComparesRead", "applyRefusesAll", "applyRefusesTouched",
   "globalDdlFloor", "restoreAllTables", "noFloorOnChange", "prepareIgnoresLocks", "noLockAtFence",
+  // 取引の lease のスイッチ (docs/design-lock-lease.md、M25)。
+  "perShardLockTtl", "localLockLease", "leaseIgnoresEpoch",
 ];
 const OTHER = [
   "rowSpanDespiteUnique", "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
@@ -58,7 +60,7 @@ const OTHER = [
   // 表ごとの epoch の、Worker の側のスイッチ (M24)。
   "globalSchemaEpoch", "viewDepsOnly", "writeDepsOnlyWritten", "doomOnSchemaChange",
   // 行ロックを持つ取引と DDL のスイッチ (M24 の m24_retry)。
-  "noWound", "noRetryAfterWound", "retryRestartsBudget", "retrySameEpoch",
+  "noWound", "noRetryAfterWound", "retryRestartsBudget", "retrySameEpoch", "renewRelocks",
 ];
 const FAULTS = ["none", ...(only ?? [...SHARD, ...OTHER])];
 const ALL_HARNESSES = ["test/replay.test.ts", "test/history.test.ts", "test/ddl-concurrent.test.ts"];

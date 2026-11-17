@@ -5,7 +5,7 @@
 //   - 複数の要求が同じ仕事を待つための合流 (表定義の適用、グループの引き取り)。
 //   - 行を待つタイマー (waitForRow)。
 // 待ちの数と順序は、核の 1 歩が返す Effect で決まる。殻は、待ちを足しも省きもしない。型は step.ts にある。
-import type { Backend, ExecReq, ExecRes, CommitReq, CommitRes, GroupCursor, LockOwner, Piece, PiecePayload, PieceWant, PrepareReq, PrepareRes, ShardApi, Span, Ts, TxnStatus } from "../types";
+import type { Backend, ExecReq, ExecRes, CommitReq, CommitRes, GroupCursor, LockOwner, Piece, PiecePayload, PieceWant, PrepareReq, PrepareRes, ShardApi, Span, Ts, TxnLease, TxnStatus } from "../types";
 import { ConflictError } from "../types";
 import type { Interval } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
@@ -232,11 +232,14 @@ export class ShardCore implements ShardApi {
         : undefined;
       // 保持者の Worker が死ぬと誰もロックを解放しない。期限で確かめないと待ち手が眠ったままになる。
       let expiry: unknown;
+      // ロックの期限は、持ち主の取引の lease の期限である。延ばされていれば、掛け直す。
       const watch = () => {
         const l = this.k.liveLock(key); // 切れていれば、核が先頭の待ち手を起こす
-        if (l) expiry = this.rt.after(Math.max(1, l.expires - now() + 1), watch);
+        const until = l ? this.k.lockExpiry(key) : undefined;
+        if (until !== undefined) expiry = this.rt.after(Math.max(1, until - now() + 1), watch);
       };
-      if (lock) expiry = this.rt.after(Math.max(1, lock.expires - now() + 1), watch);
+      const until = lock ? this.k.lockExpiry(key) : undefined;
+      if (until !== undefined) expiry = this.rt.after(Math.max(1, until - now() + 1), watch);
       const w: Waiter = { ...me, wake: () => { leave(); resolve(); } };
       const list = this.k.enqueue(key, w);
     });
@@ -325,6 +328,9 @@ export class ShardCore implements ShardApi {
   }
   async unlock(req: Parameters<ShardKernel["unlock"]>[0]): Promise<ReturnType<ShardKernel["unlock"]>> {
     return this.k.unlock(req);
+  }
+  async renew(req: { txn: string; lease: TxnLease }): Promise<void> {
+    return this.k.renew(req);
   }
   async now(req: Parameters<ShardKernel["now"]>[0]): Promise<ReturnType<ShardKernel["now"]>> {
     return this.k.now(req);

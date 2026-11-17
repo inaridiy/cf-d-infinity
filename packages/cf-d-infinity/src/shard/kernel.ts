@@ -11,12 +11,12 @@
 import { Hlc, SECOND, physicalToTs, tsToPhysical } from "../hlc";
 import { SHARD_LIMITS, ShardLimit, shardLimitOf, withinShardLimits } from "../shard-limits";
 import type {
-  Backend, Change, Clock, CommitReq, CommitRes, Dep, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, LockOwner,
+  Backend, Change, Clock, CommitReq, CommitRes, Dep, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, LockOwner, TxnLease,
   Participant, Piece, PiecePayload, PieceWant, Pos, PrepareReq, PrepareRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts,
   TxnStatus, Plain, Value,
 } from "../types";
 import {
-  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, TableLocked, WriteOutsideClaim, checkStorageFormat, isWideSpan,
+  ConflictError, LOCK_LEASE_SLACK_MS, LOCK_TTL_MS, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, TableLocked, WriteOutsideClaim, checkStorageFormat, isWideSpan,
   spanCovers, utf8Length, unprotectedSpans,
 } from "../types";
 import { ALL_OBJECTS, describeOpen, fencedBy, fold, isDdlRecord, objectKey, type Logged, type OpenDdl, type Snapshot } from "../catalog";
@@ -194,8 +194,6 @@ const BLOCKED = Symbol("blocked");
 const PENDING_UNIQUE = Symbol("pending unique");
 /** 述語の検証で読む commit の上限。超えたら競合とみなす。 */
 const PRED_WINDOW = 2000;
-/** ロックの TTL。Worker の死亡に備える。文を実行するたびに延ばす。 */
-const LOCK_TTL_MS = 5000;
 /** 読みが、1 つの取引の intent を決着させようとする回数の上限。間で待つので、合わせて 1 秒ほど待つ。 */
 const SETTLE_TRIES = 10;
 /** ロックを待つ時間の上限。SQLite の busy_timeout に相当する。 */
@@ -214,9 +212,8 @@ const LOCK_POLL_MS = 10;
 const LOCK_REFETCH_MS = 50;
 const LOCK_REFETCH_MAX_MS = 400;
 
-export interface RowLock extends LockOwner {
-  expires: number;
-}
+/** 行ロック。期限は持たない。取引の lease (ShardKernel.leases) で生きる。 */
+export type RowLock = LockOwner;
 export interface Waiter extends LockOwner {
   wake(): void;
 }
@@ -476,6 +473,8 @@ export interface LockedFrame {
   me: LockOwner;
   // ---- 持ち越す選択 ----
   deadline?: number;
+  /** 要求が着いた時刻 (シャードの時計)。新しく与えるロックの期限は、行を待った後でも、ここから数える。 */
+  since?: number;
   /** 起こされた行。取らずに去るなら、次の待ち手を起こす。起こすのは先頭の 1 件だけだからである。 */
   woken?: string | null;
   /** 待っている行。 */
@@ -749,6 +748,12 @@ export class ShardKernel {
   private maxFloor: Ts = 0;
   /** 行ロック。メモリだけに置く。消えても検証が F 以降の変更を見るので安全である。 */
   private locks = new Map<string, RowLock>();
+  /**
+   * 取引ごとの lease (docs/design-lock-lease.md、モデル M25)。鍵は取引の ID で、until は期限 (このシャードの時計の時刻)、epoch は、受けた
+   * lease の版である。取引の行ロックは、どれも、この lease で生きる。期限は時刻で決まる。期限を過ぎた取引のロックは、誰かが見たか
+   * どうかに関わらず、消えたものである。取引の生きているロックがなくなれば、lease も忘れる。再起動では、ロックと一緒に消える。
+   */
+  private leases = new Map<string, { until: number; epoch: number }>();
   private waiters = new Map<string, Waiter[]>();
   private stats = { at: 0, reads: 0, writes: 0, groups: new Map<string, number>() };
   private faults: Faults;
@@ -1445,12 +1450,61 @@ export class ShardKernel {
 
   liveLock(key: string): RowLock | undefined {
     const l = this.locks.get(key);
-    if (l && l.expires <= this.deps.clock.now()) {
-      this.locks.delete(key);
-      this.wakeNext(key);
+    if (!l) return undefined;
+    const lease = this.leases.get(l.txn);
+    if (!lease || lease.until <= this.deps.clock.now()) {
+      this.expire(l.txn);
       return undefined;
     }
     return l;
+  }
+
+  /** 行のロックの期限 (持ち主の取引の lease の期限)。ロックがなければ undefined。殻が、待ち手を起こすタイマーを掛けるのに使う。 */
+  lockExpiry(key: string): number | undefined {
+    const l = this.locks.get(key);
+    return l ? this.leases.get(l.txn)?.until : undefined;
+  }
+
+  /** 取引の lease が切れた。取引のロックを全部消し、待ち手を起こす。lease も忘れる。 */
+  private expire(txn: string): void {
+    this.leases.delete(txn);
+    for (const [key, l] of this.locks) {
+      if (l.txn !== txn) continue;
+      this.locks.delete(key);
+      this.wakeNext(key);
+    }
+  }
+
+  /** 取引 txn に、生きている行ロックがあるか。期限を過ぎた lease は、ここで片付ける。 */
+  private hasLocks(txn: string): boolean {
+    const lease = this.leases.get(txn);
+    if (!lease) return false;
+    if (lease.until <= this.deps.clock.now()) {
+      this.expire(txn);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * 取引の lease を、要求か renew が運ぶ lease で延ばす (docs/design-lock-lease.md の「シャードがすること」)。
+   *   取引の生きているロックがなければ、何もしない。lease も作らない。期限を過ぎたロックは、延長では戻らない (EXTEND_ONLY)。
+   *   運ばれた版が、持っている版より大きければ、期限を、受けた時刻 + 残りにする。等しいか小さければ、何もしない。受けたことのある版の
+   *   延長が、ランタイムの再試行で何度届いても、延びない (EPOCH_CHECK)。
+   * 欠陥のスイッチ perShardLockTtl は、運ばれた lease を見ない。leaseIgnoresEpoch は、版を比べずに延ばす。
+   */
+  private extend(txn: string, lease: TxnLease | undefined): void {
+    if (!lease || this.faults.perShardLockTtl || !this.hasLocks(txn)) return;
+    const mine = this.leases.get(txn)!;
+    const until = this.deps.clock.now() + lease.ms;
+    if (this.faults.leaseIgnoresEpoch) mine.until = Math.max(mine.until, until);
+    else if (lease.epoch > mine.epoch) mine.until = until;
+    mine.epoch = Math.max(mine.epoch, lease.epoch);
+  }
+
+  /** 取引の lease を延ばす (ShardApi.renew)。 */
+  renew(req: { txn: string; lease: TxnLease }): void {
+    this.extend(req.txn, req.lease);
   }
 
   wakeNext(key: string): void {
@@ -1469,17 +1523,44 @@ export class ShardKernel {
     for (const w of list) w.wake();
   }
 
-  private grant(key: string, owner: LockOwner): void {
-    this.locks.set(key, { ...owner, expires: this.deps.clock.now() + (this.deps.lockTtlMs ?? LOCK_TTL_MS) });
+  /**
+   * 行のロックを与える。ロックは、取引の lease に加わる。lease がまだなければ、要求の lease で作る。arrived は、要求が着いた時刻である
+   * (ロックを待った後で与えるときも、期限は、着いた時刻 + 残りで決める。待っている間の文を、文を受けたシャードだけが延ばすと、行が 1 つの
+   * シャードにある取引だけが、長くロックを持つ)。lease を運ばない要求 (試験が直に送る) の期限は、着いた時刻 + TTL である。
+   */
+  private grant(key: string, owner: LockOwner, arrived: number): void {
+    if (!this.hasLocks(owner.txn)) {
+      // 欠陥のスイッチ perShardLockTtl と localLockLease は、自分の時計で期限を決める (arrive)。
+      const own = this.faults.perShardLockTtl ? this.ttl() : this.faults.localLockLease ? this.ttl() + this.ttl() * (LOCK_LEASE_SLACK_MS / LOCK_TTL_MS) : undefined;
+      const until = own !== undefined ? this.deps.clock.now() + own : arrived + (owner.lease?.ms ?? this.ttl());
+      this.leases.set(owner.txn, { until, epoch: owner.lease?.epoch ?? 0 });
+    }
+    this.locks.set(key, owner);
   }
 
-  private renew(txn: string): void {
-    const until = this.deps.clock.now() + (this.deps.lockTtlMs ?? LOCK_TTL_MS);
-    for (const l of this.locks.values()) if (l.txn === txn) l.expires = until;
+  private ttl(): number {
+    return this.deps.lockTtlMs ?? LOCK_TTL_MS;
+  }
+
+  /**
+   * ロックを取る文が着いた。取引の lease を、要求の lease で延ばす。
+   * 欠陥のスイッチ perShardLockTtl (2026-11-17 までの形) は、自分の時計で TTL だけ延ばす。localLockLease は、自分の時計で lease の長さ
+   * (TTL + 余裕) だけ延ばす。どちらも、文を受けたシャードのロックだけが延びる。
+   */
+  private arrive(me: LockOwner): void {
+    if (this.faults.perShardLockTtl || this.faults.localLockLease) {
+      const mine = this.hasLocks(me.txn) ? this.leases.get(me.txn)! : undefined;
+      const ttl = this.ttl();
+      if (mine) mine.until = this.deps.clock.now() + (this.faults.localLockLease ? ttl + ttl * (LOCK_LEASE_SLACK_MS / LOCK_TTL_MS) : ttl);
+      if (mine && me.lease) mine.epoch = Math.max(mine.epoch, me.lease.epoch);
+      return;
+    }
+    this.extend(me.txn, me.lease);
   }
 
   private releaseLocks(txn: string): void {
     const id = lockIdOf(txn);
+    this.leases.delete(id);
     for (const [key, l] of this.locks) {
       if (l.txn !== id) continue;
       this.locks.delete(key);
@@ -1535,6 +1616,8 @@ export class ShardKernel {
     } else {
       if (this.locks.get(key)?.txn !== held.txn) return false;
       this.locks.delete(key);
+      // 取引のロックが全部なくなったら、lease も忘れる。
+      if (![...this.locks.values()].some((l) => l.txn === held.txn)) this.leases.delete(held.txn);
     }
     return true;
   }
@@ -2092,13 +2175,13 @@ export class ShardKernel {
    * 行は書かない。そのロックは、ほかの行ロックと同じく、やり直しの prepare を待たせ、取引の COMMIT か ROLLBACK で放され、期限で切れる。
    * ほかの取引がロックか intent を持つ行は、与えない。1 つでも与えたら、与えた印の付いた誤りを返す。
    */
-  private heldAtFence(e: TableLocked, me: LockOwner): TableLocked {
+  private heldAtFence(e: TableLocked, me: LockOwner, arrived: number): TableLocked {
     if (this.faults.noLockAtFence || !me.holds || me.holds.length === 0) return e;
     const holds = new Set(me.holds);
     let granted = false;
     for (const r of e.rows) {
       if (!holds.has(objectKey(r.table)) || this.blockedBy([r], me) !== null) continue;
-      this.grant(this.lockKey(r.table, r.pk), me);
+      this.grant(this.lockKey(r.table, r.pk), me, arrived);
       granted = true;
     }
     if (!granted) return e;
@@ -3057,6 +3140,12 @@ export class ShardKernel {
     const { req, me } = f;
     f.deadline ??= this.deps.clock.now() + LOCK_WAIT_MS;
     const deadline = f.deadline;
+    if (f.since === undefined) {
+      // 要求が着いた。取引の lease を、要求の lease で延ばす。延ばすのは、着いたときだけである (行を待った後では延ばさない)。
+      f.since = this.deps.clock.now();
+      this.arrive(me);
+    }
+    const since = f.since;
     // 最新の状態を読むので、読む時刻はない。
     const claim: Plan & Rows = { deps: req.deps, spans: req.spans, writes: [], at: null };
     if (f.waiting !== undefined) {
@@ -3092,7 +3181,8 @@ export class ShardKernel {
     // 入口で断るのと同じに、ここで断る (待ちの後の確かめ直し)。
     const sec = this.enter(claim);
     this.count("writes", req.spans);
-    this.renew(me.txn);
+    // 欠陥のスイッチ perShardLockTtl (2026-11-17 までの形): 文を実行するたびに、このシャードのロックだけを、自分の時計で延ばす。
+    if (this.faults.perShardLockTtl) this.arrive(me);
     const overlay = (req.overlay ?? []).map((c) => ({ table: c.table, pk: c.pk, image: c.after }));
     let out: { columns: string[]; values: Value[][]; changes: Change[]; count?: number };
     // 欠陥 lockedReadAtT は、ロック読みを T の snapshot で読む (返す F は変えない)。dmlAtT は、F = T の状態で実行する。
@@ -3109,7 +3199,7 @@ export class ShardKernel {
       this.assertUnlocked((req.lockRows ?? []).filter((r) => req.deps.some((d) => d.write === true && d.name === objectKey(r.table))));
     } catch (e) {
       // 書き込み禁止に当たった。取引がその表の行ロックを持つなら、断る前に、書こうとした行のロックを与える (heldAtFence)。
-      if (e instanceof TableLocked) throw this.heldAtFence(e, me);
+      if (e instanceof TableLocked) throw this.heldAtFence(e, me, since);
       if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner || e instanceof ShardLimit) throw e;
       // 文は F の状態を読んだうえで失敗した。読んだ時刻を付けて返し、呼び出し側に範囲を記録させる (ExecRes.error)。
       return done({ columns: [], values: [], changes: [], error: asSqlError(e).message, F, T: req.T ?? F, hlc: this.hlc.value, epoch: this.epoch });
@@ -3117,7 +3207,7 @@ export class ShardKernel {
     const rows = [...out.changes, ...(req.lockRows ?? [])] as Pick<Change, "table" | "pk">[];
     const blocked = this.blockedBy(rows, me);
     if (!blocked) {
-      for (const c of rows) this.grant(this.lockKey(c.table, c.pk), me);
+      for (const c of rows) this.grant(this.lockKey(c.table, c.pk), me, since);
       if (f.woken && this.locks.get(f.woken)?.txn === me.txn) f.woken = null;
       return done({ ...out, changes: out.changes.map((c) => ({ ...c, since: F })), F, T: req.T ?? F, hlc: this.hlc.value, epoch: this.epoch });
     }
@@ -3221,7 +3311,8 @@ export class ShardKernel {
       throw asSqlError(e);
     }
     if (!f.arrived) {
-      if (req.lock) this.renew(req.lock.txn);
+      // 悲観の取引の、ロックを取らない文。取引の lease を、要求の lease で延ばす (取引のどの文も、取引の全部のロックを延ばす)。
+      if (req.lease) this.extend(req.lease.txn, req.lease);
       f.arrived = true;
       return wait(this.call("arrive", { groups: this.sksOf(req.spans) }));
     }
@@ -3408,6 +3499,7 @@ export class ShardKernel {
     const req = f.req;
     if (!f.planned) {
       f.planned = true;
+      this.extend(lockIdOf(req.txn), req.lease);
       return wait(this.call("schema", { deps: req.deps, epoch: req.epoch, rows: { spans: req.spans, writes: req.writes } }));
     }
     if (!f.arrived) {
@@ -3447,6 +3539,7 @@ export class ShardKernel {
     const req = f.req;
     if (!f.planned) {
       f.planned = true;
+      this.extend(lockIdOf(req.txn), req.lease);
       return wait(this.call("schema", { deps: req.deps, epoch: req.epoch, rows: { spans: req.spans, writes: req.writes } }));
     }
     if (!f.arrived) {
@@ -3489,6 +3582,7 @@ export class ShardKernel {
     const req = f.req;
     if (!f.planned) {
       f.planned = true;
+      this.extend(lockIdOf(req.txn), req.lease);
       const me = req.participants.find((p) => p.shard === this.id);
       return wait(this.call("schema", { deps: me?.deps ?? [], epoch: req.epoch, ...(me ? { rows: { spans: me.spans, writes: me.writes } } : {}) }));
     }
@@ -3538,7 +3632,9 @@ export class ShardKernel {
 
     if (!f.acks) {
       const calls = others.map((p) =>
-        this.peer(p.shard, "prepare", { txn: req.txn, T: req.T, writes: p.writes, spans: p.spans, anchor: this.id, deps: p.deps, epoch: req.epoch }),
+        this.peer(p.shard, "prepare", {
+          txn: req.txn, T: req.T, writes: p.writes, spans: p.spans, anchor: this.id, deps: p.deps, epoch: req.epoch, ...(req.lease ? { lease: req.lease } : {}),
+        }),
       );
       return wait({ kind: "peers", calls }, "acks");
     }

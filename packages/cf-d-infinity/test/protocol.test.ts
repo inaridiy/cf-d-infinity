@@ -22,7 +22,11 @@ function wireSample(): string {
   const read = {
     sql: "SELECT a, b FROM t WHERE a = ?", params: [5n], columns: ["a", "b"], spans: [{ kind: "pred", table: "t", alias: "t", where: "a = ?", params: [5n, 2.5] }],
     deps: [{ name: "t", epoch: 4 }, { name: "u", epoch: 6, write: true }], epoch: 7, atLeast: 9,
+    // 悲観の取引の要求は、取引の lease (版と残り) を運ぶ (版 10 から。docs/design-lock-lease.md)。ロックを取る要求は lock の中に、取引が
+    // 行ロックを持つ表 (holds) と一緒に運ぶ。
+    lease: { txn: "t-1", epoch: 2, ms: 6500 }, lock: { txn: "t-1", start: 1000, lease: { epoch: 2, ms: 6500 }, holds: ["u"] },
   } satisfies Partial<ExecReq>;
+  const renew: Parameters<ShardApi["renew"]>[0] = { txn: "t-1", lease: { epoch: 3, ms: 7500 } };
   // 書き込みの応答は、文が入れた行を、入れた順に運ぶ (版 7 から。lastInsertRowid はこれだけから決める)。
   const written = { changes: [change], inserted: [{ table: "t", pk: keyString([1n]) }], count: 1 } satisfies Partial<ExecRes>;
   // 表定義の遷移の prepare を適用したかを尋ねる要求と、その答え (版 8 から。docs/design-catalog-epoch.md の段 3)。
@@ -35,6 +39,7 @@ function wireSample(): string {
     moveSample(),
     encode(written),
     encode(prepared),
+    encode(renew),
   ].join("\n");
 }
 
@@ -70,7 +75,7 @@ const WIRE: Record<number, string> = {
   7: "ada064f16f3fde8e",
   8: "edeccd61efb19a77",
   9: "4e20b5834a72831a",
-  10: "24801bf6c6dc931b",
+  10: "2de4394854904371",
 };
 
 describe("protocol version", () => {

@@ -1,7 +1,9 @@
 import type {
-  Change, CommitRes, Dep, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, Value,
+  Change, CommitRes, Dep, ExecReq, ExecRes, GlobalIndexDef, LockOwner, Row, ShardApi, Span, TableDef, Ts, TxnLease, Value,
 } from "../types";
-import { ConflictError, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, isWriteOutsideClaim, tableLockOf, utf8Length } from "../types";
+import {
+  ConflictError, LOCK_LEASE_SLACK_MS, LOCK_TTL_MS, MAX_WRITE_SET_BYTES, ReadTooOld, SqlError, isTableLocked, isWideSpan, isWriteOutsideClaim, tableLockOf, utf8Length,
+} from "../types";
 import { CAPTURE_TABLES, capturedChanges, captureDdl, decode, encode, encodeKey, imageAt, imageStatements, joinTerms, pkValues, q, scanList, tupleOfRow } from "../shard/rows";
 import { decodeReturned, typedReadSql, type Tuple } from "../value";
 import { DDL_WAIT_MS, type Catalog, type Prepared } from "../meta";
@@ -56,6 +58,8 @@ export interface Cluster {
   reference?: Reference;
   /** このクラスタへつなぐ Db の、欠陥を再導入するスイッチの既定。検査が欠陥を見つけるかを測る試験だけが使う。 */
   clientFaults?: ClientFaults;
+  /** 行ロックの TTL (ms)。なければ LOCK_TTL_MS。試験が、短い TTL で流すのに使う。取引の lease の長さは、これの 1.5 倍になる。 */
+  lockTtlMs?: number;
 }
 
 /** Worker の側の欠陥を再導入するスイッチ (シャードの側は types.ts の Faults)。検査が欠陥を見つけることを確かめる試験だけが使う。 */
@@ -132,6 +136,11 @@ export interface ClientFaults {
    * シャードには、やり直しの prepare を適用させない。そのシャードの確かめ (CHECK の試し) は、取引がその後に書いた行を見ていない。
    */
   retrySameEpoch?: boolean;
+  /**
+   * 取引の lease の延長を、renew ではなく、書いた行のロックを取り直す要求で済ませる (M25 の m25_red_regrant)。期限で切れた後に、別の接続が
+   * 書いた行のロックを、取引が取り直す。取引の COMMIT は検証で競合になるが、それまで、ほかの書き込みを待たせる。
+   */
+  renewRelocks?: boolean;
 }
 
 /** 要求には載せない、要求が頼るものの材料 (depsOf)。 */
@@ -527,6 +536,10 @@ class ReadScope {
   protected overlay(_shard: string, _spans?: readonly Span[]): Change[] {
     return [];
   }
+  /** ロックを取らない読みに載せる、取引の lease。取引でない読みにはない。 */
+  protected leaseFor(_shard: string): ExecReq["lease"] {
+    return undefined;
+  }
   protected record(_shard: string, _spans: Span[], _views?: readonly string[]): void {}
 
   /** 読みを 1 つ送る。autocommit の読みは T を進めないので、新しい確定を知らせてもらわない (fresh なし)。 */
@@ -541,9 +554,10 @@ class ReadScope {
   protected async send(shard: string, req: Outgoing, at: { T: Ts | undefined; fresh: boolean }): Promise<ExecRes> {
     const spans = withClaims(this.cat.routing, shard, req.spans);
     const { rely, ...wire } = req;
+    const lease = this.leaseFor(shard);
     const full: ExecReq = {
       ...wire, spans, T: at.T, minTs: this.db.token, deps: depsOf(this.cat, this.db.faults, spans, rely), epoch: this.cat.epoch, overlay: this.overlay(shard, spans),
-      fresh: at.fresh, realtime: this.realtime,
+      fresh: at.fresh, realtime: this.realtime, ...(lease ? { lease } : {}),
     };
     const res = await this.db.shardOf(shard).exec(full).catch(rerouted);
     this.T ??= res.T;
@@ -753,6 +767,8 @@ export interface TxnDump {
   views?: [string, string[]][];
   /** 取引が行ロックを取った表と、行ロックを持ち得るシャード (Txn.lockTables、Txn.lockShards)。 */
   locks?: { tables: string[]; shards: string[] };
+  /** 取引の lease の終わり (書き出した Worker の時計の時刻) と版 (Txn.lease)。 */
+  lease?: { until: number; epoch: number };
   T: Ts | undefined;
   pessimistic: boolean;
   lockReads: boolean;
@@ -790,6 +806,54 @@ export class Txn extends ReadScope {
    */
   private lockTables = new Set<string>();
   private lockShards = new Set<string>();
+  /**
+   * 取引の lease (docs/design-lock-lease.md、モデル M25)。until は終わり (この Worker の時計の時刻)、epoch は版である。悲観の取引が、
+   * 最初の文で作る。取引の行ロックは、どのシャードのものも、この lease で切れる。baton に載せる。
+   */
+  private lease: { until: number; epoch: number } | null = null;
+
+  /** いまの lease を、要求に載せる形にする (版と、残り)。 */
+  private leaseNow(): TxnLease | undefined {
+    return this.lease ? { epoch: this.lease.epoch, ms: Math.max(0, this.lease.until - this.db.rt.now()) } : undefined;
+  }
+  protected override leaseFor(shard: string): ExecReq["lease"] {
+    const lease = this.lockShards.has(shard) ? this.leaseNow() : undefined;
+    return lease ? { txn: this.id, ...lease } : undefined;
+  }
+
+  /**
+   * 開いている取引の文ごとに呼ぶ。取引のどの文も、どのシャードに行く文でも、シャードに行かない文でも、取引の全部の行ロックを延ばす
+   * (M25 の TXN_LEASE)。lease の残りが TTL より短ければ (まだなければ)、終わりを今 + L (TTL + 余裕) にし、版を 1 つ進める。それより
+   * 残っていれば、何もしない (前に延ばしてから、余裕の時間より後の文だけが延ばす)。
+   * 延ばしたら、取引がロックを持ち得るシャードへ renew を、文と並べて送る。文の要求も同じ lease を運ぶので、文が行くシャードには、同じ版が
+   * 2 度届くことがある (シャードは、先に着いたほうだけを使う)。文がどのシャードへ行くかは、文を計画するまで分からないので、送り先を
+   * 絞らない。返す Promise は、renew の答えである。呼び出し側は、文の答えと一緒に待つ。届かなくても、文は失敗させない (届かなかった
+   * シャードのロックは早く切れ得る。COMMIT の検証が受け止める)。延ばさなければ null を返す (待ちを足さない)。
+   */
+  private beat(): Promise<unknown> | null {
+    if (!this.pessimistic) return null;
+    const now = this.db.rt.now();
+    const ttl = this.db.lockTtlMs;
+    if (this.lease && this.lease.until - now >= ttl) return null;
+    // lease が切れていた。シャードのロックは、もう消えている。取引は、どの表の行ロックも持っていない。
+    if (this.lease && now >= this.lease.until) this.lockTables.clear();
+    this.lease = { until: now + ttl + ttl * (LOCK_LEASE_SLACK_MS / LOCK_TTL_MS), epoch: (this.lease?.epoch ?? 0) + 1 };
+    if (this.lockShards.size === 0) return null;
+    // 欠陥のスイッチ renewRelocks: 延長を、書いた行のロックを取り直す要求で済ませる。
+    if (this.db.faults.renewRelocks) {
+      const rows = [...this.lockShards].flatMap((shard) => this.overlay(shard).map((change) => ({ shard, change })));
+      return this.lockWritten(rows).catch(() => undefined);
+    }
+    const lease = this.leaseNow()!;
+    return Promise.allSettled([...this.lockShards].map((id) => this.db.shardOf(id).renew({ txn: this.id, lease })));
+  }
+
+  /** シャードへ行かない取引の文 (SAVEPOINT など) も、lease を延ばす。 */
+  async touch(): Promise<void> {
+    if (this.doomed) return;
+    const renewed = this.beat();
+    if (renewed) await renewed;
+  }
   constructor(db: Db, cat: Catalog, private id: string) {
     super(db, cat);
   }
@@ -1015,6 +1079,7 @@ export class Txn extends ReadScope {
       saves: [...this.saves].map(([k, v]) => [k, { writes: m(v.writes), spans: [...v.spans] }] as const),
       ...(this.views.size > 0 ? { views: [...this.views].map(([k, v]) => [k, [...v]] as [string, string[]]) } : {}),
       ...(this.lockShards.size > 0 ? { locks: { tables: [...this.lockTables], shards: [...this.lockShards] } } : {}),
+      ...(this.lease ? { lease: this.lease } : {}),
     };
   }
 
@@ -1054,6 +1119,7 @@ export class Txn extends ReadScope {
     tx.views = new Map((d.views ?? []).map(([k, v]) => [k, new Set(v)]));
     tx.lockTables = new Set(d.locks?.tables ?? []);
     tx.lockShards = new Set(d.locks?.shards ?? []);
+    tx.lease = d.lease ?? null;
     return tx;
   }
 
@@ -1132,7 +1198,8 @@ export class Txn extends ReadScope {
     const spans = withClaims(this.cat.routing, shard, req.spans);
     const { rely, ...wire } = req;
     // 取引が行ロックを持つ表。この文が、その表の書き込み禁止に当たったら、シャードは、断るときに、その行のロックを与える (M24 の HOLD)。
-    const lock: LockOwner = this.lockTables.size > 0 ? { ...this.lockOwner, holds: [...this.lockTables] } : this.lockOwner;
+    const lease = this.leaseNow();
+    const lock: LockOwner = { ...this.lockOwner, ...(lease ? { lease } : {}), ...(this.lockTables.size > 0 ? { holds: [...this.lockTables] } : {}) };
     const res = await this.db.shardOf(shard).exec({
       ...wire, spans, T: this.T, minTs: this.db.token, deps: depsOf(this.cat, this.db.faults, spans, rely), epoch: this.cat.epoch,
       overlay: o.overlay === false ? [] : this.overlay(shard, spans),
@@ -1180,6 +1247,17 @@ export class Txn extends ReadScope {
   /** 計画を実行する。taken は、計画した試みの控えである (INSERT … SELECT が分けた文の採番を、そこへ入れる)。 */
   async execute(p: Plan, taken: Taken | null = null): Promise<QueryResult> {
     if (this.doomed) throw this.doomed;
+    // 取引の文である。lease の残りが少なければ延ばし、ロックを持つシャードへ renew を、文と並べて送る (beat)。
+    const renewed = this.beat();
+    if (!renewed) return this.run(p, taken);
+    try {
+      return await this.run(p, taken);
+    } finally {
+      await renewed;
+    }
+  }
+
+  private async run(p: Plan, taken: Taken | null): Promise<QueryResult> {
     switch (p.kind) {
       case "write": return this.atomically(() => this.write(p));
       case "wasmWrite": return this.atomically(() => this.wasmWrite(p));
@@ -1590,10 +1668,12 @@ export class Txn extends ReadScope {
     });
     const T = this.T ?? 0;
     const epoch = this.cat.epoch;
+    // COMMIT は lease を延ばさない (終わった取引の文は、ロックを延ばさない)。いまの版と残りを運ぶ。
+    const lease = this.leaseNow();
     let res: CommitRes;
     if (parts.length === 1) {
       const p = parts[0]!;
-      res = await this.db.shardOf(p.shard).commitLocal({ txn: this.id, T, writes: p.writes, spans: p.spans, deps: p.deps, epoch });
+      res = await this.db.shardOf(p.shard).commitLocal({ txn: this.id, T, writes: p.writes, spans: p.spans, deps: p.deps, epoch, ...(lease ? { lease } : {}) });
     } else {
       // anchor は最後に prepare するので refresh が要らない。未保護の span が多い参加者を選ぶ。
       const score = (p: (typeof parts)[number]) =>
@@ -1609,7 +1689,7 @@ export class Txn extends ReadScope {
       const txn = this.db.faults.commitIdIsTxn ? this.id
         : `${this.id}#${sha256Text(encode([T, parts.map((p) => [p.shard, p.writes, p.spans, p.deps])])).slice(0, 32)}`;
       try {
-        res = await anchor.commit({ txn, T, participants: parts, epoch });
+        res = await anchor.commit({ txn, T, participants: parts, epoch, ...(lease ? { lease } : {}) });
       } catch (e) {
         const st = await anchor.status({ txn }); // 応答不明は status で決着を知る。
         if (st.status === "committed") res = { ok: true, c: st.c };
@@ -2259,6 +2339,10 @@ export class Db {
   get writeSetBudget(): number {
     return this.opts.limits?.writeSetBytes ?? MAX_WRITE_SET_BYTES;
   }
+  /** 行ロックの TTL (ms)。取引の lease の長さは、これに余裕 (半分) を足したものである。 */
+  get lockTtlMs(): number {
+    return this.cluster.lockTtlMs ?? LOCK_TTL_MS;
+  }
 
   /** シャードを呼ぶ。呼んだ先は文の記録のために覚える。 */
   shardOf(id: string): ReturnType<Cluster["shard"]> {
@@ -2621,14 +2705,17 @@ export class Db {
       case "savepoint":
         this.current ??= await this.begin();
         this.current.savepoint(p.name!);
+        await this.current.touch();
         return empty;
       case "release":
         if (!this.current) throw new SqlError(`no such savepoint: ${p.name}`);
         this.current.release(p.name!);
+        await this.current.touch();
         return empty;
       case "rollbackTo":
         if (!this.current) throw new SqlError(`no such savepoint: ${p.name}`);
         this.current.rollbackTo(p.name!);
+        await this.current.touch();
         return empty;
     }
   }

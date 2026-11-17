@@ -392,7 +392,7 @@ const CLIENT_FAULTS = new Set([
   "publishBeforeBackfill", "checkBeforePrepare", "scanSkipsEmpty", "guardFromCommitTs",
   "lockedReadsSkipValidation", "secondDmlNewSince", "secondDmlNewSpanSince",
   "globalSchemaEpoch", "viewDepsOnly", "writeDepsOnlyWritten", "doomOnSchemaChange",
-  "noWound", "noRetryAfterWound", "retryRestartsBudget", "retrySameEpoch",
+  "noWound", "noRetryAfterWound", "retryRestartsBudget", "retrySameEpoch", "renewRelocks",
 ]);
 /**
  * Worker と Meta の両方が読むスイッチの名前。1 つの欠陥を、2 つの守りを外して戻す (commitWithoutAcks は、Worker が 1 つのシャードの
@@ -603,6 +603,10 @@ export class SimCluster implements Cluster {
   readonly runtime: Runtime;
   /** FAULT で入れた Worker の側の欠陥 (下の injectedFault)。 */
   readonly clientFaults: ClientFaults | undefined;
+  /** 行ロックの TTL (SimOptions.lockTtlMs)。このクラスタへつなぐ Db は、取引の lease の長さを、これから決める。 */
+  get lockTtlMs(): number | undefined {
+    return this.o.lockTtlMs;
+  }
   /**
    * このクラスタへつなぐ Db を、基準経路だけで実行させる指定。環境変数 REFERENCE (scans か full) から取る。
    * SQLite と突き合わせる検査を、通常の実行と、基準経路だけの実行で流すのに使う。

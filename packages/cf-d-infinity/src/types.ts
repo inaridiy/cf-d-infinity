@@ -205,12 +205,44 @@ export interface ExecReq {
    * 運ぶ (M21 の CHECK_AT_EPOCH)。prepare は、どのものの epoch も進めないので、deps では運べない。
    */
   atLeast?: number;
+  /**
+   * 悲観の取引の、ロックを取らない要求 (読み、行を集める経路の読み) が運ぶ、取引の lease。ロックを取る要求は lock の中に運ぶ。
+   * 取引のどの文も、どのシャードに行く文でも、取引の全部の行ロックを延ばす (M25 の TXN_LEASE)。
+   */
+  lease?: TxnLease & { txn: string };
+}
+
+/**
+ * 行ロックの TTL (ms)。取引の行ロックは、取引が最後の文を実行してから、この時間の間は切れない (docs/design-lock-lease.md)。Worker が
+ * 落ちたときのためにある。SQLite の busy_timeout に相当する、行ロックの待ちの上限と同じ 5 秒である。
+ */
+export const LOCK_TTL_MS = 5000;
+/**
+ * 取引の lease の余裕 R (ms)。lease の長さは L = TTL + R (7.5 秒) で、行ロックは、最後の文から L の後には残らない。Worker が lease を
+ * 延ばすのは、残りが TTL を切った文 (前に延ばしてから R より後の文) だけである。R のうちに終わる取引は、延長を 1 つも送らない。
+ */
+export const LOCK_LEASE_SLACK_MS = LOCK_TTL_MS / 2;
+
+/**
+ * 取引の lease (docs/design-lock-lease.md、モデル M25)。取引の行ロックは、シャードごとではなく、取引の lease で切れる。epoch は lease の
+ * 版で、Worker が延ばすたびに 1 つ進める。ms は lease の残り (Worker の時計で、lease の終わりから、要求を送った時刻を引いたもの)。
+ * 時刻そのものではなく残りを運ぶのは、Worker とシャードの時計を比べないためである。シャードは、受けた時刻に残りを足す。
+ * シャードは、持っている版より大きい版でだけ延ばす。同じ版の延長が、ランタイムの再試行で何度届いても、延びない (EPOCH_CHECK)。
+ */
+export interface TxnLease {
+  epoch: number;
+  ms: number;
 }
 
 export interface LockOwner {
   txn: string;
   /** 開始時刻。古い取引が優先される (wound-wait)。 */
   start: Ts;
+  /**
+   * 取引の lease。ロックを取る要求は、ここに運ぶ。シャードは、取引の lease を、この版が新しければ延ばし、新しく与えるロックを、その lease に
+   * 加える (自分の時刻 + TTL を付けない)。ない要求 (試験が直に送る) のロックは、シャードの時計の TTL で切れる。
+   */
+  lease?: TxnLease;
   /**
    * 取引が行ロックを持つ表 (小文字の名前)。Worker が、取引の文に付ける。この文が、挙げた表の書き込み禁止 (表定義の遷移の fence) に
    * 当たったら、シャードは、文を TableLocked で断るときに、文が書こうとした行のロックを取引に与える (書かずに。M24 の HOLD)。やり直しの
@@ -267,6 +299,8 @@ export interface PrepareReq {
   /** このシャードの書き込みと確かめる範囲が頼るものと、取引のスナップショットの epoch (ExecReq と同じ)。 */
   deps: Dep[];
   epoch: number;
+  /** 悲観の取引の lease (いまの版と残り)。COMMIT は lease を延ばさないが、延長が届かなかったシャードが、同じ期限に揃う。 */
+  lease?: TxnLease;
 }
 export type PrepareRes = { ok: true; prepareTs: Ts } | { ok: false; reason: string };
 
@@ -284,6 +318,8 @@ export interface CommitReq {
   participants: Participant[];
   /** 取引のスナップショットの epoch (ExecReq と同じ)。参加者への prepare も、これを運ぶ。 */
   epoch: number;
+  /** 悲観の取引の lease (PrepareReq と同じ)。anchor は、参加者への prepare に載せる。 */
+  lease?: TxnLease;
 }
 export type CommitRes = { ok: true; c: Ts } | { ok: false; reason: string };
 
@@ -355,6 +391,12 @@ export interface ShardApi {
   exportRows(req: { table: string; after: Value[] | null; limit: number; skip?: number }): Promise<{ columns: string[]; rows: Value[][]; pk: number[] }>;
   /** 取引の rollback でロックを手放す。届かなくても TTL で消える。 */
   unlock(req: { txn: string }): Promise<void>;
+  /**
+   * 取引の lease を延ばす (docs/design-lock-lease.md)。Worker が、文で lease を延ばすと決めたときに、取引がロックを持つシャードへ、
+   * 文と並べて送る。シャードは、持っている版より大きい版でだけ、取引の生きているロックの期限を延ばす。ロックを作らない。期限の過ぎた
+   * ロック、放したロック、再起動で消えたロックは、延長では戻らない (EXTEND_ONLY)。
+   */
+  renew(req: { txn: string; lease: TxnLease }): Promise<void>;
   /**
    * 少なくとも epoch atLeast まで、Meta の列を適用する (表定義の記録も、範囲の記録も)。DDL を終えた側は、書き込みの禁止を早く解くために、
    * 全シャードへ適用させてから完了を返す (正しさには要らない。次の要求が適用させる)。
@@ -643,6 +685,22 @@ export interface Faults {
   validateFromT?: boolean;
   /** 検証の代わりにロックの保持だけを信じる。ロックを失っても検出できない。 */
   trustLocks?: boolean;
+  /**
+   * 行ロックの期限を、シャードごとに持つ (2026-11-17 までの形。M25 の m25_red_per_shard)。ロックを取る文を実行したシャードだけが、
+   * 自分の時計で、その取引のロックを TTL だけ延ばす。要求と renew が運ぶ lease は見ない。取引がシャード A で働き続ける間に、シャード B の
+   * ロックが切れる。
+   */
+  perShardLockTtl?: boolean;
+  /**
+   * ロックを取る文を受けたシャードが、要求の lease ではなく、自分の時計で lease の長さだけ延ばす (M25 の m25_red_local_lease)。文を受けた
+   * シャードのロックだけが、ほかのシャードのロックより長く残る。
+   */
+  localLockLease?: boolean;
+  /**
+   * シャードが、受けたことのある版の lease でも延ばす (M25 の m25_red_no_epoch)。延長の要求が届き直すたびに、ロックが延び、取り消した
+   * 取引のロックが残り続ける。
+   */
+  leaseIgnoresEpoch?: boolean;
   /** anchor が、committed の記録の確定 (sync) を待たずに phase 2 と応答を送る (モデル m3_red)。 */
   phase2BeforeSync?: boolean;
   /** 変更ログの世代を DROP しても logLowWater を上げない。消した commit は、再起動の後の検証から見えなくなる (モデル m8_red_drop)。 */
@@ -726,6 +784,8 @@ export class ReadTooOld extends Error {
 // 「表ごとの epoch」)。ExecReq、PrepareReq と、CommitReq の参加者が deps を運び、遷移の仕事の要求 (index の作成の行の走査、unchanged) は
 // atLeast を運ぶ。syncSchema は { atLeast } を受ける。表定義の epoch は commit の記録でだけ進む。版 9 の要求の schema は、新しいシャードが
 // 比べるものを運ばないので、受け付けない。
+// 同じ版で、行ロックの寿命を取引のものにした (docs/design-lock-lease.md)。悲観の取引の要求が lease (版と残り) を運び、新しい入口 renew が
+// 取引の lease を延ばす。ロックを取る要求は、取引が行ロックを持つ表 (holds) も運ぶ。
 export const PROTOCOL_VERSION = 10;
 export const MIN_PROTOCOL_VERSION = 10;
 
