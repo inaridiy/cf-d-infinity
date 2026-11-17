@@ -30,10 +30,14 @@ const key = (id: number) => keyString([BigInt(id)]);
 const token = (id: number) => tokenOf(key(id), key(id));
 
 export interface TruncationRun {
-  outcome: "answered" | `refused: ${string}`;
+  /**
+   * 読みが、決めた T のまま答えたか、T を進めて答えたか (X の読んだ u が変わっていなければ、取引は `moved at` で T を進めて読める。
+   * Txn.call)、断られたか。
+   */
+  outcome: "answered at its T" | "answered at a later T" | `refused: ${string}`;
   /** 答えと T の時点の表の違い。空なら一致した。 */
   wrong: string[];
-  /** 危険な形に届いたか (上の説明)。 */
+  /** 危険な形に届いたか (上の説明)。決めた T のまま答えた読みだけを数える。 */
   reached: boolean;
   shape: string;
 }
@@ -107,6 +111,9 @@ export async function oldReadAfterTruncation(seed: number, faults?: Faults): Pro
   await x.query("BEGIN");
   await x.query("SELECT id FROM u");
   const T = x.dump().tx!.T!;
+  // 半分の実行では、別の接続が u を書く。X は、読んだ u が変わったので T を進められず、T のまま読み続ける (古い読み)。
+  const pinned = rnd() < 0.5;
+  if (pinned) await writer.query("INSERT INTO u VALUES (2)");
   c.time += Math.floor(rnd() * 30);
   const child = `s${shards}`;
   await split(c, P, child, { range });
@@ -133,25 +140,35 @@ export async function oldReadAfterTruncation(seed: number, faults?: Faults): Pro
   for (let i = 0; i < 400 && c.backends.get(child)!.exec("SELECT txn FROM __intents").length > 0; i++) await c.sleep(1);
   const low = (c.backends.get(child)!.exec("SELECT v FROM __meta WHERE k = 'log_low_water'")[0]?.v as number | undefined) ?? 0;
   const m = (c.backends.get(child)!.exec("SELECT m FROM __incoming ORDER BY epoch DESC LIMIT 1")[0]?.m as number | undefined) ?? 0;
-  const reached = T < m && T >= low && carried.some((y) => y.c < m && low > y.c);
-  shape.push(`T ${T}, child ${child} m ${m}, logLowWater ${low}, carried ${carried.length} of ${ys.length}`);
+  const shapeReached = T < m && T >= low && carried.some((y) => y.c < m && low > y.c);
+  shape.push(`T ${T}${pinned ? " (pinned)" : ""}, child ${child} m ${m}, logLowWater ${low}, carried ${carried.length} of ${ys.length}`);
 
   // X は T のまま読む。主キーで Y の行を読むか、全表を読む。
   const wide = rnd() < 0.4;
   const asked = wide ? [...versions.keys()].sort((a, b) => a - b) : [...new Set([...moving, ...others].filter(() => rnd() < 0.5))].sort((a, b) => a - b);
-  const at = (id: number) => [...versions.get(id)!].filter((v) => v.ts <= T).sort((a, b) => a.ts - b.ts).at(-1)?.v;
+  // 行の、時刻 t の値。答えは、その答えが運ぶ時刻 (QueryResult.ts。T を進めたなら進めた T) の表と比べる。
+  const at = (id: number, t: Ts) => [...(versions.get(id) ?? [])].filter((v) => v.ts <= t).sort((a, b) => a.ts - b.ts).at(-1)?.v;
   const wrong: string[] = [];
-  let outcome: TruncationRun["outcome"] = "answered";
+  let outcome: TruncationRun["outcome"] = "answered at its T";
+  const answeredAt = (q: { ts?: Ts }) => {
+    const t = q.ts ?? T;
+    if (t !== T) outcome = "answered at a later T";
+    return t;
+  };
   try {
     if (wide) {
-      const rows = new Map((await x.query("SELECT id, n FROM items ORDER BY id")).rows.map((r) => [Number(r.id), Number(r.n)]));
+      const q = await x.query("SELECT id, n FROM items ORDER BY id");
+      const t = answeredAt(q);
+      const rows = new Map(q.rows.map((r) => [Number(r.id), Number(r.n)]));
       for (const id of new Set([...asked, ...rows.keys()])) {
-        if (rows.get(id) !== at(id)) wrong.push(`read row ${id} = ${rows.get(id) ?? "no row"} at T ${T} in the whole-table read, the table had ${at(id) ?? "no row"}`);
+        if (rows.get(id) !== at(id, t)) wrong.push(`read row ${id} = ${rows.get(id) ?? "no row"} at T ${t} in the whole-table read, the table had ${at(id, t) ?? "no row"}`);
       }
     } else {
       for (const id of asked) {
-        const got = (await x.query("SELECT n FROM items WHERE id = ?", [BigInt(id)])).rows[0]?.n;
-        if (Number(got) !== at(id)) wrong.push(`read row ${id} = ${got} at T ${T}, the table had ${at(id)}`);
+        const q = await x.query("SELECT n FROM items WHERE id = ?", [BigInt(id)]);
+        const t = answeredAt(q);
+        const got = q.rows[0]?.n;
+        if (Number(got) !== at(id, t)) wrong.push(`read row ${id} = ${got} at T ${t}, the table had ${at(id, t)}`);
       }
     }
     await x.query("COMMIT");
@@ -163,7 +180,7 @@ export async function oldReadAfterTruncation(seed: number, faults?: Faults): Pro
   }
   c.net.gate = () => undefined;
   await c.settle();
-  return { outcome, wrong: wrong.slice(0, 5), reached, shape: shape.join(" | ") };
+  return { outcome, wrong: wrong.slice(0, 5), reached: shapeReached && (outcome as string) !== "answered at a later T", shape: shape.join(" | ") };
 }
 
 describe("an old read across a move, after the new owner applied a carried intent below its start and truncated its log (generator 3)", () => {
