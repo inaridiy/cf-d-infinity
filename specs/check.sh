@@ -963,6 +963,71 @@ witness $f m5c_green witnessForwardBack                  # 戻る移動の途中
 witness $f m5c_green witnessAppliedAtS2                  # 転送された phase 2 を、まだ渡していない S2 が適用する
 for m in m5c_green m5c_red_clear_at_start m5c_red_follow_stale m5c_red_rehand; do tests $f $m; done
 
+echo "== M5d move messages that outlive their move (移動の要求と応答が、その移動より後に届く。問題 54、55、58 の類。実装より先に書いたモデル)"
+f=m5d_move_messages.qnt
+# 緑: 規則の全部 (docs/design-move-messages.md)
+green   $f m5d_green_return m5dSafe                      # 範囲が前の持ち主へ戻る (0 → 1 → 0)
+green   $f m5d_green_chain m5dSafe                       # 戻らない列 (0 → 1 → 2)
+green   $f m5d_green_return3 m5dSafe                     # 戻って、もう一度出る (0 → 1 → 0 → 1)。取引なし
+green   $f m5d_green_groups m5dSafe                      # グループ 2 つ (行のあるものと、ないもの)。持ち主の書き込みと再起動なし
+live    $f m5d_green_return m5dLive                      # 活性: どの移動も閉じ、始めた取引の phase 2 は届け終わる
+live    $f m5d_green_chain m5dLive
+if [ "${HEAVY:-0}" = "1" ]; then                         # 大きい形 (合わせて 10 分ほど)
+  live  $f m5d_green_return3 m5dLive
+  green $f m5d_green_return3_txn m5dSafe                 # 0 → 1 → 0 → 1 に、取引を足す (再起動なし)
+  green $f m5d_green_chain_back m5dSafe                  # 0 → 1 → 2 → 0 (再起動なし)
+  green $f m5d_green_groups_full m5dSafe                 # グループ 2 つに、持ち主の書き込みと再起動を足す
+  green $f m5d_marks_return3 m5dSafe
+fi
+# 5808b08 のコード: 類の 1 から 7
+red     $f m5d_code_return deliveredApplied              # 類の 1 と 3: 渡し直した印が、後の取引の phase 2 を適用させない
+red     $f m5d_code_return ownerHasTruth                 # 類の 2: 渡し直しの ack が、持ち主の確定した行を消す
+red     $f m5d_code_return markMatchesRecord             # 類の 3: 失敗した書き込みの前に付けた印が残る
+red     $f m5d_code_chain deliveredApplied               # 類の 4 と 7: 遅れた応答の受け取りが、次の移動の印を消す
+red     $f m5d_code_chain ackWillLand                    # 類の 5: ack が数えられない
+live_red $f m5d_code_chain movesClose                    # 類の 5: 移動が閉じない
+red     $f m5d_code_return3 ownerHasTruth                # 類の 6: 消した行が戻る
+# 5808b08 に、条件を 1 つだけ入れた形
+red     $f m5d_code_parent_rule deliveredApplied         # 親の規則だけ: 類の 7 が残る
+red     $f m5d_code_parent_rule3 ownerHasTruth           # 親の規則だけ: 類の 6 が残る
+red     $f m5d_code_child_rule deliveredApplied          # 子の規則だけ: 類の 1 と 3 が残る
+red     $f m5d_code_child_rule ownerHasTruth             # 子の規則だけ: 類の 2 が残る (子は、捨てた応答にも ack を送る)
+green   $f m5d_code_child_rule_chain m5dData             # 子の規則だけ: 戻らない列では、行も印も壊れない (類の 4、5、7)
+red     $f m5d_code_derived_return rowsOnlyAtOwner       # 印の関数だけ: 類の 2 の行が、持ち主でない前の子に入る
+red     $f m5d_code_derived_return3 ownerHasTruth        # 印の関数だけ: 類の 6 が残る
+green   $f m5d_code_derived_chain m5dData                # 印の関数だけ: 戻らない列では、行も印も壊れない (類の 4、5、7)
+# 緑から、条件を 1 つ外す
+red     $f m5d_red_rehand handsUnderFence                # 親の規則を外す (スイッチ rehandFinished)
+red     $f m5d_red_rehand noFailedWrite                  # 同上: 類の 3 の、UNIQUE の失敗
+green   $f m5d_red_rehand m5dData                        # 同上: 子の規則と印の関数があるので、行も印も壊れない
+red     $f m5d_red_late_ack handsUnderFence              # ack の規則を外す (試作の形)
+green   $f m5d_red_late_ack m5dOutcome                   # 同上: 害はない
+red     $f m5d_red_child_stale ownerHasTruth             # 子の規則を外す (スイッチ childAcceptsStale): 類の 6 と、遅れた「渡し終えた」が、いまの受け取りを終える場面
+red     $f m5d_red_child_stale receivesUnderIncoming
+red     $f m5d_red_finished_refusal noMoveRefusal        # 「渡し終えた」を断りとして読む (スイッチ finishedAsRefusal。取り下げた 89d99c8)
+red     $f m5d_red_ask_once noMoveRefusal                # 捨てた答えの後で、尋ね直さない (規則にない条件)
+red     $f m5d_red_boot_differs marksDerived             # 印を手ごとに書き換える (スイッチ bootMarksDiffer)。親の規則も外す
+red     $f m5d_red_boot_differs deliveredApplied         # 同上: 類の 1
+green   $f m5d_red_boot_differs markMatchesRecord        # 同上: 書き込みの後で付ける印は、記録と合う
+red     $f m5d_red_mark_before_write markMatchesRecord   # 印を書き込みより前に付ける (スイッチ markBeforeWrite)。親の規則も外す: 類の 3
+# 親の規則と子の規則があれば、印を 5808b08 のとおりに書き換えても破れない
+green   $f m5d_marks_return m5dSafe
+green   $f m5d_marks_chain m5dSafe
+# 読み直しの試作: 親の規則 (pull だけ)、子の規則、「渡し終えた」は答え。ack と尋ね方は 5808b08 のまま
+green   $f m5d_prototype_return m5dOutcome
+red     $f m5d_prototype_return3 noMoveRefusal           # 範囲が戻ってもう一度出ると、1 回だけ尋ねる文が group not arrived で断られる
+green   $f m5d_prototype_return3 m5dData                 # 同上: 行と印は壊れない
+witness $f m5d_green_return witnessLateAfterNext         # 終わった移動の遅れた pull に、範囲が戻った後で、親が「渡し終えた」と答える
+witness $f m5d_green_chain witnessLateAfterNext          # 同上、次の移動が閉じた後
+witness $f m5d_green_return witnessFinishedInWindow      # 親が渡し終えた後、子が受け取り終える前の pull に「渡し終えた」と答える
+witness $f m5d_green_return3 witnessLateResponse         # 生きた fence の下の応答が、子が受け取り終えた後も飛んでいる
+witness $f m5d_green_return witnessUncarriedWritten      # 運ばれなかったグループを、子が到着の記録なしで受け持って書く
+witness $f m5d_green_chain witnessForwarded              # phase 2 が転送されて、いまの持ち主で適用される
+for m in m5d_green_return m5d_green_chain m5d_green_return3 m5d_code_return m5d_code_chain m5d_code_return3 \
+         m5d_code_parent_rule m5d_code_parent_rule_return m5d_code_parent_rule3 m5d_code_child_rule m5d_code_child_rule_chain \
+         m5d_code_child_rule3 m5d_code_derived_return m5d_code_derived_chain m5d_code_derived_return3 m5d_red_rehand \
+         m5d_red_child_stale m5d_red_finished_refusal m5d_red_ask_once m5d_red_boot_differs m5d_red_mark_before_write; do tests $f $m; done
+
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt
 green   $f m7_green restoreCorrect
