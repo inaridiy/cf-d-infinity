@@ -34,6 +34,7 @@ import {
   runScenario, schemaVersions, sideImages, stuckWork, tenantOn, touchAll, type Env, type Rec, type Report, type Scenario,
 } from "./ddl-harness";
 import { oldReadAfterDdl } from "./ddl-old-reads";
+import { rebuildAcrossSplit, type RebuildRun } from "./rebuild-across-split";
 
 // ---- 違反の分類 ----
 
@@ -1025,4 +1026,62 @@ describe("7. A read whose T was picked before a move, answered after the move an
       expect(r.wrong, r.shape).toEqual([]);
     });
   }
+});
+
+// ---- 7b. 移動の後の RENAME TO と作り直しと、古い読み (生成器 7。test/ddl-old-reads.ts の OldReadDdl) ----
+//
+// docs/design-refresh-across-move.md の「乱択の検査に足す生成器」の 7。前の持ち主が残した行 (と残した版) は、表定義の変更の前の形のまま
+// かもしれない (M23j)。RENAME TO の後の名前の読みは、T の時点の行を全部返し、作り直した表の読みは、前の表の行を 1 つも返さない。
+// 行を 1 つのシャードの範囲にだけ入れる実行 (確定を持たないシャードは、表定義の変更の床を置かない) も混ぜる。foundation-4 (517b674) の
+// コードは、移動の後の古い読みを、範囲の床か表定義の変更の床で断る (答えたなら、正しくなければならない)。答えた数と断った数は、最後に 1 行で出す。
+describe("7b. A read whose T was picked before a move, answered after the move and a RENAME TO or a table re-created (generator 7)", () => {
+  const outcomes = new Map<string, number>();
+  afterAll(() => {
+    if (outcomes.size > 0) console.info(`generator 7, old reads after a move and RENAME TO or re-create: ${[...outcomes].map(([k, n]) => `${k} x${n}`).join(", ")}`);
+  });
+  for (const kind of ["rename", "recreate"] as const) {
+    for (const seed of seedsOr([1, 2, 3, 4, 5, 6, 7, 8])) {
+      it(`${kind}: answers the table at its T or refuses (seed ${seed})`, async () => {
+        const r = await oldReadAfterDdl(seed, { kind });
+        outcomes.set(`${kind} ${r.outcome}`, (outcomes.get(`${kind} ${r.outcome}`) ?? 0) + 1);
+        expect(r.wrong, r.shape).toEqual([]);
+      });
+    }
+  }
+});
+
+// ---- 8. 表の作り直しと、範囲の分割 (生成器 6。test/rebuild-across-split.ts) ----
+//
+// 作り直す取引の、写す文が古い表を読んだ後、DROP の前に、読んだ範囲を分割する。別の接続は、分割の前か後に古い表へ書くか、書かない。
+// DROP は、書き込みがあれば断られ (古い表に書き込みが残る)、なければ通らなければならない。foundation-4 (517b674) のコードは、書き込みの
+// ない DROP も、写した区切りの確定の検証と DROP の前の確かめを、読んだときのシャードへ送るので断る (未解決の問題 37、M23i の
+// m23i_red_no_rehome。test/open/rebuild-across-split.test.ts)。既定の実行は、その断りを数えて許し、最後の試験が、断りがまだ起きることを
+// 確かめる (起きなくなったら、直ったので、許すのをやめる)。OPEN=1 では許さない。
+describe("8. A table rebuilt in a transaction while the range its copy read splits (generator 6)", () => {
+  const OPEN = Boolean(process.env.OPEN);
+  const defaults = Array.from({ length: 16 }, (_v, i) => i + 1);
+  const runs = new Map<number, Promise<RebuildRun>>();
+  const once = (seed: number) => {
+    if (!runs.has(seed)) runs.set(seed, rebuildAcrossSplit(seed, { strict: OPEN }));
+    return runs.get(seed)!;
+  };
+  for (const seed of seedsOr(defaults)) {
+    it(`refuses the DROP after another connection wrote the old table, and keeps the write (seed ${seed})`, async () => {
+      const r = await once(seed);
+      expect(r.wrong, r.shape).toEqual([]);
+    });
+  }
+  it("moves the range the copy read before the DROP, with and without writes, and still meets the known refusal", async () => {
+    const all = await Promise.all(defaults.map(once));
+    const count = (f: (r: RebuildRun) => boolean) => all.filter(f).length;
+    const wrote = (r: RebuildRun) => r.writes.before + r.writes.after > 0;
+    console.info(
+      `generator 6: ${count((r) => r.moved)} of ${all.length} runs moved the copied range; with writes ${count((r) => r.moved && wrote(r))} ` +
+        `(refused ${count((r) => r.moved && wrote(r) && r.drop !== "ok")}), without writes ${count((r) => r.moved && !wrote(r))} ` +
+        `(passed ${count((r) => r.moved && !wrote(r) && r.drop === "ok")}, refused ${count((r) => r.refusedWithoutWrites)}); ` +
+        `DROP: ${JSON.stringify(Object.fromEntries([...new Set(all.map((r) => r.drop.replace(/\d+/g, "#").slice(0, 50)))].map((k) => [k, all.filter((r) => r.drop.replace(/\d+/g, "#").slice(0, 50) === k).length])))}`,
+    );
+    expect({ moved: count((r) => r.moved && wrote(r)) > 0, quiet: count((r) => r.moved && !wrote(r)) > 0 }).toEqual({ moved: true, quiet: true });
+    if (!OPEN) expect(count((r) => r.refusedWithoutWrites), "the known refusal (test/open/rebuild-across-split.test.ts) no longer happens; stop tolerating it").toBeGreaterThan(0);
+  });
 });

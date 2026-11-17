@@ -59,13 +59,29 @@ function subRange(rnd: () => number, x: Interval, strict: boolean): Interval {
 }
 const within = (x: Interval) => (id: number) => token(id) >= x.start && token(id) < x.end;
 
-export async function oldReadAfterDdl(seed: number, o: { faults?: Faults; noImageCheck?: boolean } = {}): Promise<OldReadRun> {
+/**
+ * 表定義の変更の種類 (生成器 7。docs/design-refresh-across-move.md の「乱択の検査に足す生成器」)。
+ *   add column: ALTER TABLE t ADD COLUMN (前からある形)。
+ *   rename:     ALTER TABLE t RENAME TO u。読み手は、後の名前 u を、移動の前の T で読む。答えは、T の時点の t の行の全部である。
+ *   recreate:   DROP TABLE t の後に、同じ名前で、列の違う CREATE TABLE t。読み手は、作り直した t を、移動の前の T で読む。作り直した表は T に
+ *               まだなかったので、前の表の行を 1 つも返してはならない (作り直した後に入れた行も、T より後の確定である)。
+ * rename と recreate では、読み手は、まず別の表 o を全表で読む (T を決めてから要求を送る文。止めるのは、この文の要求である)。止めた要求は、
+ * 古い表定義で断られ、取引はまだ何も読んでいないので、新しい表定義へ移って、同じ T で o を読み直す。次の文が、DDL の後の計画で、
+ * 移動の前の T のまま、t の行を読む (M23j の「まだ何も読んでいない取引」の道)。o には行を入れない (行のないシャードに確定を作らない)。
+ */
+export type OldReadDdl = "add column" | "rename" | "recreate";
+
+export async function oldReadAfterDdl(seed: number, o: { faults?: Faults; noImageCheck?: boolean; kind?: OldReadDdl } = {}): Promise<OldReadRun> {
+  const kind = o.kind ?? "add column";
   const rnd = prng(seed);
   const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rnd() * xs.length)]!;
   const shards = 2 + Math.floor(rnd() * 2);
   const c = new SimCluster({ shards, seed, faults: o.faults, noImageCheck: o.noImageCheck });
   const db = new Db(c);
   await db.ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
+  if (kind !== "add column") await db.ddl("CREATE TABLE o(id INTEGER PRIMARY KEY)");
+  /** 書き手が書く表の、いまの名前。 */
+  let table = "t";
   const routing0 = (await c.catalog()).routing;
   const home = pick(c.shardIds);
   const [region] = regionsOf(routing0, home);
@@ -104,7 +120,7 @@ export async function oldReadAfterDdl(seed: number, o: { faults?: Faults; noImag
   };
   const write = async () => {
     const id = pick(ids);
-    await db.query("UPDATE t SET v = v + 1000 WHERE id = ?", [id]).catch(() => undefined);
+    await db.query(`UPDATE ${table} SET v = v + 1000 WHERE id = ?`, [id]).catch(() => undefined);
     shape.push(`write ${id}`);
   };
   // 読み手が T を決める前に、何回移動するか。T を決めた後に、少なくとも 1 回は動かす。
@@ -131,7 +147,11 @@ export async function oldReadAfterDdl(seed: number, o: { faults?: Faults; noImag
     }
     return undefined;
   };
-  const read = conn.query("SELECT * FROM t ORDER BY id");
+  // rename と recreate では、o の読みの要求を止め、DDL の後に、後の表を同じ T で読む。
+  const later = kind === "rename" ? "u" : "t";
+  const read = kind === "add column"
+    ? conn.query("SELECT * FROM t ORDER BY id")
+    : conn.query("SELECT id FROM o ORDER BY id").then(() => conn.query(`SELECT * FROM ${later} ORDER BY id`));
   for (let i = 0; i < 400 && caught === 0; i++) await c.sleep(1);
   await c.sleep(2);
   holding = false;
@@ -140,11 +160,26 @@ export async function oldReadAfterDdl(seed: number, o: { faults?: Faults; noImag
     if (rnd() < 0.3) await write();
     await move();
   }
-  const dflt = pick(["NULL", "7", "'d'", "-1"]);
-  const ddl = rnd() < 0.85;
-  if (ddl) {
-    await db.ddl(`ALTER TABLE t ADD COLUMN x INTEGER DEFAULT ${dflt}`);
-    shape.push(`ADD COLUMN x DEFAULT ${dflt}`);
+  let dflt = "NULL";
+  let ddl = false;
+  if (kind === "add column") {
+    dflt = pick(["NULL", "7", "'d'", "-1"]);
+    ddl = rnd() < 0.85;
+    if (ddl) {
+      await db.ddl(`ALTER TABLE t ADD COLUMN x INTEGER DEFAULT ${dflt}`);
+      shape.push(`ADD COLUMN x DEFAULT ${dflt}`);
+    }
+  } else if (kind === "rename") {
+    await db.ddl("ALTER TABLE t RENAME TO u");
+    table = "u";
+    shape.push("RENAME TO u");
+  } else {
+    await db.ddl("DROP TABLE t");
+    await db.ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL, w TEXT)");
+    // 作り直した表へ、前の表と同じ主キーの行を、ときどき入れる (T より後の確定)。
+    const again = ids.filter(() => rnd() < 0.3);
+    if (again.length > 0) await db.query(`INSERT INTO t VALUES ${again.map((i) => `(${i}, ${-i}, 'new')`).join(", ")}`);
+    shape.push(`DROP TABLE t, CREATE TABLE t, ${again.length} new rows`);
   }
   if (rnd() < 0.3) await write();
   // 表定義の変更を適用していないシャード (範囲表から外れて、参加者でなくなった前の持ち主) と、そこに残る渡した行の数 (__handed のある版だけ)。
@@ -168,7 +203,15 @@ export async function oldReadAfterDdl(seed: number, o: { faults?: Faults; noImag
 
   // T の時点の表。各行の、T 以下で最後に確定した値を、全部のシャードの変更ログから引く。
   const T = r.ts!;
-  const def = (await c.catalog()).tables.t!;
+  const outcome = T === T0 ? "answered at its T" : "answered at a later T";
+  if (kind === "recreate") {
+    // 作り直した表は、T にはまだなかった (T は DROP より前)。T を進めて読んだなら、作り直した後の T の行は、作り直した表に入れた行だけである。
+    const old = r.rows.filter((row) => row.w !== "new");
+    const wrong = old.length > 0 ? [`the recreated table read ${old.length} rows of the dropped table at T ${T}: ${JSON.stringify(old.slice(0, 3))}`] : [];
+    if (T === T0 && r.rows.length > 0) wrong.push(`the recreated table read ${r.rows.length} rows at T ${T}, before it was created`);
+    return { outcome, wrong, shape: `${shape.join(" | ")} | answered at T ${T}` };
+  }
+  const def = (await c.catalog()).tables[later]!;
   const vAt = imageColumns(def).indexOf("v");
   const versions = new Map<string, { ts: number; v: number | null }>();
   for (const b of c.backends.values()) {
@@ -176,7 +219,7 @@ export async function oldReadAfterDdl(seed: number, o: { faults?: Faults; noImag
       const ts = row.commit_ts as number;
       if (ts > T) continue;
       for (const ch of decode<Change[]>(row.blob as string)) {
-        if (ch.table !== "t") continue;
+        if (ch.table !== "t" && ch.table !== later) continue;
         const prior = versions.get(ch.pk);
         if (prior && prior.ts > ts) continue;
         const v = ch.after ? decodeElem(ch.after[vAt] ?? null) : null;
@@ -195,5 +238,5 @@ export async function oldReadAfterDdl(seed: number, o: { faults?: Faults; noImag
     const w = want.get(row.id as number);
     if (w !== text(row)) wrong.push(`row ${text(row)} at T ${T}, expected ${w ?? "no row"}`);
   }
-  return { outcome: T === T0 ? "answered at its T" : "answered at a later T", wrong: wrong.slice(0, 5), shape: `${shape.join(" | ")} | answered at T ${T}` };
+  return { outcome, wrong: wrong.slice(0, 5), shape: `${shape.join(" | ")} | answered at T ${T}` };
 }
