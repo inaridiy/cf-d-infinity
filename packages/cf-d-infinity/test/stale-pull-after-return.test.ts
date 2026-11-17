@@ -14,6 +14,8 @@
 // 不変条件の候補: 親は、終わっていない fence の下でだけグループを渡す。終わった移動の pull は、渡し直さずに断る (要求した側は、もう
 // 受け取ったか、持ち主でない)。渡した印 (メモリ) と記録 (__moved) は、同じ書き込みの後で一緒に変わる。持ち主は、送り出した側の記録
 // (src/shard/kernel.ts の pullPieces、fenceOf、moveStarted)。問題 54 と同じ持ち主である。
+// 直ったのは、グループが前の親へ戻る前に届く pull だけである。グループが戻った後 (前の親はまだ受け取り中) に届く pull は、同じ内部の誤りで
+// 答える (2026-11-17、生成器 5 が見つけた。test/open/late-pull-while-range-returns.test.ts)。
 import { describe, expect, it } from "vitest";
 import { Db } from "../src/client/db";
 import { keyString } from "../src/keys";
