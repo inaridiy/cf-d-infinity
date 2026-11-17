@@ -33,6 +33,7 @@ import {
   ACCT, SIDE, SIDE_GEN, SIDE_REORDERED, checkIndexReads, duplicates, extraViolations, hold, holdFinalize, indexAgreement, misplacedRows, rawRows,
   runScenario, schemaVersions, sideImages, stuckWork, tenantOn, touchAll, type Env, type Rec, type Report, type Scenario,
 } from "./ddl-harness";
+import { oldReadAfterDdl } from "./ddl-old-reads";
 
 // ---- 違反の分類 ----
 
@@ -1005,4 +1006,23 @@ describe("the checks are not vacuous", () => {
       extra: [`r0 at 5: WHERE v = 5 returned ["9/9"], expected []`],
     });
   });
+});
+
+// ---- 7. 移動の前に T を決めた読みが、移動と ADD COLUMN の後に届く (test/ddl-old-reads.ts) ----
+//
+// 前の持ち主が、渡した行を古い読みのために持ち続けると、M21 の排他が終わった後 (move-end の後) の ADD COLUMN が、その行に当たる。
+// 古い読みの答えを、T の時点の表と比べる。いまのコードは、移動の後の古い読みを、範囲の床か表定義の変更の床で断る (答えたなら、正しくなければ
+// ならない)。答えた数と断った数は、最後に 1 行で出す。
+describe("7. A read whose T was picked before a move, answered after the move and an ADD COLUMN", () => {
+  const outcomes = new Map<string, number>();
+  afterAll(() => {
+    if (outcomes.size > 0) console.info(`old reads after a move and ADD COLUMN: ${[...outcomes].map(([k, n]) => `${k} x${n}`).join(", ")}`);
+  });
+  for (const seed of seedsOr([1, 2, 3, 4, 5, 6, 7, 8])) {
+    it(`answers the snapshot at its T or refuses (seed ${seed})`, async () => {
+      const r = await oldReadAfterDdl(seed);
+      outcomes.set(r.outcome, (outcomes.get(r.outcome) ?? 0) + 1);
+      expect(r.wrong, r.shape).toEqual([]);
+    });
+  }
 });
