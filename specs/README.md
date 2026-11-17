@@ -646,7 +646,7 @@ anchor は、S0 への要求が答えたら届け終えた印を付け、後で�
 |---|---|---|
 | 「渡した」印は、グループが届いたときに外す。戻る移動の start では外さない (`CLEAR_AT_START` = false) | `m5c_red_clear_at_start` | 移動 1 の後、移動 2 が始まり、S0 が印を外す。phase 2 が S0 に届き、S0 は intent も印も持たないので、何もせずに答える。anchor が記録を消した後、戻ってきた intent を presumed abort で捨てる |
 | 転送は、いまの印の移動の記録だけをたどる (`FOLLOW_STALE` = false) | `m5c_red_follow_stale` | 範囲が戻った後に phase 2 が届く。S0 は適用し、移動 1 の記録で S2 へも転送する。S2 は移動 2 の記録で S0 へ、S0 はまた移動 1 の記録で S2 へ転送する |
-| 親は、終わっていない fence の下でだけ渡す。終わった移動の pull は断る (`REHAND_FINISHED` = false) | `m5c_red_rehand` | 範囲が S0 へ戻った後に、移動 1 の遅れた pull が S0 に届き、S0 が移動 1 の印を付け直す。S0 に届いた phase 2 は、自分の intent に適用されずに S2 へ転送され、S2 は移動 2 の記録で S0 へ転送し返す |
+| 親は、終わっていない fence の下でだけ渡す。終わった移動の pull は断る (`REHAND_FINISHED` = false。M5d で「状態を変えずに渡し終えたと答える」に替わった。断ると、行のないグループを待っていた文が失敗する) | `m5c_red_rehand` | 範囲が S0 へ戻った後に、移動 1 の遅れた pull が S0 に届き、S0 が移動 1 の印を付け直す。S0 に届いた phase 2 は、自分の intent に適用されずに S2 へ転送され、S2 は移動 2 の記録で S0 へ転送し返す |
 
 問題 55 (`REHAND_FINISHED`) は、同じ日の 2 回目に足した。
 範囲が前の親へ戻った後に、前の移動の遅れた pull が届くと、段 4 のコードの親は、グループを終わった移動の fence でもう一度渡そうとし、「渡した」印を付け直した (印は `__moved` への書き込みより前にメモリへ付けていたので、書き込みの失敗の後も残った。`test/stale-pull-after-return.test.ts`)。

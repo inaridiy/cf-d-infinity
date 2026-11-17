@@ -515,7 +515,7 @@ M23、M23b、M23c が確かめた規則は破れていない。
 | 尋ねられたシャードも、受け取りの記録を時刻で選んで、尋ね続ける。受け取りの記録は、受け取りを終えた後も残す | `m23b_green_w`、`m23b_green_back_y`、`m23b_live` | `m23b_red_stop_first`、`m23b_red_forget`、`m23b_red_mid_from_arrival`、`m23b_live_red_cycle` | `historyStopsAtFirst` (枝)、`historyForgetsSource` (枝)、`historyFromArrival` (枝)、`historyNewestRecord` (枝) | `historyForgetsSource` だけ (history 3/240)。ほかは 0。生成器 4 が要る |
 | refresh の確かめは、時計を to まで進め、決まっていない intent を to より上へ push し、決まった intent の適用を待ち、(from, to] の変更だけを数える | `m23_green_rec`、`m1b_green_u`、`m23b_green_pess` | `m23_red_no_bump`、`m23b_red_skip_push`、`m1b_red_no_wait` | `refreshNoBump`、`refreshSkipsIntent` (枝)、`refreshNoWait` (枝) | history (140/240、49/240、39/240) |
 | 取引が読んだ表を DROP する前の確かめも、同じ規則で通す。Worker は、読んだ範囲を、DROP の範囲表の持ち主へ分け直して送る | `m23i_green` | `m23i_red_no_rehome` (断る)、`m23i_red_no_ask`、`m23i_red_from_arrival` | `guardToReader` (新。いまのコード)、`childAlone` (枝)、`childFromArrival` (枝) | なし。生成器 6 が要る |
-| 終わった移動の遅れた pull を断り、「渡した」印は、グループが届き直すまで外さない | `m5c_green`、`m5c_green3` | `m5c_red_clear_at_start`、`m5c_red_follow_stale`、`m5c_red_rehand` | `unmarkOnReturn`、`rehandFinished` (枝) | 0。move-returns が場面を作るが、落ちなかった。生成器 4 で流し直す |
+| 終わった移動の遅れた pull には、状態を変えずに「渡し終えた」と答え (断らない)、「渡した」印は、グループが届き直すまで外さない。移動のメッセージ全体の規則は [design-move-messages.md](./design-move-messages.md) にある (2026-11-17、M5d) | `m5c_green`、`m5c_green3`、`m5d_green_return`、`m5d_green_chain` | `m5c_red_clear_at_start`、`m5c_red_follow_stale`、`m5d_red_rehand`、`m5d_red_finished_refusal` | `unmarkOnReturn`、`rehandFinished` (新) | 生成器 10 (`test/history.ts` の `LateMoves`。move-returns と move-chains) |
 
 #### 不変条件 E: 残した行イメージと表定義の変更
 
