@@ -336,7 +336,9 @@ async function body(o: RunOpts, c: SimCluster, rnd: () => number): Promise<RunRe
   if (!o.faults) await expectQuiescent(c);
   // 失敗した seed を調べるための書き出し。SIM_DUMP=<ファイル> で、取引の記録と RPC の記録を JSON で残す。
   if (process.env.SIM_DUMP) {
-    const plain = (_k: string, x: unknown) => (x instanceof Uint8Array ? [...x] : x);
+    // 要求の中身には、INTEGER の値 (bigint) と、Map が入る。JSON.stringify はどちらも書けない (bigint は投げ、Map は {} になる)。
+    // test/ddl-harness.ts の書き出しと同じく、bigint は `123n` の文字列に、Map は組の配列にする。
+    const plain = (_k: string, x: unknown) => (x instanceof Map ? [...x] : x instanceof Uint8Array ? [...x] : typeof x === "bigint" ? `${x}n` : x);
     writeFileSync(process.env.SIM_DUMP, JSON.stringify({ seed: o.seed, history, rpc: c.net.log }, plain));
   }
   const counts = moves?.counts ?? { moves: 0, returns: 0, byChild: 0, restarts: 0, deferred: 0 };
