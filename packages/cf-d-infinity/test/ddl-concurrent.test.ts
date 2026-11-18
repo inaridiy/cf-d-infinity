@@ -33,7 +33,9 @@ import {
   ACCT, SIDE, SIDE_GEN, SIDE_REORDERED, checkIndexReads, duplicates, extraViolations, hold, holdFinalize, indexAgreement, misplacedRows, rawRows,
   runScenario, schemaVersions, sideImages, stuckWork, tenantOn, touchAll, type Env, type Rec, type Report, type Scenario,
 } from "./ddl-harness";
-import { oldReadAfterDdl } from "./ddl-old-reads";
+import { classOf, lockHoldersSeed, type LockRun, type SeedReport } from "./ddl-lock-holders";
+import { oldReadAfterDdl, type OldReadDdl, type OldReadRun } from "./ddl-old-reads";
+import { rebuildAcrossSplit, type RebuildRun } from "./rebuild-across-split";
 
 // ---- 違反の分類 ----
 
@@ -599,24 +601,51 @@ describe("known bugs, as deterministic interleavings", () => {
    *   syncSchema が版を進めても、起きた後は版を確かめ直さずに書く。Worker は index のない計画 (db.ts:938-940 の高速経路)
    *   で送ったので、index の項目は誰も書かない。
    */
-  /** BUG-3 の台本。古い catalog の autocommit の UPDATE が、行ロックを待っている間に index が作られる。 */
+  /**
+   * BUG-3 の台本。古い catalog の autocommit の UPDATE が、シャードの中で待っている間に index が作られる。
+   * 2026-11-17 から、表 t の行ロックを持つ取引がいる間は、t の DDL のほうが待つ (docs/design-catalog-epoch.md の「触った表の DDL と
+   * SQLite」)。だから、UPDATE が t の行ロックを待つ間に、t の index が出来上がることはない。待ちの間に index が出来上がるのは、UPDATE が、
+   * 読む別の表 u の intent の決着を待つときである (t の記録の適用は、u の intent を待たない)。u の s0 の行に、確定済みで未適用の intent を
+   * 残し、s0 からの決着の問い合わせを止めておく。
+   */
   const lockWaitAcrossIndex = async (faults?: Faults) => {
-    const { c, db, A } = await two(faults);
+    const { c, db, A, B } = await two(faults);
+    await db.ddl("CREATE TABLE u(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, n INTEGER, PRIMARY KEY (tenant_id, id))");
     await db.query("INSERT INTO t VALUES (?, 1, 7, 0)", [A]);
-    const holder = new Db(c);
-    await holder.query("BEGIN");
-    await holder.query("UPDATE t SET n = 1 WHERE tenant_id = ? AND id = 1", [A]);
+    await db.query("INSERT INTO u VALUES (?, 1, 0)", [A]);
+    await db.query("INSERT INTO u VALUES (?, 1, 0), (?, 2, 0)", [B, B]);
+    // s0 への finalize と、s0 から出る最初の queryTxn を止める。
+    let releaseFinalize!: () => void;
+    const finalizeHeld = new Promise<void>((r) => (releaseFinalize = r));
+    let releaseAsk!: () => void;
+    const askHeld = new Promise<void>((r) => (releaseAsk = r));
+    let asked!: () => void;
+    const askReached = new Promise<void>((r) => (asked = r));
+    let asks = 0;
+    c.net.gate = (m) => {
+      if (m.method === "finalize" && m.to === "s0") return finalizeHeld;
+      if (m.method === "queryTxn" && m.from === "s0" && asks++ === 0) {
+        asked();
+        return askHeld;
+      }
+      return undefined;
+    };
+    // 2 つのシャードの u に書く取引。s1 で 1 行余分に読むので、anchor は s1 になる。確定の後、s0 には u の intent が残る。
+    await db.transaction(async (tx) => {
+      await tx.query("SELECT n FROM u WHERE tenant_id = ? AND id = 2", [B]);
+      await tx.query("UPDATE u SET n = 1 WHERE tenant_id = ? AND id = 1", [A]);
+      await tx.query("UPDATE u SET n = 1 WHERE tenant_id = ? AND id = 1", [B]);
+    });
     const stale = new Db(c);
     await stale.query("SELECT 1 FROM t WHERE tenant_id = ?", [A]); // index のない catalog を持たせる
-    const waited = hold(c, "gate", (m) => m.method === "syncSchema"); // UPDATE がロック待ちに入ってから DDL を進める
-    const update = outcome(stale.query("UPDATE t SET v = 99 WHERE tenant_id = ? AND id = 1", [A]));
-    const ddl = outcome(db.ddl("CREATE UNIQUE INDEX ix ON t(v)"));
-    await waited.reached;
-    await c.sleep(20);
-    waited.release();
-    expect(await ddl).toBe("ok");
-    await holder.query("ROLLBACK");
+    // t の行を書き、u を読む。シャードは版を確かめ (この時点では一致)、u の intent の決着を待つ。
+    const update = outcome(stale.query("UPDATE t SET v = 99 WHERE tenant_id = ? AND id = 1 AND EXISTS (SELECT 1 FROM u WHERE tenant_id = ?)", [A, A]));
+    await askReached;
+    expect(await outcome(db.ddl("CREATE UNIQUE INDEX ix ON t(v)"))).toBe("ok");
+    releaseAsk();
+    releaseFinalize();
     expect(await update).toBe("ok");
+    c.net.gate = () => undefined;
     await c.settle();
     const ix = await indexAgreement(c, "t", "ix");
     return { table: await tableRows(c), read: await byIndex(c, 99), missing: ix.missing, dangling: ix.dangling, A };
@@ -985,7 +1014,8 @@ describe("the checks are not vacuous", () => {
     const { c } = await two();
     await c.applyDdl("CREATE TABLE lagging(id INTEGER PRIMARY KEY)");
     const lagging = await schemaVersions(c);
-    expect(Object.values(lagging.shards).every((v) => v === lagging.meta - 1)).toBe(true);
+    // シャードは prepare までを適用している。表定義の epoch は commit でだけ進むので、シャードの epoch は、まだ前の commit のものである。
+    expect(Object.values(lagging.shards).every((v) => v < lagging.meta)).toBe(true);
     await touchAll(c);
     const done = await schemaVersions(c);
     expect(Object.values(done.shards).every((v) => v === done.meta)).toBe(true);
@@ -1008,21 +1038,148 @@ describe("the checks are not vacuous", () => {
   });
 });
 
-// ---- 7. 移動の前に T を決めた読みが、移動と ADD COLUMN の後に届く (test/ddl-old-reads.ts) ----
+// ---- 7 と 7b. 移動の前に T を決めた読みが、移動と表定義の変更の後に届く (生成器 7。test/ddl-old-reads.ts) ----
 //
-// 前の持ち主が、渡した行を古い読みのために持ち続けると、M21 の排他が終わった後 (move-end の後) の ADD COLUMN が、その行に当たる。
-// 古い読みの答えを、T の時点の表と比べる。いまのコードは、移動の後の古い読みを、範囲の床か表定義の変更の床で断る (答えたなら、正しくなければ
-// ならない)。答えた数と断った数は、最後に 1 行で出す。
-describe("7. A read whose T was picked before a move, answered after the move and an ADD COLUMN", () => {
-  const outcomes = new Map<string, number>();
-  afterAll(() => {
-    if (outcomes.size > 0) console.info(`old reads after a move and ADD COLUMN: ${[...outcomes].map(([k, n]) => `${k} x${n}`).join(", ")}`);
+// 7: 前の持ち主が、渡した行を古い読みのために持ち続けると、M21 の排他が終わった後 (move-end の後) の ADD COLUMN が、その行に当たる。
+// 7b: docs/design-refresh-across-move.md の「乱択の検査に足す生成器」の 7。前の持ち主が残した行 (と残した版) は、表定義の変更の前の形の
+// ままかもしれない (M23j)。RENAME TO の後の名前の読みは、T の時点の行を全部返し、作り直した表の読みは、前の表の行を 1 つも返さない。
+// 行を 1 つのシャードの範囲にだけ入れる実行 (確定を持たないシャードは、表定義の変更の床を置かない) も混ぜる。
+// 古い読みの答えを、T の時点の表と比べる。読みは、答えたなら正しくなければならず、断るなら、範囲の床か表定義の変更の床の誤りである。
+//
+// 表ごとの epoch (5808b08) からは、t の DDL は、o だけを読んだ取引を古くしない。読み手の最初の文が DDL の前のスナップショットで答えれば、
+// 取引はそのスナップショットのまま続き、RENAME TO の後の名前 u を知らない (`no such table: u`。docs/sql-language.md の「取引の中の DDL」)。
+// 取引のスナップショットに u がなく、o の DDL のない実行でだけ、その誤りを受け入れる (kept its snapshot)。
+// 5808b08 の生成器は、T を決めた後にいつも移動し、範囲の床が T を断ったので、seed 1 から 600 のどの実行も、決めた T のまま答えず、
+// DDL の後の計画の読みを DDL の前の T で決める表の床 (M23j の m23j_exact_*) に届かなかった。いまの生成器は、T の後に移動しない実行、
+// 読み手の最初の文を o の DDL で DDL の後の表定義へ移す実行、その後に o を書いて T を進めさせない実行 (pinned) を混ぜる
+// (test/ddl-old-reads.ts の「読み手の形」)。pinned の読みは、表の床だけで決まるので、答えか断りかを厳密に比べる。
+// 最後の試験が、既定の seed で、決めた T のまま答えた実行、表の床が断った実行、T の後に移動した実行が、どの種類にもあることを確かめる。
+const oldReadKinds = ["add column", "rename", "recreate"] as const;
+const oldReadSeeds = Array.from({ length: 32 }, (_v, i) => i + 1);
+const oldReadRuns = new Map<string, Promise<OldReadRun>>();
+const oldRead = (kind: OldReadDdl, seed: number) => {
+  const k = `${kind}/${seed}`;
+  if (!oldReadRuns.has(k)) oldReadRuns.set(k, oldReadAfterDdl(seed, { kind }));
+  return oldReadRuns.get(k)!;
+};
+for (const kind of oldReadKinds) {
+  const title = kind === "add column"
+    ? "7. A read whose T was picked before a move, answered after the move and an ADD COLUMN"
+    : `7b. A read whose T was picked before a move, answered after the move and ${kind === "rename" ? "a RENAME TO" : "a table re-created"} (generator 7)`;
+  describe(title, () => {
+    for (const seed of seedsOr(oldReadSeeds)) {
+      it(`answers the table at its T or refuses (seed ${seed})`, async () => {
+        const r = await oldRead(kind, seed);
+        expect(r.wrong, r.shape).toEqual([]);
+      });
+    }
+    it("answers at the T picked before the DDL, has the table's floor refuse it, and still moves ranges after T", async () => {
+      const all = await Promise.all(oldReadSeeds.map((seed) => oldRead(kind, seed)));
+      const count = (f: (r: OldReadRun) => boolean) => all.filter(f).length;
+      const outcomes: Record<string, number> = {};
+      for (const r of all) outcomes[r.outcome] = (outcomes[r.outcome] ?? 0) + 1;
+      console.info(
+        `generator 7, ${kind}: ${JSON.stringify(outcomes)}; planned after the DDL and sent at the old T ${count((r) => r.plannedAfterDdl)}, ` +
+          `moved after T ${count((r) => !r.counts.quiet)}, rebased at T ${count((r) => r.counts.rebased)}, pinned ${count((r) => r.counts.pinned)}, ` +
+          `refused by the table's floor ${count((r) => r.counts.floorRefused)}`,
+      );
+      expect({
+        ownT: count((r) => r.outcome === "answered at its T") > 0,
+        floorRefused: count((r) => r.counts.floorRefused) > 0,
+        movedAfterT: count((r) => !r.counts.quiet) > 0,
+        kept: kind !== "rename" || count((r) => r.outcome.startsWith("kept its snapshot")) > 0,
+      }).toEqual({ ownT: true, floorRefused: true, movedAfterT: true, kept: true });
+    });
   });
-  for (const seed of seedsOr([1, 2, 3, 4, 5, 6, 7, 8])) {
-    it(`answers the snapshot at its T or refuses (seed ${seed})`, async () => {
-      const r = await oldReadAfterDdl(seed);
-      outcomes.set(r.outcome, (outcomes.get(r.outcome) ?? 0) + 1);
+}
+
+// ---- 8. 表の作り直しと、範囲の分割 (生成器 6。test/rebuild-across-split.ts) ----
+//
+// 作り直す取引の、写す文が古い表を読んだ後、DROP の前に、読んだ範囲を分割する。別の接続は、分割の前か後に古い表へ書くか、書かない。
+// DROP は、書き込みがあれば断られ (古い表に書き込みが残る)、なければ通らなければならない。foundation-4 (517b674) のコードは、書き込みの
+// ない DROP も、写した区切りの確定の検証と DROP の前の確かめを、読んだときのシャードへ送るので断る (未解決の問題 37、M23i の
+// m23i_red_no_rehome。test/open/rebuild-across-split.test.ts)。既定の実行は、その断りを数えて許し、最後の試験が、断りがまだ起きることを
+// 確かめる (起きなくなったら、直ったので、許すのをやめる)。OPEN=1 では許さない。
+describe("8. A table rebuilt in a transaction while the range its copy read splits (generator 6)", () => {
+  const OPEN = Boolean(process.env.OPEN);
+  const defaults = Array.from({ length: 16 }, (_v, i) => i + 1);
+  const runs = new Map<number, Promise<RebuildRun>>();
+  const once = (seed: number) => {
+    if (!runs.has(seed)) runs.set(seed, rebuildAcrossSplit(seed, { strict: OPEN }));
+    return runs.get(seed)!;
+  };
+  for (const seed of seedsOr(defaults)) {
+    it(`refuses the DROP after another connection wrote the old table, and keeps the write (seed ${seed})`, async () => {
+      const r = await once(seed);
       expect(r.wrong, r.shape).toEqual([]);
     });
   }
+  it("moves the range the copy read before the DROP, with and without writes, and still meets the known refusal", async () => {
+    const all = await Promise.all(defaults.map(once));
+    const count = (f: (r: RebuildRun) => boolean) => all.filter(f).length;
+    const wrote = (r: RebuildRun) => r.writes.before + r.writes.after > 0;
+    console.info(
+      `generator 6: ${count((r) => r.moved)} of ${all.length} runs moved the copied range; with writes ${count((r) => r.moved && wrote(r))} ` +
+        `(refused ${count((r) => r.moved && wrote(r) && r.drop !== "ok")}), without writes ${count((r) => r.moved && !wrote(r))} ` +
+        `(passed ${count((r) => r.moved && !wrote(r) && r.drop === "ok")}, refused ${count((r) => r.refusedWithoutWrites)}); ` +
+        `DROP: ${JSON.stringify(Object.fromEntries([...new Set(all.map((r) => r.drop.replace(/\d+/g, "#").slice(0, 50)))].map((k) => [k, all.filter((r) => r.drop.replace(/\d+/g, "#").slice(0, 50) === k).length])))}`,
+    );
+    expect({ moved: count((r) => r.moved && wrote(r)) > 0, quiet: count((r) => r.moved && !wrote(r)) > 0 }).toEqual({ moved: true, quiet: true });
+    if (!OPEN) expect(count((r) => r.refusedWithoutWrites), "the known refusal (test/open/rebuild-across-split.test.ts) no longer happens; stop tolerating it").toBeGreaterThan(0);
+  });
+});
+
+// ---- 9. 主キーで読んでから書く取引と、同じ表の index の DDL と ADD COLUMN (生成器 9。test/ddl-lock-holders.ts) ----
+//
+// BEGIN IMMEDIATE と素の BEGIN の取引が、主キーで読んでから書く。DDL を始める前にロックを取った取引 (holder)、全シャードが prepare を
+// 適用した後に始めた取引 (late)、DDL の前に読んで後で書く取引 (reader。半分は 5 秒の期限の後まで取引を開けておく) を混ぜ、一意でない
+// CREATE INDEX、DROP INDEX、CREATE UNIQUE INDEX (build と trial)、ADD COLUMN を同じ表へ出す。同じ台本を、1 シャードと 2 シャード、通常の
+// 経路と基準経路で流し、SQLite の答え (M24 の asSqlite と holderSurvives、M24c の lockSafe) と比べ、4 つの実行の間でも比べる。不変条件 16
+// (DDL が待つ表の集合と、ロックを与える 1 つの判断) は、シャードの状態でも直に確かめる。答えの決め方は test/ddl-lock-holders.ts の初めに
+// 書いた。2026-11-17 までは、既知の欠陥 3 つ (D1、D2、D3) の印のある違反を伏せていた。直ったので、伏せるものはない。
+describe("9. Transactions that read by primary key and then write, against index DDLs and ADD COLUMN on their table (generator 9, M24 asSqlite and holderSurvives, M24c lockSafe)", () => {
+  const defaults = Array.from({ length: 96 }, (_v, i) => i + 1);
+  const runs = new Map<number, Promise<SeedReport>>();
+  const once = (seed: number) => {
+    if (!runs.has(seed)) runs.set(seed, lockHoldersSeed(seed));
+    return runs.get(seed)!;
+  };
+  for (const seed of seedsOr(defaults)) {
+    it(`answers as SQLite does, on one shard and two, on the default path and the reference path (seed ${seed})`, async () => {
+      const r = await once(seed);
+      const txns = r.script.txns.map((t) => `${t.name} ${t.role} ${t.immediate ? "BEGIN IMMEDIATE" : "BEGIN"}${t.readOnlyBefore ? " reads first" : ""} ends at ${t.endAt}`).join(", ");
+      expect(r.findings.map((f) => `${f.kind}: ${f.detail}`), `${r.script.ddl}: ${txns}`).toEqual([]);
+    });
+  }
+  it("mixes the roles and DDLs, waits for holders and is busy at 5 s, and makes newcomers wait behind the DDL", async () => {
+    const all = await Promise.all(defaults.map(once));
+    const flat = all.flatMap((r) => r.runs);
+    const outcomeOf = (x: LockRun, name: string) => x.txns.find((o) => o.name === name)!;
+    const holderEnds = (x: LockRun) => x.script.txns.filter((t) => t.role === "holder").map((t) => outcomeOf(x, t.name).endSentAt ?? 0);
+    /** DDL が終わった時刻 (commit を記録した時刻。確定しなければ、DDL の文が返った時刻)。 */
+    const closedAt = (x: LockRun) => x.committedAt ?? x.ddlMs;
+    /** DDL を始めた後に最初のロックを求めた取引の文が、DDL が終わるまで待った。 */
+    const waitedBehind = (x: LockRun, roles: string[]) => x.script.txns.some((t) => roles.includes(t.role)
+      && outcomeOf(x, t.name).stmts.some((s) => s.sentAt >= 100 && s.sentAt < closedAt(x) - 50 && s.at >= closedAt(x)));
+    const coverage = {
+      busyAt5s: flat.filter((x) => classOf(x.ddl) === "busy" && holderEnds(x).some((e) => e > 5_000)).length,
+      waitedForHolder: flat.filter((x) => classOf(x.ddl) === "ok" && holderEnds(x).some((e) => e > 0 && x.ddlMs >= e)).length,
+      retriedAfterHolderWound: flat.filter((x) => x.wounds > 0 && x.woundsAfterSignal === 0 && classOf(x.ddl) === "ok").length,
+      lateDuringTheChange: flat.filter((x) => x.signalAt !== null && x.script.txns.some((t) => t.role === "late" && outcomeOf(x, t.name).startedAt < x.ddlMs)).length,
+      deferredBusyAfterTheChange: flat.filter((x) => x.script.txns.some((t) => !t.immediate && t.role !== "holder" && outcomeOf(x, t.name).stmts.some((s) => classOf(s.outcome) === "busy"))).length,
+      // D3 の形: holder が DDL を待たせている間に reader が書こうとして、DDL の後ろで待つ。その reader が期限の後まで取引を開けておく台本。
+      readerWaitedBehindTheDdl: flat.filter((x) => holderEnds(x).some((e) => e > 0) && waitedBehind(x, ["reader"])).length,
+      readerOpenPastTheDeadline: flat.filter((x) => holderEnds(x).some((e) => e > 0) && x.script.txns.some((t) => t.role === "reader" && t.endAt > 5_000)).length,
+      // D1 の形: 全シャードが prepare を適用した後に始めた BEGIN IMMEDIATE の取引が、DDL の後ろで待って、確定する。
+      lateImmediateWaitedBehindTheDdl: flat.filter((x) => x.script.txns.some((t) => t.role === "late" && t.immediate && outcomeOf(x, t.name).committed) && waitedBehind(x, ["late"])).length,
+      // D2 の形: 一意でない CREATE INDEX か DROP INDEX が、holder を待って確定する。
+      plainIndexDdlWaited: flat.filter((x) => /index$/.test(x.script.ddl) && !/unique/.test(x.script.ddl) && classOf(x.ddl) === "ok" && holderEnds(x).some((e) => e > 300 && x.ddlMs >= e)).length,
+    };
+    const kinds = new Set(all.map((r) => r.script.ddl));
+    console.info(`generator 9: ${flat.length} runs; ${JSON.stringify(coverage)}`);
+    expect({ kinds: kinds.size, ...Object.fromEntries(Object.entries(coverage).map(([k, n]) => [k, n > 0])) }).toEqual({
+      kinds: 6, busyAt5s: true, waitedForHolder: true, retriedAfterHolderWound: true, lateDuringTheChange: true, deferredBusyAfterTheChange: true,
+      readerWaitedBehindTheDdl: true, readerOpenPastTheDeadline: true, lateImmediateWaitedBehindTheDdl: true, plainIndexDdlWaited: true,
+    });
+  });
 });

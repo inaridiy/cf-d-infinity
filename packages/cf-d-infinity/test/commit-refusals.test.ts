@@ -15,22 +15,28 @@ import { split } from "../src/autoscaler";
 import { Db } from "../src/client/db";
 import { planSplit, slotOf } from "../src/routing";
 import { MAX_WRITE_SET_BYTES, type PrepareReq } from "../src/types";
-import { SimCluster } from "./sim";
+import { depsFor, SimCluster } from "./sim";
 
 /** 全シャードが持っている行ロックの数。 */
 const locks = (c: SimCluster) => [...c.cores.values()].reduce((n, core) => n + (core as unknown as { locks: Map<string, unknown> }).locks.size, 0);
 const outcome = (p: Promise<unknown>) => p.then(() => "ok", (e) => (e instanceof Error ? e.message : String(e)));
 
-/** 取引 X が行のロックを持つ。別の接続が列を足す。新しい表定義の autocommit の書き込み W が、その行を待つ。X が COMMIT する。 */
+/**
+ * 取引 X が表 t の行のロックを持ち、表 u を読んでいる。別の接続が u に列を足す (t の行ロックを持つ取引を待つのは、t の DDL だけである)。
+ * autocommit の書き込み W が、t の行を待つ。X が COMMIT する。X は、読んだ表 u の古い計画なので、シャードが例外で断る。
+ */
 async function refusedCommitWithWaiter(unlockArrives: boolean) {
   const c = new SimCluster({ shards: 1 });
   await new Db(c).ddl("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
+  await new Db(c).ddl("CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER NOT NULL)");
   await new Db(c).query("INSERT INTO t VALUES (1, 0)");
+  await new Db(c).query("INSERT INTO u VALUES (1, 0)");
   const x = new Db(c, { retries: 0 });
   await x.query("BEGIN");
+  await x.query("SELECT n FROM u WHERE id = 1");
   await x.query("UPDATE t SET n = 1 WHERE id = 1");
   await c.sleep(5); // X を、後から来る書き込みより古い取引にする (同じ時刻に始まると、ID の順で W が X のロックを奪うことがある)
-  await new Db(c).ddl("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 5");
+  await new Db(c).ddl("ALTER TABLE u ADD COLUMN extra INTEGER DEFAULT 5");
   const w = outcome(new Db(c).query("UPDATE t SET n = 2 WHERE id = 1"));
   await c.sleep(20); // W が行を待ち始める
   if (!unlockArrives) c.net.drop = (m) => m.method === "unlock"; // Worker が、確定の失敗の後で消えた
@@ -56,11 +62,11 @@ describe("a commit that the shard refuses by throwing (stale schema, not the own
   it("keeps the row lock until its expiry when the client's unlock never arrives, and the writer then goes on", async () => {
     const r = await refusedCommitWithWaiter(false);
     expect(r.commit).toMatch(/stale schema/);
-    // シャードは、例外で断った確定のロックを自分では手放さない。期限で消える。
+    // シャードは、例外で断った確定のロックを自分では手放さない。取引の lease の期限 (最後に延ばした文から 7.5 秒) で消える。
     expect(r.held).toBe(1);
     expect({ write: r.write, row: r.row }).toEqual({ write: "ok", row: { n: 2 } });
     expect(r.waited).toBeGreaterThan(1000);
-    expect(r.waited).toBeLessThan(6000);
+    expect(r.waited).toBeLessThan(8000);
   });
 });
 
@@ -73,11 +79,11 @@ describe("a write set that is too large, sent to a shard that gave the range awa
     while (!(slotOf(JSON.stringify([moving])) >= range.start && slotOf(JSON.stringify([moving])) < range.end)) moving++;
     await new Db(c).query("INSERT INTO docs VALUES (?, 'a')", [moving]);
     expect(await split(c, "s0", "s1", { range })).toMatchObject({ rows: 1 });
-    const { schema, epoch } = await c.catalog();
+    const cat = await c.catalog();
     const key = JSON.stringify([moving]);
     const big = "x".repeat(MAX_WRITE_SET_BYTES + 1000);
     const request = async (shard: string, txn: string): Promise<PrepareReq> => ({
-      txn, T: await c.shard(shard).now({}), schema, epoch, anchor: shard, spans: [],
+      txn, T: await c.shard(shard).now({}), deps: depsFor(cat, [], ["docs"]), epoch: cat.epoch, anchor: shard, spans: [],
       writes: [{ table: "docs", pk: key, sk: key, before: [`i${moving}`, "ta"], after: [`i${moving}`, `t${big}`] }],
     });
     const local = (shard: string, txn: string) => request(shard, txn).then((req) => outcome(c.shard(shard).commitLocal(req)));

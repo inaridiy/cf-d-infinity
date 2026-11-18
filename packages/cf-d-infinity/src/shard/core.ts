@@ -5,7 +5,7 @@
 //   - 複数の要求が同じ仕事を待つための合流 (表定義の適用、グループの引き取り)。
 //   - 行を待つタイマー (waitForRow)。
 // 待ちの数と順序は、核の 1 歩が返す Effect で決まる。殻は、待ちを足しも省きもしない。型は step.ts にある。
-import type { Backend, ExecReq, ExecRes, CommitReq, CommitRes, GroupCursor, LockOwner, Piece, PiecePayload, PieceWant, PrepareReq, PrepareRes, ShardApi, Span, Ts, TxnStatus } from "../types";
+import type { Backend, ExecReq, ExecRes, CommitReq, CommitRes, GroupCursor, LockOwner, Piece, PieceWant, PrepareReq, PrepareRes, PullRes, ShardApi, Span, Ts, TxnLease, TxnStatus } from "../types";
 import { ConflictError } from "../types";
 import type { Interval } from "../routing";
 import { type Runtime, sleep, systemRuntime } from "../runtime";
@@ -232,11 +232,14 @@ export class ShardCore implements ShardApi {
         : undefined;
       // 保持者の Worker が死ぬと誰もロックを解放しない。期限で確かめないと待ち手が眠ったままになる。
       let expiry: unknown;
+      // ロックの期限は、持ち主の取引の lease の期限である。延ばされていれば、掛け直す。
       const watch = () => {
         const l = this.k.liveLock(key); // 切れていれば、核が先頭の待ち手を起こす
-        if (l) expiry = this.rt.after(Math.max(1, l.expires - now() + 1), watch);
+        const until = l ? this.k.lockExpiry(key) : undefined;
+        if (until !== undefined) expiry = this.rt.after(Math.max(1, until - now() + 1), watch);
       };
-      if (lock) expiry = this.rt.after(Math.max(1, lock.expires - now() + 1), watch);
+      const until = lock ? this.k.lockExpiry(key) : undefined;
+      if (until !== undefined) expiry = this.rt.after(Math.max(1, until - now() + 1), watch);
       const w: Waiter = { ...me, wake: () => { leave(); resolve(); } };
       const list = this.k.enqueue(key, w);
     });
@@ -261,7 +264,7 @@ export class ShardCore implements ShardApi {
   prepare(req: PrepareReq): Promise<PrepareRes> {
     return this.start("prepare", { req });
   }
-  unchanged(req: { spans: Span[]; from: Ts; schema: number }): Promise<{ ok: boolean; reason?: string }> {
+  unchanged(req: { spans: Span[]; from: Ts; atLeast?: number }): Promise<{ ok: boolean; reason?: string }> {
     return this.start("unchanged", { req });
   }
   prepared(req: { epoch: number; early?: true }): Promise<{ ok: boolean; reason?: string }> {
@@ -279,29 +282,29 @@ export class ShardCore implements ShardApi {
   status(req: { txn: string }): Promise<TxnStatus> {
     return this.start("status", { req });
   }
-  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch?: number }): Promise<PiecePayload[]> {
+  pull(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch: number }): Promise<PullRes> {
     return this.start("pull", { req });
   }
-  listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch?: number }): Promise<{ groups: string[]; cursor: GroupCursor | null }> {
+  listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch: number }): Promise<{ groups: string[]; cursor: GroupCursor | null }> {
     return this.start("groups", { req });
   }
-  finishMove(req: Interval & { epoch?: number }): Promise<{ m: Ts }> {
+  finishMove(req: Interval & { epoch: number }): Promise<{ m: Ts }> {
     return this.start("finishMove", { req });
   }
   /** 子として、移動を終えるまで進める (ShardApi.drain)。移動を進めている最中なら、それに合流する。 */
   drain(req: Interval & { epoch: number }): Promise<{ groups: number; rows: number; bytes: number }> {
     return this.drive(req.epoch);
   }
-  syncSchema(req: { schema: number; epoch?: number }): Promise<{ moving: boolean }> {
+  syncSchema(req: { atLeast: number }): Promise<{ moving: boolean }> {
     return this.start("syncSchema", { req });
   }
   /** alarm の本体。未完了の仕事が残っていれば true を返す。呼び出し側 (DO の alarm) は true なら次の alarm を予約する。 */
   redrive(): Promise<boolean> {
     return this.start("redrive", {});
   }
-  /** 届いた piece を受け取る。試験が、届く順序を作るのに直に呼ぶ。 */
-  private receive(payload: PiecePayload[]): Promise<void> {
-    return this.start("receive", { payload });
+  /** 届いた pull の応答を受け取る。受け取った piece を返す。試験が、届く順序を作るのに直に呼ぶ。 */
+  private receive(res: PullRes): Promise<Piece[]> {
+    return this.start("receive", { res });
   }
 
   // 待ちのない要求。核の同期の関数が、そのまま答える。
@@ -325,6 +328,9 @@ export class ShardCore implements ShardApi {
   }
   async unlock(req: Parameters<ShardKernel["unlock"]>[0]): Promise<ReturnType<ShardKernel["unlock"]>> {
     return this.k.unlock(req);
+  }
+  async renew(req: { txn: string; lease: TxnLease }): Promise<void> {
+    return this.k.renew(req);
   }
   async now(req: Parameters<ShardKernel["now"]>[0]): Promise<ReturnType<ShardKernel["now"]>> {
     return this.k.now(req);

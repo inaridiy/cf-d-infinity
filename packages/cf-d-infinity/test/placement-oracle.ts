@@ -339,7 +339,7 @@ interface HranaOut {
 }
 
 /** 取引の接続。3 通りの出し方を同じ形にする。 */
-function txDriver(c: SimCluster, s: Script) {
+export function txDriver(c: SimCluster, s: Pick<Script, "mode" | "immediate">) {
   const begin = s.immediate ? "BEGIN IMMEDIATE" : "BEGIN";
   const asRows = async (p: Promise<{ values: Value[][]; changes: number; lastInsertRowid?: bigint | null }>): Promise<Outcome> => {
     try {

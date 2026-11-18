@@ -7,8 +7,8 @@
 // 転送せずに答えた。anchor は、s0 への phase 2 を届け終えたものとする。z の intent は、後で範囲と一緒に s0 に届き、決着しないまま残る。
 // 読み手が来れば anchor に尋ねて決着させるが、anchor が届け終えた取引の記録を消した後 (TXN_RETAIN_MS) は、presumed abort で捨てられる。
 //
-// いまは、印を、z が届き直したとき (receive) か、範囲を受け取り終えたとき (finishIncoming。運ばれなかったグループ) に外す (kernel.ts の
-// unmarked)。印のある s0 は、phase 2 を s2 へ転送する。s2 は、まだ z を渡していなければ自分で適用し、渡していれば、移動 2 の記録で s0 へ
+// いまは、印を、z が届き直したとき (receive) か、範囲を受け取り終えたとき (finishIncoming。運ばれなかったグループ) に外す (印は、記録から作る。kernel.ts の
+// remark。前は unmarked だった)。印のある s0 は、phase 2 を s2 へ転送する。s2 は、まだ z を渡していなければ自分で適用し、渡していれば、移動 2 の記録で s0 へ
 // 転送し返す。s0 は、piece を運ぶ転送を受けると、z を引き取ってから適用する。
 // 欠陥のスイッチ unmarkOnReturn は、段 4 のコードの外し方に戻す (m5c_red_clear_at_start)。
 //

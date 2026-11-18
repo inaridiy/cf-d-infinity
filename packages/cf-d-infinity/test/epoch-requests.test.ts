@@ -15,7 +15,8 @@ import { keyString } from "../src/keys";
 import { ownerOf, planSplit, tokenOf } from "../src/routing";
 import type { ExecReq, Faults, Span } from "../src/types";
 import { rawRows } from "./ddl-harness";
-import { allWriteEscapes, SimCluster } from "./sim";
+import type { Catalog } from "../src/meta";
+import { allWriteEscapes, depsFor, SimCluster } from "./sim";
 
 afterEach(() => {
   allWriteEscapes.length = 0; // 持ち主でないシャードへの書き込みは、ここで数えて確かめる。全体の検査には渡さない
@@ -41,28 +42,61 @@ async function scene(faults: Faults = {}) {
   while (ownerOf(routing, key(fresh)) !== "s1") fresh++;
   return { c, a, b, fresh };
 }
-/** 行 id を入れる autocommit の要求。cat の 2 つの数を名乗る。 */
-const insert = (id: number, cat: { schema: number; epoch: number }): ExecReq => ({
+/** 行 id を入れる autocommit の要求。cat の表 t の epoch と、cat の epoch を運ぶ。 */
+const insert = (id: number, cat: Catalog): ExecReq => ({
   sql: "INSERT INTO t VALUES (?, 1)", params: [BigInt(id)], columns: [], spans: [pkSpan(id)],
-  write: { sk: key(id), capture: "insert" }, schema: cat.schema, epoch: cat.epoch,
+  write: { sk: key(id), capture: "insert" }, deps: depsFor(cat, [], ["t"]), epoch: cat.epoch,
 });
-/** 行 id を書く autocommit の要求。cat の 2 つの数を名乗る。 */
-const write = (id: number, v: number, cat: { schema: number; epoch: number }): ExecReq => ({
+/** 行 id を書く autocommit の要求。cat の表 t の epoch と、cat の epoch を運ぶ。 */
+const write = (id: number, v: number, cat: Catalog): ExecReq => ({
   sql: "UPDATE t SET v = ? WHERE id = ?", params: [BigInt(v), BigInt(id)], columns: [], spans: [pkSpan(id)],
-  write: { sk: key(id), capture: "update" }, schema: cat.schema, epoch: cat.epoch,
+  write: { sk: key(id), capture: "update" }, deps: depsFor(cat, [], ["t"]), epoch: cat.epoch,
 });
 
-describe("the shard checks the schema epoch of a request (m21_red_stale, guard-only)", () => {
-  it("refuses a request planned on an older schema epoch, whatever epoch it carries", async () => {
+describe("the shard checks the epochs of the tables a request depends on (m21_red_stale, guard-only)", () => {
+  it("refuses a request planned before a DDL on its table committed, whatever epoch it carries", async () => {
     const { c, a } = await scene();
     const before = await c.catalog();
     await new Db(c).ddl("ALTER TABLE t ADD COLUMN note TEXT");
     const after = await c.catalog();
     expect(after.schema).toBeGreaterThan(before.schema);
-    // 古い表定義で計画した書き込みは、新しい epoch を名乗っても、表定義の epoch で断る。
-    expect(await outcome(c.shard("s0").execAuto(write(a, 2, before)))).toMatch(/^not owner: stale schema/);
-    expect(await outcome(c.shard("s0").execAuto(write(a, 2, { schema: before.schema, epoch: after.epoch })))).toMatch(/^not owner: stale schema/);
+    expect(after.objects.t!.read).toBeGreaterThan(before.objects.t!.read);
+    // 古い表定義で計画した書き込みは、新しい epoch を名乗っても、表 t の epoch で断る。
+    expect(await outcome(c.shard("s0").execAuto(write(a, 2, before)))).toMatch(/^not owner: stale schema: t /);
+    expect(await outcome(c.shard("s0").execAuto(write(a, 2, { ...before, epoch: after.epoch })))).toMatch(/^not owner: stale schema: t /);
     expect(await outcome(c.shard("s0").execAuto(write(a, 2, after)))).toBe("ok");
+  });
+
+  // 表ごとの epoch (docs/design-catalog-epoch.md の「表ごとの epoch」、M24 の noRefusalUnrelated)。別の表の DDL は、要求を古くしない。
+  it("serves a request planned before a DDL on another table committed", async () => {
+    const { c, a } = await scene();
+    const before = await c.catalog();
+    await new Db(c).ddl("CREATE TABLE u(id INTEGER PRIMARY KEY)");
+    await new Db(c).ddl("ALTER TABLE u ADD COLUMN note TEXT");
+    const after = await c.catalog();
+    expect(after.schema).toBeGreaterThan(before.schema);
+    expect(after.objects.t).toEqual(before.objects.t);
+    expect(await outcome(c.shard("s0").execAuto(write(a, 2, before)))).toBe("ok");
+  });
+
+  // 読みの epoch と書き込みの epoch。index を作るだけの DDL は、表の書き込みの epoch だけを進める。
+  it("after a plain CREATE INDEX, refuses a write planned before it and serves a read planned before it", async () => {
+    const { c, a } = await scene();
+    const before = await c.catalog();
+    await new Db(c).ddl("CREATE INDEX tv ON t(v)");
+    const after = await c.catalog();
+    expect([after.objects.t!.read, after.objects.t!.write > before.objects.t!.write]).toEqual([before.objects.t!.read, true]);
+    const read: ExecReq = { sql: "SELECT v FROM t WHERE id = ?", params: [BigInt(a)], columns: ["v"], spans: [pkSpan(a)], deps: depsFor(before, ["t"]), epoch: before.epoch };
+    expect(await outcome(c.shard("s0").exec(read))).toBe("ok");
+    expect(await outcome(c.shard("s0").execAuto(write(a, 2, before)))).toMatch(/^not owner: stale schema: t is at write epoch/);
+    expect(await outcome(c.shard("s0").execAuto(write(a, 2, after)))).toBe("ok");
+  });
+
+  it("put back with writeComparesRead: a write planned before a CREATE INDEX is accepted (m24_red_write_epoch)", async () => {
+    const { c, a } = await scene({ writeComparesRead: true });
+    const before = await c.catalog();
+    await new Db(c).ddl("CREATE INDEX tv ON t(v)");
+    expect(await outcome(c.shard("s0").execAuto(write(a, 2, before)))).toBe("ok");
   });
 
   it("applies the log first when the request's schema epoch is newer than its own", async () => {
@@ -99,7 +133,7 @@ describe("the shard looks ownership up in its own snapshot (m21_red_owner_unchec
     const { c } = await scene();
     const cat = await c.catalog();
     const claim = cat.routing.ranges.map((r) => ({ start: r.start, end: r.end }));
-    const req: ExecReq = { sql: "SELECT id FROM t", params: [], columns: ["id"], spans: [{ kind: "table", table: "t", claim }], schema: cat.schema, epoch: cat.epoch };
+    const req: ExecReq = { sql: "SELECT id FROM t", params: [], columns: ["id"], spans: [{ kind: "table", table: "t", claim }], deps: depsFor(cat, ["t"]), epoch: cat.epoch };
     expect(await outcome(c.shard("s0").exec(req))).toBe("not owner: s1");
   });
 });
@@ -116,9 +150,9 @@ describe("the shard does not require the request's epoch to equal its own (m21_r
     await new Db(c).ddl("CREATE TABLE u(id INTEGER PRIMARY KEY)");
     const now = await c.catalog();
     expect(applied(c, "s0")).toBe(now.epoch);
-    // 分割の前のスナップショットで計画した、動いていない行の書き込み。表定義の epoch は古いので、新しい表定義で名乗る。
-    expect(await outcome(c.shard("s0").execAuto(write(unmoved, 5, { schema: now.schema, epoch: old.epoch })))).toBe("ok");
-    expect(await outcome(c.shard("s0").execAuto(write(unmoved, 6, { schema: now.schema, epoch: 0 })))).toBe("ok");
+    // 分割の前のスナップショットで計画した、動いていない行の書き込み。その後に確定したのは別の表の DDL なので、表 t の epoch は古くない。
+    expect(await outcome(c.shard("s0").execAuto(write(unmoved, 5, old)))).toBe("ok");
+    expect(await outcome(c.shard("s0").execAuto(write(unmoved, 6, { ...now, epoch: 0 })))).toBe("ok");
   });
 
   it("serves a request with a newer epoch for a row it owns without fetching the log", async () => {

@@ -79,9 +79,24 @@ export interface UniqueRead {
 /** 挿入する 1 行の、主キーの値と、UNIQUE の列の値。index があれば、シャードをまたぐ UNIQUE である。 */
 export type Plan =
   /** 最適化の経路。全部の表が 1 つの shard key の値に固定される読みを、そのシャードへそのまま送る。 */
-  | { kind: "shard"; route: Route; sql: string; params: Value[]; tables: TableDef[]; pk: string | null }
+  | {
+      kind: "shard"; route: Route; sql: string; params: Value[]; tables: TableDef[]; pk: string | null;
+      /**
+       * 文が INDEXED BY で index を名指す表。その表には、書き込みの epoch で頼る (docs/design-catalog-epoch.md の「表ごとの epoch」の
+       * 「規則」)。index が消えた後で古い計画のまま届くと、シャードの SQLite が `no such index` で断るからである。なければ、ない。
+       */
+      indexed?: string[];
+    }
   /** 読みの基準経路。走査で行を集め、元の文を Worker の SQLite で実行する。 */
-  | { kind: "gather"; scans: Scan[]; sql: string; params: Value[] }
+  | {
+      kind: "gather"; scans: Scan[]; sql: string; params: Value[];
+      /**
+       * 文が、主キーで決まる 1 行だけを読むなら、その行 (基準経路だけの計画に付く)。BEGIN IMMEDIATE の取引は、行を集める前に、この行の
+       * ロックを取る (Txn.read)。最適化の経路の、ロックを取る主キーの読み (kind shard の pk) と同じ行である。行は、走査ではなく、文から
+       * 決める (Reference の full は、条件を押し下げない)。
+       */
+      lockRow?: { table: string; sk: string; pk: string };
+    }
   | { kind: "partial"; scan: Scan; columns: string[]; mergeSql: string; mergeParams: Value[] }
   /** pragma は、PRAGMA と EXPLAIN の文である。型つきの読みに包めないので、素の列で読む (ScratchDb.pragma)。 */
   | { kind: "meta"; sql: string; params: Value[]; pragma?: true }
@@ -100,7 +115,11 @@ export type Plan =
    * 文の結果が衝突し得る行は、実行してから集め足す (Txn.wasmWrite)。INSERT は、文が読む行がないので scans が空になる。
    * 文の結果の lastInsertRowid は、計画ではなく、実行した SQLite の捕捉が記録した、入れた行から決める (src/client/db.ts の lastInsertRowid)。
    */
-  | { kind: "wasmWrite"; scans: Scan[]; sql: string; params: Value[]; tables: TableDef[]; returning?: string }
+  | {
+      kind: "wasmWrite"; scans: Scan[]; sql: string; params: Value[]; tables: TableDef[]; returning?: string;
+      /** 文が書く表。行を集める読みは、この表に書き込みの epoch で頼る。 */
+      def: TableDef;
+    }
   | {
       kind: "insertSelect"; def: TableDef; select: Plan; head: string; columns: string[] | null; tail: string; tailParams: Value[];
       /** RETURNING のある文の、元の文面。結果の列名は、これを Worker の SQLite でコンパイルして取る (行を入れなくても列名を返す)。 */
@@ -204,6 +223,8 @@ interface Names {
   ctes: Set<string>;
   meta: { used: boolean };
   views: Set<string>;
+  /** 文が INDEXED BY で index を名指す表 (表定義の名前)。 */
+  indexed?: Set<string>;
 }
 
 function classify(name: string, n: Names): TableDef | null {
@@ -240,7 +261,11 @@ function fromTree(e: Node, nullable: boolean, s: Scope, n: Names): Ref[] {
       if (e.expr.type === "identifier" || e.expr.type === "member_expr") return add(e.expr, e.alias);
       s.derived = true;
       return [];
-    case "indexed_table":
+    case "indexed_table": {
+      const refs = fromTree(e.table, nullable, s, n);
+      for (const r of refs) if (r.def) (n.indexed ??= new Set()).add(r.def.name);
+      return refs;
+    }
     case "not_indexed_table":
       return fromTree(e.table, nullable, s, n);
     case "paren_expr":
@@ -768,14 +793,20 @@ function planRead(stmt: Node, values: Value[], cat: Catalog, reference?: Referen
   const defs = [...new Set(scopes.flatMap((s) => s.refs.flatMap((r) => (r.def ? [r.def] : []))))];
   if (n.views.size === 0 && defs.length === 0) return { kind: "meta", sql, params };
   if (n.meta.used) return { kind: "meta", sql, params };
-  if (reference) return { kind: "gather", scans: referenceScans(scopes, n, values, reference), sql, params };
+  // 文が、1 つの shard key の行だけを読むなら、その shard key。さらに、主キーで決まる 1 行だけを読むなら、その主キー。
+  const key = n.views.size === 0 ? statementPin(scopes, values) : null;
+  const top = key !== null ? scopes.find((s) => s.node === stmt) : undefined;
+  const only = scopes.length === 1 && top?.refs.length === 1 ? top : null;
+  const pk = only ? pkOf(conjuncts(only.where), only.refs[0]!, only, values) : null;
+  if (reference) {
+    // 基準経路でも、BEGIN IMMEDIATE の主キーの読みは、行のロックを取る。取らないと、ロックを持つかどうかが、文の経路で変わる
+    // (表定義の変更は、ロックを持つ取引を待つ。持たない取引は、変更の後で断られる)。
+    const lockRow = key !== null && pk !== null && defs.length === 1 ? { table: defs[0]!.name, sk: key, pk } : null;
+    return { kind: "gather", scans: referenceScans(scopes, n, values, reference), sql, params, ...(lockRow ? { lockRow } : {}) };
+  }
   if (n.views.size === 0) {
-    const key = statementPin(scopes, values);
     if (key !== null) {
-      const top = scopes.find((s) => s.node === stmt);
-      const only = scopes.length === 1 && top?.refs.length === 1 ? top : null;
-      const pk = only ? pkOf(conjuncts(only.where), only.refs[0]!, only, values) : null;
-      return { kind: "shard", route: { by: "sk", sks: [key] }, sql, params, tables: defs, pk };
+      return { kind: "shard", route: { by: "sk", sks: [key] }, sql, params, tables: defs, pk, ...(n.indexed ? { indexed: [...n.indexed] } : {}) };
     }
     // グローバル index は、読み書きの経路には使わない (一意性の保証にだけ使う)。index が挙げた shard key でシャードを選び、
     // 文を絞らずに送る経路は、読む範囲と検証する範囲がずれやすかった。index の列で引く文は、全シャードへ条件を押し下げて集める。
@@ -927,7 +958,7 @@ async function planInsert(stmt: Node, values: Value[], cat: Catalog, ctx: PlanCo
   if (viaWorker) {
     const isDefault = body.type === "default_values" && outCols.length === 0;
     return {
-      kind: "wasmWrite", scans: [], tables: [def], returning,
+      kind: "wasmWrite", scans: [], tables: [def], def, returning,
       sql: `${prefix}${colSql} ${isDefault ? "DEFAULT VALUES" : `VALUES ${built.map((b) => b.sql).join(", ")}`}${tailSql ? ` ${tailSql}` : ""}`,
       params: [...built.flatMap((b) => b.params), ...tailParams],
     };
@@ -1024,7 +1055,7 @@ function planUpdateDelete(stmt: Node, values: Value[], cat: Catalog, reference?:
       return { kind: "write", def, tables: defs, returning, targets: [{ route: { by: "sk", sks: [key] }, sql, params, write: { sk: key, capture: captureOf(stmt, pk) }, pk, uniqueReads }] };
     }
   }
-  return { kind: "wasmWrite", scans: referenceScans(scopes, n, values, reference), sql, params, tables: defs, returning };
+  return { kind: "wasmWrite", scans: referenceScans(scopes, n, values, reference), sql, params, tables: defs, def, returning };
 }
 
 // ---- 入口 ----

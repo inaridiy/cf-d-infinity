@@ -10,7 +10,8 @@
 // 未解決の問題 54 (範囲が前の持ち主へ戻る途中に届いた phase 2) は、2026-11-17 に直した (test/phase2-during-return.test.ts、M5c)。
 // それまで伏せていた MoveChaos.hide54 は外した。
 //
-// 問題 55 (終わった移動の遅れた pull) は、54 の直しで渡した印がグループの戻るまで残るので起きない (test/stale-pull-after-return.test.ts)。
+// 問題 55 (終わった移動の遅れた pull) は、親が、渡し終えた移動の pull に「渡し終えた」と答えるので起きない (計画書の不変条件 15。
+// test/stale-pull-after-return.test.ts。その前は、54 の直しで、渡した印がグループの戻るまで残ることに頼っていた)。
 // それまで伏せていた MoveChaos.hideStalePull も外した (2026-11-17。シミュレータの再起動が飛んでいる要求を失敗させる形で、OPEN=1 の
 // seed 1 から 300 が通った)。
 import { describe, expect, it } from "vitest";
@@ -51,5 +52,106 @@ describe("ranges that move away and come back to a former owner, in random order
       restarts: sum((r) => r.counts.restarts) > 0,
       byChild: sum((r) => r.counts.byChild) > 0,
     }).toEqual({ returns: true, restarts: true, byChild: true });
+  }, 240_000);
+});
+
+// ---- 生成器 4 (docs/design-refresh-across-move.md の「乱択の検査に足す生成器」) ----
+//
+// 範囲が前の持ち主へ戻る間に、持ち主が前の持ち主へ尋ねる要求 (history.ts の ASK_RPCS) と、その応答を遅らせる (MoveChaos.slowAsksMs)。
+// 尋ねてから同期区間に入るまでの間に、範囲が戻ってくる形 (C → D → C、P → C → P。M23g) を作る。取引の文と文の間に待ちを置き
+// (RunOpts.innerThinkMs)、読むだけの取引 (移動の前の T のまま読み続ける) と、書く取引 (確定の検証の窓が移動をまたぐ) を、戻る移動に
+// またがらせる。tenant を少なくして、読むだけの取引の読んだ行がほかの接続に書かれ、T を進められずに古い T で読む実行を増やす。
+// foundation-4 (517b674) のコードは、前の持ち主に尋ねないので、遅らせる手は効かない (数えた delayedAsks は 0)。移動をまたいだ読みと
+// 確かめを、範囲の床 (read too old) か競合で断る。断るのは許す。答えたなら、正しくなければならない。数えた形は、最後の試験が確かめる。
+describe("transactions across ranges that return to a former owner, with the asks to former owners delayed (generator 4)", () => {
+  const memo4 = new Map<number, Promise<RunResult>>();
+  const run4 = (seed: number) => {
+    if (!memo4.has(seed)) {
+      memo4.set(seed, runHistory({
+        seed, shards: 3, tenants: 12, skewMs: 20, ops: 20, thinkMs: 300, innerThinkMs: 600, slowPhase2Ms: 2_000,
+        moves: { kind: "returns", restarts: true, stops: true, slowMoveRpcMs: 60, paceMs: 400, maxMoves: 40, slowAsksMs: 300 },
+      }));
+    }
+    return memo4.get(seed)!;
+  };
+  const defaults4 = [101, 102, 103, 104, 105, 106];
+  for (const seed of seedsOr(defaults4)) {
+    it(`stays serializable while transactions span returns and the asks are slow (seed ${seed})`, async () => {
+      const r = await run4(seed);
+      expect(r.counts.moves).toBeGreaterThan(0);
+      expect(r.violations.slice(0, 3)).toEqual([]);
+      expect(r.problems.slice(0, 5)).toEqual([]);
+    }, 120_000);
+  }
+  // 検査が何も確かめていない実行にならないこと。範囲は前の持ち主へ戻り、読むだけの取引と書く取引が、その移動をまたぐ。既定の seed で数える。
+  it("makes read-only and writing transactions span moves that return a range", async () => {
+    const all = await Promise.all(defaults4.map(run4));
+    const sum = (f: (r: RunResult) => number) => all.reduce((a, r) => a + f(r), 0);
+    const outcomes: Record<string, number> = {};
+    for (const r of all) for (const [k, n] of Object.entries(r.across.outcomes)) outcomes[k] = (outcomes[k] ?? 0) + n;
+    console.info(
+      `generator 4: ${sum((r) => r.counts.returns)} returns; transactions across a return: ${sum((r) => r.across.readOnly)} read-only, ` +
+        `${sum((r) => r.across.writing)} writing, ${sum((r) => r.across.twoMoves)} of them across two moves of one range: ${JSON.stringify(outcomes)}; ` +
+        `asks delayed: ${sum((r) => r.across.delayedAsks)}`,
+    );
+    expect({ readOnly: sum((r) => r.across.readOnly) > 0, writing: sum((r) => r.across.writing) > 0 }).toEqual({ readOnly: true, writing: true });
+  }, 240_000);
+});
+
+// ---- 生成器 10 (遅れた移動のメッセージ。test/history.ts の LateMoves) ----
+//
+// シャードの間のメッセージに期限はなく、移動のメッセージとその応答は、その移動より長く生き得る (問題 54、55、58 は、どれもこの類
+// だった)。ここでは、上の 1 つ目と同じ作業負荷と移動に、移動のメッセージ (pull、listGroups、ack、finishMove、転送する phase 2 と、Meta への
+// endMove) の要求か応答を 1 つずつ止めて、その移動と、後に始まった移動が閉じてから届ける手を足す。範囲が前の持ち主へ戻るので、遅れた pull が、
+// 範囲を受け取り直した前の親に届く (表の 1 から 3)。
+// 足した検査は、内部の表の誤りで失敗した文と要求、「group not arrived」の断り、静止した後のメモリの印と記録から作り直す印の比べ、
+// 遅れた配送が受け手の渡しと到着の記録を変えたこと (計画書の不変条件 15) である (history.ts の runHistory)。
+// 遅れたメッセージは、どれも届ける。計画書の不変条件 15 (docs/design-move-messages.md、モデル M5d) を入れる前の木 (5808b08) は、この類を
+// 直しておらず (決まった順の再現は test/late-pull-*.test.ts)、受け手がもう生きた記録を持たない移動の pull と、その応答 (history.ts の LateRow の
+// 1 から 7、returning、other) の配送を落として数えていた。落とさずに届けると、seed 1 から 200 の 138 が落ちた。returning は、遅れた pull が、
+// 範囲が戻る途中の前の親に届く形 (問題 55 の形) で、このファイルの見出しは「起きない」としているが、グループが前の親へもう届いた後なら、
+// 直す前は、内部の誤り (UNIQUE constraint failed: __moved...) になった (test/late-pull-while-range-returns.test.ts。生成器 10 が見つけた)。
+describe("late move messages on ranges that return to a former owner (generator 10)", () => {
+  const memo5 = new Map<number, Promise<RunResult>>();
+  const run5 = (seed: number) => {
+    if (!memo5.has(seed)) {
+      memo5.set(seed, runHistory({
+        seed, shards: 3, tenants: 40, skewMs: 20, ops: 40, thinkMs: 400, slowPhase2Ms: 2_000,
+        // 再起動は seed ごとに入れたり外したりする。再起動した子には、遅れた応答の結果が起きない (受け取る instance がない)。seed 1 から 60 で、
+        // 答えが送った instance へ戻った遅れた pull (LateCounts.lateToLive) と、印の比べが見つけた実行は、再起動ありとなしで、ここでは 45 と 45、
+        // 9 と 10 だったが、前へ進む鎖 (test/move-chains.test.ts) では 29 と 51、1 と 5 だった。
+        moves: { kind: "returns", restarts: seed % 2 === 1, stops: true, slowMoveRpcMs: 60, paceMs: 200, late: { share: 0.4, max: 3 } },
+      }));
+    }
+    return memo5.get(seed)!;
+  };
+  const defaults5 = [1, 2, 3, 4, 5, 6, 7, 8];
+  for (const seed of seedsOr(defaults5)) {
+    it(`stays serializable, loses no write, and keeps its move records while move messages outlive their moves (seed ${seed})`, async () => {
+      const r = await run5(seed);
+      expect(r.counts.moves).toBeGreaterThan(0);
+      expect(r.violations.slice(0, 3)).toEqual([]);
+      expect(r.problems.slice(0, 5)).toEqual([]);
+    }, 120_000);
+  }
+  // 生成器が何もしない実行にならないこと。止めたメッセージが、移動が閉じた後に届き、遅れた pull とその応答が、範囲が戻った前の親と、受け取り
+  // 終えた子に届く。届いた配送は、受け手の渡しと到着の記録を変えていない (broken は空)。数えた形は 1 行で出す。
+  it("delivers move messages after their moves closed, and none of them changes the records of a finished move", async () => {
+    const all = await Promise.all(defaults5.map(run5));
+    const add = (pick: (r: RunResult) => Record<string, number>) => {
+      const out: Record<string, number> = {};
+      for (const r of all) for (const [k, n] of Object.entries(pick(r))) out[k] = (out[k] ?? 0) + n;
+      return out;
+    };
+    const total = (x: Record<string, number>) => Object.values(x).reduce((a, n) => a + n, 0);
+    const situations = add((r) => r.late.situations);
+    const broken = add((r) => r.late.broken);
+    const toLive = all.reduce((a, r) => a + r.late.lateToLive, 0);
+    console.info(`generator 10 (returns): held ${JSON.stringify(add((r) => r.late.held))}; outlived ${JSON.stringify(add((r) => r.late.outlived))}; situations ${JSON.stringify(situations)}; answered to the live sender ${toLive}; broken ${JSON.stringify(broken)}`);
+    expect({
+      outlived: total(add((r) => r.late.outlived)) > 0,
+      late: total(situations) - (situations["request window"] ?? 0) > 0,
+      broken,
+    }).toEqual({ outlived: true, late: true, broken: {} });
   }, 240_000);
 });

@@ -208,7 +208,7 @@ export async function schemaVersions(c: SimCluster): Promise<{ meta: number; sha
 /** 全シャードへ最新の版の要求を送る。 */
 export async function touchAll(c: SimCluster): Promise<void> {
   const cat = await c.catalog();
-  await Promise.all(shardsOf(cat.routing).map((id) => c.shard(id).syncSchema({ schema: cat.schema })));
+  await Promise.all(shardsOf(cat.routing).map((id) => c.shard(id).syncSchema({ atLeast: cat.epoch })));
 }
 
 /**

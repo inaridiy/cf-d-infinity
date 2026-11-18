@@ -76,8 +76,9 @@ describe("a split that is interrupted or repeated", () => {
     await expect(c.startMove({ ...range, to: "s2", from: "s0" })).rejects.toThrow(/owned by s1, not by s0/);
     await expect(c.startMove({ start: 0, end: range.start, to: "s2", from: "s0" })).rejects.toThrow(/split busy: a move of .* from s0 to s1 is in progress/);
     await expect(c.startMove({ ...range, to: "s2", from: "s9" })).rejects.toThrow(/owned by s1, not by s9/);
-    // 親は、move-start を適用するまで fence していないので、渡すべきでない子への pull は断る。
-    await expect(c.shard("s0").pull({ ...range, want: [{ g: "[1]", from: null }], to: "s2", maxBytes: 1000 })).rejects.toThrow();
+    // 親は、fence の宛先でない子への pull を断る。pull は、開いている移動を epoch で名指しする。
+    const [open] = await c.moves();
+    await expect(c.shard("s0").pull({ ...range, want: [{ g: "[1]", from: null }], to: "s2", maxBytes: 1000, epoch: open!.epoch })).rejects.toThrow();
     // 1 つ目の増設をやり直すと終わる。行は失われていない。
     expect(await outcome(split(c, "s0", "s1", { range }))).toBe("ok");
     await drain(c);

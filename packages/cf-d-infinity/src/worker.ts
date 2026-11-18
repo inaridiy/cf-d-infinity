@@ -229,15 +229,19 @@ export class DinfMeta extends DurableObject<Env> {
     return sql.exec(`SELECT at, ms, plan, shards, rows, changes, attempts, error, sql FROM __slow ORDER BY seq DESC LIMIT ?`, Math.max(1, Math.min(limit, SLOW_KEEP)))
       .toArray().map((r) => ({ ...(r as unknown as SlowQuery), error: (r.error as string | null) ?? undefined }));
   }
-  prepare(sql: string, initial: string[], opts: { guard?: string[] }, basedOn?: number) {
+  catalogAt(schema: number, initial: string[]) {
+    this.core.setInitial(initial);
+    return this.core.catalogAt(schema);
+  }
+  prepare(sql: string, initial: string[], opts: { guard?: string[]; waitUntil?: number }, basedOn?: number) {
     this.core.setInitial(initial);
     return this.core.prepare(sql, opts, basedOn);
   }
   commit(epoch: number, acks: string[], at?: number) {
     return this.core.commit(epoch, acks, at);
   }
-  abort(epoch: number, reason: string) {
-    return this.core.abort(epoch, reason);
+  abort(epoch: number, reason: string, wound?: boolean) {
+    return this.core.abort(epoch, reason, wound);
   }
   renew(epoch: number) {
     return this.core.renew(epoch);
@@ -437,9 +441,10 @@ export function clusterOf(env: Env, count?: number, prefix = "shard"): Cluster {
   return {
     shard: (id) => shardStub(env, id),
     catalog: () => meta.catalog(initial) as unknown as Promise<Catalog>,
+    catalogAt: (schema) => meta.catalogAt(schema, initial) as unknown as Promise<Catalog>,
     prepare: (sql, opts, basedOn) => meta.prepare(sql, initial, opts, basedOn) as never,
     commit: (epoch, acks, at) => meta.commit(epoch, acks, at) as never,
-    abort: (epoch, reason) => meta.abort(epoch, reason),
+    abort: (epoch, reason, wound) => meta.abort(epoch, reason, wound),
     renew: (epoch) => meta.renew(epoch),
     startMove: (move) => meta.startMove(move) as never,
     moves: () => meta.moves() as never,
@@ -558,7 +563,7 @@ export async function clusterStatus(env: Env, name = "shard", shards?: number) {
   const cat = await cluster.catalog();
   const ids = shardsOf(cat.routing);
   // 適用できない DDL で止まっているシャードは、適用を試みさせないと自分では気づかない (再起動で忘れる)。
-  await Promise.all(ids.map((id) => cluster.shard(id).syncSchema({ schema: cat.schema }).catch(() => {})));
+  await Promise.all(ids.map((id) => cluster.shard(id).syncSchema({ atLeast: cat.epoch }).catch(() => {})));
   // 1 つのシャードが答えなくても、ほかの状態は見せる。
   const health = await Promise.all(ids.map((id) => cluster.shard(id).health({}).catch((e): ShardHealth => ({
     id, schema: -1, format: -1, bytes: 0, intents: 0, oldestIntentMs: 0, unapplied: 0,

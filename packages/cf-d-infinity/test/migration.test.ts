@@ -149,7 +149,12 @@ describe("counterexamples from m5b_live_migration", () => {
     await c.shard("s2").moves({});
     // 親は応答を返したが子の処理はまだで、グループは飛行中である。
     const inFlight = await c.shard("s0").pull({ ...range, want: [{ g: JSON.stringify([t]), from: null }], to: "s2", maxBytes: 1_000_000, epoch });
-    const receive = () => (c.cores.get("s2") as unknown as { receive(p: unknown): Promise<void> }).receive(inFlight);
+    // 子は、受け取り中の移動の応答だけを受け取る (計画書の不変条件 15)。応答を受け取る前に、親の表定義の epoch まで列を適用するので、
+    // ここで move-start も適用して、受け取り始める。応答を捨てていないことを、到着の記録で確かめる。
+    const receive = async () => {
+      await (c.cores.get("s2") as unknown as { receive(p: unknown): Promise<unknown> }).receive(inFlight);
+      expect(c.backends.get("s2")!.exec("SELECT epoch FROM __arrived WHERE g = ?", JSON.stringify([t]))).toEqual([{ epoch }]);
+    };
     // arrivedFirst: グループが子に着き終わってから、親に phase 2 が届く (m5b_red_p2)。そうでなければ、飛行中に届く (m5b_red_p2_window)。
     if (arrivedFirst) await receive();
     c.net.gate = () => {};

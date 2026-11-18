@@ -57,7 +57,7 @@ function holdCommit(c: SimCluster): { cluster: Cluster; reached: Promise<void>; 
 async function stuck(c: SimCluster): Promise<string[]> {
   const cat = await c.catalog();
   const ids = shardsOf(cat.routing);
-  await Promise.all(ids.map((id) => c.shard(id).syncSchema({ schema: cat.schema }).catch(() => undefined)));
+  await Promise.all(ids.map((id) => c.shard(id).syncSchema({ atLeast: cat.epoch }).catch(() => undefined)));
   const health = await Promise.all(ids.map((id) => c.shard(id).health({})));
   return health.filter((h) => h.schemaError).map((h) => h.id);
 }

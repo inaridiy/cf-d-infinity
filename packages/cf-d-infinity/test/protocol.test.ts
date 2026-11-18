@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { keyString } from "../src/keys";
 import { SUBSLOTS, type Interval } from "../src/routing";
 import { encode } from "../src/shard/rows";
-import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type ExecReq, type ExecRes, type Piece, type PiecePayload, type PieceWant, type ShardApi, type Span } from "../src/types";
+import { checkProtocol, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, VersionSkew, type ExecReq, type ExecRes, type Piece, type PiecePayload, type PieceWant, type PullRes, type ShardApi, type Span } from "../src/types";
 import { encodeTuple } from "../src/value";
 
 /**
@@ -17,11 +17,18 @@ function wireSample(): string {
   // 行イメージは、表定義の列の順のタプルである (版 4 から)。
   const change = { table: "t", pk: keyString([1n]), sk: keyString(["a"]), before: null, after: encodeTuple(values) };
   // 読みの要求は、結果の列名を運ぶ (版 5 から)。条件の範囲の引数には bigint が入る。
-  // 要求は、Worker のスナップショットの epoch と、表定義の epoch を運ぶ (版 6 から。schema の数は DdlEntry.version ではない)。
+  // 要求は、Worker のスナップショットの epoch (版 6 から) と、頼るものごとの epoch を運ぶ (版 10 から。docs/design-catalog-epoch.md の
+  // 「表ごとの epoch」)。遷移の仕事の要求は、prepare の epoch を atLeast で運ぶ。
   const read = {
     sql: "SELECT a, b FROM t WHERE a = ?", params: [5n], columns: ["a", "b"], spans: [{ kind: "pred", table: "t", alias: "t", where: "a = ?", params: [5n, 2.5] }],
-    schema: 4, epoch: 7,
+    deps: [{ name: "t", epoch: 4 }, { name: "u", epoch: 6, write: true }], epoch: 7, atLeast: 9,
+    // 悲観の取引の要求は、取引の lease (版と残り) を運ぶ (版 10 から。docs/design-lock-lease.md)。ロックを取る要求は lock の中に、取引が
+    // 行ロックを持つ表 (holds) と一緒に運ぶ。
+    lease: { txn: "t-1", epoch: 2, ms: 6500 }, lock: { txn: "t-1", start: 1000, lease: { epoch: 2, ms: 6500 }, holds: ["u"] },
   } satisfies Partial<ExecReq>;
+  const renew: Parameters<ShardApi["renew"]>[0] = { txn: "t-1", lease: { epoch: 3, ms: 7500 } };
+  // 読みの時刻を進める確かめも、読んだ表の epoch を運ぶ (版 10 から)。
+  const refresh: Parameters<ShardApi["refresh"]>[0] = { txn: "t-1", spans: [{ kind: "table", table: "t" }], from: 5, to: 9, deps: [{ name: "t", epoch: 4 }] };
   // 書き込みの応答は、文が入れた行を、入れた順に運ぶ (版 7 から。lastInsertRowid はこれだけから決める)。
   const written = { changes: [change], inserted: [{ table: "t", pk: keyString([1n]) }], count: 1 } satisfies Partial<ExecRes>;
   // 表定義の遷移の prepare を適用したかを尋ねる要求と、その答え (版 8 から。docs/design-catalog-epoch.md の段 3)。
@@ -34,6 +41,8 @@ function wireSample(): string {
     moveSample(),
     encode(written),
     encode(prepared),
+    encode(renew),
+    encode(refresh),
   ].join("\n");
 }
 
@@ -56,7 +65,11 @@ function moveSample(): string {
   // 子から親への移動の要求は move-start の epoch を運び、進める側の drain も、その epoch を名指しする (版 9 から)。
   const pull = { ...range, want, to: "s1", maxBytes: 1_000_000, epoch: 11 } satisfies Parameters<ShardApi["pull"]>[0];
   const drain = { ...range, epoch: 11 } satisfies Parameters<ShardApi["drain"]>[0];
-  return JSON.stringify([span, range, part, piece, want, payload, pull, drain]);
+  // pull の応答は、piece の組か、親がその移動を渡し終えたこと (渡し終えた後に発行した時刻を運ぶ) である (版 11 から。
+  // docs/design-move-messages.md)。finishIncoming は、受け取りを、区間ではなく移動の epoch で名指しする。
+  const answers = [{ pieces: [payload] }, { finished: { epoch: 11, m: 2048 } }] satisfies PullRes[];
+  const finish = { epoch: 11, m: 2048 } satisfies Parameters<ShardApi["finishIncoming"]>[0];
+  return JSON.stringify([span, range, part, piece, want, payload, pull, drain, answers, finish]);
 }
 
 /** 版ごとの、見本の指紋。古い版の値は、その版のときの見本のもので、いまの見本からは作れない。 */
@@ -69,6 +82,8 @@ const WIRE: Record<number, string> = {
   7: "ada064f16f3fde8e",
   8: "edeccd61efb19a77",
   9: "4e20b5834a72831a",
+  10: "fb3d9f42b31bd937",
+  11: "96ef29c9127e33f0",
 };
 
 describe("protocol version", () => {

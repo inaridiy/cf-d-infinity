@@ -150,6 +150,7 @@ witness $f m5b_green_floor witnessEmptiedWritten
 witness $f m5b_green_floor_clock witnessEmptiedRead
 witness $f m5b_green_floor_resplit witnessSecondHopWritten
 witness $f m5b_green_floor_resplit witnessSecondHopEmptied
+witness $f m5b_green_floor_clock witnessLateFinish        # 渡した空のグループの応答が飛んでいる間に親が終え、子が受け持った範囲に書き込みを受けた (M5d に合わせて緩めた finishRange)
 for m in m5b_green m5b_green_range m5b_red_range m5b_red_s3 m5b_red_s3_parent m5b_red_p2 m5b_red_p2_window m5b_red_intents \
          m5b_red_emptied m5b_green_floor m5b_green_floor_clock m5b_green_floor_clock_x m5b_red_floor_volatile m5b_red_floor_no_clock \
          m5b_green_floor_resplit m5b_green_floor_resplit_x; do tests $f $m; done
@@ -620,6 +621,36 @@ if [ "${HEAVY:-0}" = "1" ]; then                        # M21 の大きな場面
   red   $f m24_m21_red_strict_epoch pinnedSurvives
 fi
 
+echo "== M24c lock holders (DDL が待つ表の集合と、ロックを与える 1 つの判断。取引 2 件、ロックを取る読み、待つ間に来た取引。不変条件 16。実装より先に書いたモデル)"
+f=m24c_lock_holders.qnt
+green   $f m24c_green lockSafe                          # 決めた設計。取引 2 件 (書き込みから始めるか、ロックを取る読みから始める)、置き場所 8 通り
+green   $f m24c_green_reader lockSafe                   # 取引 2 が、DDL より前に X をロックなしで読んでいる (計画し直せない)
+green   $f m24c_green_optimistic lockSafe               # 取引 2 が楽観の取引 (行ロックを取らず、COMMIT で書く)
+red     $f m24c_red_reads asSqlite                      # D1: ロックを与える判断が、書き込みとして頼る表にしか fence を見ない
+red     $f m24c_red_reads preparedStays                 # 同上: 全シャードが ok と答えた試みを、後から始めた取引が取り消させる
+red     $f m24c_red_fence holderSurvives                # D2: 書きの epoch を進める表が fence にない。行を書いた取引が断られる
+red     $f m24c_red_window placementFree                # D3: 待つ間も新しい取引にロックを与える。行は 1 つのシャード (asSqlite も破れる)
+red     $f m24c_red_window optimisticOutcome            # 同上: 待っているシャードが、楽観の取引の COMMIT を受ける
+green   $f m24c_window_apart lockSafe                   # 同じ形でも、2 つの取引の行が別のシャードにあれば SQLite と同じ (上の赤と合わせて、置き場所で決まる)
+red     $f m24c_red_gap asSqlite                        # やり直しを進める側が後から記録する (m24_retry の形): 取り消しとやり直しの間に、待っていた取引がロックを得る
+green   $f m24c_gap_one_shard lockSafe                  # 同じ形でも、行が 1 つのシャードにあれば取り消しが起きず、SQLite と同じ
+red     $f m24c_red_holder_here holderNotDelayed        # 待っているシャードが、そのシャードにロックを持つ取引にだけ与える: 別のシャードの持ち主の書き込みが待たされる
+green   $f m24c_holder_here_one_shard lockSafe          # 同じ形でも、行が 1 つのシャードにあれば待たされない
+# witness は、置き場所を 1 つにした場面で探す (m24c_green の置き場所の 1 つ)。モデルには、ここで流さない witness もある
+# (witnessLateBlockedFenced、witnessReaderPasses、witnessOptimisticBusyFenced、witnessOptimisticAfterBusy。2026-11-17 に届くことを確かめた)。
+witness $f m24c_green_one witnessLateWaitsOne           # 行が 1 つのシャード。待つ間に来た BEGIN IMMEDIATE の取引が待ち、DDL が確定し、取引も確定する
+witness $f m24c_green_apart witnessLateWaitsTwo         # 同じ予定で、後から来た取引の行が、prepare を適用したシャードにある
+witness $f m24c_green_one witnessLateBlockedPending     # 後から来た取引が、待っているシャードで、与えられずに待っている
+witness $f m24c_green_cross witnessRestartKeepsWaiting  # 取り消しとやり直しをまたいで、後から来た取引が待ち続け、DDL が確定する
+witness $f m24c_green_cross witnessBusyThenLate         # 持ち主が期限を過ぎてロックを持ち、DDL が期限に失敗し、待っていた取引はその後で通る
+witness $f m24c_green_cross witnessTwoHolders           # 2 つの持ち主。片方の、もう片方を待つシャードへの書き込みが、取り消させずに通る
+witness $f m24c_green_reader witnessReaderRefused       # DDL の前に読んだ取引は、DDL の確定の後で断られる
+witness $f m24c_green_optimistic witnessOptimisticBusyPending  # 楽観の取引の COMMIT が、待っているシャードで競合になる
+green   $f m24c_red_window witnessLateBlockedPending    # 同じ witness は、待つ間も与える形では届かない
+live    $f m24c_green_cross lockLive                    # 活性: 始めた DDL は終わり、時刻は上限まで進み、送られた文は答えを得る (取り消しとやり直しが起きる置き場所)
+for m in m24c_green m24c_red_reads m24c_red_fence m24c_red_window m24c_window_apart m24c_red_gap m24c_gap_one_shard \
+         m24c_red_holder_here; do tests $f $m; done
+
 echo "== M22 unique keys (主キー以外の UNIQUE をキーの行にまとめる。グループが piece ごとに動く間も、UNIQUE の値を書く文が通る。実装より先に書いたモデル)"
 f=m22_unique_keys.qnt
 green   $f m22_green uniqueSafe                         # グループの全部が piece ごとに移る。決着させてから切る規則も、子がグループを待つ規則もない
@@ -794,6 +825,136 @@ fi
 for m in m23c_green_ro_w m23c_green_ro_y m23c_green_w m23c_green_retain m23c_green_empty m23c_base_ro m23c_red_child_below \
          m23c_red_no_merge m23c_red_prev_above m23c_red_no_retain m23c_red_no_epoch m23c_red_worker_routes m23c_red_empty_no_floor; do tests $f $m; done
 
+echo "== M23d old reads keep the versions they overlay (古い読みに重ねる自分の版を、変更ログの切り詰めで失わない。実装より先に書いたモデル)"
+f=m23d_old_read_retention.qnt
+green   $f m23d_green m23dSafe                           # 受け持ち始める前の c の版を残し、logLowWater が m 以上になってから消す。書き手 Y
+green   $f m23d_green_w m23dSafe                         # 同上、書き手 Y と W
+red     $f m23d_red_log_only readAtT                     # 重ねる版を変更ログからだけ取る (1 回目の実装): 切り詰めで消えた版を落とす
+red     $f m23d_red_keep_until_c readAtT                 # 残した版を、logLowWater が c 以上になったら消す
+witness $f m23d_green witnessKeptUsed                    # 古い読みが、変更ログから消えた自分の版を、残した版から答える
+for m in m23d_green m23d_red_log_only m23d_red_keep_until_c; do tests $f $m; done
+
+echo "== M23e lock carry (範囲の移動で、行ロックを新しい持ち主へ運ぶ。寿命は M25 の取引の lease。実装より先に書いたモデル)"
+f=m23e_lock_carry.qnt
+green   $f m23e_green m23eSafe                          # 運び、lease をそのまま持ち、延長と unlock を転送し、先に届いた転送を覚え、運んだ先を保存する。動く置き場所と動かない置き場所で結果が同じ
+red     $f m23e_red_memory_record stmtKeeps             # 運んだ先をメモリにだけ持つ: 親が再起動すると延長が届かず、運んだロックが、取引が働く間に切れる
+red     $f m23e_red_memory_record endReleases           # 同上: 親が再起動した後に終わった取引の、運んだロックが残る (lease の期限で切れる)
+green   $f m23e_red_memory_record m23eWeak              # 同上でも、直列化可能性は破れず、動かない置き場所より早くロックを失うことはない
+red     $f m23e_red_no_carry outcomeSame                # 運ばない: lease は取引のものでも、W は、動く置き場所でだけ、待たずに書く
+red     $f m23e_red_regrant lockProtects                # 運ばず、延長が届いたら与え直す: 取引は、読んだ後に書かれた行のロックを持つ (M25 の m25_red_regrant と同じ欠陥)
+red     $f m23e_red_regrant outcomeSame
+red     $f m23e_red_fresh_lease idleLoses               # 受け取った側が新しい期限を与える: 放っておかれた取引のロックが L より長く残る
+red     $f m23e_red_no_forward_renew stmtKeeps          # 親が延長を転送しない: 運んだロックが、取引が働く間に切れる
+red     $f m23e_red_no_forward_renew outcomeSame
+red     $f m23e_red_no_forward_unlock outcomeSame       # 親が unlock を転送しない: ROLLBACK の後も、W は、動く置き場所でだけ待つ
+red     $f m23e_red_no_early outcomeSame                # 受け取る側が、先に届いた転送を覚えない: 飛んでいる間の ROLLBACK の後に、ロックが届く
+live    $f m23e_live leaseLive                          # 活性: ロックはいつか全部切れ、待つ W は終わる
+witness $f m23e_green witnessCarriedBusy                # 運んだロックが転送された延長で延び、W はどちらの置き場所でも SQLITE_BUSY、取引が確定する
+witness $f m23e_green witnessEarlyRenew                 # pull の応答が飛んでいる間の延長を、届いたロックに当てる
+witness $f m23e_green witnessEarlyUnlock                # 飛んでいる間に ROLLBACK した取引のロックを入れず、W がどちらの置き場所でも書く
+witness $f m23e_red_memory_record witnessLeftover       # 親の再起動の後に取引が終わり、運んだロックが残る
+for m in m23e_green m23e_red_memory_record m23e_red_no_carry m23e_red_regrant m23e_red_fresh_lease m23e_red_no_forward_renew \
+         m23e_red_no_forward_unlock m23e_red_no_early; do tests $f $m; done
+
+echo "== M23f statement snapshot (Worker の 1 つの文の要求は、どれも、その試みを計画した範囲表で区間を切る。実装より先に書いたモデル)"
+f=m23f_statement_snapshot.qnt
+green   $f m23f_green stmtSafe                          # 送る前に確かめ、取引の範囲表が試みのスナップショットでなければ計画し直す。移動 1 回
+green   $f m23f_green_plan stmtSafe                     # claim を試みのスナップショットで切り、計画し直すのは NotOwner のときだけ、という形も安全
+red     $f m23f_red_claim_at_send noRegionDropped       # 2 回目の実装: claim を、送るときの範囲表で切る。宛先にないシャードへ動いた区間を、誰も読まない
+red     $f m23f_red_claim_at_send noRegionTwice         # 同上: 答えを残した宛先から、送り直す宛先へ動いた区間を、2 度数える
+green   $f m23f_red_claim_at_send readAtT               # 同上でも、シャードの答えは T の値である (誤るのは、Worker の答えの合わせ方)
+red     $f m23f_red_resend_only noRegionTwice           # 送り直しの前だけ確かめる: 範囲表が替わった後の最初の送信が、新しい範囲表で切る
+red     $f m23f_red_keep_answers noRegionTwice          # 計画し直すとき、答えた宛先の答えを残す (2 つのスナップショットの答えが混ざる)
+live    $f m23f_live stmtEnds                           # 活性: 文はいつか揃う (移動では失敗しない)
+witness $f m23f_green witnessRestartThenDone            # 計画し直した文が、2 つのシャードの答えで揃う
+witness $f m23f_green witnessAdvancedAcrossSwap         # 範囲表を取り直した確かめが通って T が進み、文が揃う
+witness $f m23f_green witnessDoneOnOldSnapshot          # 範囲表が替わった後、送る要求が残っていなければ、前のスナップショットの答えだけで揃う
+witness $f m23f_green witnessFirstSendRestart           # 最初の送信の前の確かめで計画し直す (送り直しのない道)
+witness $f m23f_green witnessNotAdvanced                # T を進められなかった文が、古い T のまま、計画し直して揃う
+if [ "${HEAVY:-0}" = "1" ]; then                        # 移動 2 回 (2,896 万状態と 1,562 万状態。5 分と 3 分)
+  green $f m23f_green2 stmtSafe
+  green $f m23f_green_plan2 stmtSafe
+fi
+for m in m23f_green m23f_green_plan m23f_red_claim_at_send m23f_red_resend_only m23f_red_keep_answers; do tests $f $m; done
+
+echo "== M23g ask then enter (前の持ち主に尋ねてから同期区間に入る間に、範囲が戻ってくる。受け持った期間ごとに答える。実装より先に書いたモデル)"
+f=m23g_ask_then_enter.qnt
+green   $f m23g_green_read m23gSafe                     # 読むだけの取引 (古い読み)。範囲が P → C → P → C と動く。書き手 W 2 つと Y
+green   $f m23g_green_validate m23gSafe                 # 読んで書く取引 (確定の検証)
+green   $f m23g_green_read_d m23gSafe                   # 範囲が別のシャードを回って戻る形 (P → C → D → C)
+green   $f m23g_green_validate_d m23gSafe
+green   $f m23g_forward_no_recheck m23gSafe             # 範囲が前の持ち主へ戻らなければ (P → C → D)、入口の確かめがなくても破れない
+green   $f m23g_forward_no_recheck_validate m23gSafe
+red     $f m23g_red_no_recheck readConsistent           # 入口で受け取りの記録を確かめない (2 回目の実装): 古い読みが、ほかの期間に適用された T 以下の版を落とす
+red     $f m23g_red_no_recheck_validate serializable    # 同上、確定の検証: ほかの期間の確定を見落として確定する
+red     $f m23g_red_no_recheck_d serializable           # 同上、P → C → D → C の形
+red     $f m23g_red_no_window readConsistent            # 前の持ち主が、受け持った期間で区切らない: 後の期間の確定の before-image で、前の期間の行を戻す
+red     $f m23g_red_no_window answerStable              # 同上: 同じ問いの答えが、尋ねる時点で変わる
+red     $f m23g_red_held_overlaid readConsistent        # 前の持ち主が、T に持っていた部分にも残した版を重ねる: 古い版が、土台の新しい確定を隠す
+live    $f m23g_live xEnds                              # 活性: 尋ね直しは終わり、取引はいつか終わる
+witness $f m23g_green_read witnessReasked               # 尋ねてから入るまでに範囲が戻り、尋ね直して読みに答える
+witness $f m23g_green_read witnessOverlaidAfterReask    # 尋ね直した答えが、ほかのシャードの期間に、受け持ち始める前の c で適用された版である
+witness $f m23g_green_read witnessThreeHops             # 3 つの期間をさかのぼる読み
+witness $f m23g_green_validate witnessConflictAfterReask   # 尋ね直した確かめが、ほかの期間の確定を見つけて、取引が競合になる
+for m in m23g_green_read m23g_green_validate m23g_red_no_recheck m23g_red_no_recheck_validate m23g_red_no_window m23g_red_held_overlaid; do tests $f $m; done
+
+echo "== M23h wide read (シャードの全表の読み。要求の claim の行だけを、時刻 T の値で答える。実装より先に書いたモデル)"
+f=m23h_wide_read.qnt
+green   $f m23h_green m23hSafe                          # 1 回の移動で 2 つの区間が動く。親は送り出しの途中も答え、子は受け取り終えるのを待って答える
+green   $f m23h_green2 m23hSafe                         # 2 回の移動 (受け取りの記録が 2 つ)。子は claim を記録ごとに分ける
+live    $f m23h_live readEnds                           # 活性: 読みは、いつか答えられるか NotOwner で断られる (子の待ちは終わる)
+red     $f m23h_red_ignore_claim answersClaim           # 答える行を claim で絞らない: move-start を適用していない親が、動く区間の行も答える
+red     $f m23h_red_partial answersClaim                # claim の一部しか持たなくても、持つ部分だけを答える
+red     $f m23h_red_newest_floor answersAtT             # claim の全部を、いちばん新しい記録の床で決める: 子の書き込みを落とす
+red     $f m23h_red_oldest_floor answersAtT             # いちばん古い記録の床で決める: 床より前の T の区間を、受け取った行で答える
+red     $f m23h_red_no_wait answersAtT                  # 受け取り中の子が、待たずに答える: 届いていない区間の行が落ちる
+red     $f m23h_red_child_migrating neverMigrating      # 前のコード: 受け取り中の子が migrating で断る (移動だけで文が失敗する)
+red     $f m23h_red_parent_migrating neverMigrating     # 前のコード: 送り出している親が migrating で断る
+witness $f m23h_green2 witnessSplitAnswer               # 1 つの claim の中で、ある区間は親に尋ね、別の区間は自分の行で答える
+witness $f m23h_green witnessWaitedThenAnswered         # 子が、受け取り終えるのを待ってから答える
+witness $f m23h_green witnessParentDuringMove           # 親が、送り出している途中に、残る区間の claim に答える
+witness $f m23h_green witnessNarrowClaim                # 親が、まだ適用していない move-start を知っている Worker の、狭い claim に答える
+for m in m23h_green m23h_green2 m23h_red_ignore_claim m23h_red_partial m23h_red_newest_floor m23h_red_oldest_floor m23h_red_no_wait; do tests $f $m; done
+
+echo "== M23i guard across move (取引が読んだ表を DROP する前の確かめを、範囲の移動をまたいで通す。実装より先に書いたモデル)"
+f=m23i_guard_across_move.qnt
+green   $f m23i_green m23iSafe                          # 確かめをいまの持ち主へ送り、持ち主が前の持ち主に尋ね、自分の記録を読んだ時刻から確かめる
+red     $f m23i_red_no_rehome placementIndependent      # いまのコード: 確かめを読んだシャードへ送る。移動だけで DROP が失敗する
+green   $f m23i_red_no_rehome noLostWrite               # 同上でも、書き込みは失わない (断る側に倒れている)
+red     $f m23i_red_no_ask noLostWrite                  # 持ち主が前の持ち主に尋ねない: 移動の前に、読んだシャードで確定した書き込みを失う
+red     $f m23i_red_from_arrival noLostWrite            # 持ち主が自分の記録を到着の m から確かめる: pull に乗った intent の、m より小さい c の確定を失う
+witness $f m23i_green witnessDroppedAcrossMove          # 読んだ後に範囲が動いても、変更がなければ DROP が commit される
+witness $f m23i_green witnessRefusedByFormerOwner       # 前の持ち主への尋ねが、移動の前の書き込みを見つける
+witness $f m23i_green witnessRefusedByCarriedIntent     # 持ち主の確かめが、受け持ち始める前の c で適用した確定を見つける
+for m in m23i_green m23i_red_no_rehome m23i_red_no_ask m23i_red_from_arrival; do tests $f $m; done
+
+echo "== M23j retained images across DDL (残した行イメージと表定義の変更。表ごとの epoch の下で、古い読みが表定義の変更をまたぐ。実装より先に書いたモデル)"
+f=m23j_ddl_retained_images.qnt
+green   $f m23j_green_rename m23jSafe                   # RENAME TO。残したイメージに変更を当て、尋ねが表の epoch を運ぶ。床は、変更ログに確定がなければ置かない
+green   $f m23j_green_rename_y m23jSafe                 # 同上、書き手 Y (残した版) も
+green   $f m23j_green_recreate m23jSafe                 # DROP TABLE の後に、同じ名前で CREATE TABLE
+green   $f m23j_green_addcol m23jSafe                   # ADD COLUMN
+green   $f m23j_exact_rename m23jExact                  # 床を、変更ログにある確定の時刻の最大にする形。床は、前の形の before-image を戻す読みだけを断る
+green   $f m23j_exact_recreate m23jExact
+red     $f m23j_red_no_reshape_rename readAtT           # 渡した行に RENAME TO を当てない: 後の名前の古い読みが、行を見つけない
+red     $f m23j_red_no_reshape_recreate readAtT         # 渡した行に DROP TABLE を当てない: 消した表の行が、新しい表の古い読みに出てくる
+red     $f m23j_red_no_reshape_kept readAtT             # 残した版に RENAME TO を当てない: 持ち主が重ねる版が見つからない
+green   $f m23j_addcol_no_reshape readAtT               # ADD COLUMN は、当てなくても答えが変わらない
+red     $f m23j_addcol_no_reshape imagesMatch           # 同上: 違うのはイメージの形だけ (答えの検査では見えない)
+red     $f m23j_red_no_chain_epoch readAtT              # 前の持ち主への尋ねが表の epoch を運ばない: commit を適用していない (か、先に適用した) 前の持ち主が、違う名前の行で答える
+red     $f m23j_red_no_floor noRestoreAcross            # 床を置かない: 前の形の before-image を、後の形の計画の読みに戻す
+green   $f m23j_always_rename m23jSafe                  # 床を、いつも適用した時刻に置く形 (1 回目の実装より前) も、答えは誤らない
+red     $f m23j_always_rename floorNeeded               # 同上: 変更ログに確定のないシャードが、適用した時刻より前の T を断る
+green   $f m23j_always_rename witnessFormerBelowApply   # 同上: 前の持ち主が、適用した時刻より前の T の古い読みに答える道はない
+red     $f m23j_green_rename floorNeeded                # 2 回目の実装の規則に残る、要らない断り: 確定のあるシャードが、最後の確定から適用までの間の T を断る
+witness $f m23j_green_rename witnessHandedAcrossDdl     # DDL の後の計画の古い読みが、変更を当てた渡した行で答えられる
+witness $f m23j_green_rename_y witnessKeptAcrossDdl     # 同上、残した版で
+witness $f m23j_green_rename witnessFormerBelowApply    # 床を置かなかった前の持ち主が、適用した時刻より前の T の古い読みに答える
+witness $f m23j_green_rename witnessStaleAtFormerOwner  # commit の前の計画の読みを、commit を適用した前の持ち主が断る (DDL で決まる失敗)
+witness $f m23j_exact_rename witnessFloorRefuses        # 前の形の before-image を戻すことになる読みは、床が断る
+for m in m23j_green_rename m23j_exact_rename m23j_red_no_reshape_rename m23j_red_no_reshape_recreate m23j_addcol_no_reshape \
+         m23j_red_no_chain_epoch m23j_red_no_floor m23j_always_rename; do tests $f $m; done
+
 echo "== M25 txn lock lease (行ロックの寿命を取引のものにする。どの文も、取引の全部のロックを延ばす。実装より先に書いたモデル)"
 f=m25_txn_lock_lease.qnt
 green   $f m25_green leaseSafe                          # 決めた設計 (R = 1)。4 つの置き場所を、同じ利用者の手で並べて動かす
@@ -832,6 +993,74 @@ live    $f m5c_green3 delivers
 witness $f m5c_green witnessForwardBack                  # 戻る移動の途中で届いた phase 2 が、S2 へ行って S0 へ戻り、S0 で適用される
 witness $f m5c_green witnessAppliedAtS2                  # 転送された phase 2 を、まだ渡していない S2 が適用する
 for m in m5c_green m5c_red_clear_at_start m5c_red_follow_stale m5c_red_rehand; do tests $f $m; done
+
+echo "== M5d move messages that outlive their move (移動の要求と応答が、その移動より後に届く。問題 54、55、58 の類。実装より先に書いたモデル)"
+f=m5d_move_messages.qnt
+# 緑: 規則の全部 (docs/design-move-messages.md)
+green   $f m5d_green_return m5dSafe                      # 範囲が前の持ち主へ戻る (0 → 1 → 0)
+green   $f m5d_green_chain m5dSafe                       # 戻らない列 (0 → 1 → 2)
+green   $f m5d_green_return3 m5dSafe                     # 戻って、もう一度出る (0 → 1 → 0 → 1)。取引なし
+green   $f m5d_green_groups m5dSafe                      # グループ 2 つ (行のあるものと、ないもの)。持ち主の書き込みと再起動なし
+live    $f m5d_green_return m5dLive                      # 活性: どの移動も閉じ、始めた取引の phase 2 は届け終わる
+live    $f m5d_green_chain m5dLive
+if [ "${HEAVY:-0}" = "1" ]; then                         # 大きい形と、既定から外した緑 (合わせて 8 分ほど)
+  live  $f m5d_green_return3 m5dLive
+  green $f m5d_green_return3_txn m5dSafe                 # 0 → 1 → 0 → 1 に、取引を足す (再起動なし)
+  green $f m5d_green_chain_back m5dSafe                  # 0 → 1 → 2 → 0 (再起動なし)
+  green $f m5d_green_groups_owner m5dSafe                # グループ 2 つに、持ち主の書き込みを足す (取引と再起動なし)
+  green $f m5d_marks_chain m5dSafe                       # 親の規則と子の規則があれば、印を 5808b08 のとおりに書き換えても破れない
+  green $f m5d_marks_return3 m5dSafe
+  green $f m5d_red_late_ack m5dOutcome                   # ack の規則を外しても、害はない
+  green $f m5d_red_boot_differs markMatchesRecord        # 書き込みの後で付ける印は、記録と合う
+  green $f m5d_prototype_return3 m5dData                 # 試作は、範囲が戻ってもう一度出る列でも、行と印は壊さない
+  green $f m5d_prototype_chain m5dOutcome                # 試作は、戻らない列でも、害がない
+fi
+# 5808b08 のコード: 類の 1 から 7
+red     $f m5d_code_return deliveredApplied              # 類の 1 と 3: 渡し直した印が、後の取引の phase 2 を適用させない
+red     $f m5d_code_return ownerHasTruth                 # 類の 2: 渡し直しの ack が、持ち主の確定した行を消す
+red     $f m5d_code_return markMatchesRecord             # 類の 3: 失敗した書き込みの前に付けた印が残る
+red     $f m5d_code_chain deliveredApplied               # 類の 4 と 7: 遅れた応答の受け取りが、次の移動の印を消す
+red     $f m5d_code_chain ackWillLand                    # 類の 5: ack が数えられない
+live_red $f m5d_code_chain movesClose                    # 類の 5: 移動が閉じない
+red     $f m5d_code_return3 ownerHasTruth                # 類の 6: 消した行が戻る
+# 5808b08 に、条件を 1 つだけ入れた形
+red     $f m5d_code_parent_rule deliveredApplied         # 親の規則だけ: 類の 7 が残る
+red     $f m5d_code_parent_rule3 ownerHasTruth           # 親の規則だけ: 類の 6 が残る
+red     $f m5d_code_child_rule deliveredApplied          # 子の規則だけ: 類の 1 と 3 が残る
+red     $f m5d_code_child_rule ownerHasTruth             # 子の規則だけ: 類の 2 が残る (子は、捨てた応答にも ack を送る)
+green   $f m5d_code_child_rule_chain m5dData             # 子の規則だけ: 戻らない列では、行も印も壊れない (類の 4、5、7)
+red     $f m5d_code_derived_return rowsOnlyAtOwner       # 印の関数だけ: 類の 2 の行が、持ち主でない前の子に入る
+red     $f m5d_code_derived_return ackWillLand           # 印の関数だけ: 類にない順序。渡し直した行が、まだ閉じていない移動 2 の親に入り、移動が閉じない
+red     $f m5d_code_derived_return ownerHasTruth         # 印の関数だけ: 類にない順序。渡し直しが 2 回続き、持ち主が消した行が戻る
+red     $f m5d_code_derived_return3 ownerHasTruth        # 印の関数だけ: 類の 6 が残る
+green   $f m5d_code_derived_chain m5dData                # 印の関数だけ: 戻らない列では、行も印も壊れない (類の 4、5、7)
+# 緑から、条件を 1 つ外す
+red     $f m5d_red_rehand handsUnderFence                # 親の規則を外す (スイッチ rehandFinished)
+red     $f m5d_red_rehand noFailedWrite                  # 同上: 類の 3 の、UNIQUE の失敗
+green   $f m5d_red_rehand m5dData                        # 同上: 子の規則と印の関数があるので、行も印も壊れない
+red     $f m5d_red_late_ack handsUnderFence              # ack の規則を外す (試作の形)。害がないことは HEAVY で確かめる
+red     $f m5d_red_child_stale ownerHasTruth            # 子の規則を外す (スイッチ childAcceptsStale と finishIncomingByInterval): 類の 6 と、遅れた「渡し終えた」が、いまの受け取りを終える場面
+red     $f m5d_red_child_stale receivesUnderIncoming
+red     $f m5d_red_finished_refusal noMoveRefusal        # 「渡し終えた」を断りとして読む (スイッチ finishedAsRefusal。取り下げた 89d99c8)
+red     $f m5d_red_ask_once noMoveRefusal                # 捨てた答えの後で、尋ね直さない (規則にない条件。スイッチ askOnce)
+red     $f m5d_red_boot_differs marksDerived             # 印を手ごとに書き換える (スイッチ bootMarksDiffer)。親の規則も外す
+red     $f m5d_red_boot_differs deliveredApplied         # 同上: 類の 1
+red     $f m5d_red_mark_before_write markMatchesRecord   # 印を書き込みより前に付ける (スイッチ markBeforeWrite)。親の規則も外す: 類の 3
+# 親の規則と子の規則があれば、印を 5808b08 のとおりに書き換えても破れない
+green   $f m5d_marks_return m5dSafe
+# 読み直しの試作: 親の規則 (pull だけ)、子の規則、「渡し終えた」は答え。ack と尋ね方は 5808b08 のまま
+green   $f m5d_prototype_return m5dOutcome
+red     $f m5d_prototype_return3 noMoveRefusal           # 範囲が戻ってもう一度出ると、1 回だけ尋ねる文が group not arrived で断られる
+witness $f m5d_green_return witnessLateAfterNext        # 終わった移動の遅れた pull に、範囲が戻った後で、親が「渡し終えた」と答える
+witness $f m5d_green_chain witnessLateAfterNext          # 同上、次の移動が閉じた後
+witness $f m5d_green_return witnessFinishedInWindow      # 親が渡し終えた後、子が受け取り終える前の pull に「渡し終えた」と答える
+witness $f m5d_green_return3 witnessLateResponse         # 生きた fence の下の応答が、子が受け取り終えた後も飛んでいる
+witness $f m5d_green_return witnessUncarriedWritten      # 運ばれなかったグループを、子が到着の記録なしで受け持って書く
+witness $f m5d_green_chain witnessForwarded              # phase 2 が転送されて、いまの持ち主で適用される
+for m in m5d_green_return m5d_green_chain m5d_green_return3 m5d_code_return m5d_code_chain m5d_code_return3 \
+         m5d_code_parent_rule m5d_code_parent_rule_return m5d_code_parent_rule3 m5d_code_child_rule m5d_code_child_rule_chain \
+         m5d_code_child_rule3 m5d_code_derived_return m5d_code_derived_chain m5d_code_derived_return3 m5d_red_rehand \
+         m5d_red_child_stale m5d_red_finished_refusal m5d_red_ask_once m5d_red_boot_differs m5d_red_mark_before_write; do tests $f $m; done
 
 echo "== M7 restore (S6 の全シャード同時点復元)"
 f=m7_restore.qnt

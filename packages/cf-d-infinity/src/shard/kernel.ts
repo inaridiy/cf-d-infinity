@@ -11,15 +11,15 @@
 import { Hlc, SECOND, physicalToTs, tsToPhysical } from "../hlc";
 import { SHARD_LIMITS, ShardLimit, shardLimitOf, withinShardLimits } from "../shard-limits";
 import type {
-  Backend, Change, Clock, CommitReq, CommitRes, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, LockOwner,
-  Participant, Piece, PiecePayload, PieceWant, Pos, PrepareReq, PrepareRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts,
+  Backend, Change, Clock, CommitReq, CommitRes, Dep, ExecReq, ExecRes, Faults, FlushRes, GroupCursor, LockOwner, TxnLease,
+  Participant, Piece, PiecePayload, PieceWant, Pos, PrepareReq, PrepareRes, PullRes, Row, ShardApi, ShardHealth, ShardMetrics, Span, TableDef, Ts,
   TxnStatus, Plain, Value,
 } from "../types";
 import {
-  ConflictError, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, TableLocked, WriteOutsideClaim, checkStorageFormat, isWideSpan,
+  ConflictError, LOCK_LEASE_SLACK_MS, LOCK_TTL_MS, MAX_WRITE_SET_BYTES, Migrating, NotOwner, ReadTooOld, STORAGE_FORMAT, SqlError, TableLocked, WriteOutsideClaim, checkStorageFormat, isWideSpan,
   spanCovers, utf8Length, unprotectedSpans,
 } from "../types";
-import { describeOpen, fencedBy, fold, isDdlRecord, type Logged, type OpenDdl, type Snapshot } from "../catalog";
+import { ALL_OBJECTS, describeOpen, fencedBy, fold, isDdlRecord, objectKey, type Logged, type OpenDdl, type Snapshot } from "../catalog";
 import type { ParsedDdl } from "../sql/ddl";
 import { blockOf, checkInterval, overlaps, rangeText, sameInterval, slotAligned, slotOf, tokenOf, type Interval } from "../routing";
 import { keyString } from "../keys";
@@ -194,8 +194,6 @@ const BLOCKED = Symbol("blocked");
 const PENDING_UNIQUE = Symbol("pending unique");
 /** 述語の検証で読む commit の上限。超えたら競合とみなす。 */
 const PRED_WINDOW = 2000;
-/** ロックの TTL。Worker の死亡に備える。文を実行するたびに延ばす。 */
-const LOCK_TTL_MS = 5000;
 /** 読みが、1 つの取引の intent を決着させようとする回数の上限。間で待つので、合わせて 1 秒ほど待つ。 */
 const SETTLE_TRIES = 10;
 /** ロックを待つ時間の上限。SQLite の busy_timeout に相当する。 */
@@ -208,10 +206,14 @@ const LOCK_WAIT_MS = 5000;
 export const WOUND_DELAY_MS = 200;
 /** DDL の適用が、進行中の取引の決着を待つ上限。超えたら再試行できる誤りを返す。 */
 const SCHEMA_WAIT_MS = 5000;
+/** prepare の適用が、fence の表の行ロックが空いたかを見直す間隔。 */
+const LOCK_POLL_MS = 10;
+/** その待ちの間に、遷移が閉じたかを Meta の列で確かめる間隔 (最初と、上限)。確かめるたびに 2 倍にする。 */
+const LOCK_REFETCH_MS = 50;
+const LOCK_REFETCH_MAX_MS = 400;
 
-export interface RowLock extends LockOwner {
-  expires: number;
-}
+/** 行ロック。期限は持たない。取引の lease (ShardKernel.leases) で生きる。 */
+export type RowLock = LockOwner;
 export interface Waiter extends LockOwner {
   wake(): void;
 }
@@ -220,14 +222,14 @@ export interface Waiter extends LockOwner {
 type Ran = Pick<ExecRes, "columns" | "values" | "changes" | "count" | "bytes" | "over" | "inserted">;
 
 /**
- * 待ちの後で確かめ直すこと。schema は、要求を計画した表定義の epoch が、いまも現行であること。owned は、読む範囲と書く行を、読む時刻で
- * このシャードが持っていること。
+ * 待ちの後で確かめ直すこと。schema は、要求が頼る表定義のもの (ExecReq.deps) の epoch が、どれも、いまも現行であること。owned は、
+ * 読む範囲と書く行を、読む時刻でこのシャードが持っていること。
  */
 export type Check = "schema" | "owned";
 
-/** 同期区間が頼る表定義の epoch。要求を計画したときの表定義の epoch (ExecReq.schema) である。 */
+/** 同期区間が頼る表定義のもの。要求を計画したスナップショットでの、ものごとの epoch (ExecReq.deps) である。 */
 export interface Plan {
-  schema: number;
+  deps: Dep[];
 }
 
 /** 同期区間が頼る行。読む範囲、書く行、読む時刻 (null は最新の状態) である。書く行は、主キーで token が決まる。 */
@@ -262,6 +264,50 @@ class Section<K extends Check> {
   }
 }
 
+/** 移動の記録を書く印を作る鍵。このファイルの外へは出さない。使うのは ShardKernel の handing と receiving だけである。 */
+const HAND = Symbol("hand");
+const RECEIVE = Symbol("receive");
+
+/**
+ * 渡す側の入口の印 (計画書の不変条件 15。docs/design-move-messages.md の「実装がすること」の 1)。ShardKernel.handing が、要求の名指しする
+ * 移動の fence が生きている (__fenced の done = 0) ことを確かめてから作る。渡した記録を書く関数 (handGroup、dropHanded、markHanded) は、
+ * この印を受け取る。生きた fence を確かめていない入口は、印を持てないので、型の検査を通らない。
+ *
+ * Section と同じ作りである。コンストラクタは private で、作る関数は、このファイルの外へ出さない鍵でしか呼べない。印は、作った 1 歩の
+ * 中だけで使い、frame には入れない (test/determinism.test.ts が確かめる)。待ちの間に、移動は終わり得る。
+ */
+class Handing {
+  /** 型を名前で区別するための欄。これがないと、同じ形の object が印として通る。 */
+  protected readonly live = true;
+  private constructor(readonly fence: FencedRange) {}
+  static [HAND](fence: FencedRange): Handing {
+    return new Handing(fence);
+  }
+}
+
+/**
+ * 受け取る側の入口の印。ShardKernel.receiving が、応答の名指しする移動を受け取り中である (__incoming の done = 0) ことを確かめてから作る。
+ * 受け取った記録を書く関数 (storePieces、markReceived) は、この印を受け取る。作りは Handing と同じである。
+ */
+class Receiving {
+  protected readonly live = true;
+  private constructor(readonly range: IncomingRange) {}
+  static [RECEIVE](range: IncomingRange): Receiving {
+    return new Receiving(range);
+  }
+}
+
+/**
+ * 移動の記録を書いたこと。記録を書く関数 (handGroup、dropHanded、storePieces、markReceived) が、書いた後で、印を作り直すのに渡す
+ * (ShardKernel.marked)。handed はグループを渡した、acked は ack で行と intent を消した、arrived は piece を入れた、received は範囲を
+ * 受け取り終えた、である。
+ */
+type MoveWrite =
+  | { kind: "handed"; g: string; m: Ts; to: string; epoch: number }
+  | { kind: "acked"; groups: Iterable<string> }
+  | { kind: "arrived"; pieces: PiecePayload[]; epoch: number }
+  | { kind: "received"; range: IncomingRange };
+
 /**
  * 2PC の ID (`<取引の ID>#<続きの中身の指紋>`、Txn.commit) から、行ロックの持ち主の ID を取り出す。ロックは、COMMIT の前の
  * 文が取引の ID で取るので、prepare と確定と中止は、この ID で自分のロックを見分けて手放す。
@@ -283,38 +329,52 @@ export const lockIdOf = (txn: string): string => {
 
 /** 要求の入口の確かめ (schemaStep) の frame。 */
 export interface SchemaFrame {
-  /** 要求の表定義の epoch (ExecReq.schema)。 */
-  schema: number;
+  /** 要求が頼る表定義のもの (ExecReq.deps)。 */
+  deps: Dep[];
   /**
    * 要求の epoch (ExecReq.epoch) と、要求が読み書きする行。これがあれば、表定義の epoch を確かめた後で、所有を見る。要求の epoch が
    * 自分の epoch より新しく、行が自分のスナップショットで自分のものでなければ、範囲の記録を適用してから進む (M21 の gate)。
    */
   epoch?: number;
   rows?: Pick<Rows, "spans" | "writes">;
-  /** 先の表定義の epoch まで適用するのを待った。 */
+  /** 少なくともここまで列を適用してから答える epoch (ExecReq.atLeast。表定義の遷移の仕事の要求が運ぶ prepare の epoch)。 */
+  atLeast?: number;
+  /**
+   * 新しい仕事を始める要求か (文の実行)。記録の適用が、その記録の変える表の intent の決着を待っている間、その表に頼る新しい文は、
+   * 適用が終わるまで待つ。確定の途中の要求 (prepare、commitLocal、commit) は待たせない。待たせると、2 つのシャードの適用と、2 つの取引の
+   * prepare が、互いを待つ輪になる。
+   */
+  statement?: true;
+  /** atLeast の epoch まで、列の適用を待った。 */
   reached?: true;
-  /** 適用の後で、もう一度確かめた。 */
-  again?: true;
+  /** 要求のほうが新しいものの epoch まで、列の適用を待った回数。 */
+  ahead?: number;
+  /** 進行中の適用が終わるのを待った回数。 */
+  waited?: number;
+  /** 書く表の書き込み禁止を解く記録を適用した。 */
+  unfenced?: true;
   /** 範囲の記録を適用した (catchUpStep)。確かめ直しは、同期区間の入口 (enter) が行う。 */
   caught?: true;
 }
 
-/** reachSchema の frame。 */
+/** reach (少なくともこの epoch まで、列の全部を適用する) の frame。 */
 export interface ReachFrame {
-  /** 少なくともここまで進める表定義の epoch。 */
-  schema: number;
+  /** 少なくともここまで写しを進める epoch。 */
+  epoch: number;
   catchUp: boolean;
-  /** 適用を待つ前の表定義の epoch。適用の後も同じなら、Meta にその epoch がまだない。 */
+  /** 適用を待つ前の、写しの最後の epoch。適用の後も同じなら、Meta にその epoch がまだない。 */
   before?: number;
 }
 
 /** applySchema の frame。 */
 export interface ApplyFrame {
   catchUp: boolean;
-  /** intent の決着を待った (か、待たないと決めた)。 */
-  settled?: true;
+  /** 移動の途中でないことを、最初に確かめた。 */
+  checked?: true;
   /** Meta から受け取った、写しの続きの記録。 */
   got?: Logged[];
+  /** intent の決着を待つ期限 (実時間)。 */
+  deadline?: number;
 }
 
 /** catchUp (範囲の記録だけを適用する) の frame。 */
@@ -331,10 +391,17 @@ export interface PreparedFrame {
   reached?: true;
   /** 欠陥のスイッチ checkBeforePrepare: 適用せずに読んだ、その prepare の記録。 */
   got?: Logged[];
+  /**
+   * prepare の適用が、fence の表の行ロックが空くのを待っている (ShardKernel.pending)。待つ間に、その遷移が閉じることがある。Meta の列を、
+   * ときどき取り直して確かめる。refetchAt は次に取り直す時刻 (実時間)、every は、その間隔。
+   */
+  lockWait?: { refetchAt: number; every: number };
 }
 
 /** settleAllIntents の frame。 */
 export interface SettleAllFrame {
+  /** 決着させる intent の表 (小文字の名前)。なければ、全部の表。 */
+  tables?: string[];
   deadline?: number;
   /** いま決着させている intent の一覧 (取引ごとに 1 つ)。先頭が、いまの取引である。 */
   batch?: Intent[];
@@ -346,7 +413,8 @@ export interface SettleAllFrame {
 /** ensureArrived の frame。 */
 export interface ArriveFrame {
   groups: string[];
-  asked?: true;
+  /** グループごとの、最後に引き取りを頼んだときの受け取り中の移動の epoch と、その移動で頼んだ回数。 */
+  asked?: Map<string, { epoch: number; times: number }>;
 }
 
 /** toEpoch (少なくともこの epoch まで列を適用する) の frame。 */
@@ -361,21 +429,21 @@ export interface EpochFrame {
 
 /** pull の frame。 */
 export interface PullFrame {
-  req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch?: number };
+  req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch: number };
   /** 移動の epoch まで列を適用した (fence が付いた)。 */
   reached?: true;
-  out?: PiecePayload[];
+  out?: PullRes;
 }
 
 /** listGroups の frame。 */
 export interface GroupsFrame {
-  req: Interval & { limit: number; cursor?: GroupCursor | null; epoch?: number };
+  req: Interval & { limit: number; cursor?: GroupCursor | null; epoch: number };
   reached?: true;
 }
 
 /** finishMove の frame。 */
 export interface FinishMoveFrame {
-  req: Interval & { epoch?: number };
+  req: Interval & { epoch: number };
   reached?: true;
 }
 
@@ -404,15 +472,17 @@ export interface FetchFrame {
   groups: string[];
   /** 受け取り中の範囲ごとの、まだ届いていないグループ。先頭が、いまの範囲である。 */
   queue?: { range: IncomingRange; rest: string[] }[];
-  payload?: PiecePayload[];
-  received?: true;
+  /** 渡す側の答えと、そのうち受け取った piece (receive の結果)。捨てた応答の piece は入らない。 */
+  res?: PullRes;
+  taken?: Piece[];
 }
 
-/** receive の frame。 */
+/** receive の frame。res は、渡す側の pull の応答である。 */
 export interface ReceiveFrame {
-  payload: PiecePayload[];
+  res: PullRes;
   reached?: true;
-  stored?: true;
+  /** 受け取った piece (入れたか、この移動でもう届いていた)。受け取り中でない移動の piece は入らない。書き込みを終えた印でもある。 */
+  taken?: Piece[];
 }
 
 /** drain の frame。epoch は、受け取っている移動の move-start の epoch である。 */
@@ -430,8 +500,9 @@ export interface DrainFrame {
   page?: { groups: string[]; cursor: GroupCursor | null };
   ackedArrived?: true;
   rest?: string[];
-  payload?: PiecePayload[];
-  received?: true;
+  /** 渡す側の答えと、そのうち受け取った piece (receive の結果)。 */
+  res?: PullRes;
+  taken?: Piece[];
   acked?: true;
 }
 
@@ -450,10 +521,14 @@ export interface LockedFrame {
   me: LockOwner;
   // ---- 持ち越す選択 ----
   deadline?: number;
+  /** 要求が着いた時刻 (シャードの時計)。新しく与えるロックの期限は、行を待った後でも、ここから数える。 */
+  since?: number;
   /** 起こされた行。取らずに去るなら、次の待ち手を起こす。起こすのは先頭の 1 件だけだからである。 */
   woken?: string | null;
   /** 待っている行。 */
   waiting?: string;
+  /** ロックを与えられなかったので、断る前に、要求の epoch まで列を適用した。1 度だけ。 */
+  caughtUp?: true;
   // ---- 1 周 (行を待つたびにやり直す) の間だけ持ち越すもの ----
   arrived?: true;
   F?: Ts;
@@ -541,15 +616,14 @@ export interface PrepareFrame<R> {
 
 /** unchanged の frame。 */
 export interface UnchangedFrame {
-  req: { spans: Span[]; from: Ts; schema: number };
+  req: { spans: Span[]; from: Ts; atLeast?: number };
   synced?: Outcome<void>;
 }
 
 /** syncSchema の frame。 */
 export interface SyncSchemaFrame {
-  req: { schema: number; epoch?: number };
+  req: { atLeast: number };
   asked?: true;
-  caught?: true;
 }
 
 /** commit の frame。 */
@@ -636,11 +710,11 @@ export interface Sig {
   settleAll: [SettleAllFrame, void];
   arrive: [ArriveFrame, void];
   toEpoch: [EpochFrame, void];
-  pull: [PullFrame, PiecePayload[]];
+  pull: [PullFrame, PullRes];
   groups: [GroupsFrame, { groups: string[]; cursor: GroupCursor | null }];
   finishMove: [FinishMoveFrame, { m: Ts }];
   fetch: [FetchFrame, void];
-  receive: [ReceiveFrame, void];
+  receive: [ReceiveFrame, Piece[]];
   drain: [DrainFrame, { groups: number; rows: number; bytes: number }];
   move: [MoveFrame, { groups: number; rows: number; bytes: number }];
   foreignLocks: [ForeignLocksFrame, void];
@@ -672,7 +746,7 @@ export class ShardKernel {
   private hlc = new Hlc(0);
   private ceiling: Ts = 0;
   private defs = new Map<string, TableDef>();
-  /** スナップショットの表定義の epoch (snap.schema)。要求の schema と比べる。 */
+  /** スナップショットの、どれかの DDL が最後に確定した epoch (snap.schema)。渡す行の形の版として運ぶ (PiecePayload.schema)。 */
   private schema = 0;
   /**
    * Meta の epoch の列のうち、このシャードが適用した分の写し (__epoch の行) と、それを畳んだスナップショット (src/catalog.ts の fold)。
@@ -683,12 +757,42 @@ export class ShardKernel {
   private snap: Snapshot = fold([]);
   /** 表定義の適用が進行中か。殻が、適用を始めるときと終えたときに書く。 */
   private schemaChanging = false;
+  /**
+   * 適用が、いま intent の決着を待っている記録の、変えるもの (小文字の名前)。待っていなければ null。"all" は、欠陥のスイッチ
+   * applyRefusesAll (段 3 の形) で、全部の表である。これに頼る新しい文は、適用が終わるまで待つ (schemaStep)。受けると、その表の intent が
+   * 増え続けて、適用がいつまでも終わらない。ほかの表の文は通す (docs/design-catalog-epoch.md の「表ごとの epoch」の「シャード」)。
+   */
+  private applying: Set<string> | "all" | null = null;
+  /**
+   * 適用が、行ロックを待って止めている prepare (計画書の不変条件 16。モデル M24c の PENDING)。待っていなければ null。
+   * 表の prepare は、その表 (fence) に行ロックがある間は適用しない (M24 の WAIT_LOCKS)。適用は、その prepare の手前で終わり、ここに
+   * 覚える。待つのは、prepare を適用させたい者 (preparedStep。DDL を進める側の要求) で、ロックが空いたら、適用をやり直す。
+   * 待っている間、シャードは、tables の表の新しい行ロックを、その表の行ロックを持たない取引に与えず、その取引の書き込みも受けない (tableGate)。与えると、後から来た
+   * 取引が DDL を待たせ、成否が、行の置き場所で決まる (もう prepare を適用したシャードでは、その取引は禁止で待つ)。
+   * その prepare を適用したとき (ロックが空いたか、取ってきた続きで、もう閉じていた) に消す。メモリだけに持つ。再起動すれば行ロックも
+   * 消えるので、prepare は待たずに適用される。
+   *   epoch      待っている prepare の epoch
+   *   tables     fence の表 (小文字の名前)
+   *   by         誤りの文に書く、遷移の名前
+   *   waitUntil  DDL の待ちの期限 (prepare の記録が運ぶ。進める側の時計の時刻)。ない記録は、待たない
+   */
+  private pending: { epoch: number; tables: Set<string>; by: string; waitUntil: number | undefined } | null = null;
   /** 直近の write の索引。キーごとの最新 commit 時刻だけを持ち、検査を O(1) にする。 */
   private recent = new Map<string, Ts>();
   private recentLowWater: Ts = 0;
   private maxCommit: Ts = 0;
   private logLowWater: Ts = 0;
-  private ddlFloor: Ts = 0;
+  /**
+   * 表ごとの、表定義の変更の床 (docs/design-catalog-epoch.md の「表ごとの epoch」の「シャード」の床)。鍵は小文字の表の名前で、値は、その表の
+   * 読みの epoch を進める commit を適用したときに、このシャードの変更ログにあった、その表の確定の時刻の最大である (lastLogged。モデル
+   * M23j の m23j_exact_*)。それらの確定の行イメージは、commit より前の表の形なので、床より古い時刻には、その表の行を読み戻せない。床より
+   * 古い時刻の、その表の読み戻し、refresh、述語の検証を断る。床以上の時刻の読みが戻す行イメージは、commit の後の形のものだけである。
+   * その表の確定が変更ログにないシャードは、床を置かない。ほかの表の読みは断らない (M24 の m24_floor_red_global)。
+   * 床を見るのは、行を T まで戻すシャードである (自分の変更ログで戻すので、自分の床を見る)。
+   * 欠陥のスイッチ globalDdlFloor は、どの commit でも、全部の表 (ALL_OBJECTS) の床を、適用した時刻に置く (段 3 の形)。ddlFloorAtApply は、
+   * 表ごとの床を、適用した時刻に置く (M23j の m23j_always_*。前の形の最後の確定から適用までの間の時刻の読みを、要らないのに断る)。
+   */
+  private tableFloors = new Map<string, Ts>();
   private flushedTs: Ts = 0;
   private inflight = new Map<string, Flight>();
   private fenced: FencedRange[] = [];
@@ -712,6 +816,12 @@ export class ShardKernel {
   private maxFloor: Ts = 0;
   /** 行ロック。メモリだけに置く。消えても検証が F 以降の変更を見るので安全である。 */
   private locks = new Map<string, RowLock>();
+  /**
+   * 取引ごとの lease (docs/design-lock-lease.md、モデル M25)。鍵は取引の ID で、until は期限 (このシャードの時計の時刻)、epoch は、受けた
+   * lease の版である。取引の行ロックは、どれも、この lease で生きる。期限は時刻で決まる。期限を過ぎた取引のロックは、誰かが見たか
+   * どうかに関わらず、消えたものである。取引の生きているロックがなくなれば、lease も忘れる。再起動では、ロックと一緒に消える。
+   */
+  private leases = new Map<string, { until: number; epoch: number }>();
   private waiters = new Map<string, Waiter[]>();
   private stats = { at: 0, reads: 0, writes: 0, groups: new Map<string, number>() };
   private faults: Faults;
@@ -775,28 +885,16 @@ export class ShardKernel {
     for (const r of b.exec(`SELECT lo, hi, m FROM __incoming WHERE done = 1`)) {
       this.raiseFloor({ start: r.lo as number, end: r.hi as number }, (r.m as Ts | null) ?? 0);
     }
-    // グループごとに、いちばん新しい送り出しと到着を読み戻す。送り出した後に受け取り直したグループは、渡した印を持たない。
-    let maxMoved = 0;
-    for (const r of b.exec(`SELECT g, m, dest, acked, epoch FROM __moved ORDER BY epoch`)) {
-      this.moved.set(r.g as string, { m: r.m as Ts, to: r.dest as string, acked: r.acked === 1, epoch: r.epoch as number });
-      if ((r.m as Ts) > maxMoved) maxMoved = r.m as Ts;
-    }
-    for (const r of b.exec(`SELECT g, m, epoch FROM __arrived ORDER BY epoch`)) {
-      this.arrived.set(r.g as string, { m: r.m as Ts, epoch: r.epoch as number });
-      this.maxArrived = Math.max(this.maxArrived, r.m as Ts);
-    }
-    // 「渡した」印は、そのグループが届き直したとき (到着の記録) か、そのグループを含む範囲を受け取り終えたとき (終えた __incoming) に
-    // 外す (unmarked)。起動の後も、動いている間と同じ規則で作り直す。
-    // 欠陥のスイッチ unmarkOnReturn は、段 4 のコードのとおり、受け取り始めただけの範囲でも外す。
-    const received = b.exec(`SELECT lo, hi, epoch FROM __incoming ${this.faults.unmarkOnReturn ? "" : "WHERE done = 1"}`)
-      .map((r) => ({ start: r.lo as number, end: r.hi as number, epoch: r.epoch as number }));
-    for (const [g, k] of this.moved) if (this.unmarked(g, k.epoch, received)) this.moved.delete(g);
+    // グループごとの印 (渡した印と到着の印) を、記録から作る。動いている間と同じ関数である (remark)。
+    this.remark();
+    // 渡したときに発行した時刻は、印が外れたグループのものも、時計の下限に入れる。
+    const maxMoved = (b.exec(`SELECT max(m) v FROM __moved`)[0]?.v as Ts | null) ?? 0;
     this.epoch = ((this.metaGet("epoch") as number) ?? 0) + 1;
     this.metaSet("epoch", this.epoch);
     this.ceiling = (this.metaGet("ceiling") as number) ?? 0;
     this.flushedTs = (this.metaGet("flushed") as number) ?? 0;
     this.logLowWater = (this.metaGet("log_low_water") as number) ?? 0;
-    this.ddlFloor = (this.metaGet("ddl_floor") as number) ?? 0;
+    this.tableFloors = new Map(JSON.parse((this.metaGet("ddl_floors") as string | null) ?? "[]") as [string, Ts][]);
 
     // 直近 write の索引はメモリにしかないので __log から作り直す。GC で消えた commit は logLowWater 以下にある。
     this.maxCommit = this.logLowWater;
@@ -928,7 +1026,7 @@ export class ShardKernel {
   }
   /** 写しを畳み直し、表定義と表定義の epoch を取り直す。 */
   private resnap(): void {
-    this.snap = fold(this.log);
+    this.snap = fold(this.log, undefined, this.faults);
     this.defs = new Map(Object.entries(this.snap.tables));
     this.schema = this.snap.schema;
   }
@@ -994,17 +1092,94 @@ export class ShardKernel {
     return this.arrived.get(g)?.epoch === range.epoch;
   }
   /**
-   * 移動 epoch で渡したグループ g の「渡した」印 (moved) を外してよいか。印のある間、g の intent はここでは適用せず、phase 2 は渡した先へ
-   * 転送する (localIntents、forwards)。外すのは、g がその後の移動で届き直したとき (到着の記録) か、g を含む範囲をその後の移動で受け取り
-   * 終えたとき (received。行も intent もないグループは運ばれず、到着の記録がない) だけである。範囲を受け取り始めただけでは外さない。
-   * 外すと、g が届く前に来た phase 2 を、ここでは intent がないので何もせず、印がないので転送もせずに、受け取ったと答える。anchor は
-   * 届け終えた印を付け、記録を消した後は、届いた intent を presumed abort で捨てる (未解決の問題 54、specs/m5c_phase2_return.qnt の
-   * m5c_red_clear_at_start。不変条件: 参加者は、intent を適用したか、いまの持ち主へ転送した後でだけ、phase 2 を受け取ったと答える)。
-   * 起動のときも、動いている間 (receiveStep、finishIncoming) も、この規則で外す。
+   * 印 (メモリの moved と arrived) を、記録から作る (計画書の不変条件 15。docs/design-move-messages.md の規則 4。モデル M5d の dMark と dArr)。
+   * 印を書き換えるのは、この関数だけである。起動のときは全部のグループの印を作り、移動の記録を書いた後は、その記録のグループの印を
+   * 作り直す。起動のときと動いている間で作り方が違うと、同じ記録から、再起動の前と後で別の印ができる。
+   *   到着の印: そのグループの __arrived の行のうち、epoch のいちばん大きいもの。
+   *   「渡した」印: そのグループの __moved の行のうち、epoch のいちばん大きいもの。ただし、それより大きい epoch の __arrived の行があるか
+   *     (グループが届き直した)、それより大きい epoch の、終えた __incoming の行がグループを含むなら (範囲を受け取り終えた。行も intent も
+   *     ないグループは運ばれず、到着の記録がない)、印はない。
+   * 「渡した」印のある間、g の intent はここでは適用せず、phase 2 は渡した先へ転送する (localIntents、forwards)。範囲を受け取り始めただけ
+   * では、印は外れない。外すと、g が届く前に来た phase 2 を、ここでは intent がないので何もせず、印がないので転送もせずに、受け取ったと
+   * 答える。anchor は届け終えた印を付け、記録を消した後は、届いた intent を presumed abort で捨てる (未解決の問題 54、
+   * specs/m5c_phase2_return.qnt の m5c_red_clear_at_start。不変条件: 参加者は、intent を適用したか、いまの持ち主へ転送した後でだけ、
+   * phase 2 を受け取ったと答える)。欠陥のスイッチ unmarkOnReturn は、段 4 のコードのとおり、受け取り始めただけの範囲でも外す。
    */
-  private unmarked(g: string, epoch: number, received: (Interval & { epoch: number })[]): boolean {
-    if ((this.arrived.get(g)?.epoch ?? -1) > epoch) return true;
-    return received.some((r) => r.epoch > epoch && overlaps(blockOf(g), r));
+  private remark(groups?: Iterable<string>): void {
+    const b = this.b;
+    if (groups === undefined) {
+      this.moved.clear();
+      this.arrived.clear();
+      const all = new Set<string>();
+      for (const r of b.exec(`SELECT DISTINCT g FROM __moved`)) all.add(r.g as string);
+      for (const r of b.exec(`SELECT DISTINCT g FROM __arrived`)) all.add(r.g as string);
+      groups = all;
+      this.maxArrived = (b.exec(`SELECT max(m) v FROM __arrived`)[0]?.v as Ts | null) ?? 0;
+    }
+    const todo = [...groups];
+    // 作り直すグループがなければ、記録を読まない。
+    if (todo.length === 0) return;
+    const received = b.exec(`SELECT lo, hi, epoch FROM __incoming ${this.faults.unmarkOnReturn ? "" : "WHERE done = 1"}`)
+      .map((r) => ({ start: r.lo as number, end: r.hi as number, epoch: r.epoch as number }));
+    for (const g of todo) {
+      const a = b.exec(`SELECT m, epoch FROM __arrived WHERE g = ? ORDER BY epoch DESC LIMIT 1`, g)[0];
+      if (a) {
+        this.arrived.set(g, { m: a.m as Ts, epoch: a.epoch as number });
+        this.maxArrived = Math.max(this.maxArrived, a.m as Ts);
+      } else this.arrived.delete(g);
+      const k = b.exec(`SELECT m, dest, acked, epoch FROM __moved WHERE g = ? ORDER BY epoch DESC LIMIT 1`, g)[0];
+      const epoch = k ? (k.epoch as number) : -1;
+      const back = a !== undefined && (a.epoch as number) > epoch;
+      if (k && !back && !received.some((r) => r.epoch > epoch && overlaps(blockOf(g), r))) {
+        this.moved.set(g, { m: k.m as Ts, to: k.dest as string, acked: k.acked === 1, epoch });
+      } else this.moved.delete(g);
+    }
+  }
+
+  /**
+   * 移動の記録を書いた後で、その記録のグループの印を、記録から作り直す (remark)。受け取り終えた記録が変えるのは、その範囲のグループの
+   * 「渡した」印だけである。
+   *
+   * 欠陥のスイッチ bootMarksDiffer と markBeforeWrite は、記録から作らずに、書いた手ごとに印を書き換える (5808b08 のコード。記録から
+   * 作るのは起動のときだけ。M5d の MARKS = 1 と 2)。markBeforeWrite は、それに加えて、渡した印を記録の書き込みより前に付ける (handGroup)。
+   * 生きた記録の下の書き換えは、remark と同じ印を作るので、どちらも、それだけでは何も破らない (M5d の m5d_marks_*)。親の規則を外す
+   * スイッチ rehandFinished と一緒に入れると、渡し直しの印が残り、確定した書き込みを失う (m5d_red_boot_differs、m5d_red_mark_before_write)。
+   */
+  private marked(wrote: MoveWrite): void {
+    if (!this.faults.bootMarksDiffer && !this.faults.markBeforeWrite) {
+      this.remark(
+        wrote.kind === "handed" ? [wrote.g]
+          : wrote.kind === "acked" ? wrote.groups
+            : wrote.kind === "arrived" ? wrote.pieces.map((p) => p.g)
+              : [...this.moved.keys()].filter((g) => overlaps(blockOf(g), wrote.range)),
+      );
+      return;
+    }
+    switch (wrote.kind) {
+      case "handed":
+        this.moved.set(wrote.g, { m: wrote.m, to: wrote.to, acked: false, epoch: wrote.epoch });
+        return;
+      case "acked":
+        for (const g of wrote.groups) {
+          const k = this.moved.get(g);
+          if (k) k.acked = true;
+        }
+        return;
+      case "arrived":
+        // 届いたグループの「渡した」印を、移動を比べずに外す。
+        for (const p of wrote.pieces) {
+          this.arrived.set(p.g, { m: p.m, epoch: wrote.epoch });
+          this.moved.delete(p.g);
+          this.maxArrived = Math.max(this.maxArrived, p.m);
+        }
+        return;
+      case "received":
+        for (const [g, k] of [...this.moved]) {
+          const back = (this.arrived.get(g)?.epoch ?? -1) > k.epoch;
+          if (back || (wrote.range.epoch > k.epoch && overlaps(blockOf(g), wrote.range))) this.moved.delete(g);
+        }
+        return;
+    }
   }
   /** 子として進める移動の epoch。受け取り中の移動と、受け取り終えたが、自分の写しでまだ閉じていない (move-end を記録させていない) 移動である。 */
   private childMoves(): number[] {
@@ -1136,6 +1311,23 @@ export class ShardKernel {
     }
   }
 
+  // ---- 表定義のものの epoch ----
+
+  /**
+   * 頼るもの d の、このシャードのスナップショットでの epoch (docs/design-catalog-epoch.md の「表ごとの epoch」)。書き込みとして頼るものは
+   * 書き込みの epoch、ほかは読みの epoch である。このシャードが知らない名前は 0 で、要求のほうが新しければ、列を適用してから比べ直す。
+   * 欠陥のスイッチ writeComparesRead は、書き込みも読みの epoch と比べる (M24 の m24_red_write_epoch)。
+   */
+  private epochOf(d: Dep): number {
+    const o = this.snap.objects[d.name];
+    if (!o) return 0;
+    return d.write && !this.faults.writeComparesRead ? o.write : o.read;
+  }
+  /** 要求が頼るもの d の epoch が、このシャードのものと違うときの、断る誤り。計画を取り直させる (経路の拒否と同じ)。 */
+  private staleSchema(d: Dep): NotOwner {
+    return new NotOwner(`stale schema: ${d.name} is at ${d.write ? "write " : ""}epoch ${this.epochOf(d)} on shard ${this.id}, and the request was planned at epoch ${d.epoch}`);
+  }
+
   // ---- 同期区間 ----
 
   /**
@@ -1143,8 +1335,8 @@ export class ShardKernel {
    * これを呼び、返った印を使って、await を挟まずに状態を読み書きする。もう一度待ったら、もう一度呼ぶ。
    *
    * 待っている間に変わり得ることを、ここで確かめ直す。入口ごとに手で並べない。確かめるのは、引数に挙げたことである。
-   *   schema: 要求の表定義が、まだ現行か。入口で確かめた後、行ロックや intent の決着を待っている間に DDL が適用されることがある。
-   *     そのまま書くと、新しいグローバル index を保守しない古い計画が通ってしまう。
+   *   deps: 要求が頼る表定義のもの (表と view) が、どれも、まだ現行か。入口で確かめた後、行ロックや intent の決着を待っている間に
+   *     DDL が適用されることがある。そのまま書くと、新しいグローバル index を保守しない古い計画が通ってしまう。
    *   spans、writes、at: 読む範囲と書く行を、読む時刻でこのシャードが持っているか (assertOwned)。所有は token の区間で
    *     確かめる。1 行は token 1 つ、shard key の範囲はブロックの全体、全表の範囲は読み手の claim である。
    * 確かめるだけで、状態は変えない。時計を進める、数える、ロックを延ばすのは、呼び出し側が区間の中でする。
@@ -1154,8 +1346,9 @@ export class ShardKernel {
   private enter(claim: Rows): Section<"owned">;
   private enter(claim: Partial<Plan> & Partial<Rows>): Section<Check> {
     const rechecked: { schema?: true; owned?: true } = {};
-    if ("schema" in claim) {
-      if (!this.faults.noSchemaRecheck && claim.schema !== this.schema) throw new NotOwner(`stale schema ${claim.schema} < ${this.schema}`);
+    if ("deps" in claim) {
+      const moved = this.faults.noSchemaRecheck ? undefined : claim.deps!.find((d) => d.epoch !== this.epochOf(d));
+      if (moved) throw this.staleSchema(moved);
       rechecked.schema = true;
     }
     if ("spans" in claim) {
@@ -1181,25 +1374,67 @@ export class ShardKernel {
 
 
 
+  // ---- 移動の記録の入口 (計画書の不変条件 15。docs/design-move-messages.md、モデル M5d) ----
+  //
+  // シャードの間の要求と応答には期限がないので、移動の要求と応答は、その移動が閉じた後に届くことがある。シャードは、自分が生きた記録を
+  // 持つ移動の epoch を名指しする要求と応答でだけ、渡した記録 (__moved、__moved_txn、ack で消す行と intent、__fenced の done) と、受け取った
+  // 記録 (入れる行と intent、__arrived、__incoming の done と m) を変える。生きた記録は、親では __fenced の done = 0 の行、子では
+  // __incoming の done = 0 の行である。ほかの epoch の要求と応答には、状態を変えずに答える。親は「渡し終えた」と、いまの時計を答え、子は
+  // 応答を捨てる。
+  // 入口は、渡す側 (handing) と受け取る側 (receiving) に 1 つずつある。入口だけが印 (Handing、Receiving) を作り、記録を書く関数は、
+  // その印を引数に取る。印 (メモリの moved と arrived) は、記録を書いた後で、記録から作り直す (remark)。
+
   /**
-   * 子からの移動の要求 (listGroups、pull、finishMove) が名指しする fence。epoch は移動の move-start の epoch で、親はその epoch まで
-   * 列を適用してから引く (M21 の PULL_AT_EPOCH)。区間も、その fence の区間でなければならない。epoch を運ばない要求 (試験が直に
-   * 送る) は、区間の終わっていない fence を引く。
+   * 渡す側の入口。子からの移動の要求 (listGroups、pull、ack、finishMove) が名指しする移動の fence を引く。epoch は移動の move-start の
+   * epoch で、親はその epoch まで列を適用してから引く (M21 の PULL_AT_EPOCH)。区間も、その fence の区間でなければならない。fence は epoch で
+   * 名指しする。区間で引くと、終わった移動の遅れた要求が、同じ区間の後の移動の fence に当たる。
+   *   fence が生きている (done = 0)   印を返す。渡した記録を書けるのは、この印を持つ関数だけである。
+   *   fence が終わっている (done = 1) "finished" を返す。呼び出し側は、状態を変えずに答える。
+   *   その fence がない               null を返す。
+   * 欠陥のスイッチ pullWithoutEpoch は、move-start を適用していない (fence していない) 親が、頼まれた区間を、頼んだシャードへ渡す。
+   * 欠陥のスイッチ rehandFinished は、終わった fence にも印を返す (5808b08 のコード。M5d の m5d_red_rehand)。
    */
-  private fenceOf(req: Interval & { epoch?: number }): FencedRange | undefined {
-    if (req.epoch !== undefined) return this.fenced.find((x) => x.epoch === req.epoch && sameInterval(x, req));
-    return this.fenced.find((x) => sameInterval(x, req) && !x.done);
+  private handing(req: Interval & { epoch: number; to?: string }): Handing | "finished" | null {
+    const fence = this.fenced.find((x) => x.epoch === req.epoch && sameInterval(x, req));
+    if (!fence) {
+      return this.faults.pullWithoutEpoch ? Handing[HAND]({ ...intervalOf(req), to: req.to ?? "", done: 0, epoch: req.epoch }) : null;
+    }
+    return fence.done && !this.faults.rehandFinished ? "finished" : Handing[HAND](fence);
+  }
+
+  /**
+   * 受け取る側の入口。渡す側の応答が名指しする移動 epoch を、受け取り中 (__incoming の done = 0) なら、印を返す。受け取った記録を書ける
+   * のは、この印を持つ関数だけである。受け取り中でなければ null を返し、呼び出し側は応答を捨てる。受け取りも epoch で名指しする。
+   * pieces は、応答が piece を運ぶか (運ばなければ、受け取り終える答えである)。欠陥のスイッチが、応答の種類ごとにある。どちらも 5808b08 の
+   * コードで、M5d の m5d_red_child_stale の 2 つの run である。
+   *   childAcceptsStale         受け取り終えた移動の piece も受け取る (member6Test。受け取り直した後に消した行が戻る)。
+   *   finishIncomingByInterval  受け取り終える答えを、epoch ではなく区間で引く。名指しされた移動と同じ区間の、いまの受け取りを終える
+   *                             (closeEarlyTest。移動 1 の遅れた答えが、移動 3 の受け取りを終える)。
+   */
+  private receiving(epoch: number, pieces = false): Receiving | null {
+    const range = this.incoming.find((x) => x.epoch === epoch);
+    if (range) return Receiving[RECEIVE](range);
+    if (!(pieces ? this.faults.childAcceptsStale : this.faults.finishIncomingByInterval)) return null;
+    const past = this.b.exec(`SELECT lo AS start, hi AS "end", from_id, epoch FROM __incoming WHERE epoch = ?`, epoch)[0] as unknown as IncomingRange | undefined;
+    if (!past) return null;
+    if (pieces) return Receiving[RECEIVE](past);
+    const same = this.incoming.find((x) => sameInterval(x, past));
+    return same ? Receiving[RECEIVE](same) : null;
   }
 
   /**
    * 範囲のグループを列挙する。fence の後に呼べば取り残しはない。
    * ack されていないグループは移動済みでも返す。子が受け取る前に落ちると応答が失われるからである。
    * 渡して ack を受けたと数えるのは、この移動 (fence の epoch) で渡したグループだけである。前の移動で渡して、受け取り直したグループは数えない。
+   * 状態は変えない。生きた fence がなければ (渡し終えたか、その移動の fence がない)、挙げるものがないと答える。渡し終えた親の範囲には、
+   * その移動の行も intent も残っていない。範囲が戻った後なら、そこにあるのは、いまの持ち主としての行である。
    */
-  private listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch?: number }): { groups: string[]; cursor: GroupCursor | null } {
+  private listGroups(req: Interval & { limit: number; cursor?: GroupCursor | null; epoch: number }): { groups: string[]; cursor: GroupCursor | null } {
     // ブロックを途中で切る範囲では、範囲の中に行か intent を持つグループだけを挙げることになる。いまは、切らない範囲だけを受ける。
     this.wholeSlotsOnly(req);
-    const epoch = this.fenceOf(req)?.epoch ?? req.epoch;
+    const h = this.handing(req);
+    if (!(h instanceof Handing)) return { groups: [], cursor: null };
+    const epoch = h.fence.epoch;
     const handed = (g: string) => {
       const k = this.moved.get(g);
       return k !== undefined && k.epoch === epoch && k.acked;
@@ -1258,55 +1493,147 @@ export class ShardKernel {
 
 
 
-  ack(req: { pieces: Piece[] }): void {
+  /**
+   * グループ g を、生きた fence の宛先へ渡したと記録し、渡した時刻 m を返す (__moved と、g の intent の取引ごとの __moved_txn)。
+   * 印は、記録を書いた後で、記録から作る。書き込みが失敗すれば、印は付かない。
+   */
+  private handGroup(h: Handing, g: string, intents: Row[]): Ts {
+    const f = h.fence;
+    const m = this.issue();
+    const wrote: MoveWrite = { kind: "handed", g, m, to: f.to, epoch: f.epoch };
+    // 欠陥のスイッチ markBeforeWrite: 印を、記録の書き込みより前に付ける。書き込みが失敗しても、印はメモリにだけ残る (5808b08 のコード)。
+    if (this.faults.markBeforeWrite) this.marked(wrote);
     this.b.tx(() => {
-      for (const p of req.pieces) {
-        const g = p.g;
-        // いまは、渡した piece はどれもグループの全体で、移動ごとにグループに 1 つである。記録もグループの名前で引く。
-        // 前の移動の piece の遅れた ack は数えない。受け取り直した後の行を消してしまう。
-        const known = p.after === null ? this.moved.get(g) : undefined;
-        if (!known || known.acked || known.epoch !== p.epoch) continue;
+      this.b.exec(
+        `INSERT INTO __moved(g, lo, hi, "after", up_to, m, dest, epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, g, f.start, f.end, END, END, m, f.to, f.epoch,
+      );
+      for (const i of intents) {
+        this.b.exec(
+          `INSERT OR IGNORE INTO __moved_txn(txn, g, lo, "after", dest, epoch) VALUES (?, ?, ?, ?, ?, ?)`, i.txn as string, g, f.start, END, f.to, f.epoch,
+        );
+      }
+    });
+    if (!this.faults.markBeforeWrite) this.marked(wrote);
+    return m;
+  }
+
+  /**
+   * 生きた fence の移動で渡して、ack を待っているグループの、行と intent を消す。子が受け取った後である。その移動で渡していない
+   * グループと、もう ack を受けたグループには、何もしない。
+   */
+  private dropHanded(h: Handing, groups: string[]): void {
+    const acked = new Set<string>();
+    this.b.tx(() => {
+      for (const g of groups) {
+        const known = this.moved.get(g);
+        if (!known || known.acked || known.epoch !== h.fence.epoch || acked.has(g)) continue;
         for (const def of this.defs.values()) {
           for (const row of selectGroup(this.b, def, g)) deleteRow(this.b, def, tupleKey(def, row).pk);
         }
         this.b.exec(`DELETE FROM __intents WHERE sk = ?`, g);
-        this.b.exec(`UPDATE __moved SET acked = 1 WHERE g = ? AND epoch = ?`, g, p.epoch);
-        known.acked = true;
+        this.b.exec(`UPDATE __moved SET acked = 1 WHERE g = ? AND epoch = ?`, g, h.fence.epoch);
+        acked.add(g);
       }
     });
+    // 印は、記録を書いた取引の後で作り直す。取引が失敗して巻き戻れば、印も変えない。
+    this.marked({ kind: "acked", groups: acked });
   }
 
-  /** 範囲を渡し終えた印を付けて、子に渡す時刻を返す。呼ぶのは、移動の epoch まで列を適用した後である (finishMoveStep)。 */
-  private finishHanding(req: Interval & { epoch?: number }): { m: Ts } {
-    const f = this.fenceOf(req);
-    if (f && !f.done) {
-      this.b.exec(`UPDATE __fenced SET done = 1 WHERE epoch = ?`, f.epoch);
-      f.done = 1;
+  /** 生きた fence に、渡し終えた印を付ける。以後、この移動の要求には、状態を変えずに答える。 */
+  private markHanded(h: Handing): void {
+    this.b.exec(`UPDATE __fenced SET done = 1 WHERE epoch = ?`, h.fence.epoch);
+    h.fence.done = 1;
+  }
+
+  /**
+   * 子が受け取った piece の ack (ShardApi.ack)。piece は、運んだ移動の epoch と fence の区間を運ぶ。生きた fence の移動の piece だけを
+   * 数える。終わった移動の遅れた ack は数えない。範囲が戻った後なら、受け取り直した行を消してしまう。
+   */
+  ack(req: { pieces: Piece[] }): void {
+    // いまは、渡した piece はどれもグループの全体で、移動ごとにグループに 1 つである。グループの一部を指す ack は、渡した piece のものではない。
+    const byMove = new Map<number, { range: Interval; groups: string[] }>();
+    for (const p of req.pieces) {
+      if (p.after !== null) continue;
+      const of = byMove.get(p.epoch) ?? { range: p.range, groups: [] };
+      of.groups.push(p.g);
+      byMove.set(p.epoch, of);
     }
+    for (const [epoch, { range, groups }] of byMove) {
+      const h = this.handing({ ...range, epoch });
+      if (h instanceof Handing) this.dropHanded(h, groups);
+    }
+  }
+
+  /**
+   * 範囲を渡し終えた印を付けて、子に渡す時刻を返す。呼ぶのは、移動の epoch まで列を適用した後である (finishMoveStep)。
+   * もう渡し終えた移動には、時刻だけを答える。
+   */
+  private finishHanding(req: Interval & { epoch: number }): { m: Ts } {
+    const h = this.handing(req);
+    if (h instanceof Handing) this.markHanded(h);
     // fence の後、このシャードは範囲の行について何も答えていない。いま発行する時刻は、範囲について答えたどの読みの時刻よりも、
     // 確定したどの書き込みの時刻よりも大きい。もう終えた範囲にもう一度呼ばれても、新しく発行してよい (どちらの時刻も、この性質を持つ)。
     return { m: this.issue() };
   }
 
   /**
-   * 範囲を受け取り終えた印を付ける (子が、移動を進める手順 moveStep の中で、親の finishMove の後に呼ぶ)。
-   * 行のあるグループは、pull が時刻を運び、時計はそこまで進んでいる (receive)。渡す側に行のなかったグループは運ばれないので、
+   * 受け取り中の移動の piece を入れる。この移動で、まだ届いていない piece の行と intent を入れ、到着を記録する (__arrived)。到着の
+   * 記録は移動ごとにある。前の移動で届いて、その後に渡したグループが、範囲と一緒に戻ってきたら、それは新しい到着である
+   * (docs/design-refresh-across-move.md の「実装がすること」の 5)。この移動でもう届いている piece には、何もしない。
+   * 到着の印は、挿入と同じ同期区間で付ける。確定の待ちの間に、要求駆動の pull と背景の drain が同じグループを受け取ると、二重に
+   * 挿入してしまう。応答は output gate が確定まで止めるので安全である。印は、書いた記録から作る (remark)。届いたグループの
+   * 「渡した」印は、到着の記録のほうが新しいので外れる。
+   */
+  private storePieces(r: Receiving, pieces: PiecePayload[]): void {
+    const fresh = pieces.filter((p) => !this.arrivedIn(p.g, r.range));
+    this.b.tx(() => {
+      for (const p of fresh) {
+        for (const { table, row } of p.rows) insertRow(this.b, this.def(table), row);
+        for (const i of p.intents) {
+          this.b.exec(
+            `INSERT OR IGNORE INTO __intents(tbl, pk, sk, txn, anchor, prepare_ts, change) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            i.tbl ?? null, i.pk ?? null, i.sk ?? null, i.txn ?? null, i.anchor ?? null, i.prepare_ts ?? null, i.change ?? null,
+          );
+        }
+        this.b.exec(
+          `INSERT OR IGNORE INTO __arrived(g, lo, hi, "after", up_to, m, epoch) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          p.g, p.range.start, p.range.end, posKey(p.after), posKey(p.upTo), p.m, r.range.epoch,
+        );
+      }
+    });
+    this.marked({ kind: "arrived", pieces: fresh, epoch: r.range.epoch });
+    for (const p of fresh) this.observe(p.m);
+  }
+
+  /**
+   * 受け取り中の移動に、受け取り終えた印を付ける。m は、渡した側が、渡し終えた後に発行した時刻である (finishMove の応答か、pull への
+   * 「渡し終えた」の答え)。
+   * 行のあるグループは、pull が時刻を運び、時計はそこまで進んでいる (storePieces)。渡す側に行のなかったグループは運ばれないので、
    * 渡す側の時計を、ここで受け取る。受け取らないと、渡す側が「行はない」と答えた時刻より小さい時刻で、その行を書いてしまい、
    * 答え済みの読みが、後から書き込みの後になる (モデル M5b の noWriteBelowRead)。
    * 記録は消さずに、終えた印と、渡した側から受け取った時刻を残す。メモリからは外すので、移動の途中ではなくなる。残した記録が、範囲の床で
    * あり、移動をまたぐ確かめがたどる受け取りの記録である。記録は受け取りごとにあり、書き換えるのは、いま受け取っている移動の行だけで
-   * ある (docs/design-refresh-across-move.md の「実装がすること」の 5)。もう受け取り終えた移動には何もしない。前の受け取りの m を
-   * 書き換えると、尋ねる列が、どの受け取りをたどるかを選べなくなる。
+   * ある (docs/design-refresh-across-move.md の「実装がすること」の 5)。前の受け取りの m を書き換えると、尋ねる列が、どの受け取りを
+   * たどるかを選べなくなる。
    */
-  finishIncoming(req: Interval & { m: Ts }): void {
-    if (!this.faults.finishWithoutClock) this.observe(req.m);
-    const cur = this.incoming.find((x) => sameInterval(x, req));
-    if (!cur) return;
-    this.b.exec(`UPDATE __incoming SET done = 1, m = ? WHERE epoch = ? AND done = 0`, req.m, cur.epoch);
+  private markReceived(r: Receiving, m: Ts): void {
+    const cur = r.range;
+    if (!this.faults.finishWithoutClock) this.observe(m);
+    this.b.exec(`UPDATE __incoming SET done = 1, m = ? WHERE epoch = ? AND done = 0`, m, cur.epoch);
     this.incoming = this.incoming.filter((x) => x !== cur);
-    this.raiseFloor(intervalOf(req), req.m);
-    // 範囲が前の持ち主へ戻ったとき、運ばれなかった (行も intent もない) グループの「渡した」印は、受け取り終えたここで外す (unmarked)。
-    for (const [g, k] of [...this.moved]) if (this.unmarked(g, k.epoch, [cur])) this.moved.delete(g);
+    this.raiseFloor(intervalOf(cur), m);
+    // 範囲が前の持ち主へ戻ったとき、運ばれなかった (行も intent もない) グループの「渡した」印は、受け取り終えたここで外れる。終えた
+    // 記録が変えるのは、その範囲のグループの「渡した」印だけなので、その印を作り直す (marked)。
+    this.marked({ kind: "received", range: cur });
+  }
+
+  /**
+   * 移動 epoch を受け取り終えた印を付ける (ShardApi.finishIncoming)。その移動を受け取り中でなければ (もう受け取り終えた)、何もしない。
+   * 時計も進めない。
+   */
+  finishIncoming(req: { epoch: number; m: Ts }): void {
+    const r = this.receiving(req.epoch);
+    if (r) this.markReceived(r, req.m);
   }
 
   health(_req: Record<string, never>): ShardHealth {
@@ -1390,12 +1717,61 @@ export class ShardKernel {
 
   liveLock(key: string): RowLock | undefined {
     const l = this.locks.get(key);
-    if (l && l.expires <= this.deps.clock.now()) {
-      this.locks.delete(key);
-      this.wakeNext(key);
+    if (!l) return undefined;
+    const lease = this.leases.get(l.txn);
+    if (!lease || lease.until <= this.deps.clock.now()) {
+      this.expire(l.txn);
       return undefined;
     }
     return l;
+  }
+
+  /** 行のロックの期限 (持ち主の取引の lease の期限)。ロックがなければ undefined。殻が、待ち手を起こすタイマーを掛けるのに使う。 */
+  lockExpiry(key: string): number | undefined {
+    const l = this.locks.get(key);
+    return l ? this.leases.get(l.txn)?.until : undefined;
+  }
+
+  /** 取引の lease が切れた。取引のロックを全部消し、待ち手を起こす。lease も忘れる。 */
+  private expire(txn: string): void {
+    this.leases.delete(txn);
+    for (const [key, l] of this.locks) {
+      if (l.txn !== txn) continue;
+      this.locks.delete(key);
+      this.wakeNext(key);
+    }
+  }
+
+  /** 取引 txn に、生きている行ロックがあるか。期限を過ぎた lease は、ここで片付ける。 */
+  private hasLocks(txn: string): boolean {
+    const lease = this.leases.get(txn);
+    if (!lease) return false;
+    if (lease.until <= this.deps.clock.now()) {
+      this.expire(txn);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * 取引の lease を、要求か renew が運ぶ lease で延ばす (docs/design-lock-lease.md の「シャードがすること」)。
+   *   取引の生きているロックがなければ、何もしない。lease も作らない。期限を過ぎたロックは、延長では戻らない (EXTEND_ONLY)。
+   *   運ばれた版が、持っている版より大きければ、期限を、受けた時刻 + 残りにする。等しいか小さければ、何もしない。受けたことのある版の
+   *   延長が、ランタイムの再試行で何度届いても、延びない (EPOCH_CHECK)。
+   * 欠陥のスイッチ perShardLockTtl は、運ばれた lease を見ない。leaseIgnoresEpoch は、版を比べずに延ばす。
+   */
+  private extend(txn: string, lease: TxnLease | undefined): void {
+    if (!lease || this.faults.perShardLockTtl || !this.hasLocks(txn)) return;
+    const mine = this.leases.get(txn)!;
+    const until = this.deps.clock.now() + lease.ms;
+    if (this.faults.leaseIgnoresEpoch) mine.until = Math.max(mine.until, until);
+    else if (lease.epoch > mine.epoch) mine.until = until;
+    mine.epoch = Math.max(mine.epoch, lease.epoch);
+  }
+
+  /** 取引の lease を延ばす (ShardApi.renew)。 */
+  renew(req: { txn: string; lease: TxnLease }): void {
+    this.extend(req.txn, req.lease);
   }
 
   wakeNext(key: string): void {
@@ -1414,17 +1790,44 @@ export class ShardKernel {
     for (const w of list) w.wake();
   }
 
-  private grant(key: string, owner: LockOwner): void {
-    this.locks.set(key, { ...owner, expires: this.deps.clock.now() + (this.deps.lockTtlMs ?? LOCK_TTL_MS) });
+  /**
+   * 行のロックを与える。ロックは、取引の lease に加わる。lease がまだなければ、要求の lease で作る。arrived は、要求が着いた時刻である
+   * (ロックを待った後で与えるときも、期限は、着いた時刻 + 残りで決める。待っている間の文を、文を受けたシャードだけが延ばすと、行が 1 つの
+   * シャードにある取引だけが、長くロックを持つ)。lease を運ばない要求 (試験が直に送る) の期限は、着いた時刻 + TTL である。
+   */
+  private grant(key: string, owner: LockOwner, arrived: number): void {
+    if (!this.hasLocks(owner.txn)) {
+      // 欠陥のスイッチ perShardLockTtl と localLockLease は、自分の時計で期限を決める (arrive)。
+      const own = this.faults.perShardLockTtl ? this.ttl() : this.faults.localLockLease ? this.ttl() + this.ttl() * (LOCK_LEASE_SLACK_MS / LOCK_TTL_MS) : undefined;
+      const until = own !== undefined ? this.deps.clock.now() + own : arrived + (owner.lease?.ms ?? this.ttl());
+      this.leases.set(owner.txn, { until, epoch: owner.lease?.epoch ?? 0 });
+    }
+    this.locks.set(key, owner);
   }
 
-  private renew(txn: string): void {
-    const until = this.deps.clock.now() + (this.deps.lockTtlMs ?? LOCK_TTL_MS);
-    for (const l of this.locks.values()) if (l.txn === txn) l.expires = until;
+  private ttl(): number {
+    return this.deps.lockTtlMs ?? LOCK_TTL_MS;
+  }
+
+  /**
+   * ロックを取る文が着いた。取引の lease を、要求の lease で延ばす。
+   * 欠陥のスイッチ perShardLockTtl (2026-11-17 までの形) は、自分の時計で TTL だけ延ばす。localLockLease は、自分の時計で lease の長さ
+   * (TTL + 余裕) だけ延ばす。どちらも、文を受けたシャードのロックだけが延びる。
+   */
+  private arrive(me: LockOwner): void {
+    if (this.faults.perShardLockTtl || this.faults.localLockLease) {
+      const mine = this.hasLocks(me.txn) ? this.leases.get(me.txn)! : undefined;
+      const ttl = this.ttl();
+      if (mine) mine.until = this.deps.clock.now() + (this.faults.localLockLease ? ttl + ttl * (LOCK_LEASE_SLACK_MS / LOCK_TTL_MS) : ttl);
+      if (mine && me.lease) mine.epoch = Math.max(mine.epoch, me.lease.epoch);
+      return;
+    }
+    this.extend(me.txn, me.lease);
   }
 
   private releaseLocks(txn: string): void {
     const id = lockIdOf(txn);
+    this.leases.delete(id);
     for (const [key, l] of this.locks) {
       if (l.txn !== id) continue;
       this.locks.delete(key);
@@ -1480,6 +1883,8 @@ export class ShardKernel {
     } else {
       if (this.locks.get(key)?.txn !== held.txn) return false;
       this.locks.delete(key);
+      // 取引のロックが全部なくなったら、lease も忘れる。
+      if (![...this.locks.values()].some((l) => l.txn === held.txn)) this.leases.delete(held.txn);
     }
     return true;
   }
@@ -1570,7 +1975,7 @@ export class ShardKernel {
   /** (from, 現在] の commit のうち、述語に関わるものがあるか。 */
   private predicateChanged(s: Extract<Span, { kind: "pred" }>, from: Ts): boolean {
     const def = this.defs.get(s.table);
-    if (!def || from < this.logLowWater || from < this.ddlFloor) return true;
+    if (!def || from < this.logLowWater || from < this.floorOf([s.table])) return true;
     const rows = this.logScan(`WHERE commit_ts > ?`, [from], PRED_WINDOW + 1);
     if (rows.length > PRED_WINDOW) return true;
     for (const r of rows) {
@@ -1600,15 +2005,54 @@ export class ShardKernel {
     return out!.v;
   }
 
-  /** T より後の commit について、pk ごとに最も古い before-image を集める。 */
-  private deltaAfter(T: Ts): { table: string; pk: string; image: Tuple | null }[] {
+  /**
+   * 変更ログにある、表 keys (小文字の名前) の行の確定の時刻の最大。なければ 0。表定義の変更の床に使う (tableFloors)。
+   * 表ごとの最新の確定の時刻は、直近 write の索引が持つ (touch の `t\0表`。起動のときに変更ログから作り直す)。索引は、膨らむと捨てる
+   * (pruneRecent)。捨てた時刻以下の確定は索引にないので、変更ログから探す。変更ログの切り詰めで消えた確定は、数えない (それより古い
+   * 時刻の読みは、logLowWater が断る)。
+   * RENAME TO は、前の名前と後の名前の両方が keys に入る。後の名前の床は、前の名前で記録された確定の時刻になる。
+   */
+  private lastLogged(keys: ReadonlySet<string>): Ts {
+    let last = 0;
+    for (const [k, ts] of this.recent) {
+      if (ts > last && k.startsWith("t\0") && keys.has(objectKey(k.slice(2)))) last = ts;
+    }
+    if (last < this.recentLowWater && this.recentLowWater > this.logLowWater) {
+      this.logEach(`WHERE commit_ts > ? AND commit_ts <= ?`, [last, this.recentLowWater], (ts, _txn, blob) => {
+        if (decode<Change[]>(blob).some((c) => keys.has(objectKey(c.table)))) last = Math.max(last, ts);
+      });
+    }
+    return last;
+  }
+
+  /**
+   * 表 tables (範囲の表の名前。"*" は全部の表) の、表定義の変更の床のうち、いちばん大きいもの。床がなければ 0。
+   */
+  private floorOf(tables: Iterable<string>): Ts {
+    let floor = this.tableFloors.get(ALL_OBJECTS) ?? 0;
+    for (const t of tables) {
+      if (t === ALL_OBJECTS) for (const f of this.tableFloors.values()) floor = Math.max(floor, f);
+      else floor = Math.max(floor, this.tableFloors.get(objectKey(t)) ?? 0);
+    }
+    return floor;
+  }
+
+  /**
+   * T より後の commit について、pk ごとに最も古い before-image を集める。集めるのは、文が読む表 (範囲 spans の表) の行だけである。
+   * 見る床も、その表のものだけである。ほかの表の DDL の後でも、古い時刻の読みに答えられる (M24 の m24_floor_red_restore_all)。
+   * 欠陥のスイッチ restoreAllTables は、T より後に確定した全部の表の行を戻し、全部の表の床を見る (段 3 の形)。
+   */
+  private deltaAfter(T: Ts, spans: readonly Span[]): { table: string; pk: string; image: Tuple | null }[] {
     if (T >= this.maxCommit) return [];
-    const floor = Math.max(this.logLowWater, this.ddlFloor);
+    const all = this.faults.restoreAllTables || spans.some((s) => s.table === ALL_OBJECTS);
+    const tables = new Set(spans.map((s) => s.table));
+    const floor = Math.max(this.logLowWater, this.floorOf(all ? [ALL_OBJECTS] : tables));
     if (T < floor) throw new ReadTooOld(`moved at ${floor}`);
     const seen = new Map<string, { table: string; pk: string; image: Tuple | null }>();
     // K を超えた時点で読むのをやめる。T 以降の全ログを読んでから数えると、古い T の読みが来るたびに保持窓の全行を読む。
     this.logEach(`WHERE commit_ts > ?`, [T], (_ts, _txn, blob) => {
       for (const c of decode<Change[]>(blob)) {
+        if (!all && !tables.has(c.table)) continue;
         const key = `${c.table}\0${c.pk}`;
         if (!seen.has(key) && this.defs.has(c.table)) seen.set(key, { table: c.table, pk: c.pk, image: c.before });
       }
@@ -1633,8 +2077,8 @@ export class ShardKernel {
   private run(sec: Section<"owned">, req: ExecReq): Ran {
     const out = this.checked(sec, req, () => this.runStatement(req));
     // 取引の文は、ここでは変更を返すだけで、確定のときにもう一度確かめられる (assertWriteSetFits)。
-    // ここでも断るのは、COMMIT まで待たずに、文の時点で伝えるためである。
-    this.assertUnlocked(out.changes);
+    // ここでも断るのは、COMMIT まで待たずに、文の時点で伝えるためである。悲観の取引の文は、取引とその行ロックの表を運ぶ (req.lock)。
+    this.assertUnlocked(out.changes, req.lock ?? null);
     return out;
   }
 
@@ -1985,10 +2429,11 @@ export class ShardKernel {
    *   表が書き込み禁止でないこと。表定義の遷移の prepare から commit か abort まで、fence の表の行は変わってはならない。
    *   変更ログの 1 行に収まること。
    * 書き込み禁止は、このシャードのスナップショットの開いている遷移なので、要求の表定義の epoch が現行であることを確かめた
-   * 同期区間の印を受け取る。
+   * 同期区間の印を受け取る。who は、書く取引である (その表の行ロックを持つ取引は、prepare の適用を待っているシャードで通る)。
+   * autocommit の書き込みは null。
    */
-  private assertWriteSetFits(_sec: Section<"schema">, writes: Change[]): void {
-    this.assertUnlocked(writes);
+  private assertWriteSetFits(_sec: Section<"schema">, writes: Change[], who: Pick<LockOwner, "txn" | "holds"> | null): void {
+    this.assertUnlocked(writes, who);
     if (this.faults.noWriteSetLimit || writes.length === 0) return;
     let bytes = 0;
     for (const w of writes) {
@@ -1998,15 +2443,92 @@ export class ShardKernel {
   }
 
   /**
-   * 書き込む表が、開いている表定義の遷移の fence にないか (docs/design-catalog-epoch.md の「要求ごとの確かめ」の書き込み禁止)。
-   * 禁止は、このシャードが prepare を適用したときから、commit か abort を適用するまで続く。
+   * 表定義の遷移が、行を書くことと、行ロックを取ることを、止めているか (計画書の不変条件 16。モデル M24c の mayLock。
+   * docs/design-catalog-epoch.md の「ロックを与える判断と fence」)。書き込みも、ロックを取る読みも、ここの 1 つの判断を通る。rows は、
+   * 要求が書く行か、ロックを取る行で、表への頼り方 (書き込みとして頼るか、読みとして頼るか) を見ない。止めているなら、その理由を返す。
+   *   その表の prepare を適用している (書き込み禁止)   止める。prepare を適用したときから、commit か abort を適用するまで続く。
+   *   その表の prepare の適用を待っている (pending)     その表の行ロックを持たない取引を、止める。持つ取引は通す (その後の文と COMMIT を
+   *                                                     待たせない)。持つかは、要求が運ぶ (LockOwner.holds。どのシャードに持っていても
+   *                                                     よい) か、このシャードのロックで分かる。autocommit の書き込みと、楽観の取引の
+   *                                                     COMMIT は、ロックを持たない (who が null か、ロックのない取引)。
+   * 止められた要求は、DDL の後ろで待つ (Worker が、DDL が終わるのを待って、送り直す。COMMIT は、送り直さずに競合になる)。SQLite で、
+   * DDL が書き込みのロックを待つ間に来た書き手が、DDL の後ろで待つのと同じである。待っている間も通すと、後から来た取引が DDL を待たせ、
+   * 成否が、行の置き場所で決まる (もう prepare を適用したシャードでは、その取引は止められる)。
+   * その表の行ロックを持つ取引が、適用した prepare に当たったときは、呼び出し側が、断るときに行のロックを与える (heldAtFence)。
+   * ロックについては、与える直前に呼ぶ。行を待っていた要求は、起こされた後で、もう一度ここを通る。
+   * 欠陥のスイッチ lockDuringDdlWait (D3) は、待っている prepare を見ない。holdsOnlyHere は、待っている間、このシャードにロックを持つ
+   * 取引だけを通す。
    */
-  private assertUnlocked(writes: Pick<Change, "table">[]): void {
-    if (this.faults.ignoreTableLock || this.snap.opens.length === 0) return;
-    for (const w of writes) {
-      const by = fencedBy(this.snap, w.table);
-      if (by) throw new TableLocked(w.table, describeOpen(by));
+  private tableGate(rows: readonly Pick<Change, "table" | "pk">[], who: Pick<LockOwner, "txn" | "holds"> | null): TableLocked | null {
+    if (this.faults.ignoreTableLock || rows.length === 0 || (this.snap.opens.length === 0 && this.pending === null)) return null;
+    const refuse = (table: string, by: string, epoch: number, closed: (t: string) => boolean): TableLocked => {
+      const refused = new TableLocked(table, by, epoch);
+      refused.rows = rows.filter((x) => closed(x.table)).map((x) => ({ table: x.table, pk: x.pk }));
+      return refused;
+    };
+    for (const r of rows) {
+      const by = fencedBy(this.snap, r.table);
+      if (by) return refuse(r.table, describeOpen(by), by.epoch, (t) => fencedBy(this.snap, t) !== null);
     }
+    const p = this.faults.lockDuringDdlWait ? null : this.pending;
+    if (p === null) return null;
+    // 欠陥のスイッチ holdsOnlyHere: 要求の運ぶ holds を見ない (このシャードにロックを持つ取引だけを、ロックを持つ取引とする)。
+    const holds = new Set(this.faults.holdsOnlyHere ? [] : (who?.holds ?? []));
+    const waited = (t: string) => p.tables.has(objectKey(t)) && !holds.has(objectKey(t)) && !(who !== null && this.holdsRowOf(who.txn, t));
+    for (const r of rows) if (waited(r.table)) return refuse(r.table, p.by, p.epoch, waited);
+    return null;
+  }
+
+  /** 行を書いてよいか、行ロックを取ってよいかを確かめ、止められていれば TableLocked を投げる (tableGate)。 */
+  private assertUnlocked(rows: readonly Pick<Change, "table" | "pk">[], who: Pick<LockOwner, "txn" | "holds"> | null): void {
+    const refused = this.tableGate(rows, who);
+    if (refused) throw refused;
+  }
+
+  /** 取引 txn が、このシャードに、表 table の生きている行ロックを持つか。 */
+  private holdsRowOf(txn: string, table: string): boolean {
+    if (!this.hasLocks(txn)) return false;
+    const key = objectKey(table);
+    for (const [k, l] of this.locks) if (l.txn === txn && objectKey(k.slice(0, k.indexOf("\0"))) === key) return true;
+    return false;
+  }
+
+  /**
+   * ロックを持つ取引の文が、書き込み禁止に当たった (docs/design-catalog-epoch.md の「表ごとの epoch」の「シャード」、M24 の HOLD)。
+   * 要求が、取引がその表の行ロックを (ほかのシャードに) 持つと運んでいれば、文を断るときに、文が書こうとした行のロックを取引に与える。
+   * 行は書かない。そのロックは、ほかの行ロックと同じく、やり直しの prepare を待たせ、取引の COMMIT か ROLLBACK で放され、期限で切れる。
+   * ほかの取引がロックか intent を持つ行は、与えない。1 つでも与えたら、与えた印の付いた誤りを返す。
+   */
+  private heldAtFence(e: TableLocked, me: LockOwner, arrived: number): TableLocked {
+    if (this.faults.noLockAtFence || !me.holds || me.holds.length === 0) return e;
+    // 適用を待っている prepare に止められたのは、その表の行ロックを持たない取引である (tableGate)。与えるロックはない。
+    if (this.pending !== null && e.epoch === this.pending.epoch) return e;
+    const holds = new Set(me.holds);
+    let granted = false;
+    for (const r of e.rows) {
+      if (!holds.has(objectKey(r.table)) || this.blockedBy([r], me) !== null) continue;
+      this.grant(this.lockKey(r.table, r.pk), me, arrived);
+      granted = true;
+    }
+    if (!granted) return e;
+    const held = new TableLocked(e.table, e.by, e.epoch, true);
+    held.rows = e.rows;
+    return held;
+  }
+
+  /**
+   * 表 tables のどれかに、生きている行ロックがあれば、その表の名前。なければ null。表の prepare は、その表の行ロックがある間は
+   * 適用しない (M24 の WAIT_LOCKS)。
+   */
+  private lockedTable(tables: readonly string[]): string | null {
+    if (this.locks.size === 0 || tables.length === 0) return null;
+    const wanted = new Set(tables.map(objectKey));
+    for (const key of [...this.locks.keys()]) {
+      if (!this.liveLock(key)) continue;
+      const table = key.slice(0, key.indexOf("\0"));
+      if (wanted.has(objectKey(table))) return table;
+    }
+    return null;
   }
 
   /** 主キーが違っても衝突し得る表か。UNIQUE index のある表である。 */
@@ -2065,7 +2587,7 @@ export class ShardKernel {
     if (dup) return { ok: true, prepareTs: dup.prepare_ts as Ts };
     // phase 2 で初めて上限に当たると、確定した取引が適用できなくなる。intent を置く前に拒否する。
     try {
-      this.assertWriteSetFits(plan, req.writes);
+      this.assertWriteSetFits(plan, req.writes, { txn: lockIdOf(req.txn) });
     } catch (e) {
       this.releaseLocks(req.txn);
       return { ok: false, reason: (e as Error).message };
@@ -2073,7 +2595,7 @@ export class ShardKernel {
     this.observe(req.T);
     let sec: Section<Check>;
     try {
-      sec = this.enter({ schema: req.schema, spans: req.spans, writes: req.writes, at: req.T });
+      sec = this.enter({ deps: req.deps, spans: req.spans, writes: req.writes, at: req.T });
     } catch (e) {
       // 参加者が非オーナーなら取引は abort で、Worker が経路を更新して再実行する。
       this.releaseLocks(req.txn);
@@ -2109,15 +2631,19 @@ export class ShardKernel {
     return { ok: true, prepareTs };
   }
 
-  refresh(req: { txn: string; spans: Span[]; from: Ts; to: Ts }): { ok: boolean; reason?: string } {
+  refresh(req: { txn: string; spans: Span[]; from: Ts; to: Ts; deps: Dep[] }): { ok: boolean; reason?: string } {
     // 先に HLC を to まで進める。これ以後に置かれる intent は prepare_ts > to になる。
     if (!this.faults.refreshNoBump) this.observe(req.to);
-    // DDL や変更ログの切り詰めより古い窓は、変更の有無を確かめられない。
-    if (req.from < this.ddlFloor || req.from < this.logLowWater) return { ok: false, reason: "refresh: window too old" };
+    // 前の形の確定が窓に入る表や、変更ログの切り詰めより古い窓は、変更の有無を確かめられない。ほかの表の DDL は、窓を古くしない。
+    if (req.from < this.floorOf(req.spans.map((s) => s.table)) || req.from < this.logLowWater) return { ok: false, reason: "refresh: window too old" };
     let sec: Section<"owned">;
     try {
+      // 取引が読んだ表の DDL が、読んだ後に確定していれば、断る (deps が、このシャードの epoch と違う)。表の床は、適用した時刻より前に
+      // あるので、床だけでは、行の変更のない DDL をまたぐ前進を止められない。取引は、DDL の前の表と、DDL の後のほかの表を見ることになる。
+      // 範囲は、このシャードが、同じ deps の読みに答えたものなので、このシャードが要求より古いことはない。違えば、どちら向きでも断る。
+      // 欠陥のスイッチ refreshIgnoresSchema は、比べない。
       // from より後に移動してきたグループは、親での変更を確かめられないので abort する。
-      sec = this.enter({ spans: req.spans, writes: [], at: req.from });
+      sec = this.enter({ deps: this.faults.refreshIgnoresSchema ? [] : req.deps, spans: req.spans, writes: [], at: req.from });
     } catch (e) {
       return { ok: false, reason: e instanceof Error ? e.message : String(e) };
     }
@@ -2201,31 +2727,67 @@ export class ShardKernel {
   // ---- 手続き: 表定義 ----
 
   /**
-   * 要求の入口の確かめ (docs/design-catalog-epoch.md の「要求ごとの確かめ」、M21 の gate)。
-   *   表定義: 要求の表定義の epoch が自分のものより古ければ断る。新しければ、Meta の列を適用してから、もう一度確かめる。
+   * 要求の入口の確かめ (docs/design-catalog-epoch.md の「要求ごとの確かめ」と「表ごとの epoch」、M21 の gate、M24)。
+   *   遷移の仕事: f.atLeast があれば、その epoch まで列を適用する (prepare は、どのものの epoch も進めないので、別に運ぶ)。
+   *   表定義: 要求が頼るもの (f.deps) ごとに、要求の epoch を自分の epoch と比べる。要求のほうが古いものが 1 つでもあれば断る。新しい
+   *     ものがあれば、Meta の列をその epoch まで適用してから、もう一度比べる。運ばれなかった表の DDL は、要求を古くしない。
+   *   適用中: 記録の適用が、その記録の変える表の intent の決着を待っている間、その表に頼る新しい文は、適用が終わるまで待つ。断らない
+   *     (失敗する DDL が、触った表の取引を断らないように。M24 の m24_red_apply_touched)。ほかの表の文は通す (m24_red_apply_all)。
+   *   書き込み禁止: 書く表が、自分のスナップショットで書き込み禁止で、要求の epoch (f.epoch) が自分の epoch より新しければ、列を適用して
+   *     から進む。commit だけが epoch を進める形では、abort の後に、要求が頼るものの epoch は進まない。禁止を解く記録を適用させるのは、
+   *     遷移が閉じたと知った Worker の、この要求である。
    *   所有: f.epoch と f.rows があれば、表定義を確かめた後で見る。要求の epoch が自分の epoch より新しく、要求の行が自分の
    *     スナップショットでは自分のものでないときだけ、範囲の記録を適用する (catchUpStep)。要求の epoch が古いことでは断らない。
    *     範囲表だけが進んだ epoch は、動いていない行の要求を古くしない (M21 の pinnedSurvives、m21_red_strict_epoch)。
    *     断るかどうかは、同期区間の入口 (enter の assertOwned) が、自分のスナップショットと移動の記録で決める。
    */
   private schemaStep(f: SchemaFrame): Step<void, SchemaFrame> {
-    const schema = f.schema;
-    if (!f.again) {
-      if (f.reached) {
-        // Meta にある記録は全部適用するので、要求の表定義の epoch を通り越していることがある。要求の表定義が取り消されたときもそうなる。
-        // その場合は、この要求が古い。
-        f.again = true;
-        return wait(this.call("schema", { schema }));
+    if (!f.reached && f.atLeast !== undefined && f.atLeast > this.applied) {
+      f.reached = true;
+      return wait(this.call("reach", { epoch: f.atLeast, catchUp: false }));
+    }
+    // 遷移の仕事の要求 (atLeast は prepare の epoch) は、その prepare を適用したシャードの行を見なければならない。適用が、行ロックを待って
+    // 止まっているなら (pending)、答えない。進める側は、全シャードの prepared の ok の後で送るので、起きるのは、順序が破れたときだけである。
+    if (f.atLeast !== undefined && f.atLeast > this.applied && this.pending !== null) {
+      throw new ConflictError(`the schema change of epoch ${this.pending.epoch} (${this.pending.by}) is waiting for transactions that hold row locks on shard ${this.id}`);
+    }
+    // 古い表定義の要求を通すと、新しいグローバル index の更新が漏れる。経路と同じく取り直させる。
+    const older = f.deps.find((d) => d.epoch < this.epochOf(d));
+    if (older) throw this.staleSchema(older);
+    const newer = f.deps.filter((d) => d.epoch > this.epochOf(d));
+    if (newer.length > 0) {
+      // Meta にある記録は全部適用するので、適用の後で、要求のほうが古くなっていることがある。もう一度、先頭から比べる。
+      // 2 度適用しても届かない epoch は、Meta の列にない。
+      f.ahead = (f.ahead ?? 0) + 1;
+      if (f.ahead > 2) throw new SqlError(`schema epoch ${newer[0]!.epoch} of ${newer[0]!.name} is not recorded yet (shard ${this.id} has applied the epoch log up to ${this.applied})`);
+      return wait(this.call("reach", { epoch: Math.max(...newer.map((d) => d.epoch)), catchUp: false }));
+    }
+    // 欠陥のスイッチ applyRefusesAll (段 3 の形): 適用が進んでいる間は、どの表の、どの要求も断る。
+    if (this.faults.applyRefusesAll && this.schemaChanging) throw new NotOwner(`stale schema: a schema change is being applied on shard ${this.id}`);
+    if (f.statement && this.applying !== null) {
+      const touched = this.applying;
+      const hit = touched === "all" || f.deps.some((d) => touched.has(d.name));
+      // 欠陥のスイッチ applyRefusesTouched: 変わるものに頼る文を、待たせずに断る。
+      if (hit && this.faults.applyRefusesTouched) throw new NotOwner(`stale schema: a schema change is being applied on shard ${this.id}`);
+      if (hit) {
+        f.waited = (f.waited ?? 0) + 1;
+        // 適用は、決着の待ちの期限 (SCHEMA_WAIT_MS) で終わる。待ち続けることはない。
+        if (f.waited > 50) throw new ConflictError(`a schema change is being applied on shard ${this.id}`);
+        return wait({ kind: "schemaChangeOver" });
       }
-      // 古い表定義の要求を通すと、新しいグローバル index の更新が漏れる。経路と同じく取り直させる。
-      if (schema < this.schema) throw new NotOwner(`stale schema ${schema} < ${this.schema}`);
-      if (schema > this.schema) {
-        f.reached = true;
-        return wait(this.call("reach", { schema, catchUp: false }));
-      }
-      // DDL の適用が intent の決着を待っている間は、古い表定義の新しい要求を受けない。
-      // 受けると intent が増え続けて、DDL がいつまでも適用できない。呼び出し側は表定義を取り直して、同じ待ちに合流する。
-      if (this.schemaChanging) throw new NotOwner(`stale schema ${schema}: a schema change is being applied`);
+    }
+    if (!f.unfenced && f.epoch !== undefined && f.epoch > this.applied && this.snap.opens.length > 0
+      && f.deps.some((d) => d.write && this.snap.opens.some((o) => o.fence.some((t) => objectKey(t) === d.name)))) {
+      f.unfenced = true;
+      return wait(this.call("reach", { epoch: f.epoch, catchUp: false }));
+    }
+    // 適用が、行ロックを待って止めている prepare (pending) は、もう閉じているかもしれない。prepare の次の記録は、その遷移の commit か
+    // abort である (Meta は、遷移を 1 つしか開かない) ので、要求の epoch が、その prepare より新しければ、閉じている。列を適用して、
+    // 待ちを解く (やり直しの prepare が続いていれば、そちらを待ち始める)。要求の epoch が、その prepare と同じなら (取り消させた取引の
+    // 送り直しは、やり直しの prepare の epoch を運ぶ)、適用しない。
+    if (!f.unfenced && f.epoch !== undefined && this.pending !== null && f.epoch > this.pending.epoch && f.deps.some((d) => this.pending!.tables.has(d.name))) {
+      f.unfenced = true;
+      return wait(this.call("reach", { epoch: f.epoch, catchUp: false }));
     }
     if (!f.caught && f.epoch !== undefined && f.rows && f.epoch > this.applied && !this.ownsRows(f.rows)) {
       f.caught = true;
@@ -2235,30 +2797,33 @@ export class ShardKernel {
   }
 
   /**
-   * 少なくともこの表定義の epoch まで、Meta の列を適用する。先まで進んでもよい。
-   * 要求の計画の表定義を確かめる schemaStep と違い、増設の手順 (受け入れ、fence、行の受け取り) が使う。
-   * そこでは「この表定義より古くない」ことだけが要る。
+   * 少なくとも epoch まで、Meta の列の全部 (表定義の記録も) を適用する。先まで進んでもよい。
+   * 要求の入口 (schemaStep)、prepare の適用の答え (preparedStep)、増設の手順 (行の受け取り) が使う。
    */
   private reachStep(f: ReachFrame): Step<void, ReachFrame> {
     if (f.before !== undefined) {
-      if (this.schema === f.before) throw new SqlError(`schema epoch ${f.schema} is not recorded yet (shard ${this.id} is at ${f.before})`);
+      // 適用が、行ロックを待つ prepare の手前で終わった (pending)。その手前までは適用してある。それより先へは、ロックが空くまで進めない。
+      // 待つかどうかは、呼び出し側が決める (prepare を適用させたい preparedStep は待つ。文の要求は、待たずに進む)。
+      if (f.epoch > this.applied && this.pending !== null && this.pending.epoch === this.applied + 1) return done(undefined);
+      if (this.applied === f.before) throw new SqlError(`epoch ${f.epoch} is not recorded yet (shard ${this.id} has applied the epoch log up to ${f.before})`);
       f.before = undefined;
     }
-    if (!(f.schema > this.schema)) return done(undefined);
+    if (f.epoch <= this.applied) return done(undefined);
     // 追いつくための適用は、移動の途中でも通る。進行中の通常の適用 (移動の途中は断られる) には合流しない。
     if (f.catchUp && this.schemaChanging) return wait({ kind: "schemaChangeOver" });
-    f.before = this.schema;
+    f.before = this.applied;
     return wait({ kind: "schemaChange", catchUp: f.catchUp });
   }
 
   /**
-   * Meta の列の続きを取り、順に 1 つずつ写しに足す (docs/design-catalog-epoch.md の「列の適用」)。
-   * 先に、このシャードが持つ intent をすべて決着させる。intent の行イメージは DDL より前の表の形なので、表や列が消えた後では
-   * 適用できない。確定済みの取引がそうなると、再駆動が永久に失敗する。prepare の後は fence の表に新しい intent ができないので、
-   * commit の文は、決着していない書き込みのない表に掛かる。
+   * Meta の列の続きを取り、順に 1 つずつ写しに足す (docs/design-catalog-epoch.md の「列の適用」と「表ごとの epoch」の「シャード」)。
+   * 表定義の記録は、その記録が変える表 (fence の表、文が作る、変える、消す表、index の表) の intent を決着させてから適用する。intent の
+   * 行イメージは DDL より前の表の形なので、表や列が消えた後では適用できない。確定済みの取引がそうなると、再駆動が永久に失敗する。
+   * ほかの表の intent は待たない。決着を待つ間、その表に頼る新しい文は入口で待つ (schemaStep) ので、待つ intent は増え続けない。
+   * prepare の後は fence の表に新しい intent ができないので、commit の文は、決着していない書き込みのない表に掛かる。
    * 記録ごとの手は次のとおりで、どれも記録を写しに足すのと同じ 1 つの同期の取引で行う。
    *   prepare  staging の表 (index の表) を作る。以後、fence の表への書き込みを断る (assertUnlocked)。利用者の表には触らない。
-   *   commit   prepare の ddl の文を実行する。at があれば時計を進め、ddlFloor を取り直す。
+   *   commit   prepare の ddl の文を実行する。at があれば時計を進め、読みの epoch が進む表の床を置く (tableFloors)。
    *   abort    staging の表を名前で消す。禁止が解ける。
    *   範囲の記録 (genesis、move-start、move-end)  文を持たない (catchUpStep も、これだけを適用する)。move-start は、親と子の移動の
    *            記録を書く (moveRows)。
@@ -2266,15 +2831,17 @@ export class ShardKernel {
    * このシャードは止まる (schemaStuck。health が報告する)。
    */
   private applyStep(f: ApplyFrame): Step<void, ApplyFrame> {
-    if (!f.settled) {
+    this.applying = null;
+    if (!f.checked) {
       // 範囲の移動の途中は適用しない。親と子の版がずれると、運ぶ行と intent の形が受け取る側の表と合わなくなる。
       // 親は intent を決着させないと DDL を適用できず、その決着は子へ転送され、子はその行を受け取れない、という行き詰まりになる。
       // 子が親の版へ追いつく場合 (catchUp) だけは通す。届く行がその版の形だからである。
       if (!f.catchUp && this.moving()) throw new ConflictError(`schema change is waiting for a shard split on ${this.id} to finish`);
-      f.settled = true;
-      if (!this.faults.ddlIgnoresIntents) return wait(this.call("settleAll", {}));
+      f.checked = true;
     }
     if (!f.got) return wait({ kind: "meta", method: "epochsSince", args: [this.applied] }, "got");
+    // 待ちは実時間のタイマーなので、期限も実時間で測る。
+    f.deadline ??= this.rt.now() + SCHEMA_WAIT_MS;
     // 範囲の記録の後は、畳み直しを後回しにする。表定義の記録の文は、直前までを畳んだスナップショットから決めるので、その前に畳む。
     let stale = false;
     const forks: Fork[] = [];
@@ -2289,7 +2856,33 @@ export class ShardKernel {
         if (stale) this.resnap();
         throw new ConflictError(`schema change is waiting for a shard split on ${this.id} to finish`);
       }
-      if (stale && isDdlRecord(rec)) this.resnap();
+      if (stale && isDdlRecord(rec)) {
+        this.resnap();
+        stale = false;
+      }
+      // 表の prepare は、その表 (fence) に行ロックがある間は適用しない (M24 の WAIT_LOCKS)。行を書いた取引がロックを持つ間、その表の DDL の
+      // ほうが待つ。SQLite で、書いた取引が書き込みのロックを持つ間、ほかの接続の DDL が busy_timeout まで待つのと同じである。
+      // 適用は、ここで終わる (その手前までは適用した)。待ち始めたことを覚え (pending)、その表の新しい行ロックを、ロックを持たない取引に
+      // 与えず、その取引の書き込みも受けなくなる (tableGate)。待つのは、prepare を適用させたい者 (preparedStep) である。ほかの要求は通す (ロックを持つ取引の、その後の
+      // 文と COMMIT を待たせない)。取ってきた続きで、もう閉じている prepare は、待たない (遅れたシャードが prepare と abort を続けて
+      // 適用するときに、ロックの持ち主が追いつきを止めないように)。
+      if (rec.kind === "prepare" && !this.faults.prepareIgnoresLocks && !f.got.some((y) => (y.rec.kind === "abort" || y.rec.kind === "commit") && y.rec.of === x.epoch)) {
+        if (this.lockedTable(rec.fence) !== null) {
+          if (stale) this.resnap();
+          this.pending = { epoch: x.epoch, tables: new Set(rec.fence.map(objectKey)), by: describeOpen(rec), waitUntil: rec.waitUntil };
+          return done(undefined, forks.length > 0 ? forks : undefined);
+        }
+      }
+      // この記録が変える表の intent を、先に決着させる。決着を待つ間は、その表に頼る新しい文を入口で待たせる (applying)。
+      // 待ちの後は、この 1 歩を先頭から呼び直し、intent がなくなったことを確かめた同じ 1 歩の中で、記録を適用する。
+      const touched = this.faults.ddlIgnoresIntents ? null : this.touchedBy(x, f.got);
+      if (touched !== null && this.intentsOn(touched)) {
+        if (stale) this.resnap();
+        if (this.rt.now() > f.deadline) throw new ConflictError("schema change is waiting for transactions on this shard to finish");
+        this.applying = touched;
+        const settle = this.call("settleAll", touched === "all" ? {} : { tables: [...touched] });
+        return forks.length > 0 ? { done: false, wait: settle, forks } : wait(settle);
+      }
       const statements = this.statementsOf(rec);
       try {
         this.b.tx(() => {
@@ -2304,6 +2897,8 @@ export class ShardKernel {
         throw new SqlError(`schema change of epoch ${x.epoch} cannot be applied on shard ${this.id}: ${(err as Error).message}`);
       }
       this.log.push(x);
+      // 待っていた prepare を適用した (ロックが空いたか、取ってきた続きで、もう閉じていた)。
+      if (this.pending !== null && this.pending.epoch <= x.epoch) this.pending = null;
       forks.push(...this.moveStarted(x));
       stale = !isDdlRecord(rec);
       if (!stale) this.resnap();
@@ -2312,12 +2907,55 @@ export class ShardKernel {
       // index を公開する commit は、時刻を運ぶ。index を使わずに確定した書き込みは、どのシャードのものも、この時刻以下である。
       // ここから先、このシャードで読む文は index を使う。その文が、時刻の順で、それらの書き込みの後ろに来るようにする。
       if (rec.at !== undefined && !this.faults.publishWithoutClock) this.observe(rec.at);
-      // 変更ログの行イメージは DDL より前の形なので、それより古い T は読み戻せない。
-      this.ddlFloor = this.issue();
-      this.metaSet("ddl_floor", this.ddlFloor);
+      // 変更ログの行イメージは DDL より前の形なので、それより古い T には、形の変わった表の行を読み戻せない。読みの epoch が進む表に床を置く。
+      // 床は、変更ログにある、その表の確定の時刻の最大である (lastLogged)。それ以上の T の読みが戻す行イメージは、この commit の後の
+      // 形のものだけなので、断らなくてよい (M23j の m23j_exact_*)。その表の確定が変更ログになければ、床を置かない。
+      // index を作るか消すだけの DDL (書き込みの epoch だけが進む) は、行の形を変えないので、床を置かない。
+      // 欠陥のスイッチ globalDdlFloor は、どの commit でも全部の表の床を、ddlFloorAtApply は、形の変わった表の床を、適用した時刻に置く。
+      // noFloorOnChange は、床を置かない。
+      const changed = this.faults.globalDdlFloor ? [ALL_OBJECTS] : this.faults.noFloorOnChange ? []
+        : Object.entries(this.snap.objects).filter(([k, o]) => k !== ALL_OBJECTS && o.read === x.epoch).map(([k]) => k);
+      if (changed.length > 0) {
+        const floor = this.faults.globalDdlFloor || this.faults.ddlFloorAtApply ? this.issue() : this.lastLogged(new Set(changed));
+        if (floor > 0) {
+          for (const k of changed) this.tableFloors.set(k, Math.max(this.tableFloors.get(k) ?? 0, floor));
+          this.metaSet("ddl_floors", JSON.stringify([...this.tableFloors]));
+        }
+      }
     }
     if (stale) this.resnap();
     return done(undefined, forks.length > 0 ? forks : undefined);
+  }
+
+  /** 適用が、intent の決着を待ったまま終わったとき (期限、失敗) の後始末。入口で待つ文を、通す。 */
+  private applyExit(_f: ApplyFrame): Fork[] {
+    this.applying = null;
+    return [];
+  }
+
+  /**
+   * 記録 x を適用する前に、intent を決着させる表 (小文字の名前)。決着の要らない記録なら null。
+   *   prepare  fence の表と、その DDL が確定で変えるもの、作る内部の表。取ってきた続き (got) で、もう abort で閉じている prepare は、
+   *            禁止を掛けた途端に解くだけなので、何も待たない。
+   *   commit   閉じる prepare と同じもの。fence の表には、prepare の適用の後、新しい intent ができていない。
+   * 欠陥のスイッチ applyRefusesAll (段 3 の形) は、どの表定義の記録の前にも、全部の表の intent を決着させる。
+   */
+  private touchedBy(x: Logged, got: readonly Logged[]): Set<string> | "all" | null {
+    const rec = x.rec;
+    if (!isDdlRecord(rec)) return null;
+    if (this.faults.applyRefusesAll) return "all";
+    const names = (o: Pick<OpenDdl, "fence" | "ddl" | "staging">) => new Set(
+      [...o.fence, ...(o.ddl.changes?.read ?? []), ...(o.ddl.changes?.write ?? []), ...(o.staging?.defs ?? []).map((d) => d.name)].map(objectKey),
+    );
+    if (rec.kind === "prepare") return got.some((y) => y.rec.kind === "abort" && y.rec.of === x.epoch) ? null : names(rec);
+    if (rec.kind === "commit") return names(this.openOf(rec.of));
+    return null;
+  }
+
+  /** 表 tables (小文字の名前。"all" なら全部) に、決着していない intent があるか。 */
+  private intentsOn(tables: Set<string> | "all"): boolean {
+    if (tables === "all") return (this.b.exec(`SELECT count(*) n FROM __intents`)[0]!.n as number) > 0;
+    return this.b.exec(`SELECT DISTINCT tbl FROM __intents`).some((r) => tables.has(objectKey(r.tbl as string)));
   }
 
   /** 記録を写しに足すときに、同じ取引で実行する文。いまのスナップショット (記録の直前まで畳んだもの) から決める。 */
@@ -2354,8 +2992,8 @@ export class ShardKernel {
   /**
    * moveRows を書いた取引の後で、メモリの記録を足す。子なら、自分で移動を進め始める (決めたこと 4)。応答の後の仕事ですぐに始め、
    * DO が落ちて仕事が消えても続くように、alarm も予約する。返す fork を、手続きの 1 歩の結果に付ける。
-   * 範囲が前の持ち主へ戻るときも、その範囲のグループの「渡した」印は、ここでは外さない。グループが届くか、受け取り終えたときに外す
-   * (unmarked)。欠陥のスイッチ unmarkOnReturn は、段 4 のコードのとおり、ここで外す。
+   * 範囲が前の持ち主へ戻るときも、その範囲のグループの「渡した」印は、ここでは外れない。グループが届くか、受け取り終えたときに外れる
+   * (remark)。欠陥のスイッチ unmarkOnReturn は、段 4 のコードのとおり、受け取り始めただけの範囲でも外すので、ここで印を作り直す。
    */
   private moveStarted(x: Logged): Fork[] {
     const rec = x.rec;
@@ -2364,7 +3002,7 @@ export class ShardKernel {
     if (rec.from === this.id) this.fenced.push({ ...range, to: rec.to, done: 0, epoch: x.epoch });
     if (rec.to !== this.id) return [];
     this.incoming.push({ ...range, from_id: rec.from, epoch: x.epoch });
-    if (this.faults.unmarkOnReturn) for (const g of [...this.moved.keys()]) if (overlaps(blockOf(g), range)) this.moved.delete(g);
+    if (this.faults.unmarkOnReturn) this.remark([...this.moved.keys()].filter((g) => overlaps(blockOf(g), range)));
     this.deps.scheduleRedrive?.("move");
     return [{ kind: "background", effect: { kind: "move", epoch: x.epoch } }];
   }
@@ -2386,7 +3024,28 @@ export class ShardKernel {
     }
     if (!f.reached) {
       f.reached = true;
-      return wait(this.call("reach", { schema: epoch, catchUp: false }));
+      return wait(this.call("reach", { epoch, catchUp: false }));
+    }
+    // 適用が、この prepare の手前で、fence の表の行ロックを待って止まっている。ロックが空くのを、prepare の記録が運ぶ DDL の待ちの期限
+    // (waitUntil) まで待つ。過ぎれば断る (進める側の DDL が SQLITE_BUSY で失敗する)。待つ間、ロックが空いたかを LOCK_POLL_MS ごとに見直し、
+    // 空いていれば、適用をやり直す。その遷移が、待っている間に閉じることがある (ロックを持つ取引が取り消させる、進める側が止まって
+    // 期限が切れる) ので、空いていなくても、ときどき列の続きを取り直して、適用をやり直す。
+    const p = this.pending;
+    if (p !== null && p.epoch === epoch) {
+      const now = this.rt.now();
+      const held = this.lockedTable([...p.tables]);
+      if (held !== null && (p.waitUntil === undefined || now >= p.waitUntil)) {
+        throw new ConflictError(`a transaction holds row locks on table ${held}, and the schema change (${p.by}) of epoch ${epoch} did not get the table within its wait`);
+      }
+      const w = (f.lockWait ??= { refetchAt: now + LOCK_REFETCH_MS, every: LOCK_REFETCH_MS });
+      if (held === null || now >= w.refetchAt) {
+        if (now >= w.refetchAt) {
+          w.every = Math.min(LOCK_REFETCH_MAX_MS, w.every * 2);
+          w.refetchAt = now + w.every;
+        }
+        return wait(this.call("reach", { epoch, catchUp: false }));
+      }
+      return wait({ kind: "sleep", ms: Math.max(1, Math.min(LOCK_POLL_MS, p.waitUntil! - now)) });
     }
     const open = this.snap.opens.find((o) => o.epoch === epoch);
     if (!open) return done({ ok: false, reason: `stale epoch: the schema change of epoch ${epoch} is no longer open on shard ${this.id}` });
@@ -2454,15 +3113,22 @@ export class ShardKernel {
   }
 
   /**
-   * 持っている intent を、anchor に尋ねて全部決着させる。進行中の取引は終わるまで待つ。
-   * 待っている間、新しい prepare は schemaStep が断るので、intent は増えない。
+   * 表 f.tables の intent (なければ、持っている intent の全部) を、anchor に尋ねて決着させる。進行中の取引は終わるまで待つ。
+   * 待っている間、その表に頼る新しい文は、入口で待つ (schemaStep) ので、intent は増え続けない。確定の途中の取引の prepare は通るので、
+   * その intent も、ここで決着を待つ。
    */
   private settleAllStep(f: SettleAllFrame): Step<void, SettleAllFrame> {
     // 待ちは実時間のタイマーなので、期限も実時間で測る。
     f.deadline ??= this.rt.now() + SCHEMA_WAIT_MS;
+    const tables = f.tables ? new Set(f.tables) : null;
+    const pendingNow = (): Intent[] => {
+      const all = this.b.exec(`SELECT DISTINCT txn, anchor, tbl FROM __intents`) as unknown as Intent[];
+      const seen = new Set<string>();
+      return all.filter((i) => (tables === null || tables.has(objectKey(i.tbl))) && !seen.has(i.txn) && seen.add(i.txn));
+    };
     for (;;) {
       if (!f.batch) {
-        const pending = this.b.exec(`SELECT DISTINCT txn, anchor FROM __intents`) as unknown as Intent[];
+        const pending = pendingNow();
         if (pending.length === 0) return done(undefined);
         f.batch = pending;
       }
@@ -2480,7 +3146,7 @@ export class ShardKernel {
         continue;
       }
       if (!f.slept) {
-        if ((this.b.exec(`SELECT count(*) n FROM __intents`)[0]!.n as number) === 0) return done(undefined);
+        if (pendingNow().length === 0) return done(undefined);
         if (this.rt.now() > f.deadline) {
           throw new ConflictError("schema change is waiting for transactions on this shard to finish");
         }
@@ -2493,28 +3159,41 @@ export class ShardKernel {
   }
 
   private syncSchemaStep(f: SyncSchemaFrame): Step<{ moving: boolean }, SyncSchemaFrame> {
-    if (!f.asked) {
+    if (!f.asked && f.req.atLeast > this.applied) {
       f.asked = true;
-      if (f.req.schema > this.schema) return wait(this.call("schema", { schema: f.req.schema }));
-    }
-    if (!f.caught && f.req.epoch !== undefined && f.req.epoch > this.applied) {
-      f.caught = true;
-      return wait(this.call("toEpoch", { epoch: f.req.epoch }));
+      return wait(this.call("toEpoch", { epoch: f.req.atLeast }));
     }
     return done({ moving: this.moving() });
   }
 
   // ---- 手続き: ライブ移動 ----
 
-  /** 未着のグループを引き取る。 */
+  /**
+   * 未着のグループを引き取る。引き取りの答えが返った後も、受け取り中の範囲にあって、まだ届いていないグループがあれば、いまの受け取り中の
+   * 移動で、もう一度頼む (docs/design-move-messages.md の規則 5。モデル M5d の ASK_AGAIN)。答えは、捨てられていることがある。前の移動の
+   * 間に頼んだ引き取りの答えは、その移動を受け取り終えた後に届くと捨てられ、そのとき範囲が戻って、また出ていれば、グループは、いまの
+   * 移動ではまだ届いていない。1 回だけ頼んで進むと、文は group not arrived で断られる。断られる理由は移動だけである (計画書の規則 4)。
+   *
+   * 頼み直す回数は、移動の数で抑えられる。受け取り中の移動の答えは、いつも、グループを届かせるか、受け取り終えさせるからである。
+   * 同じ移動で 2 回頼んでも届かないグループは、もう頼まない。殻は、引き取りをグループの名前でまとめるので、1 回目は、前の移動の間に
+   * 始まった引き取りに合流していることがある (その答えは捨てられる)。2 回目の引き取りは、その引き取りが終わった後に始まるので、いまの
+   * 移動のものである。その答えでも届かなければ、3 回目も同じ答えになる。
+   * 欠陥のスイッチ askOnce は、1 回だけ頼んで、届いたかを見ずに進む。
+   */
   private arriveStep(f: ArriveFrame): Step<void, ArriveFrame> {
-    if (f.asked) return done(undefined);
-    const wanted = f.groups.filter((g) => {
+    if (this.faults.askOnce && f.asked) return done(undefined);
+    const asked = (f.asked ??= new Map());
+    const wanted: string[] = [];
+    for (const g of f.groups) {
       const range = this.incomingIn(this.areaOf(g));
-      return range !== undefined && !this.arrivedIn(g, range);
-    });
+      if (range === undefined || this.arrivedIn(g, range)) continue;
+      const last = asked.get(g);
+      const times = last?.epoch === range.epoch ? last.times : 0;
+      if (times >= 2) continue;
+      asked.set(g, { epoch: range.epoch, times: times + 1 });
+      wanted.push(g);
+    }
     if (!wanted.length) return done(undefined);
-    f.asked = true;
     return wait({ kind: "pull", groups: wanted });
   }
 
@@ -2522,15 +3201,15 @@ export class ShardKernel {
    * 子から親への移動の要求 (listGroups、pull、finishMove) を受けた親が、答える前に、要求が運ぶ move-start の epoch まで列を適用するか
    * (M21 の PULL_AT_EPOCH)。適用すると fence が付く。欠陥のスイッチ pullWithoutEpoch は、適用せずに (fence の前に) 答える。
    */
-  private reachMove(req: { epoch?: number }): boolean {
-    return !this.faults.pullWithoutEpoch && req.epoch !== undefined && req.epoch > this.applied;
+  private reachMove(req: { epoch: number }): boolean {
+    return !this.faults.pullWithoutEpoch && req.epoch > this.applied;
   }
 
   /** 範囲のグループを列挙する (ShardApi.listGroups)。親は、移動の epoch まで列を適用してから (fence が付いてから) 答える。 */
   private groupsStep(f: GroupsFrame): Step<{ groups: string[]; cursor: GroupCursor | null }, GroupsFrame> {
     if (!f.reached) {
       f.reached = true;
-      if (this.reachMove(f.req)) return wait(this.call("toEpoch", { epoch: f.req.epoch! }));
+      if (this.reachMove(f.req)) return wait(this.call("toEpoch", { epoch: f.req.epoch }));
     }
     return done(this.listGroups(f.req));
   }
@@ -2539,7 +3218,7 @@ export class ShardKernel {
   private finishMoveStep(f: FinishMoveFrame): Step<{ m: Ts }, FinishMoveFrame> {
     if (!f.reached) {
       f.reached = true;
-      if (this.reachMove(f.req)) return wait(this.call("toEpoch", { epoch: f.req.epoch! }));
+      if (this.reachMove(f.req)) return wait(this.call("toEpoch", { epoch: f.req.epoch }));
     }
     return done(this.finishHanding(f.req));
   }
@@ -2553,29 +3232,36 @@ export class ShardKernel {
    * いまは、どの piece もグループの全体である (区間は端から端まで)。1 通に収まらないグループを主キーの順の区間に切るのは、
    * 後の段で足す (docs/design-subslots.md の「piece の pull」)。
    */
-  private pullStep(f: PullFrame): Step<PiecePayload[], PullFrame> {
+  private pullStep(f: PullFrame): Step<PullRes, PullFrame> {
     if (f.out) return done(f.out);
     if (!f.reached) {
       // 移動の epoch まで列を適用してから渡す。適用で fence が付き、以後、この区間の書き込みを断る。適用する前に渡すと、渡した後も古い
       // 範囲表の書き込みを受け、子へ渡した行に届かない (M21 の m21_red_pull_unfenced)。
       f.reached = true;
-      if (this.reachMove(f.req)) return wait(this.call("toEpoch", { epoch: f.req.epoch! }));
+      if (this.reachMove(f.req)) return wait(this.call("toEpoch", { epoch: f.req.epoch }));
     }
     f.out = this.pullPieces(f.req);
     return wait({ kind: "sync" });
   }
 
-  private pullPieces(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch?: number }): PiecePayload[] {
-    // 欠陥のスイッチ pullWithoutEpoch: move-start を適用していない (fence していない) 親が、頼まれた区間を、頼んだシャードへ渡す。
-    const fence = this.fenceOf(req) ?? (this.faults.pullWithoutEpoch ? { ...intervalOf(req), to: req.to, done: 0, epoch: req.epoch ?? 0 } : undefined);
+  /**
+   * pull に答える。生きた fence の下でだけ、グループを渡す (渡した記録を書く)。渡し終えた移動の pull には、記録も印も変えずに、
+   * 「渡し終えた」と、いま発行した時刻を答える。渡し終えた親の範囲には、その移動の行も intent も残っていない (子の drain は、親の
+   * グループを列挙し直し、行か intent のあるグループを全部受け取って ack してから、finishMove を頼む)。だから、その後に届いた pull が
+   * 名指しするグループは、もう子に届いているか、行も intent もないかである。子は、どちらでも、受け取り終えれば答えられる。
+   * 渡し直すと、範囲が戻った後の持ち主の行を、終わった移動の宛先へ渡してしまう (未解決だった問題 58 と、その類)。
+   */
+  private pullPieces(req: Interval & { want: PieceWant[]; to: string; maxBytes: number; epoch: number }): PullRes {
+    const h = this.handing(req);
+    if (h === "finished") return { finished: { epoch: req.epoch, m: this.issue() } };
     const out: PiecePayload[] = [];
     let bytes = 0;
     for (const w of req.want) {
       const g = w.g;
       // 続きの位置からの要求は、グループを分けて運ぶようになってから受ける。
       if ("from" in w && w.from !== null) throw new SqlError(`pull of group ${g} from a position: a group is still moved as one piece`);
-      const f = fence && overlaps(fence, blockOf(g)) ? fence : undefined;
-      if (!f) throw new SqlError(`pull of unfenced group ${g}`);
+      const f = h && overlaps(h.fence, blockOf(g)) ? h.fence : undefined;
+      if (!h || !f) throw new SqlError(`pull of unfenced group ${g}`);
       // fence の宛先でないシャードには渡さない。渡すと、行が範囲表の指さないシャードへ行く。
       if (f.to !== req.to) throw new NotOwner(f.to);
       const rows = [...this.defs.values()].flatMap((def) =>
@@ -2591,25 +3277,12 @@ export class ShardKernel {
       if (out.length > 0 && bytes + size > req.maxBytes) break;
       bytes += size;
       // この移動で、もう渡したグループなら、同じ m で渡し直す (応答が失われた子の再送)。前の移動で渡した印は、範囲が戻って、グループが
-      // 届くか受け取り終えたときに外している (unmarked)。範囲を送り出すのは受け取り終えた後だけなので、ここにあるのは、この移動の印である。
-      let known = this.moved.get(g);
-      if (!known || known.epoch !== f.epoch) {
-        known = { m: this.issue(), to: req.to, acked: false, epoch: f.epoch };
-        this.moved.set(g, known);
-        this.b.tx(() => {
-          this.b.exec(
-            `INSERT INTO __moved(g, lo, hi, "after", up_to, m, dest, epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, g, f.start, f.end, END, END, known!.m, req.to, f.epoch,
-          );
-          for (const i of intents) {
-            this.b.exec(
-              `INSERT OR IGNORE INTO __moved_txn(txn, g, lo, "after", dest, epoch) VALUES (?, ?, ?, ?, ?, ?)`, i.txn as string, g, f.start, END, req.to, f.epoch,
-            );
-          }
-        });
-      }
-      out.push({ g, range: intervalOf(f), after: null, epoch: f.epoch, upTo: null, m: known.m, rows, intents, schema: this.schema });
+      // 届くか受け取り終えたときに外れている (remark)。範囲を送り出すのは受け取り終えた後だけなので、ここにあるのは、この移動の印である。
+      const known = this.moved.get(g);
+      const m = known && known.epoch === f.epoch ? known.m : this.handGroup(h, g, intents);
+      out.push({ g, range: intervalOf(f), after: null, epoch: f.epoch, upTo: null, m, rows, intents, schema: this.schema });
     }
-    return out;
+    return { pieces: out };
   }
 
   /** グループを、渡す側から引き取る。 */
@@ -2618,8 +3291,9 @@ export class ShardKernel {
       // pull は、渡す側の fence を範囲で名指しする。受け取り中の範囲ごとにまとめて送る。
       const byRange = new Map<IncomingRange, string[]>();
       for (const g of f.groups) {
-        const range = this.incomingIn(this.areaOf(g))!;
-        byRange.set(range, [...(byRange.get(range) ?? []), g]);
+        // 頼まれてから、ここへ来るまでに、その範囲を受け取り終えていることがある。そのグループは、もう引き取らない。
+        const range = this.incomingIn(this.areaOf(g));
+        if (range) byRange.set(range, [...(byRange.get(range) ?? []), g]);
       }
       f.queue = [...byRange].map(([range, rest]) => ({ range, rest }));
     }
@@ -2628,18 +3302,19 @@ export class ShardKernel {
       const cur = f.queue[0];
       if (!cur) return done(undefined, forks);
       const from = cur.range.from_id;
-      if (f.payload) {
-        if (!f.received) {
-          f.received = true;
-          return wait(this.call("receive", { payload: f.payload }));
+      if (f.res) {
+        if (!f.taken) return wait(this.call("receive", { res: f.res }), "taken");
+        // 受け取った piece (入れたか、もう届いていた) にだけ、待たずに ack を送る。捨てた応答の piece には送らない。
+        if (f.taken.length) forks = [{ kind: "detached", effect: { kind: "peer", call: this.peer(from, "ack", { pieces: f.taken }) } }];
+        if ("finished" in f.res) {
+          // 渡す側は、この移動を渡し終えている。この範囲のグループは、もう引き取るものがない。
+          cur.rest = [];
+        } else {
+          const got = new Set(f.res.pieces.map((p) => p.g));
+          cur.rest = cur.rest.filter((g) => !got.has(g));
         }
-        // 受け取った。渡す側には、待たずに ack を送る。
-        const payload = f.payload;
-        forks = [{ kind: "detached", effect: { kind: "peer", call: this.peer(from, "ack", { pieces: payload.map(pieceOf) }) } }];
-        const got = new Set(payload.map((p) => p.g));
-        cur.rest = cur.rest.filter((g) => !got.has(g));
-        f.payload = undefined;
-        f.received = undefined;
+        f.res = undefined;
+        f.taken = undefined;
       }
       if (!cur.rest.length) {
         f.queue.shift();
@@ -2648,13 +3323,27 @@ export class ShardKernel {
       const pull = this.peer(from, "pull", {
         ...intervalOf(cur.range), want: cur.rest.map((g) => ({ g, from: null })), to: this.id, maxBytes: 1_000_000, epoch: cur.range.epoch,
       });
-      return wait({ kind: "peer", call: pull }, "payload", forks);
+      return wait({ kind: "peer", call: pull }, "res", forks);
     }
   }
 
-  private receiveStep(f: ReceiveFrame): Step<void, ReceiveFrame> {
-    const payload = f.payload;
-    if (f.stored) return done(undefined);
+  /**
+   * 渡す側の pull の応答を受け取る。受け取った記録を変えるのは、応答の名指しする移動を、いま受け取り中のときだけである (receiving)。
+   * 受け取り中でない移動の応答は、捨てる。受け取った piece (入れたか、この移動でもう届いていた) を返す。呼び出し側は、それにだけ ack を送る。
+   */
+  private receiveStep(f: ReceiveFrame): Step<Piece[], ReceiveFrame> {
+    if (f.taken) return done(f.taken);
+    if ("finished" in f.res) {
+      // 渡す側は、この移動を渡し終えている。行か intent のあるグループは、もう届いている。受け取り中なら、渡す側の時計を受け取って、
+      // ここで受け取り終える。答えを待っていた文は、行のないグループを、到着の記録なしで、範囲の床から受け持つ。
+      // 欠陥のスイッチ finishedAsRefusal は、この答えを断りとして読み飛ばす (取り下げた直し 89d99c8。M5d の m5d_red_finished_refusal)。
+      // 子は受け取り中のままで、行のないグループを待っていた文は group not arrived で断られる。
+      const r = this.faults.finishedAsRefusal ? null : this.receiving(f.res.finished.epoch);
+      if (r) this.markReceived(r, f.res.finished.m);
+      f.taken = [];
+      return done(f.taken);
+    }
+    const payload = f.res.pieces;
     if (!f.reached) {
       // グループの一部だけの piece は、まだ受け取れない。受け取ると、一部しか届いていないグループを「到着した」と記録してしまう。
       const part = payload.find((p) => p.after !== null || p.upTo !== null);
@@ -2663,35 +3352,21 @@ export class ShardKernel {
       // 漏れることがある。古い版のままだと、届いた行と表の形が合わず、新しい index を保守しない古い計画の書き込みも通る。
       const schema = Math.max(0, ...payload.map((p) => p.schema));
       f.reached = true;
-      if (!this.faults.childKeepsOldSchema) return wait(this.call("reach", { schema, catchUp: true }));
+      if (!this.faults.childKeepsOldSchema) return wait(this.call("reach", { epoch: schema, catchUp: true }));
     }
-    // この移動で、まだ届いていない piece だけを入れる。到着の記録は移動ごとにある。前の移動で届いて、その後に渡したグループが、範囲と
-    // 一緒に戻ってきたら、それは新しい到着である (docs/design-refresh-across-move.md の「実装がすること」の 5)。
-    const fresh = payload.filter((p) => this.arrived.get(p.g)?.epoch !== p.epoch);
-    this.b.tx(() => {
-      for (const p of fresh) {
-        for (const { table, row } of p.rows) insertRow(this.b, this.def(table), row);
-        for (const i of p.intents) {
-          this.b.exec(
-            `INSERT OR IGNORE INTO __intents(tbl, pk, sk, txn, anchor, prepare_ts, change) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            i.tbl ?? null, i.pk ?? null, i.sk ?? null, i.txn ?? null, i.anchor ?? null, i.prepare_ts ?? null, i.change ?? null,
-          );
-        }
-        this.b.exec(
-          `INSERT OR IGNORE INTO __arrived(g, lo, hi, "after", up_to, m, epoch) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          p.g, p.range.start, p.range.end, posKey(p.after), posKey(p.upTo), p.m, p.epoch,
-        );
-      }
-    });
-    // 到着の印は挿入と同じ同期区間で付ける。確定の待ちの間に、要求駆動の pull と背景の drain が
-    // 同じグループを受け取ると二重に挿入してしまう。応答は output gate が確定まで止めるので安全である。
-    for (const p of fresh) {
-      this.arrived.set(p.g, { m: p.m, epoch: p.epoch });
-      this.moved.delete(p.g);
-      this.maxArrived = Math.max(this.maxArrived, p.m);
-      this.observe(p.m);
+    // 入口は、待ちの後で通る。待っている間に、その移動を受け取り終えていることがある。piece は、運んだ移動の epoch を運ぶ。
+    // 1 つの応答の piece は、どれも同じ移動のものだが、移動ごとに入口を通す。
+    const byMove = new Map<number, PiecePayload[]>();
+    for (const p of payload) byMove.set(p.epoch, [...(byMove.get(p.epoch) ?? []), p]);
+    const taken: Piece[] = [];
+    for (const [epoch, pieces] of byMove) {
+      const r = this.receiving(epoch, true);
+      // 受け取り中でない移動の応答は、捨てる。受け取ると、受け取り直した後に消した行が戻り、受け取り終えた移動に到着の記録が付く。
+      if (!r) continue;
+      this.storePieces(r, pieces);
+      taken.push(...pieces.map(pieceOf));
     }
-    f.stored = true;
+    f.taken = taken;
     return wait({ kind: "sync" }); // 親が行を消すのは到着の確定後である。
   }
 
@@ -2728,31 +3403,34 @@ export class ShardKernel {
         f.rest = page.groups.filter((g) => !here(g));
         f.moved! += page.groups.length;
       }
-      if (f.payload) {
-        const payload = f.payload;
-        if (!f.received) {
-          f.received = true;
-          return wait(this.call("receive", { payload }));
-        }
+      if (f.res) {
+        const res = f.res;
+        if (!f.taken) return wait(this.call("receive", { res }), "taken");
+        const taken = f.taken;
         if (!f.acked) {
           f.acked = true;
-          return wait({ kind: "peer", call: this.peer(from, "ack", { pieces: payload.map(pieceOf) }) });
+          // 受け取った piece にだけ ack を送る。捨てた応答の piece には送らない。
+          if (taken.length) return wait({ kind: "peer", call: this.peer(from, "ack", { pieces: taken }) });
         }
-        total.groups += payload.length;
-        for (const p of payload) {
+        // 渡す側は、この移動を渡し終えている。行か intent のあるグループは、もう届いている。引き取るものは残っていない。
+        if ("finished" in res) return done(total);
+        const got = new Set(taken.map((p) => p.g));
+        for (const p of res.pieces) {
+          if (!got.has(p.g)) continue;
+          total.groups++;
           total.rows += p.rows.length;
           total.bytes += encode(p.rows).length;
         }
-        const got = new Set(payload.map((p) => p.g));
-        f.rest = f.rest.filter((g) => !got.has(g));
-        f.payload = undefined;
-        f.received = undefined;
+        const answered = new Set(res.pieces.map((p) => p.g));
+        f.rest = f.rest.filter((g) => !answered.has(g));
+        f.res = undefined;
+        f.taken = undefined;
         f.acked = undefined;
       }
       // pull は大きさの上限で途中までしか返さないことがある。残りを取り終えるまで繰り返す。
       if (f.rest.length) {
         const pull = this.peer(from, "pull", { ...interval, want: f.rest.map((g) => ({ g, from: null })), to: this.id, maxBytes: 1_000_000, epoch: f.epoch });
-        return wait({ kind: "peer", call: pull }, "payload");
+        return wait({ kind: "peer", call: pull }, "res");
       }
       f.rest = undefined;
       f.page = undefined;
@@ -2797,7 +3475,8 @@ export class ShardKernel {
       if (!f.total) return wait(this.call("drain", { epoch: f.epoch }), "total");
       if (!f.m) return wait({ kind: "peer", call: this.peer(range.from_id, "finishMove", { ...intervalOf(range), epoch: f.epoch }) }, "m");
       if (!f.finished) {
-        this.finishIncoming({ ...intervalOf(range), m: f.m.m });
+        // 親の答えを待っている間に、この移動を受け取り終えていることがある (文の pull への「渡し終えた」の答え)。そのときは、何もしない。
+        this.finishIncoming({ epoch: f.epoch, m: f.m.m });
         f.finished = true;
       }
     }
@@ -2838,8 +3517,14 @@ export class ShardKernel {
     const { req, me } = f;
     f.deadline ??= this.deps.clock.now() + LOCK_WAIT_MS;
     const deadline = f.deadline;
+    if (f.since === undefined) {
+      // 要求が着いた。取引の lease を、要求の lease で延ばす。延ばすのは、着いたときだけである (行を待った後では延ばさない)。
+      f.since = this.deps.clock.now();
+      this.arrive(me);
+    }
+    const since = f.since;
     // 最新の状態を読むので、読む時刻はない。
-    const claim: Plan & Rows = { schema: req.schema, spans: req.spans, writes: [], at: null };
+    const claim: Plan & Rows = { deps: req.deps, spans: req.spans, writes: [], at: null };
     if (f.waiting !== undefined) {
       // 行を待って、起こされた。到着の待ちからやり直す。
       f.woken = f.waiting;
@@ -2873,26 +3558,48 @@ export class ShardKernel {
     // 入口で断るのと同じに、ここで断る (待ちの後の確かめ直し)。
     const sec = this.enter(claim);
     this.count("writes", req.spans);
-    this.renew(me.txn);
+    // 欠陥のスイッチ perShardLockTtl (2026-11-17 までの形): 文を実行するたびに、このシャードのロックだけを、自分の時計で延ばす。
+    if (this.faults.perShardLockTtl) this.arrive(me);
     const overlay = (req.overlay ?? []).map((c) => ({ table: c.table, pk: c.pk, image: c.after }));
-    let out: { columns: string[]; values: Value[][]; changes: Change[]; count?: number };
+    let out: { columns: string[]; values: Value[][]; changes: Change[]; count?: number } | undefined;
+    // ロックを与える判断 (tableGate)。文が書いた行は、文の実行 (run) が確かめる。ロックを取る読みの行 (BEGIN IMMEDIATE の主キーの読み、
+    // Worker の SQLite で実行した文が書いた行の Txn.lockWritten) も、表への頼り方に依らず、同じ判断を通す。表の prepare を適用しているか、
+    // その適用を待っている間は、その表の行ロックを持たない取引に、ロックを与えない。与えると、後から来た取引が DDL を取り消させるか、
+    // 待たせる。欠陥のスイッチ lockGateWritesOnly (D1) は、書き込みとして頼る表 (Dep.write) の行だけを確かめる。
+    let refused: TableLocked | null = null;
     // 欠陥 lockedReadAtT は、ロック読みを T の snapshot で読む (返す F は変えない)。dmlAtT は、F = T の状態で実行する。
     const readAt = atT ? F : this.faults.lockedReadAtT && !req.write ? req.T : undefined;
     try {
       out = this.rollback(() => {
-        if (readAt !== undefined) this.restore(this.deltaAfter(readAt));
+        if (readAt !== undefined) this.restore(this.deltaAfter(readAt, req.spans));
         if (overlay.length) setBasedRestore(this.b, (t) => this.def(t), overlay);
         return this.run(sec, req);
       });
+      const locked = req.lockRows ?? [];
+      refused = this.tableGate(this.faults.lockGateWritesOnly ? locked.filter((r) => req.deps.some((d) => d.write === true && d.name === objectKey(r.table))) : locked, me);
     } catch (e) {
-      if (e instanceof ReadTooOld || e instanceof ConflictError || e instanceof NotOwner || e instanceof ShardLimit) throw e;
+      if (e instanceof ReadTooOld || e instanceof ConflictError && !(e instanceof TableLocked) || e instanceof NotOwner || e instanceof ShardLimit) throw e;
       // 文は F の状態を読んだうえで失敗した。読んだ時刻を付けて返し、呼び出し側に範囲を記録させる (ExecRes.error)。
-      return done({ columns: [], values: [], changes: [], error: asSqlError(e).message, F, T: req.T ?? F, hlc: this.hlc.value, epoch: this.epoch });
+      if (!(e instanceof TableLocked)) return done({ columns: [], values: [], changes: [], error: asSqlError(e).message, F, T: req.T ?? F, hlc: this.hlc.value, epoch: this.epoch });
+      refused = e;
+    }
+    if (refused || !out) {
+      // 適用した prepare に止められたなら、断る前に、要求の epoch まで列を適用する。遷移は、もう閉じているかもしれない (Worker は、
+      // DDL が終わったと知ってから送り直す)。書き込みとして頼る表の禁止と、もう閉じた prepare の待ち (pending) は、入口 (schemaStep) が
+      // 同じことをしている。読みとして頼る表の禁止は、ここで見る。適用の後は、先頭からやり直す (到着の待ち、intent の決着、版の確かめ)。
+      if (!f.caughtUp && refused!.epoch !== this.pending?.epoch && req.epoch !== undefined && req.epoch > this.applied) {
+        f.caughtUp = true;
+        f.arrived = undefined;
+        f.F = undefined;
+        return wait(this.call("reach", { epoch: req.epoch, catchUp: false }));
+      }
+      // 取引がその表の行ロックを持つなら、断る前に、書こうとした行のロックを与える (heldAtFence)。
+      throw this.heldAtFence(refused!, me, since);
     }
     const rows = [...out.changes, ...(req.lockRows ?? [])] as Pick<Change, "table" | "pk">[];
     const blocked = this.blockedBy(rows, me);
     if (!blocked) {
-      for (const c of rows) this.grant(this.lockKey(c.table, c.pk), me);
+      for (const c of rows) this.grant(this.lockKey(c.table, c.pk), me, since);
       if (f.woken && this.locks.get(f.woken)?.txn === me.txn) f.woken = null;
       return done({ ...out, changes: out.changes.map((c) => ({ ...c, since: F })), F, T: req.T ?? F, hlc: this.hlc.value, epoch: this.epoch });
     }
@@ -2986,7 +3693,7 @@ export class ShardKernel {
     if (!f.planned) {
       this.withinLimits(req);
       f.planned = true;
-      return wait(this.call("schema", { schema: req.schema, epoch: req.epoch, rows: { spans: req.spans, writes: [] } }));
+      return wait(this.call("schema", { deps: req.deps, epoch: req.epoch, rows: { spans: req.spans, writes: [] }, atLeast: req.atLeast, statement: true }));
     }
     if (req.lock && (req.write || req.lockRows)) {
       if (!f.locked) return attempt(this.call("locked", { req, me: req.lock }), "locked");
@@ -2996,7 +3703,8 @@ export class ShardKernel {
       throw asSqlError(e);
     }
     if (!f.arrived) {
-      if (req.lock) this.renew(req.lock.txn);
+      // 悲観の取引の、ロックを取らない文。取引の lease を、要求の lease で延ばす (取引のどの文も、取引の全部のロックを延ばす)。
+      if (req.lease) this.extend(req.lease.txn, req.lease);
       f.arrived = true;
       return wait(this.call("arrive", { groups: this.sksOf(req.spans) }));
     }
@@ -3024,12 +3732,12 @@ export class ShardKernel {
     // ここから先は待たない。intent の決着を待っている間に DDL が適用されていたら、この文は古い計画である。入口で断るのと同じに、
     // ここで断る。断らないと、読むだけの取引が、古い計画の読みの答えを、検証なしでそのまま使う
     // (test/stale-plan-after-wait.test.ts)。
-    const sec = this.enter({ schema: req.schema, spans: req.spans, writes: [], at: T });
+    const sec = this.enter({ deps: req.deps, spans: req.spans, writes: [], at: T });
     this.count(req.write ? "writes" : "reads", req.spans);
     if (req.fresh && req.spans.some((s) => this.changedSince(sec, s, T))) {
       throw new ReadTooOld(`moved at ${this.hlc.value}`);
     }
-    const delta = this.deltaAfter(T);
+    const delta = this.deltaAfter(T, req.spans);
     const overlay = (req.overlay ?? []).map((c) => ({ table: c.table, pk: c.pk, image: c.after }));
     try {
       if (delta.length === 0 && overlay.length === 0 && !req.write) {
@@ -3055,14 +3763,14 @@ export class ShardKernel {
     if (!f.planned) {
       this.withinLimits(req);
       f.planned = true;
-      return wait(this.call("schema", { schema: req.schema, epoch: req.epoch, rows: { spans: req.spans, writes: [] } }));
+      return wait(this.call("schema", { deps: req.deps, epoch: req.epoch, rows: { spans: req.spans, writes: [] }, statement: true }));
     }
     if (!f.arrived) {
       f.arrived = true;
       return wait(this.call("arrive", { groups: this.sksOf(req.spans) }));
     }
     // 最新の状態に書くので、読む時刻はない。
-    const claim: Plan & Rows = { schema: req.schema, spans: req.spans, writes: [], at: null };
+    const claim: Plan & Rows = { deps: req.deps, spans: req.spans, writes: [], at: null };
     if (f.now === undefined) {
       this.observe(req.minTs);
       f.now = this.issue();
@@ -3118,7 +3826,7 @@ export class ShardKernel {
       // 同じ主キーでなくても、他の取引の intent が同じ UNIQUE の値を持っていれば確定できない。
       const pending = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, dry.changes);
       if (pending) throw new ConflictError(pending);
-      this.assertWriteSetFits(sec, dry.changes);
+      this.assertWriteSetFits(sec, dry.changes, null);
       // 下書きを取った区間の続きで、間に待ちはない。版も持ち主も、この区間の入口 (enter) で確かめてある。
       const c = this.issue();
       if (dry.changes.length) this.b.tx(() => this.applyAndLog(`auto-${c}`, c, dry.changes));
@@ -3162,7 +3870,7 @@ export class ShardKernel {
         if (hit.key !== null) throw BLOCKED;
         pending.reason = this.faults.autoIgnoresUniqueIntents ? null : this.uniquePending(me.txn, r.changes);
         if (pending.reason) throw PENDING_UNIQUE;
-        this.assertWriteSetFits(sec, r.changes);
+        this.assertWriteSetFits(sec, r.changes, null);
         const c = this.issue();
         if (r.changes.length) this.logChanges(`auto-${c}`, c, r.changes);
         return { changes: r.changes, inserted: r.inserted, c };
@@ -3183,7 +3891,8 @@ export class ShardKernel {
     const req = f.req;
     if (!f.planned) {
       f.planned = true;
-      return wait(this.call("schema", { schema: req.schema, epoch: req.epoch, rows: { spans: req.spans, writes: req.writes } }));
+      this.extend(lockIdOf(req.txn), req.lease);
+      return wait(this.call("schema", { deps: req.deps, epoch: req.epoch, rows: { spans: req.spans, writes: req.writes } }));
     }
     if (!f.arrived) {
       f.arrived = true;
@@ -3195,11 +3904,11 @@ export class ShardKernel {
     }
     // グループの到着を待っている間に DDL が適用されることがある。古い計画のまま書かない。
     // 時計は、版を確かめた後、持ち主を確かめる前に進める。版の古い要求の T は、時計に取り込まない。
-    this.enter({ schema: req.schema });
+    this.enter({ deps: req.deps });
     this.observe(req.T);
-    const sec = this.enter({ schema: req.schema, spans: req.spans, writes: req.writes, at: req.T });
+    const sec = this.enter({ deps: req.deps, spans: req.spans, writes: req.writes, at: req.T });
     try {
-      this.assertWriteSetFits(sec, req.writes);
+      this.assertWriteSetFits(sec, req.writes, { txn: lockIdOf(req.txn) });
       // 取引が溜めた変更の行を、適用する前に確かめる (書き込みの守り)。
       this.claimed(sec, req.writes, null);
     } catch (e) {
@@ -3222,7 +3931,8 @@ export class ShardKernel {
     const req = f.req;
     if (!f.planned) {
       f.planned = true;
-      return wait(this.call("schema", { schema: req.schema, epoch: req.epoch, rows: { spans: req.spans, writes: req.writes } }));
+      this.extend(lockIdOf(req.txn), req.lease);
+      return wait(this.call("schema", { deps: req.deps, epoch: req.epoch, rows: { spans: req.spans, writes: req.writes } }));
     }
     if (!f.arrived) {
       f.arrived = true;
@@ -3232,17 +3942,17 @@ export class ShardKernel {
       f.waitedLocks = true;
       return wait(this.call("foreignLocks", { txn: req.txn, writes: req.writes }));
     }
-    return done(this.prepareSync(this.enter({ schema: req.schema }), req));
+    return done(this.prepareSync(this.enter({ deps: req.deps }), req));
   }
 
   /**
    * 表を消す前の確認 (Db の changeSchema の mode guard、M21 の DROP の場面)。
-   * 先に、表を書き込み禁止にする prepare (要求の schema) を適用する。適用の前に intent を全部決着させ、適用の後は、その表への書き込みを
-   * 断る。だから、ここで変更がなければ、表を消すまで、読んだ範囲は変わらない。
+   * 先に、表を書き込み禁止にする prepare (要求の atLeast) を適用する。適用の前に、その表の intent を決着させ、適用の後は、その表への
+   * 書き込みを断る。だから、ここで変更がなければ、表を消すまで、読んだ範囲は変わらない。
    */
   private unchangedStep(f: UnchangedFrame): Step<{ ok: boolean; reason?: string }, UnchangedFrame> {
     const req = f.req;
-    if (!f.synced) return attempt(this.call("schema", { schema: req.schema }), "synced");
+    if (!f.synced) return attempt(this.call("schema", { deps: [], atLeast: req.atLeast }), "synced");
     let sec: Section<"owned">;
     try {
       unwrap(f.synced);
@@ -3264,8 +3974,9 @@ export class ShardKernel {
     const req = f.req;
     if (!f.planned) {
       f.planned = true;
+      this.extend(lockIdOf(req.txn), req.lease);
       const me = req.participants.find((p) => p.shard === this.id);
-      return wait(this.call("schema", { schema: req.schema, epoch: req.epoch, ...(me ? { rows: { spans: me.spans, writes: me.writes } } : {}) }));
+      return wait(this.call("schema", { deps: me?.deps ?? [], epoch: req.epoch, ...(me ? { rows: { spans: me.spans, writes: me.writes } } : {}) }));
     }
     if (!f.flight) {
       // 同じ 2PC の ID の実行は 1 つずつにする。同じ中身の COMMIT が 2 つ同時に届くと (再送が元の COMMIT を追い越す)、後の実行の
@@ -3313,7 +4024,9 @@ export class ShardKernel {
 
     if (!f.acks) {
       const calls = others.map((p) =>
-        this.peer(p.shard, "prepare", { txn: req.txn, T: req.T, writes: p.writes, spans: p.spans, anchor: this.id, schema: req.schema, epoch: req.epoch }),
+        this.peer(p.shard, "prepare", {
+          txn: req.txn, T: req.T, writes: p.writes, spans: p.spans, anchor: this.id, deps: p.deps, epoch: req.epoch, ...(req.lease ? { lease: req.lease } : {}),
+        }),
       );
       return wait({ kind: "peers", calls }, "acks");
     }
@@ -3331,13 +4044,13 @@ export class ShardKernel {
       // 参加者の応答を待っている間に、この anchor に DDL が適用されていれば、取引は古い表定義で計画されている。
       let plan: Section<"schema">;
       try {
-        plan = this.enter({ schema: req.schema });
+        plan = this.enter({ deps: self.deps });
       } catch (e) {
         return this.decideAbort(req, (e as Error).message);
       }
       if (!this.faults.anchorNoAbsorb) this.observe(Math.max(0, ...stamps, flight.pushed));
       const mine = this.prepareSync(plan, {
-        txn: req.txn, T: req.T, writes: self.writes, spans: self.spans, anchor: this.id, schema: req.schema, epoch: req.epoch,
+        txn: req.txn, T: req.T, writes: self.writes, spans: self.spans, anchor: this.id, deps: self.deps, epoch: req.epoch,
       });
       if (!mine.ok) return this.decideAbort(req, mine.reason);
       const c = this.faults.anchorNoAbsorb
@@ -3352,7 +4065,8 @@ export class ShardKernel {
           : unprotectedSpans(p.spans, p.writes);
         return spans.length > 0 && stamps[i]! < c ? [{ p, spans, from: stamps[i]! }] : [];
       });
-      const calls = stale.map((s) => this.peer(s.p.shard, "refresh", { txn: req.txn, spans: s.spans, from: s.from, to: c }));
+      // 確かめは、参加者の prepare と同じ deps を運ぶ。prepare の後に、読んだだけの表の DDL が確定していれば、参加者は断る。
+      const calls = stale.map((s) => this.peer(s.p.shard, "refresh", { txn: req.txn, spans: s.spans, from: s.from, to: c, deps: s.p.deps }));
       return wait({ kind: "peers", calls }, "refreshed");
     }
     const c = f.c;
@@ -3528,7 +4242,7 @@ export class ShardKernel {
   readonly programs: { [N in keyof Sig]: Program<ShardKernel, Sig[N][0], Sig[N][1]> } = {
     schema: { step: this.schemaStep },
     reach: { step: this.reachStep },
-    apply: { step: this.applyStep },
+    apply: { step: this.applyStep, exit: this.applyExit },
     catchUp: { step: this.catchUpStep },
     prepared: { step: this.preparedStep },
     settleAll: { step: this.settleAllStep },

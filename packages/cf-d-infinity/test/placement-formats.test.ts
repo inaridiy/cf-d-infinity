@@ -11,7 +11,7 @@ import { fold } from "../src/catalog";
 import { Db } from "../src/client/db";
 import { readEpochs } from "../src/meta";
 import { REGION_TOKENS, SUBSLOTS, TOKENS, blockOf, ownerOf, planSplit, slotAligned, slotOf } from "../src/routing";
-import type { PiecePayload } from "../src/types";
+import type { PiecePayload, PullRes } from "../src/types";
 import { quiescentProblems } from "./invariants";
 import { SimCluster, USERS } from "./sim";
 
@@ -168,13 +168,14 @@ describe("a shard", () => {
     // Meta が、移動を記録する前に断る。
     expect(await outcome(split(c, "s0", "s2", { range: part }))).toBe(refused);
     expect(await c.moves()).toEqual([]);
-    expect(await outcome(c.shard("s0").listGroups({ ...part, limit: 10 }))).toBe(refused);
+    // 移動の要求は epoch を運ぶ。移動は開いていないので、適用済みの epoch を名指しする。区間の形の確かめが、先に断る。
+    expect(await outcome(c.shard("s0").listGroups({ ...part, limit: 10, epoch: 0 }))).toBe(refused);
     // 始まりだけ、終わりだけがブロックの中にある範囲も同じである。
     for (const cut of [{ start: block.start + 1, end: block.end + SUBSLOTS }, { start: block.start, end: block.end - 1 }]) {
       expect(await outcome(c.startMove({ ...cut, to: "s2", from: "s0" }))).toMatch(/moving a part of a slot is not supported yet/);
-      expect(await outcome(c.shard("s0").listGroups({ ...cut, limit: 10 }))).toMatch(/moving a part of a slot is not supported yet/);
+      expect(await outcome(c.shard("s0").listGroups({ ...cut, limit: 10, epoch: 0 }))).toMatch(/moving a part of a slot is not supported yet/);
     }
-    expect(await outcome(c.shard("s0").listGroups({ start: block.end, end: block.start, limit: 10 }))).toMatch(/invalid token range/);
+    expect(await outcome(c.shard("s0").listGroups({ start: block.end, end: block.start, limit: 10, epoch: 0 }))).toMatch(/invalid token range/);
     expect((await c.catalog()).routing).toEqual(before);
     for (const id of ["s0", "s2"]) expect(await c.shard(id).moves({})).toEqual({ outgoing: [], incoming: [] });
     // slot の境目で切る分割は通る。
@@ -190,17 +191,20 @@ describe("a shard", () => {
     // 続きの位置からの要求は、グループを分けて運ぶ段で足す。
     const from: [string, string] = ["users", JSON.stringify([moving[0]!, 1])];
     expect(await outcome(c.shard("s0").pull({ ...range, want: [{ g, from }], to: "s2", maxBytes: 1_000_000, epoch }))).toMatch(/still moved as one piece/);
-    // fence を名指ししない要求 (区間が fence と違う) は、fence のないグループの要求と同じに断る。
-    for (const e of [undefined, epoch]) {
-      expect(await outcome(c.shard("s0").pull({ start: range.start, end: range.end - SUBSLOTS, want: [{ g, from: null }], to: "s2", maxBytes: 1_000_000, epoch: e }))).toMatch(/unfenced/);
+    // fence を名指ししない要求は、fence のないグループの要求と同じに断る。区間が fence と違う要求と、epoch が移動のものでない要求である。
+    const wrong = [{ start: range.start, end: range.end - SUBSLOTS, epoch }, { ...range, epoch: epoch - 1 }];
+    for (const named of wrong) {
+      expect(await outcome(c.shard("s0").pull({ ...named, want: [{ g, from: null }], to: "s2", maxBytes: 1_000_000 }))).toMatch(/unfenced/);
     }
-    const [piece] = await c.shard("s0").pull({ ...range, want: [{ g, from: null }], to: "s2", maxBytes: 1_000_000, epoch });
+    // 親は、終わっていない fence の下で渡す。応答は piece の組である (渡し終えた移動には「渡し終えた」と答える。src/types.ts の PullRes)。
+    const answer = await c.shard("s0").pull({ ...range, want: [{ g, from: null }], to: "s2", maxBytes: 1_000_000, epoch });
+    const [piece] = "pieces" in answer ? answer.pieces : [];
     expect({ ...piece, m: 0, rows: piece!.rows.length, intents: piece!.intents.length }).toEqual({
       g, range, after: null, epoch, upTo: null, m: 0, rows: 1, intents: 0, schema: (await c.catalog()).schema,
     });
     // グループの一部だけの piece を受け取ると、届いていない行のあるグループを「到着した」と記録してしまう。子の SQLite は、ここで作る。
     await c.shard("s2").moves({});
-    const receive = (p: PiecePayload) => (c.cores.get("s2") as unknown as { receive(p: PiecePayload[]): Promise<void> }).receive([p]);
+    const receive = (p: PiecePayload) => (c.cores.get("s2") as unknown as { receive(res: PullRes): Promise<unknown> }).receive({ pieces: [p] });
     expect(await outcome(receive({ ...piece!, upTo: from }))).toMatch(/received a part of group/);
     expect(c.backends.get("s2")!.exec("SELECT count(*) AS n FROM __arrived")[0]!.n).toBe(0);
     // グループの一部を指す ack は、渡した piece のものではないので、何も消さない。

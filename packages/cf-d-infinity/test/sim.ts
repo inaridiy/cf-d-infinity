@@ -1,7 +1,7 @@
 import { compoundTerms, depthOf, SHARD_LIMITS } from "../src/shard-limits";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { Db, type ClientFaults, type Cluster } from "../src/client/db";
+import { Db, depsOf, type ClientFaults, type Cluster } from "../src/client/db";
 import { keyString } from "../src/keys";
 import { fold, type EpochRecord, type Move } from "../src/catalog";
 import { MetaCore, type Catalog } from "../src/meta";
@@ -10,7 +10,7 @@ import { type Runtime, sleep, systemRuntime } from "../src/runtime";
 import type { Reference } from "../src/sql/plan";
 import { ShardCore, type SpanEscape, type WriteCheck } from "../src/shard/core";
 import { imageColumns } from "../src/shard/rows";
-import { isWideSpan, type Backend, type Change, type ExecReq, type Faults, type Plain, type PlainRow, type ShardApi, type Span, type TableDef, type Ts, type Value } from "../src/types";
+import { isWideSpan, type Backend, type Change, type Dep, type ExecReq, type Faults, type Plain, type PlainRow, type ShardApi, type Span, type TableDef, type Ts, type Value } from "../src/types";
 import { bindPlain, bindTyped, decodeElem, restoreColumns, type Tuple } from "../src/value";
 
 /**
@@ -384,6 +384,12 @@ export class SimNet {
    * 既定では何もしない。
    */
   reply: (m: Rpc) => Promise<void> | void = () => {};
+  /**
+   * 要求が宛先に届く瞬間に呼ぶ (gate と網の遅延の後、宛先の処理の直前)。投げると、その要求は届かずに失敗する (drop と同じ)。
+   * gate は遅延の前に呼ぶので、届くときの宛先の状態は、ここでしか見られない。乱択の検査が、届いた要求を宛先の記録で分類し、
+   * 見つけて直していない欠陥の要求を落とすのに使う (test/history.ts の MoveChaos.late)。既定では何もしない (RPC の列を変えない)。
+   */
+  arrive: (m: Rpc) => void = () => {};
 }
 
 /** Worker の側の欠陥のスイッチの名前 (src/client/db.ts の ClientFaults)。 */
@@ -391,10 +397,12 @@ const CLIENT_FAULTS = new Set([
   "repinOnRestore", "replayAcrossSchemaChange", "dropWithoutGuard", "noImplicitCommit", "ddlAfterFailedCommit",
   "publishBeforeBackfill", "checkBeforePrepare", "scanSkipsEmpty", "guardFromCommitTs",
   "lockedReadsSkipValidation", "secondDmlNewSince", "secondDmlNewSpanSince",
+  "globalSchemaEpoch", "viewDepsOnly", "writeDepsOnlyWritten", "doomOnSchemaChange",
+  "noWound", "noRetryAfterWound", "retryRestartsBudget", "retrySameEpoch", "renewRelocks",
 ]);
 /**
  * Worker と Meta の両方が読むスイッチの名前。1 つの欠陥を、2 つの守りを外して戻す (commitWithoutAcks は、Worker が 1 つのシャードの
- * prepared を待たず、Meta が ok の集合を確かめない)。injectedFault は、両方に入れる。
+ * prepared を待たず、Meta が ok の集合を確かめない)。injectedFaults は、両方に入れる。
  */
 const BOTH_FAULTS = new Set(["commitWithoutAcks"]);
 /** 範囲の作り方の欠陥のスイッチの名前 (src/client/spans.ts の spanFaults)。test/setup.ts が入れる。 */
@@ -403,16 +411,16 @@ export const SPAN_FAULTS = new Set(["rowSpanDespiteUnique"]);
 export const IMAGE_FAULTS = new Set(["roundedImages"]);
 
 /**
- * 環境変数 FAULT で、欠陥のスイッチを 1 つ、全部のシミュレータに入れる。乱択の検査が、その欠陥を見つけるかを測るためにある
+ * 環境変数 FAULT で、欠陥のスイッチを、全部のシミュレータに入れる。乱択の検査が、その欠陥を見つけるかを測るためにある
  * (scripts/fault-table.mjs)。試験が自分で入れるスイッチには、上書きせずに足す。
+ * ふつうは 1 つである。`FAULT=rehandFinished+markBeforeWrite` のように + でつなぐと、いくつかを一緒に入れる。1 つの守りを外しただけでは
+ * 何も破らず、もう 1 つと組でだけ欠陥になるスイッチがある (docs/design-move-messages.md の「条件 4 は、規則が 2 つともあれば破れない」)。
  */
-export function injectedFault(): { name: string; side: "shard" | "client" | "both" | "span" | "image" } | null {
-  const name = process.env.FAULT;
-  if (!name) return null;
-  return {
+export function injectedFaults(): { name: string; side: "shard" | "client" | "both" | "span" | "image" }[] {
+  return (process.env.FAULT ?? "").split("+").filter((name) => name !== "").map((name) => ({
     name,
     side: BOTH_FAULTS.has(name) ? "both" : CLIENT_FAULTS.has(name) ? "client" : SPAN_FAULTS.has(name) ? "span" : IMAGE_FAULTS.has(name) ? "image" : "shard",
-  };
+  }));
 }
 
 export interface SimOptions {
@@ -588,7 +596,7 @@ export function withOverrides(c: SimCluster, over: Partial<Cluster>): Cluster {
  */
 export const delivers = (m: Pick<Rpc, "method" | "req">, version: number): boolean =>
   (m.method === "prepared" && (m.req as { epoch: number }).epoch === version) ||
-  (m.method === "syncSchema" && (m.req as { schema: number }).schema === version);
+  (m.method === "syncSchema" && (m.req as { atLeast: number }).atLeast >= version);
 
 /** 行イメージの検査を、いまの試験の間だけ止めているか (SimOptions の noImageCheck)。test/setup.ts が試験ごとに戻す。 */
 export const imageCheckOff = { now: false };
@@ -599,8 +607,12 @@ export class SimCluster implements Cluster {
   net = new SimNet();
   /** 時刻、待ち、乱数、識別子の出どころ。Db もシャードも、ここから取る。 */
   readonly runtime: Runtime;
-  /** FAULT で入れた Worker の側の欠陥 (下の injectedFault)。 */
+  /** FAULT で入れた Worker の側の欠陥 (下の injectedFaults)。 */
   readonly clientFaults: ClientFaults | undefined;
+  /** 行ロックの TTL (SimOptions.lockTtlMs)。このクラスタへつなぐ Db は、取引の lease の長さを、これから決める。 */
+  get lockTtlMs(): number | undefined {
+    return this.o.lockTtlMs;
+  }
   /**
    * このクラスタへつなぐ Db を、基準経路だけで実行させる指定。環境変数 REFERENCE (scans か full) から取る。
    * SQLite と突き合わせる検査を、通常の実行と、基準経路だけの実行で流すのに使う。
@@ -626,9 +638,11 @@ export class SimCluster implements Cluster {
   alarms = new Set<string>();
 
   constructor(private o: SimOptions = {}) {
-    const injected = injectedFault();
-    if (injected?.side === "shard" || injected?.side === "both") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
-    this.clientFaults = injected?.side === "client" || injected?.side === "both" ? { ...o.clientFaults, [injected.name]: true } : o.clientFaults;
+    this.clientFaults = o.clientFaults;
+    for (const injected of injectedFaults()) {
+      if (injected.side === "shard" || injected.side === "both") this.o = o = { ...o, faults: { ...o.faults, [injected.name]: true } };
+      if (injected.side === "client" || injected.side === "both") this.clientFaults = { ...this.clientFaults, [injected.name]: true };
+    }
     if (process.env.RPC_TRACE) tracedNets.push(this.net);
     if (o.noImageCheck) imageCheckOff.now = true;
     this.virtual = o.realTime || o.now ? null : new VirtualRuntime(o.seed ?? 1);
@@ -908,6 +922,7 @@ export class SimCluster implements Cluster {
           const delay = this.net.jitter?.() ?? 0;
           if (this.virtual) await this.sleep(delay);
           else await new Promise((r) => (delay > 0 ? setTimeout(r, delay) : setImmediate(r)));
+          this.net.arrive(m);
           // JSON を通して、DO の RPC と同じく参照を共有しないようにする。
           const core = this.core(to);
           // シャードが再起動すると、その instance に届いていた要求は、答えを待たずに失敗する (DO の再起動と同じ。test/workerd-restart.test.ts)。
@@ -946,14 +961,17 @@ export class SimCluster implements Cluster {
   catalog() {
     return this.meta.catalog();
   }
-  prepare(sql: string, opts: { guard?: string[] } = {}, basedOn?: number) {
+  catalogAt(schema: number) {
+    return this.meta.catalogAt(schema);
+  }
+  prepare(sql: string, opts: { guard?: string[]; waitUntil?: number } = {}, basedOn?: number) {
     return this.meta.prepare(sql, opts, basedOn);
   }
   commit(epoch: number, acks: string[], at?: Ts) {
     return this.meta.commit(epoch, acks, at);
   }
-  abort(epoch: number, reason: string) {
-    return this.meta.abort(epoch, reason);
+  abort(epoch: number, reason: string, wound?: boolean) {
+    return this.meta.abort(epoch, reason, wound);
   }
   renew(epoch: number) {
     return this.meta.renew(epoch);
@@ -970,8 +988,7 @@ export class SimCluster implements Cluster {
    */
   async moveAt(parent: string, child: string, range: Interval, tell: string[] = []): Promise<{ epoch: number }> {
     const { epoch } = await this.meta.startMove({ from: parent, to: child, ...range });
-    const { schema } = await this.catalog();
-    for (const id of tell) await this.shard(id).syncSchema({ schema, epoch });
+    for (const id of tell) await this.shard(id).syncSchema({ atLeast: epoch });
     return { epoch };
   }
   /**
@@ -1001,6 +1018,13 @@ export class SimCluster implements Cluster {
     return new Db(this);
   }
 }
+
+/**
+ * 試験が要求を手で作るときの、頼るもの (ExecReq.deps)。スナップショット cat の表 tables に、読みの epoch で頼る。write に挙げた表には、
+ * 書き込みの epoch で頼る。
+ */
+export const depsFor = (cat: Catalog, tables: string[], write: string[] = []): Dep[] =>
+  depsOf(cat, {}, [...tables, ...write].map((table) => ({ kind: "table" as const, table })), { write });
 
 /** シャードの変更ログを commit_ts の昇順で全部読む (テスト用)。 */
 export function logRows(b: SqliteBackend): PlainRow[] {

@@ -122,9 +122,13 @@ describe("a transaction that reads, at its old read time, a group the parent emp
     // 段 4 より前は、大きい m なら床を上げた (同じ区間の、ほかの受け取りの行の m も書き換えた)。受け取りの記録は、受け取りごとに、
     // そのときの m を残す (docs/design-refresh-across-move.md の「実装がすること」の 5。範囲が前の持ち主へ戻ると、同じ区間を 2 度受け取る)。
     // どちらの m も、渡した側がその範囲について発行したどの時刻よりも大きいので、初めの m で足りる。
-    await c.shard("s1").finishIncoming({ ...range, m: m - 1000 });
+    // 受け取りは、移動の epoch で名指しする (計画書の不変条件 15)。受け取り終えた移動の epoch には、何もしない。
+    const received = c.backends.get("s1")!.exec("SELECT epoch, lo, hi, done FROM __incoming");
+    expect(received).toEqual([{ epoch: expect.any(Number), lo: range.start, hi: range.end, done: 1 }]);
+    const epoch = received[0]!.epoch as number;
+    await c.shard("s1").finishIncoming({ epoch, m: m - 1000 });
     expect(await floor()).toBe(m);
-    await c.shard("s1").finishIncoming({ ...range, m: m + 7 });
+    await c.shard("s1").finishIncoming({ epoch, m: m + 7 });
     expect(await floor()).toBe(m);
     c.restart("s1");
     expect(await floor()).toBe(m);

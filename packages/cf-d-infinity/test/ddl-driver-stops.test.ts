@@ -44,6 +44,10 @@ const SCENARIOS: Scenario[] = [
         async check(c) {
           const other = new Db(c);
           const wrote = await outcome(other.query("INSERT INTO p VALUES (?, 5, 'e', NULL)", [good]));
+          // 進める側が止まった遷移は、期限 (5 秒) が来るまで開いている。prepare は、どのものの epoch も進めないので、ほかの接続の書き込みは、
+          // prepare を適用していないシャードでは待たずに通る (段 3 までは、書き込みが prepare を適用させ、期限まで待った)。index が
+          // 「どこにもない」ことは、遷移が閉じた後で確かめる。
+          for (let i = 0; i < 100 && (await c.catalog()).open; i++) await c.sleep(100);
           // 消した index の表は、そのシャードが表定義を適用するときに消える。まだ適用していないシャードに残る表は数えない。
           await settled(c);
           const listed = (await c.catalog()).indexes.ux !== undefined;

@@ -179,8 +179,14 @@ only the range table moved is not stale.
 
 `DinfMeta` runs the shard statements of a change in its own SQLite, on empty copies of the tables, and records the
 prepare only if they succeed. A statement that parses but that SQLite rejects is therefore refused up front. The
-prepare stops writes to the tables the change must keep still (a table it drops, renames or adds a column to, or
-indexes from its rows); a shard that applies it refuses those writes until it applies the commit or the abort. A
+prepare stops writes to every existing table whose write plans the change makes stale (a table it drops, renames,
+adds a column to, or creates or drops an index on); a shard that applies it refuses those writes, and gives out no
+new row lock on those tables, until it applies the commit or the abort. A shard does not apply the prepare while a
+transaction holds a row lock on such a table: the change waits for that transaction, for at most 5 seconds from its
+start, as a schema change in SQLite waits for the writer. From the moment a shard starts waiting it stops the table
+for every transaction that holds no row lock on it, so a transaction that arrives later waits behind the change
+wherever its rows are, and the change's outcome depends only on the transactions that held locks before it began
+(models M24 and M24c). A
 statement that can fail only where rows exist (a `UNIQUE` index over duplicates, `ADD COLUMN` with a `CHECK`) is tried
 by every shard on its fenced table and rolled back; if a shard's rows break it, the change is aborted and the caller
 gets SQLite's message. Nothing is undone: a change enters the schema only at its commit, so no statement ever planned
@@ -244,6 +250,15 @@ The child keeps that last timestamp with the range (the *range floor*) and refus
 or validation of a key in the range at an earlier time. It has no history of the range from before the move: a group
 the parent emptied before the fence is not copied either, and without the floor the child would answer "no rows" for
 it at a time when the rows still existed.
+
+A request or an answer of a move can arrive after the move is over, because messages between shards have no deadline;
+by then the range may have moved on or come back. A shard changes what it recorded about a move only for a message
+that names a move it is still handing or still receiving. For any other move the parent changes nothing and answers
+that it has finished handing, with its clock. A child that still receives that move finishes receiving on the answer,
+so a statement on a shard key without rows is served instead of refused; any other child discards it, and a statement
+that waited for it asks again in the move its shard receives now. What a shard keeps in memory about handed and
+arrived groups is rebuilt from those records by one function, at boot and after every write. Model M5d; see
+[design-move-messages.md](./design-move-messages.md).
 
 Ownership moves before the data does, which sheds load from a hot parent immediately instead of making it also pay
 for a bulk copy first. A Worker whose range table predates the split is told so: a request for a moved shard key, and

@@ -1,7 +1,7 @@
 // M7: rollback-read はどの過去時点の状態も正確に再構成できる。実 SQLite に対するプロパティテスト。
 import { describe, expect, it } from "vitest";
 import { Db, QueryResult } from "../src/client/db";
-import { SimCluster } from "./sim";
+import { depsFor, SimCluster } from "./sim";
 
 function prng(seed: number) {
   let a = seed >>> 0;
@@ -51,10 +51,10 @@ describe("rollback-read reconstructs every past state", () => {
       }
 
       const shard = c.shard(c.shardIds[0]!);
-      const { schema, epoch } = await c.catalog();
+      const cat = await c.catalog();
       for (const s of snapshots) {
         const past = await shard.exec({
-          T: s.T, sql: dump, columns: ["id", "code", "n"], params: [], spans: [{ kind: "sk", table: "t", sk: "[1]" }], schema, epoch,
+          T: s.T, sql: dump, columns: ["id", "code", "n"], params: [], spans: [{ kind: "sk", table: "t", sk: "[1]" }], deps: depsFor(cat, ["t"]), epoch: cat.epoch,
         });
         expect(new QueryResult(past.columns, past.values).rows).toEqual(s.rows);
       }
@@ -68,7 +68,11 @@ describe("rollback-read reconstructs every past state", () => {
     await db.ddl(`CREATE TABLE t(tenant_id INTEGER NOT NULL, id INTEGER NOT NULL, PRIMARY KEY (tenant_id,id))`);
     const T = (await db.query("SELECT count(*) c FROM t WHERE tenant_id = 1")).ts!;
     for (let i = 0; i < 5; i++) await db.query("INSERT INTO t VALUES (1,?)", [i]);
-    const { schema, epoch } = await c.catalog();
-    await expect(c.shard("s0").exec({ T, sql: "SELECT 1", columns: ["1"], params: [], spans: [], schema, epoch })).rejects.toThrow(/read too old/);
+    const cat = await c.catalog();
+    // 読み戻すのは、文が読む表 (範囲の表) の行だけである。表 t を読む文は、t の 5 行の変更を戻すことになり、上限 K を超える。
+    const read = { T, sql: "SELECT count(*) FROM t", columns: ["count(*)"], params: [], deps: depsFor(cat, ["t"]), epoch: cat.epoch };
+    await expect(c.shard("s0").exec({ ...read, spans: [{ kind: "table", table: "t" }] })).rejects.toThrow(/read too old: delta exceeds K/);
+    // t を読まない文は、t の変更を読み戻さない (docs/design-catalog-epoch.md の「表ごとの epoch」の床)。
+    expect((await c.shard("s0").exec({ ...read, sql: "SELECT 1", columns: ["1"], spans: [] })).values).toEqual([[1n]]);
   });
 });

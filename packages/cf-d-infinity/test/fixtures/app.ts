@@ -73,10 +73,23 @@ const scenarios: Record<string, (db: Connection, env: Env) => Promise<unknown>> 
     await db.transaction((t) => t.execute("UPDATE acc SET balance = balance + 0 WHERE id = 2"));
     return { ms: Date.now() - t0, balance: await db.prepare("SELECT balance FROM acc WHERE id = 2").first("balance") };
   },
+  /**
+   * 放っておかれた取引の行ロックは、取引の最後の文から 7.5 秒までに切れる (docs/design-lock-lease.md)。行ロックの待ちは 5 秒が上限
+   * なので、すぐ後に同じ行を書く取引は、1 度 SQLITE_BUSY になり得る。アプリと同じに、やり直す。
+   */
   async afterAbandon(db) {
     const t0 = Date.now();
-    await db.transaction((t) => t.execute("UPDATE acc SET balance = balance + 0 WHERE id = 1"));
-    return { ms: Date.now() - t0, balance: await db.prepare("SELECT balance FROM acc WHERE id = 1").first("balance") };
+    const failed: string[] = [];
+    for (;;) {
+      try {
+        await db.transaction((t) => t.execute("UPDATE acc SET balance = balance + 0 WHERE id = 1"));
+        break;
+      } catch (e) {
+        failed.push((e as Error).message);
+        if (failed.length >= 3) throw e;
+      }
+    }
+    return { ms: Date.now() - t0, failed, balance: await db.prepare("SELECT balance FROM acc WHERE id = 1").first("balance") };
   },
   async conflict(db) {
     const tx = await db.begin("deferred");

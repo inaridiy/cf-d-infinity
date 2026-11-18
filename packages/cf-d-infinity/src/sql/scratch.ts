@@ -54,6 +54,11 @@ export interface Compiled {
   metadata: boolean;
   /** 結果の列名。SQLite が文を用意したときに付けた名前である。シャードへ送る読みの ExecReq.columns に使う。 */
   columns: string[];
+  /**
+   * 文が頼る view。文が名指す view と、その view が通して読む view である。view を通る読みの要求は、view と、その元の表に頼る
+   * (docs/design-catalog-epoch.md の「表ごとの epoch」の「規則」)。
+   */
+  views: string[];
 }
 
 /**
@@ -201,7 +206,32 @@ export class ScratchDb implements Backend {
       } else if (op.opcode === "VOpen") virtual = true;
     }
     const { columns } = this.run(sql, [], null, () => null);
-    return { tables: [...out], read: [...read], metadata: schema || (virtual && namesPragmaFunction(sql)), columns };
+    return { tables: [...out], read: [...read], metadata: schema || (virtual && namesPragmaFunction(sql)), columns, views: this.viewsUsed(sql) };
+  }
+
+  /**
+   * 文が頼る view を、SQLite に尋ねる。view を 1 つ消してみて、文を用意できなくなれば、文はその view に頼っている (view を通して読む
+   * view も同じに分かる)。消した view は巻き戻す。構文から拾うと、同じ名前の CTE や列を view と取り違える。view のない表定義では、
+   * 何も実行しない。
+   */
+  private viewsUsed(sql: string): string[] {
+    const views = this.exec(`SELECT name FROM sqlite_master WHERE type = 'view'`).map((r) => r.name as string);
+    const used: string[] = [];
+    for (const v of views) {
+      this.db.run("SAVEPOINT dinf_view");
+      try {
+        this.db.run(`DROP VIEW "${v.replaceAll('"', '""')}"`);
+        try {
+          this.db.prepare(sql).free();
+        } catch {
+          used.push(v);
+        }
+      } finally {
+        this.db.run("ROLLBACK TO dinf_view");
+        this.db.run("RELEASE dinf_view");
+      }
+    }
+    return used;
   }
 
   /**
